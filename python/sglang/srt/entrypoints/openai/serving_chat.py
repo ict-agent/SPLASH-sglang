@@ -857,6 +857,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
+                            logprobs=choice_logprobs,
                             finish_reason=None,
                         )
                         chunk = ChatCompletionStreamResponse(
@@ -885,6 +886,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
+                        choice_logprobs,
                         parser_dict,
                         content,
                         request,
@@ -1471,6 +1473,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         index: int,
         delta: str,
+        logprobs: Dict[str, Any],
         parser_dict: Dict[int, FunctionCallParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
@@ -1512,6 +1515,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
+                logprobs=logprobs,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -1564,6 +1568,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
+                logprobs=logprobs,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
