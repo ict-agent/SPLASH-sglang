@@ -646,6 +646,9 @@ class ChatCompletionRequest(BaseModel):
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
+    # Return token IDs in response
+    return_token_ids: bool = False
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -907,6 +910,8 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
     sglext: Optional[SglExt] = None
+    # GLM NOTE: additional metadata, such as output_ids
+    metadata: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
