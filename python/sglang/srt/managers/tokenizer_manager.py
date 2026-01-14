@@ -37,7 +37,7 @@ import torch
 import uvloop
 import zmq
 import zmq.asyncio
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -560,6 +560,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 async for response in self._handle_batch_request(obj, request):
                     yield response
 
+    async def tokenize_and_cache_one_chat_request(
+        self,
+        obj: GenerateReqInput,
+    ) -> None:
+        """Tokenize one request and cache the result in the object.
+
+        This method is used to tokenize a single chat request and cache the result in the object.
+        It was called for pre_checking the request validate and avoid tokenize repeatedly.
+
+        TODO: Used for /generate API and batch inference. Now only Used for /v1/chat/completions API.
+        """
+
+        # tokenize input request and check it validate
+        tokenized_obj = await self._tokenize_one_request(obj)
+
+        # cache the result in the object
+        obj.input_ids = tokenized_obj.input_ids
+
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
     ) -> InputFormat:
@@ -845,7 +863,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             elif self.server_args.glm_check_chat_prompt_length and isinstance(
                 obj, GenerateReqInput
             ):
-                raise fastapi.HTTPException(
+                raise HTTPException(
                     status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
                     detail=f"Request {len(input_ids)} input tokens exceeds the model's maximum context length {self.context_len}",
                 )
