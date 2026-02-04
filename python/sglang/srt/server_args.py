@@ -741,6 +741,9 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # GLM extended args
+    glm_check_chat_prompt_length: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -5960,6 +5963,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        # GLM extended args
+        parser.add_argument(
+            "--glm-check-chat-prompt-length",
+            action="store_true",
+            help="Check input prompt tokenized tokens length before inference. If the length exceeded the maximum input length, server will return 413 error.",
         )
 
     @classmethod

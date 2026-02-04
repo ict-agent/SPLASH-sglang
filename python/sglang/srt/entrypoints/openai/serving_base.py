@@ -98,6 +98,16 @@ class OpenAIServingBase(ABC):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
 
+            if (
+                self.tokenizer_manager.server_args.glm_check_chat_prompt_length
+                and isinstance(adapted_request, GenerateReqInput)
+            ):
+                # GLM NOTE: validate the request by pre_tokenizing it and cache the result.
+                # Otherwise, fastapi won't response 413 http code in StreamingResponse.
+                await self.tokenizer_manager.tokenize_and_cache_one_chat_request(
+                    adapted_request
+                )
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
