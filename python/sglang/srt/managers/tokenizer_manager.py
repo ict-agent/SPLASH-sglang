@@ -2173,6 +2173,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
 
+            # GLM NOTE: TODO: fix bug. If the request is in scheduler wait_queue and is interrupted
+            # by client, only marked as finished but won't be deleted from rid_to_state.
+            remain_rids_without_finished = [
+                k for k, v in self.rid_to_state.items() if not v.finished
+            ]
+            remain_num_req_without_finished = len(remain_rids_without_finished)
+
             if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
@@ -2191,9 +2198,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 break
 
             logger.info(
-                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
+                f"Gracefully exiting... Remaining number of requests {remain_num_req},"
+                f"including unfinished requests {remain_num_req_without_finished}."
+                f"Remaining total requests {remaining_rids=}."
+                f"Remaining unfinished requests {remain_rids_without_finished=}."
             )
-            if remain_num_req > 0:
+            if remain_num_req_without_finished > 0:
                 await asyncio.sleep(5)
             else:
                 self.dump_requests_before_crash()
