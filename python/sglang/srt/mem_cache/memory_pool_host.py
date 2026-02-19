@@ -12,8 +12,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
+import os
 import psutil
+import time
 import torch
+import torch.distributed as dist
+import uuid
 
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
@@ -29,6 +33,15 @@ from sglang.jit_kernel.hicache import (
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+)
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -1936,3 +1949,241 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._backup_indexer_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
+
+
+class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
+    """
+    基于 Shared Memory 的 NSA Host Cache 管理。
+
+    特性：
+    1. 同时支持 NSA 的 KV Cache 和 Indexer Cache (index_k_with_scale_buffer) 的共享内存管理。
+    2. Rank 0 创建 /dev/shm 映射文件，组内其他 Rank 映射同一物理内存。
+    3. Load 时：所有 Rank 并行读取。
+    4. Backup 时：仅 Rank 0 写回，保证数据一致性并减少总线竞争。
+    """
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ):
+        logger.info("Using NSATokenToKVPoolHostShared for zero-copy shared host cache (NSA).")
+
+        # 初始化 TP/DP 信息
+        if is_dp_attention_enabled():
+            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_attention_tp_size()
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = tp_group
+
+        # 初始化父类
+        # 注意：父类 __init__ 会调用 init_kv_buffer，所以在此之前 tp_rank 等必须已设置
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+        # 重新初始化 NSA 特有的 Index buffer 引用 (父类中已经做过，但这里确保 shared memory 设置正确后引用也是对的)
+        self.index_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.index_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+        # 重新初始化 MLA 部分的引用
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _allocate_shared_buffer(self, name_suffix: str, shape: tuple, dtype: torch.dtype):
+        """
+        通用的共享内存分配辅助函数（已针对 cudaHostRegister 的 Page Fault 瓶颈进行优化，包含耗时打点）。
+        """
+        numel = 1
+        for d in shape:
+            numel *= d
+        total_bytes = numel * dtype.itemsize
+        size_gb = total_bytes / (1024**3)
+
+        t_start_all = time.perf_counter()
+
+        if self.tp_rank == 0:
+            logger.info(f"[{name_suffix}] Allocating shared memory buffer: {size_gb:.2f} GB")
+
+        # 1. 协商文件名
+        shared_filename = None
+        if self.tp_rank == 0:
+            t_file_start = time.perf_counter()
+            unique_id = str(uuid.uuid4())
+            # 区分 KV 和 Indexer 的文件名
+            shared_filename = f"/dev/shm/sglang_nsa_{name_suffix}_{unique_id}.bin"
+            with open(shared_filename, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, total_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(total_bytes)
+            logger.info(f"[{name_suffix}] Rank 0 created shared file in {time.perf_counter() - t_file_start:.3f}s")
+
+        object_list = [shared_filename]
+        dist.broadcast_object_list(object_list, src=0, group=self.tp_group)
+        shared_filename = object_list[0]
+
+        dist.barrier(group=self.tp_group)
+
+        try:
+            # 2. 映射内存
+            t_map_start = time.perf_counter()
+            flat_tensor = torch.from_file(
+                shared_filename,
+                shared=True,
+                size=numel,
+                dtype=dtype,
+                device="cpu",
+            )
+            if self.tp_rank == 0:
+                logger.info(f"[{name_suffix}] Memory mapping took {time.perf_counter() - t_map_start:.3f}s")
+
+            # =================================================================
+            # 3. 并行缺页中断 (Parallel Page Faulting)
+            # =================================================================
+            t_zero_start = time.perf_counter()
+
+            chunk_size = numel // self.tp_size
+            start_idx = self.tp_rank * chunk_size
+            end_idx = numel if self.tp_rank == self.tp_size - 1 else start_idx + chunk_size
+
+            # 强制操作系统真正分配物理内存页
+            flat_tensor[start_idx:end_idx].zero_()
+
+            t_zero_end = time.perf_counter()
+            logger.info(f"[{name_suffix}] Rank {self.tp_rank} finished zeroing chunk in {t_zero_end - t_zero_start:.3f}s")
+
+            # 等待所有进程都完成
+            dist.barrier(group=self.tp_group)
+            if self.tp_rank == 0:
+                logger.info(f"[{name_suffix}] Parallel page faulting (all ranks) completed in {time.perf_counter() - t_zero_start:.3f}s")
+
+            buffer = flat_tensor.view(shape)
+
+            # 4. 注册 Pinned Memory
+            if self.pin_memory and is_cuda():
+                t_pin_start = time.perf_counter()
+                err = torch.cuda.cudart().cudaHostRegister(
+                    buffer.data_ptr(), total_bytes, 0
+                )
+                if err != 0:
+                    logger.warning(
+                        f"Failed to pin shared memory for {name_suffix}. Error code: {err}"
+                    )
+                t_pin_end = time.perf_counter()
+                if self.tp_rank == 0:
+                    logger.info(f"[{name_suffix}] cudaHostRegister took {t_pin_end - t_pin_start:.3f}s")
+
+            if self.tp_rank == 0:
+                logger.info(f"[{name_suffix}] Total allocation pipeline took {time.perf_counter() - t_start_all:.3f}s")
+
+            return buffer
+        finally:
+            # 清理文件名
+            dist.barrier(group=self.tp_group)
+            if self.tp_rank == 0 and os.path.exists(shared_filename):
+                os.remove(shared_filename)
+
+    def init_kv_buffer(self):
+        """
+        初始化共享内存 Buffer，包括 KV Buffer 和 NSA Index Buffer。
+        """
+        # --- 1. 初始化 KV Buffer (Base MLA Logic) ---
+        if self.layout == "layer_first":
+            kv_dims = (
+                self.layer_num,
+                self.size,
+                1,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            )
+        else:
+            raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
+
+        self.token_stride_size = (
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ) * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.kv_buffer = self._allocate_shared_buffer("kv", kv_dims, self.dtype)
+
+        # --- 2. 初始化 NSA Index Buffer ---
+        # 计算 Shape，逻辑同 NSATokenToKVPoolHost.init_kv_buffer
+        index_buffer_second_dim = self.page_size * (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        )
+        self.index_stride_size = (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        ) * self.index_k_with_scale_buffer_dtype.itemsize
+
+        # NSATokenToKVPoolHost 将其存储为 list[Tensor]，这里为了共享内存分配，先分配一个大 Tensor
+        # Shape: (LayerNum, PageNum, ElementDim)
+        index_dims = (self.layer_num, self.page_num, index_buffer_second_dim)
+
+        full_index_buffer = self._allocate_shared_buffer(
+            "index",
+            index_dims,
+            self.index_k_with_scale_buffer_dtype
+        )
+
+        # 将大 Tensor 切分为 list，以兼容父类接口: [tensor(layer_0), tensor(layer_1), ...]
+        self.index_k_with_scale_buffer = [
+            full_index_buffer[i] for i in range(self.layer_num)
+        ]
+
+        # 返回 kv_buffer 以满足 HostKVCache 的接口约定
+        return self.kv_buffer
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """
+        所有 Rank 并行从共享 Host 内存加载数据 (KV + Indexer)。
+        """
+        # 直接调用父类的逻辑即可。
+        # 父类 NSATokenToKVPoolHost.load_to_device_per_layer 会依次调用:
+        # 1. super().load... (即 MLATokenToKVPoolHost 的 load，负责 KV)
+        # 2. self._load_indexer_to_device_per_layer (负责 Indexer)
+        # 因为所有 Rank 都映射了共享内存，所以 standard load 逻辑 = 并行读取 = 正确。
+        super().load_to_device_per_layer(
+             device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        """
+        Backup 数据。仅 Rank 0 写回共享内存。
+        同时处理 KV Buffer 和 Index Buffer。
+        """
+        if self.tp_rank == 0:
+            # 调用父类 backup，父类会依次处理 KV 和 Indexer 的写回。
+            # 只有 Rank 0 执行此操作，避免写入冲突。
+            super().backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )

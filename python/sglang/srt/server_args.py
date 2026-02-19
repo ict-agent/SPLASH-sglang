@@ -726,6 +726,7 @@ class ServerArgs:
     glm_check_chat_prompt_length: bool = False
     glm_decoding_constraint_module: Optional[str] = None
     glm_ignore_decoding_constraint_exception: bool = False
+    glm_nsa_shared_hicache: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -5905,6 +5906,14 @@ class ServerArgs:
             default=ServerArgs.glm_ignore_decoding_constraint_exception,
             help="If set, log constraint generation exceptions instead of raising them, "
             "and proceed without constraint. Useful for production as a fallback",
+        )
+        parser.add_argument(
+            "--glm-nsa-shared-hicache",
+            action="store_true",
+            help="Enable shared-memory optimization for GLM-NSA Host KV Cache in Tensor Parallel mode. "
+                "Instead of saving replicaed data on each rank, all intra-node ranks directly access a single "
+                "shared host memory region. This reduces communication latency and maximizes PCIe bandwidth. "
+                "Note: Only works for single-node setups."
         )
 
         # For PD-Multiplexing
