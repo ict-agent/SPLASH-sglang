@@ -51,6 +51,13 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.mem_cache.glm.hugepage_utils import (
+    GLM_HICACHE_SHM_DIR,
+    _align_up,
+    _hugepage_enabled,
+    _hugepage_size,
+)
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -203,7 +210,7 @@ class HostKVCache(abc.ABC):
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
         available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
+        if requested_bytes > available_bytes and not _hugepage_enabled():
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -2187,3 +2194,261 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
             super().backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend
             )
+
+
+class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
+    """
+    基于分布式 Shared Memory 的 NSA Host Cache 管理 (兼顾 Pipeline Parallel)。
+
+    特性：
+    1. 每个 Rank 创建并初始化属于自己的 cache 空间（按相对层划分），并通过 shared memory 映射给组内所有 Rank。
+    2. 支持 Pipeline Parallel：文件名与分块逻辑明确使用 absolute layer 进行唯一化隔离。
+    3. Load 时：所有 Rank 可以并行地按照 layer id 从组装好的全局 List[Tensor] 中并行读取。
+    4. Backup 时：每个 Rank 仅将自己负责的 layer 范围通过内核写回到自己初始化的那段 cache，消除总线竞争。
+    """
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ):
+        logger.info("Using NSATokenToKVPoolHostShared (Per-Rank Distributed Shards) for zero-copy host cache (NSA).")
+
+        if is_dp_attention_enabled():
+            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_attention_tp_size()
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = tp_group
+
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        local_layer_num = device_pool.layer_num
+
+        chunk = local_layer_num // self.tp_size
+        rem = local_layer_num % self.tp_size
+
+        self.my_rel_start = self.tp_rank * chunk + min(self.tp_rank, rem)
+        self.my_rel_end = self.my_rel_start + chunk + (1 if self.tp_rank < rem else 0)
+        self.my_num_layers = self.my_rel_end - self.my_rel_start
+
+        self.my_abs_start = self.start_layer + self.my_rel_start
+        self.my_abs_end = self.start_layer + self.my_rel_end
+
+        logger.info(
+            f"Host Cache Sharding: Rank {self.tp_rank}/{self.tp_size} owns relative layers "
+            f"[{self.my_rel_start}, {self.my_rel_end}) -> absolute layers [{self.my_abs_start}, {self.my_abs_end})."
+        )
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+        self.index_data_refs = [self.index_k_with_scale_buffer[i] for i in range(self.layer_num)]
+        self.index_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.index_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def init_kv_buffer(self):
+        if self.layout != "layer_first":
+            raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
+
+        if _hugepage_enabled():
+            logger.info(f"HugePage enabled. Using shared host cache directory: {GLM_HICACHE_SHM_DIR}, PageSize = {_hugepage_size()}.")
+
+        # 计算 Element Dimensions
+        self.token_stride_size = (self.kv_lora_rank + self.qk_rope_head_dim) * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+        kv_element_dim = self.kv_lora_rank + self.qk_rope_head_dim
+
+        index_buffer_second_dim = self.page_size * (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        )
+        self.index_stride_size = (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        ) * self.index_k_with_scale_buffer_dtype.itemsize
+
+        # === Step 1: 当前 Rank 在本地 /dev/shm 创建并分配自己负责的那块 Cache 空间 ===
+        my_files = None
+        t_zero = time.perf_counter()
+        if self.my_num_layers > 0:
+            uid = str(uuid.uuid4())
+            # 文件名带上 absolute layer 以隔离同节点上运行的其他 PP Stage
+            kv_name = f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_kv_{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
+            idx_name = f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_idx_{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
+
+            kv_bytes = self.my_num_layers * self.size * kv_element_dim * self.dtype.itemsize
+            idx_bytes = self.my_num_layers * self.page_num * index_buffer_second_dim * self.index_k_with_scale_buffer_dtype.itemsize
+            kv_alloc_bytes = _align_up(kv_bytes) if _hugepage_enabled() else kv_bytes
+            idx_alloc_bytes = _align_up(idx_bytes) if _hugepage_enabled() else idx_bytes
+
+            t_zero_alloc = time.perf_counter()
+            with open(kv_name, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, kv_alloc_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(kv_alloc_bytes)
+
+            with open(idx_name, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, idx_alloc_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(idx_alloc_bytes)
+            logger.info(f"Rank {self.tp_rank} cache file creation finished in {time.perf_counter()-t_zero_alloc:.3f}s")
+
+            # 在 Step 1 就原地将文件映射到内存并执行 zero_()。
+            # 此时各个 Rank 之间完全并行，物理内存分配（触发缺页中断）会落在此 Rank 绑定的 NUMA 节点上。
+            # 提前写满 0，消除后续 Step 3 中 cudaHostRegister 时因等待物理页分配产生的锁竞争等待。
+            t_zero_alloc = time.perf_counter()
+            my_kv_numel = self.my_num_layers * self.size * 1 * kv_element_dim
+            tmp_kv_numel = kv_alloc_bytes // self.dtype.itemsize
+            tmp_kv = torch.from_file(kv_name, shared=True, size=tmp_kv_numel, dtype=self.dtype, device="cpu")
+            tmp_kv[:my_kv_numel].zero_()
+            del tmp_kv  # 释放临时映射句柄
+
+            my_idx_numel = self.my_num_layers * self.page_num * index_buffer_second_dim
+            tmp_idx_numel = idx_alloc_bytes // self.index_k_with_scale_buffer_dtype.itemsize
+            tmp_idx = torch.from_file(idx_name, shared=True, size=tmp_idx_numel, dtype=self.index_k_with_scale_buffer_dtype, device="cpu")
+            tmp_idx[:my_idx_numel].zero_()
+            del tmp_idx # 释放临时映射句柄
+            logger.info(f"Rank {self.tp_rank} allocated and zeroed its own physical memory locally in {time.perf_counter()-t_zero_alloc:.3f}s")
+
+            my_files = {"kv": kv_name, "index": idx_name}
+
+        # === Step 2: 组内全局收集当前 PP Stage 所有 Rank 创建的文件名 ===
+        all_files = [None] * self.tp_size
+        dist.all_gather_object(all_files, my_files, group=self.tp_group)
+
+        # === Step 3: 所有 Rank 统一映射文件到自己的内存空间并拼装 ===
+        self.kv_buffer = [None] * self.layer_num
+        self.index_k_with_scale_buffer = [None] * self.layer_num
+
+        for step in range(self.tp_size):
+            # Rotate stagger 错开锁竞争
+            file_idx = (step + self.tp_rank) % self.tp_size
+
+            chunk = self.layer_num // self.tp_size
+            rem = self.layer_num % self.tp_size
+            r_rel_start = file_idx * chunk + min(file_idx, rem)
+            r_rel_end = r_rel_start + chunk + (1 if file_idx < rem else 0)
+            r_num = r_rel_end - r_rel_start
+
+            if r_num == 0:
+                continue
+
+            files = all_files[file_idx]
+
+            t_zero_pin = time.perf_counter()
+
+            # --- 映射 KV ---
+            kv_shape = (r_num, self.size, 1, kv_element_dim)
+            kv_numel = r_num * self.size * 1 * kv_element_dim
+            kv_mapped_numel = (
+                _align_up(kv_numel * self.dtype.itemsize) // self.dtype.itemsize
+                if _hugepage_enabled() else kv_numel
+            )
+            kv_tensor = torch.from_file(
+                files["kv"], shared=True, size=kv_mapped_numel, dtype=self.dtype, device="cpu"
+            )[:kv_numel].view(kv_shape)
+            if self.pin_memory and is_cuda():
+                torch.cuda.cudart().cudaHostRegister(kv_tensor.data_ptr(), kv_numel * self.dtype.itemsize, 0)
+
+            # --- 映射 Indexer ---
+            idx_shape = (r_num, self.page_num, index_buffer_second_dim)
+            idx_numel = r_num * self.page_num * index_buffer_second_dim
+            idx_mapped_numel = (
+                _align_up(idx_numel * self.index_k_with_scale_buffer_dtype.itemsize)
+                // self.index_k_with_scale_buffer_dtype.itemsize
+                if _hugepage_enabled() else idx_numel
+            )
+            idx_tensor = torch.from_file(
+                files["index"], shared=True, size=idx_mapped_numel, dtype=self.index_k_with_scale_buffer_dtype, device="cpu"
+            )[:idx_numel].view(idx_shape)
+            if self.pin_memory and is_cuda():
+                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.index_k_with_scale_buffer_dtype.itemsize, 0)
+
+            logger.info(f"Rank {self.tp_rank} finish cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_zero_pin:.3f}s")
+
+            for i in range(r_num):
+                global_layer_idx = r_rel_start + i
+                self.kv_buffer[global_layer_idx] = kv_tensor[i]
+                self.index_k_with_scale_buffer[global_layer_idx] = idx_tensor[i]
+
+        dist.barrier(group=self.tp_group)
+        if my_files:
+            if os.path.exists(my_files["kv"]): os.remove(my_files["kv"])
+            if os.path.exists(my_files["index"]): os.remove(my_files["index"])
+
+        return self.kv_buffer
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        super().load_to_device_per_layer(
+             device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        if self.my_num_layers == 0:
+            return
+
+        # 1. Backup KV Buffer
+        if io_backend == "kernel":
+            src_ptrs = device_pool.data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            dst_ptrs = self.data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+
+            transfer_kv_all_layer_mla(
+                src_layers=src_ptrs,
+                dst_layers=dst_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.token_stride_size,
+                num_layers=self.my_num_layers,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        # 2. Backup Index Buffer (NSA)
+        page_indices_host = host_indices[:: self.page_size] // self.page_size
+        page_indices_device = device_indices[:: self.page_size] // self.page_size
+
+        if io_backend == "kernel":
+            src_ptrs = device_pool.index_k_with_scale_buffer_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            dst_ptrs = self.index_data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+
+            transfer_kv_all_layer_mla(
+                src_layers=src_ptrs,
+                dst_layers=dst_ptrs,
+                src_indices=page_indices_device,
+                dst_indices=page_indices_host,
+                item_size=self.index_stride_size * self.page_size,
+                num_layers=self.my_num_layers,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")

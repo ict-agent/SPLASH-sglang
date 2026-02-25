@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
     NSATokenToKVPoolHostShared,
+    NSATokenToKVPoolHostSharedLayerGroup,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -72,6 +73,16 @@ class HiRadixCache(RadixCache):
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool) and server_args.glm_nsa_shared_hicache:
             self.token_to_kv_pool_host = NSATokenToKVPoolHostShared(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+                tp_group=params.tp_cache_group,
+            )
+        elif isinstance(self.kv_cache, NSATokenToKVPool) and server_args.glm_nsa_shared_layer_group_hicache:
+            self.token_to_kv_pool_host = NSATokenToKVPoolHostSharedLayerGroup(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
