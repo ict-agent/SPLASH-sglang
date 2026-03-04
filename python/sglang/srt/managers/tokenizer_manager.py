@@ -855,6 +855,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Request {max_new_tokens} max_new_tokens exceeds the model's maximum context length {self.context_len}"
             )
 
+        if self.server_args.glm_adaptive_max_tokens:
+            adaptive_max = self.context_len - len(input_ids) - 1
+            if adaptive_max > 0 and max_new_tokens > adaptive_max:
+                logger.debug(
+                    f"adaptive_max_tokens: reduce max_new_tokens {max_new_tokens} -> {adaptive_max}"
+                )
+                max_new_tokens = adaptive_max
+                obj.sampling_params["max_new_tokens"] = max_new_tokens
+
         if len(input_ids) + max_new_tokens >= self.context_len:
             if self.server_args.allow_auto_truncate:
                 input_token_num = self.context_len - max_new_tokens - 1
