@@ -834,6 +834,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
         # Validate total tokens (input + max_new_tokens)
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
+
+        # Adaptive max tokens: clip max_new_tokens to fit within context length
+        if self.server_args.glm_adaptive_max_tokens and max_new_tokens is not None:
+            adaptive_max = _max_req_len - input_token_num
+            if adaptive_max > 0 and max_new_tokens > adaptive_max:
+                logger.debug(
+                    f"adaptive_max_tokens: reduce max_new_tokens {max_new_tokens} -> {adaptive_max}"
+                )
+                max_new_tokens = adaptive_max
+                obj.sampling_params["max_new_tokens"] = max_new_tokens
+
         if (
             self.validate_total_tokens
             and max_new_tokens is not None

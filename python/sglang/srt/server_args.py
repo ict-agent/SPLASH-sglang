@@ -742,6 +742,7 @@ class ServerArgs:
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
     # GLM extended args
+    glm_adaptive_max_tokens: bool = False
     glm_check_chat_prompt_length: bool = False
     glm_decoding_constraint_module: Optional[str] = None
     glm_ignore_decoding_constraint_exception: bool = False
@@ -5968,6 +5969,12 @@ class ServerArgs:
         )
 
         # GLM extended args
+        parser.add_argument(
+            "--glm-adaptive-max-tokens",
+            action="store_true",
+            help="Automatically reduce max_completion_tokens to fit within the model's context length "
+            "instead of returning an error when context_length - max_completion_tokens < input_tokens < context_length.",
+        )
         parser.add_argument(
             "--glm-check-chat-prompt-length",
             action="store_true",
