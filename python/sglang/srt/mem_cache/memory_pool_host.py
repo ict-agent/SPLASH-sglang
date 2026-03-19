@@ -2023,6 +2023,47 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
             device=self.device_pool.device,
         )
 
+    def _init_indexer_buffers(self):
+        """
+        初始化共享内存 NSA Index Buffer。
+        """
+        # 计算 Shape
+        index_buffer_second_dim = self.page_size * (
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+        )
+        self.index_stride_size = (
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+        ) * self.indexer_dtype.itemsize
+
+        # Shape: (LayerNum, PageNum, ElementDim)
+        index_dims = (self.layer_num, self.page_num, index_buffer_second_dim)
+
+        full_index_buffer = self._allocate_shared_buffer(
+            "index",
+            index_dims,
+            self.indexer_dtype
+        )
+
+        # 切分为 list 以兼容父类接口: [tensor(layer_0), tensor(layer_1), ...]
+        self.index_k_with_scale_buffer = [
+            full_index_buffer[i] for i in range(self.layer_num)
+        ]
+
+        # Set up pointer tensors
+        self.index_k_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.index_k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.index_k_device_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
     def _allocate_shared_buffer(self, name_suffix: str, shape: tuple, dtype: torch.dtype):
         """
         通用的共享内存分配辅助函数（已针对 cudaHostRegister 的 Page Fault 瓶颈进行优化，包含耗时打点）。
@@ -2119,7 +2160,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
 
     def init_kv_buffer(self):
         """
-        初始化共享内存 Buffer，包括 KV Buffer 和 NSA Index Buffer。
+        初始化共享内存 KV Buffer。Indexer Buffer 由 _init_indexer_buffers 负责。
         """
         # --- 1. 初始化 KV Buffer (Base MLA Logic) ---
         if self.layout == "layer_first":
@@ -2138,30 +2179,6 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         self.layout_dim = self.token_stride_size * self.layer_num
 
         self.kv_buffer = self._allocate_shared_buffer("kv", kv_dims, self.dtype)
-
-        # --- 2. 初始化 NSA Index Buffer ---
-        # 计算 Shape，逻辑同 NSATokenToKVPoolHost.init_kv_buffer
-        index_buffer_second_dim = self.page_size * (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
-        self.index_stride_size = (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
-        ) * self.indexer_dtype.itemsize
-
-        # NSATokenToKVPoolHost 将其存储为 list[Tensor]，这里为了共享内存分配，先分配一个大 Tensor
-        # Shape: (LayerNum, PageNum, ElementDim)
-        index_dims = (self.layer_num, self.page_num, index_buffer_second_dim)
-
-        full_index_buffer = self._allocate_shared_buffer(
-            "index",
-            index_dims,
-            self.indexer_dtype
-        )
-
-        # 将大 Tensor 切分为 list，以兼容父类接口: [tensor(layer_0), tensor(layer_1), ...]
-        self.index_k_with_scale_buffer = [
-            full_index_buffer[i] for i in range(self.layer_num)
-        ]
 
         # 返回 kv_buffer 以满足 HostKVCache 的接口约定
         return self.kv_buffer
@@ -2273,6 +2290,81 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             device=self.device_pool.device,
         )
 
+    def _init_indexer_buffers(self):
+        """
+        映射共享内存中的 NSA Indexer Buffer 并注册 CUDA pinned memory。
+        使用 init_kv_buffer 中保存的 self._shared_all_files。
+        """
+        all_files = self._shared_all_files
+        my_files = self._shared_my_files
+
+        index_buffer_second_dim = self.page_size * self.indexer_size_per_token
+        self.index_stride_size = self.indexer_size_per_token * self.indexer_dtype.itemsize
+
+        self.index_k_with_scale_buffer = [None] * self.layer_num
+
+        for step in range(self.tp_size):
+            # Rotate stagger 错开锁竞争
+            file_idx = (step + self.tp_rank) % self.tp_size
+
+            chunk = self.layer_num // self.tp_size
+            rem = self.layer_num % self.tp_size
+            r_rel_start = file_idx * chunk + min(file_idx, rem)
+            r_rel_end = r_rel_start + chunk + (1 if file_idx < rem else 0)
+            r_num = r_rel_end - r_rel_start
+
+            if r_num == 0:
+                continue
+
+            files = all_files[file_idx]
+
+            t_pin = time.perf_counter()
+
+            idx_shape = (r_num, self.page_num, index_buffer_second_dim)
+            idx_numel = r_num * self.page_num * index_buffer_second_dim
+            idx_mapped_numel = (
+                _align_up(idx_numel * self.indexer_dtype.itemsize)
+                // self.indexer_dtype.itemsize
+                if _hugepage_enabled() else idx_numel
+            )
+            idx_tensor = torch.from_file(
+                files["index"], shared=True, size=idx_mapped_numel, dtype=self.indexer_dtype, device="cpu"
+            )[:idx_numel].view(idx_shape)
+            if self.pin_memory and is_cuda():
+                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.indexer_dtype.itemsize, 0)
+
+            logger.info(f"Rank {self.tp_rank} finish Indexer cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s")
+
+            for i in range(r_num):
+                global_layer_idx = r_rel_start + i
+                self.index_k_with_scale_buffer[global_layer_idx] = idx_tensor[i]
+
+        # 等待所有 Rank 完成 Indexer 映射后，清理 idx 文件
+        dist.barrier(group=self.tp_group)
+        if my_files:
+            idx_file = my_files.get("index")
+            if idx_file and os.path.exists(idx_file):
+                os.remove(idx_file)
+
+        # 清理临时属性
+        del self._shared_all_files
+        del self._shared_my_files
+
+        # 设置指针 Tensor
+        self.index_k_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.index_k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.index_k_device_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
     def init_kv_buffer(self):
         if self.layout != "layer_first":
             raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
@@ -2288,9 +2380,6 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         index_buffer_second_dim = self.page_size * (
             self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
         )
-        self.index_stride_size = (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
-        ) * self.indexer_dtype.itemsize
 
         # === Step 1: 当前 Rank 在本地 /dev/shm 创建并分配自己负责的那块 Cache 空间 ===
         my_files = None
@@ -2343,9 +2432,8 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         all_files = [None] * self.tp_size
         dist.all_gather_object(all_files, my_files, group=self.tp_group)
 
-        # === Step 3: 所有 Rank 统一映射文件到自己的内存空间并拼装 ===
+        # === Step 3: 映射 KV Buffer（Indexer 由 _init_indexer_buffers 负责映射） ===
         self.kv_buffer = [None] * self.layer_num
-        self.index_k_with_scale_buffer = [None] * self.layer_num
 
         for step in range(self.tp_size):
             # Rotate stagger 错开锁竞争
@@ -2362,7 +2450,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
             files = all_files[file_idx]
 
-            t_zero_pin = time.perf_counter()
+            t_pin = time.perf_counter()
 
             # --- 映射 KV ---
             kv_shape = (r_num, self.size, 1, kv_element_dim)
@@ -2377,31 +2465,22 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             if self.pin_memory and is_cuda():
                 torch.cuda.cudart().cudaHostRegister(kv_tensor.data_ptr(), kv_numel * self.dtype.itemsize, 0)
 
-            # --- 映射 Indexer ---
-            idx_shape = (r_num, self.page_num, index_buffer_second_dim)
-            idx_numel = r_num * self.page_num * index_buffer_second_dim
-            idx_mapped_numel = (
-                _align_up(idx_numel * self.indexer_dtype.itemsize)
-                // self.indexer_dtype.itemsize
-                if _hugepage_enabled() else idx_numel
-            )
-            idx_tensor = torch.from_file(
-                files["index"], shared=True, size=idx_mapped_numel, dtype=self.indexer_dtype, device="cpu"
-            )[:idx_numel].view(idx_shape)
-            if self.pin_memory and is_cuda():
-                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.indexer_dtype.itemsize, 0)
-
-            logger.info(f"Rank {self.tp_rank} finish cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_zero_pin:.3f}s")
+            logger.info(f"Rank {self.tp_rank} finish KV cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s")
 
             for i in range(r_num):
                 global_layer_idx = r_rel_start + i
                 self.kv_buffer[global_layer_idx] = kv_tensor[i]
-                self.index_k_with_scale_buffer[global_layer_idx] = idx_tensor[i]
 
+        # 等待所有 Rank 完成 KV 映射后，清理 KV 文件（映射保持有效）
         dist.barrier(group=self.tp_group)
         if my_files:
-            if os.path.exists(my_files["kv"]): os.remove(my_files["kv"])
-            if os.path.exists(my_files["index"]): os.remove(my_files["index"])
+            kv_file = my_files.get("kv")
+            if kv_file and os.path.exists(kv_file):
+                os.remove(kv_file)
+
+        # 存储文件信息供 _init_indexer_buffers 使用
+        self._shared_all_files = all_files
+        self._shared_my_files = my_files
 
         return self.kv_buffer
 
