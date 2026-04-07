@@ -2510,6 +2510,20 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 item_size=self.token_stride_size,
                 num_layers=self.my_num_layers,
             )
+        elif io_backend == "direct":
+            src_layers = [
+                device_pool.kv_buffer[i] for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            dst_layers = [
+                self.data_refs[i] for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -2528,6 +2542,22 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 dst_indices=page_indices_host,
                 item_size=self.index_stride_size * self.page_size,
                 num_layers=self.my_num_layers,
+            )
+        elif io_backend == "direct":
+            src_layers = [
+                device_pool.index_k_with_scale_buffer[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            dst_layers = [
+                self.index_k_with_scale_buffer[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=page_indices_device,
+                dst_indices=page_indices_host,
+                page_size=1,
             )
         else:
             raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")
