@@ -121,6 +121,11 @@ class SchedulerStats:
     # CUDA graph
     is_cuda_graph: float = 0.0
 
+    # Hicache usage
+    evictable_size: int = 0
+    host_used_tokens: int = 0
+    host_total_tokens: int = 0
+
     # LoRA pool metrics
     lora_pool_slots_used: int = 0
     lora_pool_slots_total: int = 0
@@ -314,7 +319,27 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        # PD disaggregation
+        # Hicache usage
+        self.evictable_size = Gauge(
+            name="sglang:evictable_size",
+            documentation="The total number of tokens stored in the tree cache and not in use.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.host_used_tokens = Gauge(
+            name="sglang:host_used_tokens",
+            documentation="The number of used tokens in the hierarchical cache.",
+            labelnames=labels.keys(),
+        )
+
+        self.host_total_tokens = Gauge(
+            name="sglang:host_total_tokens",
+            documentation="The number of total tokens in the hierarchical cache.",
+            labelnames=labels.keys(),
+        )
+
+        # Disaggregation queue metrics
         self.num_prefill_prealloc_queue_reqs = Gauge(
             name="sglang:num_prefill_prealloc_queue_reqs",
             documentation="The number of requests in the prefill prealloc queue.",
@@ -991,6 +1016,11 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+
+        # Hicache usage
+        self._log_gauge(self.evictable_size, stats.evictable_size)
+        self._log_gauge(self.host_used_tokens, stats.host_used_tokens)
+        self._log_gauge(self.host_total_tokens, stats.host_total_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

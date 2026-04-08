@@ -301,7 +301,7 @@ class SchedulerRuntimeCheckerMixin:
                     full_token_usage,
                     swa_token_usage,
                     _,
-                    _,
+                    evictable_size,
                     _,
                     _,
                 ) = self._get_swa_token_info()
@@ -319,7 +319,7 @@ class SchedulerRuntimeCheckerMixin:
                     _,
                 ) = self._get_mamba_token_info()
             else:
-                num_used, token_usage, _, _ = self._get_token_info()
+                num_used, token_usage, _, evictable_size = self._get_token_info()
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_running_reqs = QueueCount.from_reqs(
@@ -332,6 +332,9 @@ class SchedulerRuntimeCheckerMixin:
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            self.stats.evictable_size = evictable_size
+            self.stats.host_used_tokens = getattr(self.tree_cache, "host_used_tokens", 0)
+            self.stats.host_total_tokens = getattr(self.tree_cache, "host_total_tokens", 0)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_bootstrap_queue.queue, priority_enabled

@@ -1419,3 +1419,17 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+    @property
+    def host_used_tokens(self):
+        """
+        Return the number of tokens already backuped to host memory.
+        """
+        return self.token_to_kv_pool_host.size - self.token_to_kv_pool_host.available_size()
+
+    @property
+    def host_total_tokens(self):
+        """
+        Return the number of tokens host memory can hold.
+        """
+        return self.token_to_kv_pool_host.size

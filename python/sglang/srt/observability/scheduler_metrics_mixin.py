@@ -345,9 +345,15 @@ class SchedulerMetricsMixin:
         num_used = token_usage = full_token_usage = None
 
         if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
-                self._get_swa_token_info()
-            )
+            (
+                full_num_used,
+                swa_num_used,
+                full_tok,
+                swa_token_usage,
+                _,
+                evictable_size,
+                *_,
+            ) = self._get_swa_token_info()
             num_used = max(full_num_used, swa_num_used)
             token_usage = max(full_tok, swa_token_usage)
             full_token_usage = full_tok
@@ -370,7 +376,7 @@ class SchedulerMetricsMixin:
             msg_parts.append(f"mamba usage: {mamba_usage:.2f}")
 
         if full_token_usage is None:
-            num_used, tok, _, _ = self._get_token_info()
+            num_used, tok, _, evictable_size = self._get_token_info()
             full_token_usage = tok
             token_usage = tok
             msg_parts.append(f"token usage: {tok:.2f}")
@@ -467,6 +473,11 @@ class SchedulerMetricsMixin:
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
+            # GLM NOTE: Tree cache
+            self.stats.evictable_size = evictable_size
+            self.stats.host_used_tokens = getattr(self.tree_cache, "host_used_tokens", 0)
+            self.stats.host_total_tokens = getattr(self.tree_cache, "host_total_tokens", 0)
+
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
@@ -552,9 +563,15 @@ class SchedulerMetricsMixin:
         num_used = token_usage = full_token_usage = None
 
         if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
-                self._get_swa_token_info()
-            )
+            (
+                full_num_used,
+                swa_num_used,
+                full_tok,
+                swa_token_usage,
+                _,
+                evictable_size,
+                *_,
+            ) = self._get_swa_token_info()
             num_used = max(full_num_used, swa_num_used)
             token_usage = max(full_tok, swa_token_usage)
             full_token_usage = full_tok
@@ -587,7 +604,7 @@ class SchedulerMetricsMixin:
             ]
 
         if full_token_usage is None:
-            num_used, tok, _, _ = self._get_token_info()
+            num_used, tok, _, evictable_size = self._get_token_info()
             full_token_usage = tok
             token_usage = tok
             msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")
@@ -704,6 +721,11 @@ class SchedulerMetricsMixin:
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
+
+            # GLM NOTE: Tree cache
+            self.stats.evictable_size = evictable_size
+            self.stats.host_used_tokens = getattr(self.tree_cache, "host_used_tokens", 0)
+            self.stats.host_total_tokens = getattr(self.tree_cache, "host_total_tokens", 0)
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
