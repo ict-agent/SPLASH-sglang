@@ -656,6 +656,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
             try:
+                # TODO(somefive): use more accurate truncation strategy
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,

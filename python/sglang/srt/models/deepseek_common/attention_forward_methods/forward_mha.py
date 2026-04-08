@@ -499,11 +499,10 @@ class DeepseekMHAForwardMixin:
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif (
-            _is_cuda
-            and next_power_of_2(self.num_local_heads) == self.num_local_heads
-            and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
-            and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+        elif _is_cuda and all(
+            # (i.bit_count() == 1) == (is_power_of_two(i))
+            i.bit_count() == 1
+            for i in (k_shape[1], k_nope.shape[-1], k_pe.shape[-1])
         ):
             # fa3 mha support fp8 inputs
             if (

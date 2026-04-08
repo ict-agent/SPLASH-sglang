@@ -819,10 +819,49 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
-        self._validate_one_request(obj, input_ids)
+        input_ids = self._validate_one_request_glm(obj, input_ids) # TODO(somefive)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    # TODO(somefive): use more accurate truncation strategy in serving_chat.py
+    def _validate_one_request_glm(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
+    ) -> List[int]:
+        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+
+        max_new_tokens = obj.sampling_params.get("max_new_tokens") or 1
+        input_ids = input_ids or []
+        if max_new_tokens >= self.context_len:
+            raise ValueError(
+                f"Request {max_new_tokens} max_new_tokens exceeds the model's maximum context length {self.context_len}"
+            )
+
+        if len(input_ids) + max_new_tokens >= self.context_len:
+            if self.server_args.allow_auto_truncate:
+                input_token_num = self.context_len - max_new_tokens - 1
+                logger.debug(f"truncate {len(input_ids)} to {input_token_num}")
+                input_ids = input_ids[-input_token_num:]
+            elif self.server_args.glm_check_chat_prompt_length and isinstance(
+                obj, GenerateReqInput
+            ):
+                raise fastapi.HTTPException(
+                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
+                    detail=f"Request {len(input_ids)} input tokens exceeds the model's maximum context length {self.context_len}",
+                )
+            else:
+                input_token_num = len(input_ids)
+                total_tokens = max_new_tokens + input_token_num
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
+
+        return input_ids
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1312,6 +1351,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Drain all pending outputs atomically.
             out_list = state.out_list
+            # GLM NOTE: GLM streaming removed, TODO: check
             state.out_list = []
             finished = state.finished
             state.event.clear()

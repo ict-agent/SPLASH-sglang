@@ -512,7 +512,7 @@ class ToolCall(BaseModel):
 
 
 _GenericMessageRole = Literal[
-    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+    "system", "assistant", "tool", "function", "developer", "latest_reminder", "observation"
 ]
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 

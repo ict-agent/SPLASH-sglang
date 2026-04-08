@@ -835,6 +835,11 @@ class ServerArgs:
     engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
 
+    # GLM extended args
+    glm_check_chat_prompt_length: bool = False
+    glm_decoding_constraint_module: Optional[str] = None
+    glm_ignore_decoding_constraint_exception: bool = False
+
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
@@ -7101,6 +7106,27 @@ class ServerArgs:
             type=str,
             default=ServerArgs.modelexpress_config,
             help='JSON config for ModelExpress P2P weight loading. Keys: "url" (required, gRPC host:port), "model_name" (optional, defaults to --model-path), "source" (optional bool, true for seed mode). Example: \'{"url": "localhost:8001", "model_name": "my-model", "source": true}\'',
+        )
+
+        # GLM extended args
+        parser.add_argument(
+            "--glm-check-chat-prompt-length",
+            action="store_true",
+            help="Check input prompt tokenized tokens length before inference. If the length exceeded the maximum input length, server will return 413 error.",
+        )
+        parser.add_argument(
+            "--glm-decoding-constraint-module",
+            type=str,
+            default=ServerArgs.glm_decoding_constraint_module,
+            help="Module path for EBNF constraint (e.g., 'sglang.srt.constrained.glm'). "
+            "Must export 'generation_constraint' and 'get_special_token_config'.",
+        )
+        parser.add_argument(
+            "--glm-ignore-decoding-constraint-exception",
+            action="store_true",
+            default=ServerArgs.glm_ignore_decoding_constraint_exception,
+            help="If set, log constraint generation exceptions instead of raising them, "
+            "and proceed without constraint. Useful for production as a fallback",
         )
 
         # For PD-Multiplexing

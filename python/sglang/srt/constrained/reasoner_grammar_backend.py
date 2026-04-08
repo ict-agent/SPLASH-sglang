@@ -74,6 +74,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
+        self.accepted_tokens = []
 
     def maybe_init_reasoning(self, reasoning: bool):
         if reasoning:
@@ -110,6 +111,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def accept_token(self, token: int):
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
+        self.accepted_tokens.append(token)
         self.transfer_state(token)
 
     def is_terminated(self):

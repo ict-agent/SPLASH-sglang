@@ -75,12 +75,12 @@ def set_mla_kv_buffer_kernel(
         src_nope = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask & is_nope,
-            other=0,
+            other=0.0,
         )
         src_rope = tl.load(
             cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
             mask=mask & is_rope,
-            other=0,
+            other=0.0,
         )
 
         src = tl.where(is_nope, src_nope, src_rope)
