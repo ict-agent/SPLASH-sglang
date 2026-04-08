@@ -288,8 +288,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
                 # Calculate delta (new text since last chunk)
                 current_text = content.get("text", "")
-                delta = current_text[len(stream_buffer) :]
-                stream_buffer = current_text
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = current_text
+                else:
+                    delta = current_text[len(stream_buffer) :]
+                stream_buffer += delta
 
                 # Send content delta if there's new text
                 if delta:

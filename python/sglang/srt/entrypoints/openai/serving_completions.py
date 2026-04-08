@@ -290,7 +290,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
-                delta = text[len(stream_buffer) :]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = text
+                else:
+                    delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
