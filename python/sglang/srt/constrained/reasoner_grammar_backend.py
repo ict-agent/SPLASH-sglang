@@ -29,6 +29,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
+        self.accepted_tokens = []
         # -1    means thinking has not ended yet
         # 0     means just ended thinking in the last token
         # +     means number of tokens after thinking ended
@@ -52,6 +53,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def accept_token(self, token: int):
         if self.tokens_after_think_end >= 0:
             self.grammar.accept_token(token)
+        self.accepted_tokens.append(token)
         self.transfer_state(token)
 
     def is_terminated(self):
