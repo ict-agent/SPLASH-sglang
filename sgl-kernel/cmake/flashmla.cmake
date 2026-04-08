@@ -1,5 +1,9 @@
 include(FetchContent)
 
+if(DISABLE_FETCH_CONTENT)
+    set(repo-flashmla_SOURCE_DIR ${PROJECT_SOURCE_DIR}/3rdparty/flashmla)
+else()
+
 # flash_mla
 FetchContent_Declare(
     repo-flashmla
@@ -8,6 +12,8 @@ FetchContent_Declare(
     GIT_SHALLOW OFF
 )
 FetchContent_Populate(repo-flashmla)
+
+endif() # DISABLE_FETCH_CONTENT
 
 set(FLASHMLA_CUDA_FLAGS
     "--expt-relaxed-constexpr"

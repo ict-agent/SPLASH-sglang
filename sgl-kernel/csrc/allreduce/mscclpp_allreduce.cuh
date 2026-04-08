@@ -12,7 +12,7 @@
 #include <mscclpp/core.hpp>
 #include <mscclpp/memory_channel.hpp>
 #include <mscclpp/memory_channel_device.hpp>
-#include <mscclpp/nvls_device.hpp>
+#include <mscclpp/switch_channel_device.hpp>
 #include <mscclpp/port_channel.hpp>
 #include <mscclpp/port_channel_device.hpp>
 

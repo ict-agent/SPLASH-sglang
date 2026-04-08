@@ -120,6 +120,9 @@ class TemplateManager:
             # Guess chat template from model path
             self.guess_chat_template_from_model_path(model_path)
 
+            # GLM NOTE: never guess_chat_template_from_model_path
+            self._chat_template_name = None
+
             # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
                 # Try HuggingFace template first

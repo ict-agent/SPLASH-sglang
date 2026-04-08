@@ -1,0 +1,51 @@
+stages:
+  - build
+
+variables:
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: fast
+  CACHE_COMPRESSION_LEVEL: fast
+  GLM_SGL_IMAGE: zcr.zhipuai-infra.cn/infra/sglang
+  GLM_PLATFORM_SGLANG_IMAGE: preset-registry.glm.ai/sglang
+
+default:
+  interruptible: true
+
+build:inference-image:
+  image: $CI_BUILDKIT_IMAGE
+  tags: ["builder"]
+  stage: build
+  when: manual
+  variables:
+    RECENT_VTAG: "v0.5.10"
+  before_script:
+    - CONFIG_FILE=$HOME/.docker/config.json &&
+      mkdir -p $(dirname $CONFIG_FILE) &&
+      ln -s $CI_DOCKER_CONFIG $CONFIG_FILE
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        IMAGE_TAG: $RECENT_VTAG-mr-$CI_MERGE_REQUEST_IID-$CI_COMMIT_SHORT_SHA
+    - if: $CI_COMMIT_TAG =~ /^\d{6}/  # date tag
+      variables:
+        IMAGE_TAG: $RECENT_VTAG-$CI_COMMIT_TAG-$CI_COMMIT_SHORT_SHA
+    - if: $CI_COMMIT_BRANCH =~ /^v.*-prerelease$/
+      when: always
+      variables:
+        IMAGE_TAG: $RECENT_VTAG-prerelease-$CI_COMMIT_SHORT_SHA
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+      when: always
+      variables:
+        IMAGE_TAG: $RECENT_VTAG-$CI_COMMIT_SHORT_SHA
+  script:
+    - buildctl
+      --addr $CI_BUILDKIT_HOST
+      build
+      --frontend dockerfile.v0
+      --local dockerfile=.
+      --local context=.
+      --opt build-arg:HTTP_PROXY=$CI_PROXY
+      --opt build-arg:HTTPS_PROXY=$CI_PROXY
+      --opt filename=docker/Dockerfile.glm
+      --output type=image,name=$GLM_SGL_IMAGE:$IMAGE_TAG,oci-mediatypes=true,compression=zstd,push=true
+      --output type=image,name=$GLM_PLATFORM_SGLANG_IMAGE:$IMAGE_TAG,oci-mediatypes=true,compression=zstd,push=true

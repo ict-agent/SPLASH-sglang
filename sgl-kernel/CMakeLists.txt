@@ -42,6 +42,31 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+find_program(SCCACHE_FOUND sccache)
+if(SCCACHE_FOUND)
+    message(STATUS "Building with SCCACHE enabled")
+    set(CMAKE_C_COMPILER_LAUNCHER sccache)
+    set(CMAKE_CXX_COMPILER_LAUNCHER sccache)
+    set(CMAKE_CUDA_COMPILER_LAUNCHER sccache)
+    set(CMAKE_C_LINKER_LAUNCHER sccache)
+    set(CMAKE_CXX_LINKER_LAUNCHER sccache)
+    set(CMAKE_CUDA_LINKER_LAUNCHER sccache)
+endif()
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(DISABLE_FETCH_CONTENT)
+    set(repo-cutlass_SOURCE_DIR         ${PROJECT_SOURCE_DIR}/3rdparty/cutlass)
+    set(repo-fmt_SOURCE_DIR             ${PROJECT_SOURCE_DIR}/3rdparty/fmt)
+    set(repo-deepgemm_SOURCE_DIR        ${PROJECT_SOURCE_DIR}/3rdparty/deepgemm)
+    set(repo-triton_SOURCE_DIR          ${PROJECT_SOURCE_DIR}/3rdparty/triton)
+    set(repo-flashinfer_SOURCE_DIR      ${PROJECT_SOURCE_DIR}/3rdparty/flashinfer)
+    set(repo-flash-attention_SOURCE_DIR ${PROJECT_SOURCE_DIR}/3rdparty/flash-attention)
+    set(repo-mscclpp_SOURCE_DIR         ${PROJECT_SOURCE_DIR}/3rdparty/mscclpp)
+    set(repo-flash-attention-origin_SOURCE_DIR
+        ${PROJECT_SOURCE_DIR}/3rdparty/flash-attention-origin)
+else()
+
 # Third Party repos
 # cutlass
 FetchContent_Declare(
@@ -101,10 +126,12 @@ FetchContent_Populate(repo-flash-attention)
 FetchContent_Declare(
     repo-mscclpp
     GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
+    GIT_TAG        5e991cf5c8e0bea75782a1ce4049dc56454b308b
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-mscclpp)
+
+endif() # DISABLE_FETCH_CONTENT
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -387,6 +414,7 @@ set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+    EXCLUDE_FROM_ALL
 )
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
