@@ -2142,11 +2142,11 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         # --- 2. 初始化 NSA Index Buffer ---
         # 计算 Shape，逻辑同 NSATokenToKVPoolHost.init_kv_buffer
         index_buffer_second_dim = self.page_size * (
-            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
         )
         self.index_stride_size = (
-            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
-        ) * self.index_k_with_scale_buffer_dtype.itemsize
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+        ) * self.indexer_dtype.itemsize
 
         # NSATokenToKVPoolHost 将其存储为 list[Tensor]，这里为了共享内存分配，先分配一个大 Tensor
         # Shape: (LayerNum, PageNum, ElementDim)
@@ -2155,7 +2155,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         full_index_buffer = self._allocate_shared_buffer(
             "index",
             index_dims,
-            self.index_k_with_scale_buffer_dtype
+            self.indexer_dtype
         )
 
         # 将大 Tensor 切分为 list，以兼容父类接口: [tensor(layer_0), tensor(layer_1), ...]
@@ -2286,11 +2286,11 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         kv_element_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         index_buffer_second_dim = self.page_size * (
-            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
         )
         self.index_stride_size = (
-            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
-        ) * self.index_k_with_scale_buffer_dtype.itemsize
+            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+        ) * self.indexer_dtype.itemsize
 
         # === Step 1: 当前 Rank 在本地 /dev/shm 创建并分配自己负责的那块 Cache 空间 ===
         my_files = None
@@ -2302,7 +2302,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             idx_name = f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_idx_{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
 
             kv_bytes = self.my_num_layers * self.size * kv_element_dim * self.dtype.itemsize
-            idx_bytes = self.my_num_layers * self.page_num * index_buffer_second_dim * self.index_k_with_scale_buffer_dtype.itemsize
+            idx_bytes = self.my_num_layers * self.page_num * index_buffer_second_dim * self.indexer_dtype.itemsize
             kv_alloc_bytes = _align_up(kv_bytes) if _hugepage_enabled() else kv_bytes
             idx_alloc_bytes = _align_up(idx_bytes) if _hugepage_enabled() else idx_bytes
 
@@ -2331,8 +2331,8 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             del tmp_kv  # 释放临时映射句柄
 
             my_idx_numel = self.my_num_layers * self.page_num * index_buffer_second_dim
-            tmp_idx_numel = idx_alloc_bytes // self.index_k_with_scale_buffer_dtype.itemsize
-            tmp_idx = torch.from_file(idx_name, shared=True, size=tmp_idx_numel, dtype=self.index_k_with_scale_buffer_dtype, device="cpu")
+            tmp_idx_numel = idx_alloc_bytes // self.indexer_dtype.itemsize
+            tmp_idx = torch.from_file(idx_name, shared=True, size=tmp_idx_numel, dtype=self.indexer_dtype, device="cpu")
             tmp_idx[:my_idx_numel].zero_()
             del tmp_idx # 释放临时映射句柄
             logger.info(f"Rank {self.tp_rank} allocated and zeroed its own physical memory locally in {time.perf_counter()-t_zero_alloc:.3f}s")
@@ -2381,15 +2381,15 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             idx_shape = (r_num, self.page_num, index_buffer_second_dim)
             idx_numel = r_num * self.page_num * index_buffer_second_dim
             idx_mapped_numel = (
-                _align_up(idx_numel * self.index_k_with_scale_buffer_dtype.itemsize)
-                // self.index_k_with_scale_buffer_dtype.itemsize
+                _align_up(idx_numel * self.indexer_dtype.itemsize)
+                // self.indexer_dtype.itemsize
                 if _hugepage_enabled() else idx_numel
             )
             idx_tensor = torch.from_file(
-                files["index"], shared=True, size=idx_mapped_numel, dtype=self.index_k_with_scale_buffer_dtype, device="cpu"
+                files["index"], shared=True, size=idx_mapped_numel, dtype=self.indexer_dtype, device="cpu"
             )[:idx_numel].view(idx_shape)
             if self.pin_memory and is_cuda():
-                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.index_k_with_scale_buffer_dtype.itemsize, 0)
+                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.indexer_dtype.itemsize, 0)
 
             logger.info(f"Rank {self.tp_rank} finish cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_zero_pin:.3f}s")
 
