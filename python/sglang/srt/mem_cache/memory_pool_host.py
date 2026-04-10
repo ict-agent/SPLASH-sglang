@@ -2168,14 +2168,12 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                 self.layer_num,
                 self.size,
                 1,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.kv_cache_dim,
             )
         else:
             raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
 
-        self.token_stride_size = (
-            self.kv_lora_rank + self.qk_rope_head_dim
-        ) * self.dtype.itemsize
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
         self.kv_buffer = self._allocate_shared_buffer("kv", kv_dims, self.dtype)
@@ -2373,9 +2371,9 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             logger.info(f"HugePage enabled. Using shared host cache directory: {GLM_HICACHE_SHM_DIR}, PageSize = {_hugepage_size()}.")
 
         # 计算 Element Dimensions
-        self.token_stride_size = (self.kv_lora_rank + self.qk_rope_head_dim) * self.dtype.itemsize
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        kv_element_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        kv_element_dim = self.kv_cache_dim
 
         index_buffer_second_dim = self.page_size * (
             self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
