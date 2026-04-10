@@ -1142,8 +1142,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state.get(obj.rid)
+        if state is not None:
+            tokenized_obj.time_stats = state.time_stats
+            state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
