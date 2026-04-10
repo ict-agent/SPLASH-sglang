@@ -1075,8 +1075,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state.get(obj.rid)
+        if state is not None:
+            tokenized_obj.time_stats = state.time_stats
+            state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
