@@ -2530,7 +2530,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         page_indices_device = device_indices[:: self.page_size] // self.page_size
 
         if io_backend == "kernel":
-            src_ptrs = device_pool.index_k_with_scale_buffer_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            src_ptrs = self.index_k_device_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
             dst_ptrs = self.index_data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
 
             transfer_kv_all_layer_mla(
