@@ -73,6 +73,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self.tokens_after_think_end >= 0:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
+        else:
+            vocab_mask.fill_(-1)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return self.grammar.move_vocab_mask(vocab_mask, device)

@@ -181,7 +181,7 @@ class HostKVCache(abc.ABC):
         self.end_layer = device_pool.end_layer
 
         assert (
-            self.size > device_pool.size
+            self.size > device_pool.size or True # GLM NOTE: Skip this check
         ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.

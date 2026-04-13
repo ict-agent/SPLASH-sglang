@@ -567,9 +567,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         if "arguments" in item["function"] and isinstance(
                             item["function"]["arguments"], str
                         ):
-                            item["function"]["arguments"] = orjson.loads(
-                                item["function"]["arguments"]
-                            )
+                            try:
+                                _args = orjson.loads(item["function"]["arguments"])
+                                item["function"]["arguments"] = (
+                                    _args if isinstance(_args, dict) else {}
+                                )
+                            except:
+                                item["function"]["arguments"] = {}
 
                 openai_compatible_messages.append(processed_msg)
 

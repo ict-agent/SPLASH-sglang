@@ -253,7 +253,10 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
     # 2. Post-processing of weights, including assigning specific member variables.
     # For `dummy_init`, only the second stage is required.
     if hasattr(model, "post_load_weights"):
-        if model_config.hf_config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+        # Do not make it specific to DeepseekV3ForCausalLMNextN,
+        # e.g. GLM 4.6 MTP or EAGLE should also use NextN post load process.
+        model_name = type(model).__name__
+        if model_name.endswith("NextN") or model_name.endswith("EAGLE"):
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()

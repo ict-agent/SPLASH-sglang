@@ -413,7 +413,7 @@ class DeepseekV2WeightLoaderMixin:
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
         if is_nextn:
-            layer_ids = [self.config.num_hidden_layers]
+            layer_ids = list(range(self.config.num_hidden_layers))
         else:
             if weight_names is None:
                 layer_ids = range(self.model.start_layer, self.model.end_layer)
@@ -428,9 +428,12 @@ class DeepseekV2WeightLoaderMixin:
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
-                if not is_nextn
+                # GLM NOTE: EAGLE models (has multiple layers) should not be treated as nextn (has only 1 layer, i.e., decoder)
+                if not is_nextn or not hasattr(self.model, "decoder")
                 else self.model.decoder.self_attn
             )
+            if not hasattr(self_attn, "kv_b_proj"):
+                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -531,6 +534,13 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
+
+                    # GLM NOTE: Transpose weight if needed. This is required because
+                    # when loading from sharded state weights, self_attn.kv_b_proj.weight
+                    # is transposed when saving. We need to transpose it back to the
+                    # original shape to make channel_quant_to_tensor_quant() work properly.
+                    if weight_scale.shape[0] != weight.shape[0] and weight_scale.shape[0] == weight.shape[1]:
+                        weight = weight.t()
 
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                     self_attn.w_scale = scale
