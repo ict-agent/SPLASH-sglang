@@ -1278,8 +1278,16 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in the response"""
 
         # Handle required or named tool choice
-        if tool_choice == "required" or (
-            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        if (
+            (
+                tool_choice == "required"
+                or (
+                    isinstance(tool_choice, ToolChoice)
+                    and tool_choice.type == "function"
+                )
+            )
+            # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+            and "glm" not in self.tool_call_parser
         ):
             # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":
@@ -1438,7 +1446,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+        if self.reasoning_parser in ["qwen3", "glm45", "glm5", "nemotron_3", "interns1"]:
             # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not request.chat_template_kwargs
@@ -1472,8 +1480,16 @@ class OpenAIServingChat(OpenAIServingBase):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
+            if (
+                (
+                    request.tool_choice == "required"
+                    or isinstance(
+                        request.tool_choice,
+                        ToolChoice,
+                    )
+                )
+                # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+                and "glm" not in self.tool_call_parser
             ):
                 parser_dict[index] = JsonArrayParser()
             else:
