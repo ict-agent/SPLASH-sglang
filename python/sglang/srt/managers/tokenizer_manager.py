@@ -1970,10 +1970,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            vals = token_logprobs_val[i]
+            idxs = token_logprobs_idx[i]
+            # Note(xunkai): 这里不能再假设 vals/idxs 一定是 Python list。
+            # 0.5.10 中 return_logprob 为了减少同步开销后，部分 decode producer 会把
+            # top_logprobs/token_ids_logprobs 保持成 tensor，中间层也可能只是搬到 CPU 再继续透传。
+            # 
+            # See also: #a27651d5e，因为是上游的错误，估计会在0.5.11修复。
+            if hasattr(vals, "tolist"):
+                vals = vals.tolist()
+            if hasattr(idxs, "tolist"):
+                idxs = idxs.tolist()
+            if vals is not None and len(vals) > 0:
                 ret.append(
                     self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                        vals, idxs, decode_to_text
                     )
                 )
             else:
