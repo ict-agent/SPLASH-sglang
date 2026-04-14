@@ -726,6 +726,7 @@ class ServerArgs:
     glm_check_chat_prompt_length: bool = False
     glm_decoding_constraint_module: Optional[str] = None
     glm_ignore_decoding_constraint_exception: bool = False
+    glm_stream_speculated_tokens: bool = False
     glm_nsa_shared_hicache: bool = False
     glm_nsa_shared_layer_group_hicache: bool = False
 
@@ -5907,6 +5908,13 @@ class ServerArgs:
             default=ServerArgs.glm_ignore_decoding_constraint_exception,
             help="If set, log constraint generation exceptions instead of raising them, "
             "and proceed without constraint. Useful for production as a fallback",
+        )
+        parser.add_argument(
+            "--glm-stream-speculated-tokens",
+            action="store_true",
+            help="When using speculative decoding, the speculated accepted tokens will be merged into one event by default, therefore "
+            "leading mis-calculation for token throughputs when using streaming event count for token estimation. This argument will "
+            "return tokens separately instead of merging them."
         )
         parser.add_argument(
             "--glm-nsa-shared-hicache",

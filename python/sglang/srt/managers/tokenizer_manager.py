@@ -1234,13 +1234,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             incremental_stream = (
                 is_stream and self.server_args.incremental_streaming_output
             )
+            glm_interleaved_stream = (
+                is_stream and self.server_args.glm_stream_speculated_tokens
+            )
             out_list = state.out_list
-            # GLM NOTE: GLM streaming removed, TODO: check
             state.out_list = []
             finished = state.finished
             state.event.clear()
 
-            if incremental_stream and len(out_list) > 1:
+            if glm_interleaved_stream:
+                outs = out_list
+                out = outs[-1]
+            elif incremental_stream and len(out_list) > 1:
                 if len(out_list) >= 20:
                     logger.warning(
                         "Streaming backlog: rid=%s, coalescing %d queued chunks into one. "
@@ -1258,8 +1263,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     ]
                 if "text" in out:
                     out["text"] = "".join(chunk["text"] for chunk in out_list)
+                outs = [out]
             else:
                 out = out_list[-1]
+                outs = [out]
 
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
@@ -1291,7 +1298,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         if not is_stream:
                             raise ValueError(finish_reason["message"])
                         else:
-                            yield out
+                            for stream_out in outs:
+                                yield stream_out
                             break
 
                     if finish_reason.get("type") == "abort" and finish_reason.get(
@@ -1315,19 +1323,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                                 detail=finish_reason["message"],
                             )
                         else:
-                            yield out
+                            for stream_out in outs:
+                                yield stream_out
                             break
-                yield out
+                for stream_out in outs:
+                    yield stream_out
                 break
 
             if is_stream:
-                # Record response sent time right before we send response.
-                if not state.time_stats.response_sent_to_client_time:
-                    state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
-                yield out
+                for stream_out in outs:
+                    # Record response sent time right before we send response.
+                    if not state.time_stats.response_sent_to_client_time:
+                        state.time_stats.set_response_sent_to_client_time()
+                        out["meta_info"][
+                            "response_sent_to_client_ts"
+                        ] = state.time_stats.get_response_sent_to_client_realtime()
+                    yield stream_out
 
             if not is_stream:
                 if (

@@ -308,6 +308,13 @@ class MultiHttpWorkerDetokenizerMixin:
                 recv_obj, BaseBatchReq
             ), "for multi-http-worker, recv_obj must be BaseBatchReq"
 
+            if self.glm_stream_speculated_tokens:
+                for o in output if isinstance(output, list) else [output]:
+                    for i, ipc_name in enumerate(o.http_worker_ipcs):
+                        new_output = _handle_output_by_index(o, i)
+                        self.socket_mapping.send_output(ipc_name, new_output)
+                continue
+
             # Send data using the corresponding socket
             for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
                 new_output = _handle_output_by_index(output, i)

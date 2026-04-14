@@ -26,6 +26,7 @@ import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.managers.glm_utils import interleave_batch_token_id_out
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -114,6 +115,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.glm_stream_speculated_tokens = server_args.glm_stream_speculated_tokens
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -141,7 +143,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                for o in output if isinstance(output, list) else [output]:
+                    self.send_to_tokenizer.send_pyobj(o)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(
@@ -318,6 +321,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    @interleave_batch_token_id_out
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
