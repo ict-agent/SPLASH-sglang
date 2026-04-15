@@ -868,13 +868,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
                 del input_ids[_max_req_len:]
                 input_token_num = len(input_ids)
-            elif self.server_args.glm_check_chat_prompt_length and isinstance(
-                obj, GenerateReqInput
-            ):
-                raise fastapi.HTTPException(
-                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
-                    detail=f"Request {len(input_ids)} input tokens exceeds the model's maximum context length {self.context_len}",
-                )
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
