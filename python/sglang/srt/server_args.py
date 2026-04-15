@@ -746,12 +746,6 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
-    # GLM extended args
-    glm_adaptive_max_tokens: bool = False
-    glm_check_chat_prompt_length: bool = False
-    glm_decoding_constraint_module: Optional[str] = None
-    glm_ignore_decoding_constraint_exception: bool = False
-
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -5992,33 +5986,6 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
-        )
-
-        # GLM extended args
-        parser.add_argument(
-            "--glm-adaptive-max-tokens",
-            action="store_true",
-            help="Automatically reduce max_completion_tokens to fit within the model's context length "
-            "instead of returning an error when context_length - max_completion_tokens < input_tokens < context_length.",
-        )
-        parser.add_argument(
-            "--glm-check-chat-prompt-length",
-            action="store_true",
-            help="Check input prompt tokenized tokens length before inference. If the length exceeded the maximum input length, server will return 413 error.",
-        )
-        parser.add_argument(
-            "--glm-decoding-constraint-module",
-            type=str,
-            default=ServerArgs.glm_decoding_constraint_module,
-            help="Module path for EBNF constraint (e.g., 'sglang.srt.constrained.glm'). "
-            "Must export 'generation_constraint' and 'get_special_token_config'.",
-        )
-        parser.add_argument(
-            "--glm-ignore-decoding-constraint-exception",
-            action="store_true",
-            default=ServerArgs.glm_ignore_decoding_constraint_exception,
-            help="If set, log constraint generation exceptions instead of raising them, "
-            "and proceed without constraint. Useful for production as a fallback",
         )
 
     @classmethod
