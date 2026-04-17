@@ -4,6 +4,7 @@ import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+import os
 import torch
 from einops import rearrange
 
@@ -506,11 +507,17 @@ class Indexer(MultiPlatformOp):
             return False, 0
 
         free_mem, total_mem = torch.cuda.mem_get_info(device)
+        if os.getenv("GLM_FORCE_INDEXER_LOGITS_CHUNK", "0") == "1":
+            reserved = torch.cuda.memory_reserved(device)
+            allocated = torch.cuda.memory_allocated(device)
+            allocator_cache = reserved - allocated
+            free_mem += allocator_cache  # Consider all free memory including allocated but not used memory
         bytes_per_elem = 4  # float32
         logits_bytes = num_q * num_k * bytes_per_elem
 
-        # Logits should not exceed 50% of free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
+        # Logits should not exceed configured ratio of free memory or 30% of total memory
+        ratio = float(os.getenv("GLM_NSA_CHUNK_MEM_RATIO", 0.5))
+        need_chunk = (logits_bytes > free_mem * ratio) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
     def _get_topk_ragged(
@@ -616,8 +623,9 @@ class Indexer(MultiPlatformOp):
         # Chunk path
         bytes_per_elem = 4  # float32
         bytes_per_row = k_offset * bytes_per_elem
-        # Reserve 50% of free memory for logits
-        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        # Reserve configured ratio of free memory for logits
+        ratio = float(os.getenv("GLM_NSA_CHUNK_MEM_RATIO", 0.5))
+        max_rows = max(1, int((free_mem * ratio) // max(bytes_per_row, 1)))
         max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
