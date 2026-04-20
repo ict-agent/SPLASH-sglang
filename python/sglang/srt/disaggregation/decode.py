@@ -907,8 +907,26 @@ class DecodePreallocQueue:
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
         # populate metadata
-        req.fill_ids = req.origin_input_ids + req.output_ids
+        # NOTE(GLM-fix): For retract-resumed requests (output_ids already
+        # populated), drop output_ids[-1] from fill_ids. The last sampled
+        # token's KV was never computed/offloaded (only seqlen-1 slots were
+        # saved), so we have fill_len = seqlen-1 valid slots loaded back from
+        # CPU. Setting extend_input_len = len(fill_ids) = seqlen would cause
+        # prepare_for_prebuilt to read one stale slot index from req_to_token,
+        # which then leaks into the radix tree via cache_unfinished_req and
+        # corrupts other requests that prefix-match against this entry.
+        # Aligning fill_ids/extend_input_len to fill_len makes retracted
+        # resume structurally identical to a fresh PD-transferred request.
+        if len(req.output_ids) > 0:
+            req.fill_ids = req.origin_input_ids + req.output_ids[:-1]
+        else:
+            req.fill_ids = req.origin_input_ids
         req.set_extend_input_len(len(req.fill_ids))
+        assert len(req.fill_ids) == fill_len, (
+            f"_pre_alloc fill_ids/fill_len mismatch: "
+            f"len(fill_ids)={len(req.fill_ids)} vs fill_len={fill_len} "
+            f"(origin={len(req.origin_input_ids)}, output={len(req.output_ids)})"
+        )
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1012,9 +1030,19 @@ class DecodeTransferQueue:
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
         if not self.spec_algorithm.is_none():
-            decode_req.req.output_topk_p = output_topk_p
-            decode_req.req.output_topk_index = output_topk_index
-            decode_req.req.hidden_states_tensor = output_hidden_states
+            # NOTE(GLM-fix): get_buf returns SLICES into the shared metadata
+            # buffer at this metadata_buffer_index. The slot is freed (line
+            # ~1188) and immediately reused by other incoming requests'
+            # set_buf, which would silently mutate this request's spec state.
+            # For a fresh PD-decode req, process_prebuilt usually runs before
+            # the slot is reused, but for retract-resumed reqs it may run
+            # thousands of decode steps later -- by then the slice contains
+            # arbitrary other-request data, which seeds EAGLE with foreign
+            # hidden_states and produces garbled output. Clone here to detach
+            # from the metadata buffer.
+            decode_req.req.output_topk_p = output_topk_p.clone()
+            decode_req.req.output_topk_index = output_topk_index.clone()
+            decode_req.req.hidden_states_tensor = output_hidden_states.clone()
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(

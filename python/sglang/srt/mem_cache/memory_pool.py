@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1880,6 +1880,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
             ]
         self._finalize_allocation_log(size)
 
+    def _clear_buffers(self):
+        super()._clear_buffers()
+        del self.index_k_with_scale_buffer
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -1965,6 +1969,50 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
         return data_ptrs, data_lens, item_lens
+
+    def get_cpu_copy(self, indices):
+        # First, save the kv_buffer (inherited from MLATokenToKVPool)
+        kv_cache_cpu = super().get_cpu_copy(indices)
+
+        # Additionally, save the index_k_with_scale_buffer (page-indexed)
+        page_indices = indices[:: self.page_size] // self.page_size
+        torch.cuda.synchronize()
+        index_k_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        # Convert chunk_size from token-level to page-level
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            index_k_cpu.append([])
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = self.index_k_with_scale_buffer[layer_id][
+                    chunk_page_indices
+                ].to("cpu", non_blocking=True)
+                index_k_cpu[-1].append(idx_cpu)
+        torch.cuda.synchronize()
+
+        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
+        # Restore the kv_buffer (inherited from MLATokenToKVPool)
+        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+
+        # Restore the index_k_with_scale_buffer (page-indexed)
+        page_indices = indices[:: self.page_size] // self.page_size
+        index_k_cpu = kv_cache_cpu_dict["index_k"]
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                idx_chunk = idx_cpu.to(
+                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                )
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+        torch.cuda.synchronize()
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
