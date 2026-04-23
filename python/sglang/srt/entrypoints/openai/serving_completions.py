@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import os
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -299,7 +300,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # If the abort is from scheduler.
-                if finish_reason_type == "abort":
+                if finish_reason_type == "abort" and os.getenv("GLM_USE_ABORT_FINISH_REASON", "0") == "0":
                     code = finish_reason.get(
                         "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
                     )

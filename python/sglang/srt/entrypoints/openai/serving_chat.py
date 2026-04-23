@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from http import HTTPStatus
@@ -813,7 +814,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Track finish_reason for each index
                 if finish_reason_type:
                     # If the abort is from scheduler.
-                    if finish_reason_type == "abort":
+                    if finish_reason_type == "abort" and os.getenv("GLM_USE_ABORT_FINISH_REASON", "0") == "0":
                         code = finish_reason.get(
                             "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
                         )
