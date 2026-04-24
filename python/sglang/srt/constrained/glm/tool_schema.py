@@ -50,6 +50,15 @@ def _get_value_rule(prop: dict) -> str:
     return "text_without_special_tokens"
 
 
+def _escape_ebnf_string(s: str) -> str:
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", "\\n")
+    s = s.replace("\t", "\\t")
+    s = s.replace("\r", "\\r")
+    return s
+
+
 def _handle_enum(prop: dict) -> str:
     enum_values = prop["enum"]
     prop_type = prop.get("type", "string")
@@ -58,7 +67,7 @@ def _handle_enum(prop: dict) -> str:
         if prop_type == "boolean":
             return '"true"' if v else '"false"'
         if prop_type == "string":
-            return f'"{v}"'
+            return f'"{_escape_ebnf_string(v)}"'
         return f'"{v}"'
 
     formatted_values = [format_enum_val(v) for v in enum_values]
