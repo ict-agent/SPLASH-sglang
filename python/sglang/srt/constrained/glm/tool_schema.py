@@ -56,7 +56,7 @@ def _handle_enum(prop: dict) -> str:
 
     def format_enum_val(v: Any) -> str:
         if prop_type == "boolean":
-            return "true" if v else "false"
+            return '"true"' if v else '"false"'
         if prop_type == "string":
             return f'"{v}"'
         return f'"{v}"'
