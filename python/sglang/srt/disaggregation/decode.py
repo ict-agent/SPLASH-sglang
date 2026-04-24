@@ -530,15 +530,40 @@ class DecodePreallocQueue:
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
+        # Bootstrap timeout: if a request has been stuck in Bootstrapping for too long, treat it as failed.
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            if poll == KVPoll.Bootstrapping:
-                pass
-            elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
-                decode_req.req.time_stats.set_bootstrap_done_time()
+            if poll == KVPoll.Bootstrapping or poll == KVPoll.WaitingForInput:
+                # Check for bootstrap and pre-alloc timeout
+                entry_time = getattr(
+                    decode_req.req.time_stats,
+                    "decode_prealloc_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > bootstrap_timeout:
+                    error_message = (
+                        f"Decode bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                elif poll == KVPoll.WaitingForInput:
+                    decode_req.waiting_for_input = True
+                    decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
