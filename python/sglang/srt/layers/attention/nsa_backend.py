@@ -2129,7 +2129,13 @@ class NativeSparseAttnBackend(
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
 
-            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
+            # GLM Note: Decode/target-verify/draft-extend use paged KV metadata. During CUDA
+            # graph capture they do not have topk_indices_offset, so keep them PAGED.
+            if forward_mode is not None and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
+            ):
                 topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
