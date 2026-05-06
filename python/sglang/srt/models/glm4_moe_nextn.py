@@ -36,7 +36,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -128,10 +128,15 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.needs_quant_draft = (
-            get_global_server_args().speculative_draft_model_quantization
-        )
-        quant_config = quant_config if self.needs_quant_draft else None
+        if is_npu():
+            # NOTE(GLM-fix): Guard https://github.com/sgl-project/sglang/pull/22315
+            # which actually breaks speculative decoding for existing models.
+            self.needs_quant_draft = (
+                get_global_server_args().speculative_draft_model_quantization
+            )
+            quant_config = quant_config if self.needs_quant_draft else None
+        else:
+            self.needs_quant_draft = True if quant_config else False
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
