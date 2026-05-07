@@ -1753,6 +1753,10 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    # Per-queue breakdown: list of {name, num_reqs, num_tokens, reqs: [{rid, seqlen, input_len, output_len}]}
+    queue_details: Optional[List[Dict[str, Any]]] = None
+    # Running batch info
+    running_details: Optional[Dict[str, Any]] = None
 
 
 @dataclass

@@ -905,12 +905,48 @@ class SchedulerMetricsMixin:
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
+        # Collect per-queue details
+        queue_names = ["waiting_queue"]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            queue_names.append("bootstrap_queue")
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            queue_names.append("prealloc_queue")
+            queue_names.append("transfer_queue")
+            queue_names.append("retracted_queue")
+
+        queue_details = []
+        for name, queue in zip(queue_names, waiting_queues):
+            reqs_info = []
+            for req in queue:
+                reqs_info.append({
+                    "seqlen": req.seqlen,
+                })
+            queue_details.append({
+                "name": name,
+                "num_reqs": len(queue),
+                "num_tokens": sum(r["seqlen"] for r in reqs_info),
+                "reqs": reqs_info,
+            })
+
+        # Collect running batch details
+        running_reqs_info = []
+        for req in self.running_batch.reqs:
+            running_reqs_info.append({
+                "seqlen": req.seqlen,
+            })
+        running_details = {
+            "num_reqs": len(self.running_batch.reqs),
+            "reqs": running_reqs_info,
+        }
+
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+            queue_details=queue_details,
+            running_details=running_details,
         )
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
