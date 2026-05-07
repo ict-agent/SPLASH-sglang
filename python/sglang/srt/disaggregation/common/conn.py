@@ -123,7 +123,7 @@ class CommonKVManager(BaseKVManager):
         # bind zmq socket
         context = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=self.local_ip
+            context, zmq.REP, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
@@ -496,6 +496,10 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+
+    # GLM Fix: avoid ZMQ Too Many Open Files
+    _ctx.set(zmq.MAX_SOCKETS, 65535)
+
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()

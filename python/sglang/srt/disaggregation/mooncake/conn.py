@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -24,6 +25,8 @@ from sglang.srt.disaggregation.common.conn import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
+    send_multipart_by_req_socket,
+    ZMQ_SOCKET_SEND_TIMEOUT_MS,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -364,12 +367,11 @@ class MooncakeKVManager(CommonKVManager):
     def _send_chunk_ready(self, req, chunk_idx, kv_chunk, prefill_unique_rank):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
-            na = NetworkAddress(req.endpoint, req.dst_port)
-            self._connect(
-                na.to_tcp(),
-                is_ipv6=na.is_ipv6,
-            ).send_multipart(
-                [
+            send_multipart_by_req_socket(
+                None,
+                req.endpoint,
+                req.dst_port,
+                multipart_data= [
                     b"CHUNK_READY",
                     str(req.room).encode("ascii"),
                     str(chunk_idx).encode("ascii"),
@@ -377,10 +379,12 @@ class MooncakeKVManager(CommonKVManager):
                     str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
                     req.mooncake_session_id.encode("ascii"),
                     str(prefill_unique_rank).encode("ascii"),
-                ]
+                ],
+                desc="Sync prefill status to decode instance",
+                bootstrap_room=req.room,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error occurred while sending chunk ready message: {e} room={req.room} chunk_idx={chunk_idx} session_id={req.mooncake_session_id}")
 
     def _do_staging_transfer(
         self,
@@ -926,18 +930,20 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-
-        socket.send_multipart(
-            [
+        send_multipart_by_req_socket(
+            None,
+            remote,
+            dst_port,
+            multipart_data=[
                 MooncakeKVManager.AUX_DATA_HEADER,
                 str(room).encode("ascii"),
                 str(buffer_index).encode("ascii"),
                 str(aux_index).encode("ascii"),
                 struct.pack(">I", len(data)),
                 data,
-            ]
+            ],
+            desc="Send auxdata to decode instance",
+            bootstrap_room=room,
         )
 
     def _handle_aux_data(self, msg: List[bytes]):
@@ -1134,13 +1140,17 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-            [
+        send_multipart_by_req_socket(
+            None,
+            remote,
+            dst_port,
+            multipart_data= [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
-            ]
+            ],
+            desc="Sync prefill status to decode instance",
+            bootstrap_room=room,
         )
 
     def transfer_worker(
@@ -1263,6 +1273,7 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                             )
+
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1345,9 +1356,24 @@ class MooncakeKVManager(CommonKVManager):
     def start_prefill_thread(self):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
+
+            self.server_socket.setsockopt(zmq.SNDTIMEO, ZMQ_SOCKET_SEND_TIMEOUT_MS) # avoid blocking on ACK
+
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
+                try:
+                    waiting_req_bytes = self.server_socket.recv_multipart()
+                    self.server_socket.send(b"ACK")  # ACK is requried by REP socket to receive next message
+                except Exception as e:
+                    logger.error(
+                        "Received message from decode with exception, src=%s:%s err=%s msg=%s",
+                        self.bootstrap_host,
+                        self.bootstrap_port,
+                        e,
+                        waiting_req_bytes if 'waiting_req_bytes' in locals() else None
+                    )
+                    continue
+
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -1406,6 +1432,7 @@ class MooncakeKVManager(CommonKVManager):
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
+
                     continue
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
@@ -1424,8 +1451,22 @@ class MooncakeKVManager(CommonKVManager):
 
     def start_decode_thread(self):
         def decode_thread():
+            self.server_socket.setsockopt(zmq.SNDTIMEO, 50) # avoid blocking on ACK
             while True:
-                msg = self.server_socket.recv_multipart()
+                msg = ""
+                try:
+                    msg = self.server_socket.recv_multipart()
+                    self.server_socket.send(b"ACK")
+                except Exception as e:
+                    logger.error(
+                        "Received message from prefill with exception, src=%s:%s err=%s msg=%s",
+                        self.bootstrap_host,
+                        self.bootstrap_port,
+                        e,
+                        msg if 'msg' in locals() else None
+                    )
+                    continue
+
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -1789,27 +1830,32 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        enable_hisparse,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                    ]
-                )
+            send_multipart_by_req_socket(
+                CommonKVReceiver._ctx,
+                bootstrap_info["rank_ip"],
+                bootstrap_info["rank_port"],
+                multipart_data=[
+                    "None".encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    packed_kv_data_ptrs,
+                    packed_aux_data_ptrs,
+                    packed_state_data_ptrs,
+                    dst_tp_rank,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    packed_state_item_lens,
+                    packed_state_dim_per_tensor,
+                    enable_hisparse,
+                    packed_staging_base_ptr,
+                    staging_total_size_str,
+                ],
+                non_blocking=True, # invoking in decode main loop, should never block
+                max_retries=3,
+                retry_delay_ms=10,
+                desc="Send kvargs registration to prefill instance",
+            )
 
     def init(
         self,
@@ -1841,29 +1887,36 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            np.array(
-                                state_indices,
-                                dtype=np.int32,
-                            ).tobytes()
-                            if not is_dummy and state_indices is not None
-                            else b""
-                        ),
-                        str(self.required_dst_info_num).encode("ascii"),
-                    ]
-                )
+            send_multipart_by_req_socket(
+                CommonKVReceiver._ctx,
+                bootstrap_info["rank_ip"],
+                bootstrap_info["rank_port"],
+                multipart_data=[
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    kv_indices.tobytes() if not is_dummy else b"",
+                    str(aux_index).encode("ascii") if not is_dummy else b"",
+                    (
+                        np.array(
+                            state_indices,
+                            dtype=np.int32,
+                        ).tobytes()
+                        if not is_dummy and state_indices is not None
+                        else b""
+                    ),
+                    str(self.required_dst_info_num).encode("ascii"),
+                ],
+                non_blocking=True, # invoking in decode main loop, should never block
+                max_retries=3,
+                retry_delay_ms=10,
+                desc="Send kvcache and aux/state indices to prefill instance",
+                bootstrap_room=self.bootstrap_room,
+            )
+
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
