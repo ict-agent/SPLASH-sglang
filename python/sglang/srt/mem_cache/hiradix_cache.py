@@ -25,17 +25,29 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+
+from sglang.srt.environ import envs
+
+if envs.GLM_USE_HICACHE_MTP_FIX.get():
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+        PrefetchOperation,
+    )
+
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
     NSATokenToKVPoolHostShared,
     NSATokenToKVPoolHostSharedLayerGroup,
+    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -133,23 +145,44 @@ class HiRadixCache(RadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        self.extra_hicache_entries: list[PoolEntry] = []
+
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            enable_storage_metrics=self.enable_storage_metrics,
-        )
+        if envs.GLM_USE_HICACHE_MTP_FIX.get():
+            self.cache_controller = HybridCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
+        else:
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+            )
+
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -183,6 +216,116 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def register_mtp_hicache_pools(
+        self,
+        mtp_kv_pools: list[NSATokenToKVPool],
+        server_args: "ServerArgs",
+    ) -> None:
+        """Wrap each MTP draft KV pool with a sibling host pool and expose them
+        through a `HostPoolGroup` so that hicache backup/load moves the MTP KV
+        in lockstep with the main KV (same host/device slot indices).
+
+        Idempotent and safe to call when MTP is disabled (no-op).
+        """
+        if not mtp_kv_pools or not isinstance(self.kv_cache, NSATokenToKVPool):
+            return
+
+        # MTP transfers reuse the main pool's host indices (see
+        # `_mtp_pool_transfers`) so the MTP host pool only needs as many
+        # slots as the main host pool. Sizing it via `hicache_size` would
+        # otherwise allocate a full extra ~main_pool_bytes per MTP layer
+        # — `size_per_token` here only covers MTP's (small) layer count
+        # — which crashes the host with OOM under CP fan-out.
+        # Override: bypass `host_size` and pin the slot count to
+        # `main_host.size = device.size * mtp_host_to_device_ratio`.
+        mtp_host_to_device_ratio = (
+            self.token_to_kv_pool_host.size / self.kv_cache.size
+        )
+
+        seen = {id(entry.device_pool) for entry in self.extra_hicache_entries}
+        offset = sum(e.device_pool.layer_num for e in self.extra_hicache_entries)
+        added = False
+        for pool in mtp_kv_pools:
+            if id(pool) in seen:
+                continue
+            assert offset + pool.layer_num <= self.kv_cache.layer_num
+            if server_args.glm_nsa_shared_hicache:
+                host_pool = NSATokenToKVPoolHostShared(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,  # host_size=0 => size = device.size * ratio
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            elif server_args.glm_nsa_shared_layer_group_hicache:
+                host_pool = NSATokenToKVPoolHostSharedLayerGroup(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,  # host_size=0 => size = device.size * ratio
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            else:
+                host_pool = NSATokenToKVPoolHost(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,  # host_size=0 => size = device.size * ratio
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            start, layer_num = offset, pool.layer_num
+            self.extra_hicache_entries.append(
+                PoolEntry(
+                    name=f"mtp_{len(self.extra_hicache_entries)}",
+                    host_pool=host_pool,
+                    device_pool=pool,
+                    layer_mapper=(
+                        lambda i, s=start, n=layer_num: (i - s)
+                        if s <= i < s + n
+                        else None
+                    ),
+                )
+            )
+            offset += pool.layer_num
+            seen.add(id(pool))
+            added = True
+
+        if not added:
+            return
+
+        main_layer_num = self.kv_cache.layer_num
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name="kv",
+                    host_pool=self.token_to_kv_pool_host,
+                    device_pool=self.kv_cache,
+                    layer_mapper=(
+                        lambda i, n=main_layer_num: i if 0 <= i < n else None
+                    ),
+                    is_primary_index_anchor=True,
+                ),
+                *self.extra_hicache_entries,
+            ]
+        )
+        self.cache_controller.mem_pool_host = group
+
+        if self.enable_storage and self.cache_controller.storage_backend is not None:
+            for entry in self.extra_hicache_entries:
+                self.cache_controller.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+
+    def _mtp_pool_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.extra_hicache_entries:
+            return None
+        return [PoolTransfer(name=entry.name) for entry in self.extra_hicache_entries]
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -342,6 +485,9 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
+                host_pools=getattr(
+                    self.cache_controller.mem_pool_host, "entries", None
+                ),
             )
         except Exception as e:
             logger.exception(
@@ -594,7 +740,14 @@ class HiRadixCache(RadixCache):
     def reset(self):
         TreeNode.counter = 0
         self.cache_controller.reset()
-        self.token_to_kv_pool_host.clear()
+
+        if envs.GLM_USE_HICACHE_MTP_FIX.get():
+            # Clears the main host pool when MTP is unregistered, or all entries
+            # in the HostPoolGroup (anchor + MTP siblings) when registered.
+            self.cache_controller.mem_pool_host.clear()
+        else:
+            self.token_to_kv_pool_host.clear()
+
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
@@ -630,16 +783,18 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-        )
+        cache_write_kwargs = {
+            "device_indices": node.value,
+            "node_id": node.id,
+        }
+
+        if envs.GLM_USE_HICACHE_MTP_FIX.get():
+            cache_write_kwargs["extra_pools"] = self._mtp_pool_transfers()
+
+        host_indices = self.cache_controller.write(**cache_write_kwargs)
         if host_indices is None:
             self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
-                device_indices=node.value,
-                node_id=node.id,
-            )
+            host_indices = self.cache_controller.write(**cache_write_kwargs)
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
@@ -928,14 +1083,18 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(ancester_node)
             return None
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
-        )
+        cache_load_kwargs = {
+            "host_indices": host_indices,
+            "node_id": last_hit_node.id,
+        }
+
+        if envs.GLM_USE_HICACHE_MTP_FIX.get():
+            cache_load_kwargs["extra_pools"] = self._mtp_pool_transfers()
+
+        device_indices = self.cache_controller.load(**cache_load_kwargs)
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
-            device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
-            )
+            device_indices = self.cache_controller.load(**cache_load_kwargs)
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches

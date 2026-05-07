@@ -147,6 +147,19 @@ class PrefetchOperation(StorageOperation):
 
 
 class HybridCacheController(BaseHiCacheController):
+    @staticmethod
+    def _bind_primary_indices(
+        extra_pools: Optional[list[PoolTransfer]],
+        *,
+        host_indices: Optional[torch.Tensor] = None,
+        device_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        for pool in extra_pools or []:
+            if host_indices is not None and pool.host_indices is None:
+                pool.host_indices = host_indices
+            if device_indices is not None and pool.device_indices is None:
+                pool.device_indices = device_indices
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -162,6 +175,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_storage_metrics: bool = False,
         transfer_layer_num: Optional[int] = None,
     ):
         startup_storage_backend = storage_backend
@@ -179,6 +193,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=pp_rank,
             pp_size=pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -219,6 +234,37 @@ class HybridCacheController(BaseHiCacheController):
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    def move_indices(self, op):
+        """Move op indices to the right device for the chosen IO backend, then
+        rebind every PoolTransfer in `op.pool_transfers` to the *same* moved
+        tensors as the primary op.
+
+        PoolTransfers are bound to the op's CPU/GPU indices at enqueue time
+        (see `_bind_primary_indices`) and carry identical values to the primary
+        op. We must NOT create independent CUDA copies here: the controller
+        only `record_stream`s the primary `host_indices` / `device_indices` in
+        `start_writing` / `start_loading`, so an independently-allocated
+        PoolTransfer tensor would be reclaimed by PyTorch's caching allocator
+        the moment `op` goes out of scope, while the backup/load kernel on
+        the write/load stream is still reading from it — manifesting as
+        "CUDA error: an illegal memory access" surfaced through the NCCL
+        watchdog on the next collective.
+        """
+        host_indices, device_indices = super().move_indices(op)
+        pool_transfers = getattr(op, "pool_transfers", None)
+        if not pool_transfers:
+            return host_indices, device_indices
+
+        # Same values as the primary op by construction in `_bind_primary_indices`,
+        # so we can safely share the moved tensors across all PoolTransfers.
+        for pt in pool_transfers:
+            if pt.host_indices is not None:
+                pt.host_indices = host_indices
+            if pt.device_indices is not None:
+                pt.device_indices = device_indices
+
+        return host_indices, device_indices
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -229,6 +275,9 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
+        self._bind_primary_indices(
+            extra_pools, host_indices=host_indices, device_indices=device_indices
+        )
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools, alloc_host=True
         )
@@ -288,6 +337,9 @@ class HybridCacheController(BaseHiCacheController):
         else:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
+        self._bind_primary_indices(
+            extra_pools, host_indices=host_indices, device_indices=device_indices
+        )
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools, alloc_host=False
         )
@@ -350,6 +402,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
+        self._bind_primary_indices(extra_pools, host_indices=host_indices)
         operation = PrefetchOperation(
             request_id,
             host_indices,
@@ -369,6 +422,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
+        self._bind_primary_indices(extra_pools, host_indices=host_indices)
         operation = StorageOperation(
             host_indices,
             token_ids,

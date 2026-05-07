@@ -817,6 +817,13 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        if (
+            self.enable_hierarchical_cache
+            and self.draft_worker is not None
+            and envs.GLM_USE_HICACHE_MTP_FIX.get()
+        ):
+            self._register_mtp_hicache_pools()
+
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
@@ -841,6 +848,48 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _register_mtp_hicache_pools(self):
+        """Register MTP draft KV pools with HiRadixCache so hicache offload/load
+        moves the MTP KV in lockstep with the main KV. No-op if `tree_cache`
+        isn't a `HiRadixCache` or no NSA MTP pool is found.
+
+        Walks both spec-worker layouts:
+          * V2 (`BaseSpecWorker`): inner draft worker at `draft_worker`
+            exposing `draft_runner` (single) or `draft_runner_list` (multi-layer).
+          * V1 (`TpModelWorker` subclass — `EAGLEWorker` / `MultiLayerEagleWorker`
+            / `StandaloneWorker`): the spec worker is itself the draft
+            `TpModelWorker`, exposing `model_runner` / `model_runner_list`.
+        """
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+        if not isinstance(self.tree_cache, HiRadixCache):
+            return
+
+        runners = []
+        inner = getattr(self.draft_worker, "draft_worker", None)
+        if inner is not None:
+            runners = list(getattr(inner, "draft_runner_list", None) or []) or (
+                [inner.draft_runner] if hasattr(inner, "draft_runner") else []
+            )
+        if not runners:
+            runners = list(
+                getattr(self.draft_worker, "model_runner_list", None) or []
+            ) or (
+                [self.draft_worker.model_runner]
+                if hasattr(self.draft_worker, "model_runner")
+                else []
+            )
+
+        seen, mtp_pools = set(), []
+        for runner in runners:
+            pool = getattr(runner, "token_to_kv_pool", None)
+            if isinstance(pool, NSATokenToKVPool) and id(pool) not in seen:
+                mtp_pools.append(pool)
+                seen.add(id(pool))
+
+        self.tree_cache.register_mtp_hicache_pools(mtp_pools, self.server_args)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []

@@ -531,6 +531,9 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # GLM
+    GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

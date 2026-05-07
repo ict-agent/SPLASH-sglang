@@ -1932,6 +1932,10 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    # `pool_transfers` is forwarded by `HybridCacheController` to keep the call
+    # signature uniform with `HostPoolGroup`, which dispatches per-pool
+    # transfers (e.g. for MTP siblings). This pool only handles its own KV /
+    # indexer, so the kwarg is accepted-but-ignored here.
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1939,6 +1943,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices,
         layer_id,
         io_backend,
+        pool_transfers=None,
     ):
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend
@@ -1948,7 +1953,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend, pool_transfers=None
     ):
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
@@ -2181,8 +2186,11 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         # 返回 kv_buffer 以满足 HostKVCache 的接口约定
         return self.kv_buffer
 
+    # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
+    # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        pool_transfers=None,
     ):
         """
         所有 Rank 并行从共享 Host 内存加载数据 (KV + Indexer)。
@@ -2197,7 +2205,8 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend,
+        pool_transfers=None,
     ) -> None:
         """
         Backup 数据。仅 Rank 0 写回共享内存。
@@ -2482,15 +2491,19 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
         return self.kv_buffer
 
+    # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
+    # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        pool_transfers=None,
     ):
         super().load_to_device_per_layer(
              device_pool, host_indices, device_indices, layer_id, io_backend
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend,
+        pool_transfers=None,
     ) -> None:
         if self.my_num_layers == 0:
             return
