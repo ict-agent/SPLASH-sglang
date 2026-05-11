@@ -1278,7 +1278,7 @@ class MooncakeKVManager(CommonKVManager):
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                if self.session_failures[req.mooncake_session_id] >= envs.SGLANG_DISAGGREGATION_SESSION_MAX_FAILURE.get():
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
