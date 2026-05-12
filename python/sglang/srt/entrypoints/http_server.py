@@ -469,6 +469,15 @@ async def validate_json_request(raw_request: Request):
             ]
         )
 
+async def validate_manager_status(raw_request: Request):
+    if (
+        _global_state.tokenizer_manager.server_args.glm_refuse_request_during_exit
+        and _global_state.tokenizer_manager.gracefully_exit
+    ):
+        rid = raw_request.headers.get("X-Request-ID") or raw_request.headers.get("Request-Id") or "none"
+        logger.info(f"New request received during server shutdown, return 503. rid: {rid}")
+        raise HTTPException(status_code=503)
+
 
 ##### Native API endpoints #####
 
@@ -1377,7 +1386,7 @@ async def continue_generation(obj: ContinueGenerationReqInput, request: Request)
 ##### OpenAI-compatible API endpoints #####
 
 
-@app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+@app.post("/v1/completions", dependencies=[Depends(validate_manager_status), Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
     return await raw_request.app.state.openai_serving_completion.handle_request(
@@ -1385,7 +1394,7 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
     )
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+@app.post("/v1/chat/completions", dependencies=[Depends(validate_manager_status), Depends(validate_json_request)])
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):

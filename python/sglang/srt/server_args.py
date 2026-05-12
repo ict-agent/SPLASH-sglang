@@ -729,6 +729,7 @@ class ServerArgs:
     glm_stream_speculated_tokens: bool = False
     glm_nsa_shared_hicache: bool = False
     glm_nsa_shared_layer_group_hicache: bool = False
+    glm_refuse_request_during_exit: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -5929,6 +5930,11 @@ class ServerArgs:
             action="store_true",
             help="Enable shared-memory optimization for GLM-NSA Host KV Cache in Tensor Parallel mode. "
                 "Each rank saves part of the layers of the original model and shared with other ranks."
+        )
+        parser.add_argument(
+            "--glm-refuse-request-during-exit",
+            action="store_true",
+            help="When the tokenizer server is gracefully exiting, refuse new requests from outside to avoid high abort rates.",
         )
 
         # For PD-Multiplexing
