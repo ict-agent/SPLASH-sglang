@@ -419,6 +419,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend,
+        pool_transfers=None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -530,7 +531,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend,
+        pool_transfers=None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -941,7 +943,8 @@ class MLATokenToKVPoolHost(HostKVCache):
         return buffer
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        pool_transfers=None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -1024,7 +1027,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend,
+        pool_transfers=None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
