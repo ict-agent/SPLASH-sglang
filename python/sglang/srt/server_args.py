@@ -730,6 +730,7 @@ class ServerArgs:
     glm_nsa_shared_hicache: bool = False
     glm_nsa_shared_layer_group_hicache: bool = False
     glm_refuse_request_during_exit: bool = False
+    glm_patch_uvicorn_sigquit_handler: bool = False
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -5936,6 +5937,12 @@ class ServerArgs:
             action="store_true",
             help="When the tokenizer server is gracefully exiting, refuse new requests from outside to avoid high abort rates.",
         )
+        parser.add_argument(
+            "--glm-patch-uvicorn-sigquit-handler",
+            action="store_true",
+            help="Patch the uvicorn SIGQUIT handler to terminate the process when receiving SIGQUIT."
+        )
+
 
         # For PD-Multiplexing
         parser.add_argument(

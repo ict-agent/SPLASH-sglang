@@ -498,6 +498,15 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
 
         Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
 
+        # Patch handle_quit method to Multiprocess. Without this, uvicorn silently swallows SIGQUIT signals.
+        if ServerArgs.glm_patch_uvicorn_sigquit_handler:
+            from uvicorn.supervisors.multiprocess import Multiprocess
+            def handle_quit(self):
+                logger.error(
+                    f"Uvicorn received SIGQUIT on pid={os.getpid()}, triggering cleanup and exit.")
+                kill_process_tree(os.getpid())
+            Multiprocess.handle_quit = handle_quit
+
     except ImportError:
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
