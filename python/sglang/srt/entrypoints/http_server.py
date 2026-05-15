@@ -283,6 +283,10 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
+    # Start the tokenizer callback loop before serving requests so the first
+    # scheduler/detokenizer reply cannot race with lazy loop creation.
+    _global_state.tokenizer_manager.auto_create_handle_loop()
+
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -2095,6 +2099,7 @@ def _setup_and_run_http_server(
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_worker_healthcheck=envs.SGLANG_TIMEOUT_WORKER_HEALTHCHECK.get(),
                     loop="uvloop",
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_certfile=server_args.ssl_certfile,
@@ -2126,6 +2131,7 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                timeout_worker_healthcheck=envs.SGLANG_TIMEOUT_WORKER_HEALTHCHECK.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,

@@ -489,6 +489,7 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    SGLANG_TIMEOUT_WORKER_HEALTHCHECK = EnvInt(15)
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
