@@ -2115,7 +2115,7 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
+            monkey_patch_uvicorn_multiprocessing(server_args)
 
             if server_args.enable_ssl_refresh:
                 logger.warning(

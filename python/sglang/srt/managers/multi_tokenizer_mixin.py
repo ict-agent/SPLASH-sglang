@@ -490,7 +490,7 @@ def write_data_for_multi_tokenizer(
     return args_shm
 
 
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
+def monkey_patch_uvicorn_multiprocessing(server_args: ServerArgs, timeout: float = 10):
     """Monkey patch uvicorn multiprocessing is_alive timeout"""
     # from default 5s -> 10s
     try:
@@ -499,7 +499,7 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
         Process.is_alive = partialmethod(Process.is_alive, timeout=timeout)
 
         # Patch handle_quit method to Multiprocess. Without this, uvicorn silently swallows SIGQUIT signals.
-        if ServerArgs.glm_patch_uvicorn_sigquit_handler:
+        if server_args.glm_patch_uvicorn_sigquit_handler:
             from uvicorn.supervisors.multiprocess import Multiprocess
             def handle_quit(self):
                 logger.error(
