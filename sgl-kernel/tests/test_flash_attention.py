@@ -1365,5 +1365,99 @@ def test_flash_attn_varlen_output(
         ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(
+    not is_hopper(),
+    reason="MLA-no-rope (only_qv) path requires the HasQv kernel, which is Hopper-only",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [16, 64])
+@pytest.mark.parametrize("q_len,kv_len", [(1, 1024), (1, 8192), (64, 8192)])
+@pytest.mark.parametrize("block_size", [1, 64])
+def test_flash_attn_kvcache_only_qv(
+    q_len,
+    kv_len,
+    num_heads,
+    block_size,
+    dtype,
+):
+    """
+    Exercises the MLA decode path without Q/K rope channels.
+
+    The caller passes q=None and k_cache=None; the wrapper forwards head_dim==0
+    sentinel tensors to the C++ side, which routes to the "Qv@V only" kernel
+    (Q@K^T is skipped). The reference path passes zero-filled q_rope and
+    k_cache to the same kernel: Q@K^T evaluates to zero, so the math reduces
+    to Qv@V and both calls must produce the same output.
+    """
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    if kv_len % block_size != 0:
+        pytest.skip()
+
+    torch.random.manual_seed(0)
+    device = "cuda"
+    batch_size = 1
+    num_kv_heads = 1  # MLA
+    head_dim = 64  # rope channels (HasQv kernel constraint)
+    kv_lora_rank = 512  # nope channels == head_dim_v
+
+    num_blocks = (kv_len // block_size) * batch_size
+
+    q_rope = torch.randn(q_len, num_heads, head_dim, device=device, dtype=dtype)
+    q_nope = torch.randn(q_len, num_heads, kv_lora_rank, device=device, dtype=dtype)
+    kv_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        kv_lora_rank + head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    k_cache = kv_cache[..., kv_lora_rank:].contiguous()
+    v_cache = kv_cache[..., :kv_lora_rank].contiguous()
+
+    page_table = torch.arange(
+        kv_len // block_size, dtype=torch.int32, device=device
+    ).reshape(batch_size, -1)
+    cache_seqlens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    cu_seqlens_k = F.pad(cache_seqlens.cumsum(dim=0), (1, 0)).to(torch.int32)
+
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    window_size = (-1, -1)
+
+    common_kwargs = dict(
+        v_cache=v_cache,
+        qv=q_nope,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k_new=cu_seqlens_k,
+        max_seqlen_q=q_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=window_size,
+        softcap=0.0,
+        k_descale=None,
+        v_descale=None,
+        return_softmax_lse=False,
+    )
+
+    # only_qv path: q and k_cache are None; wrapper forwards head_dim==0 sentinel.
+    out_only_qv = flash_attn_with_kvcache(q=None, k_cache=None, **common_kwargs)
+
+    # Reference: zero-filled q_rope and k_cache make Q@K^T == 0, leaving Qv@V.
+    out_ref = flash_attn_with_kvcache(
+        q=torch.zeros_like(q_rope),
+        k_cache=torch.zeros_like(k_cache),
+        **common_kwargs,
+    )
+
+    assert out_only_qv.shape == out_ref.shape
+    print(f"only_qv vs ref max diff: {(out_only_qv - out_ref).abs().max().item()}")
+    print(f"only_qv vs ref mean diff: {(out_only_qv - out_ref).abs().mean().item()}")
+    torch.testing.assert_close(out_only_qv, out_ref, atol=1e-3, rtol=1e-3)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

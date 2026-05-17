@@ -118,7 +118,12 @@ class RadixAttention(nn.Module):
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
-                output = torch.empty_like(q)
+                # Force contiguous: torch.empty_like defaults to
+                # preserve_format, which inherits q's strides. When q is a
+                # non-contiguous slice (e.g. q_nope_out from MLA absorb),
+                # the resulting non-contiguous output breaks the
+                # `output.view(ret.shape)` in unified_attention_with_output.
+                output = torch.empty_like(q, memory_format=torch.contiguous_format)
             unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )

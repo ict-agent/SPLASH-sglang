@@ -520,6 +520,104 @@ def test_flash_mla_decode(
     torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
 
 
+@pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FlashMLA")
+@pytest.mark.parametrize("b", [1, 2, 64])
+@pytest.mark.parametrize("s_q", [1, 2, 4])
+@pytest.mark.parametrize("s_k", [140, 4096])
+@pytest.mark.parametrize("is_varlen", IS_VARLEN)
+@pytest.mark.parametrize("causal_topk", [(True, None), (False, None)])
+@pytest.mark.parametrize("dtype", DTYPE)
+@torch.inference_mode()
+def test_flash_mla_decode_no_rope(
+    b: int,
+    s_q: int,
+    s_k: int,
+    is_varlen: bool,
+    causal_topk: Tuple[bool, Optional[int]],
+    dtype: torch.dtype,
+):
+    """
+    Exercises the head_dim_k == head_dim_v == 512 path (no rope tail).
+
+    With the templated `run_flash_splitkv_mla_kernel<InputT, HEAD_DIM_K>` and
+    DISPATCH_HEAD_DIM(576|512) wiring, REUSE_ROPE folds out (TILE_SIZE_K !=
+    HEAD_DIM_K - HEAD_DIM_V) and a separate sP1 smem buffer is allocated.
+    """
+    d = 512  # head_dim_k == head_dim_v -> no rope tail, REUSE_ROPE=false
+    dv = 512
+    block_size = 64
+    h_q = 128
+    h_kv = 1
+    is_causal = causal_topk[0]
+    topk = causal_topk[1]
+
+    torch.cuda.synchronize()
+
+    cache_seqlens_cpu = torch.full((b,), s_k, dtype=torch.int32, device="cpu")
+    if is_varlen:
+        for i in range(b):
+            cache_seqlens_cpu[i] = max(random.normalvariate(s_k, s_k / 2), s_q)
+
+    max_seqlen = cache_seqlens_cpu.max().item()
+    max_seqlen_pad = cdiv(max_seqlen, 256) * 256
+    cache_seqlens = cache_seqlens_cpu.cuda()
+
+    q = torch.randn(b, s_q, h_q, d, dtype=dtype, device="cuda")
+    q.clamp_(min=-1.0, max=1.0)
+
+    block_table = torch.arange(
+        b * max_seqlen_pad // block_size, dtype=torch.int32, device="cuda"
+    ).view(b, max_seqlen_pad // block_size)
+    block_table = block_table.view(-1)[torch.randperm(block_table.numel())].view(b, -1)
+    blocked_k = (
+        torch.randn(
+            block_table.numel(),
+            block_size,
+            h_kv,
+            d,
+            dtype=dtype,
+            device="cuda",
+        )
+        / 10
+    )
+    blocked_k.clamp_(min=-1.0, max=1.0)
+
+    for i in range(b):
+        cur_len = cache_seqlens_cpu[i].item()
+        cur_num_blocks = cdiv(cur_len, block_size)
+        blocked_k[block_table[i][cur_num_blocks:]] = float("nan")
+        if cur_len % block_size != 0:
+            blocked_k[block_table[i][cur_num_blocks - 1]][
+                cur_len % block_size :
+            ] = float("nan")
+        block_table[i][cur_num_blocks:] = 2147480000
+
+    torch.cuda.synchronize()
+    tile_scheduler_metadata, num_splits = get_mla_metadata(
+        cache_seqlens, s_q * h_q // h_kv, h_kv, h_q, False, topk
+    )
+    torch.cuda.synchronize()
+
+    out_ans, lse_ans = flash_mla_with_kvcache(
+        q,
+        blocked_k,
+        block_table,
+        cache_seqlens,
+        dv,
+        tile_scheduler_metadata,
+        num_splits,
+        causal=is_causal,
+        is_fp8_kvcache=False,
+        indices=None,
+    )
+
+    out_ref, lse_ref = reference_torch_decode(
+        cache_seqlens, block_table, q, blocked_k, dv, is_causal, None
+    )
+    torch.testing.assert_close(out_ans.to(out_ref.dtype), out_ref, atol=8e-4, rtol=2.01 / 128)
+    torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
+
+
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
 @pytest.mark.parametrize("b", [128])
 @pytest.mark.parametrize("s_q", [1, 2])

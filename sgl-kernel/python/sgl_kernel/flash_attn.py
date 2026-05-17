@@ -112,10 +112,12 @@ def flash_attn_with_kvcache(
     Note: Does not support backward pass.
 
     Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
+        q: (batch_size, seqlen, nheads, headdim). Pass None to skip Q@K^T (MLA-no-rope /
+            only_qv mode, requires qv); the C++ side allocates an internal placeholder.
         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
-            page_block_size must be a multiple of 256.
+            page_block_size must be a multiple of 256. Pass None alongside q=None to skip K
+            traffic entirely (only_qv mode); a placeholder is allocated internally.
         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
@@ -158,15 +160,30 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
+    # MLA-no-rope path: when the layer has no rope head dim, caller passes q=None
+    # and/or k_cache=None. We forward head_dim==0 sentinel tensors to the C++
+    # side, which detects the sentinel and routes to the "Qv@V only" kernel
+    # (the kernel never reads Q / K_cache contents in that mode).
+    if q is None or k_cache is None:
+        if qv is None or v_cache is None:
+            raise ValueError(
+                "When q or k_cache is None (MLA-no-rope path), both qv and v_cache must be provided"
+            )
+        if k_cache is None:
+            k_cache = v_cache.new_empty((*v_cache.shape[:-1], 0))
+        if q is None:
+            q = qv.new_empty((*qv.shape[:-1], 0))
+
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    # NOTE: v_cache.stride(-1) == 1 is intentionally NOT asserted here; v_cache
+    # may be V_colmajor (stride(-3)==1) and is auto-contiguified below.
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
             -0.5
         )
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
 

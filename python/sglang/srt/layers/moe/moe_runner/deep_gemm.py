@@ -114,6 +114,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         super().__init__(config)
         assert self.config.activation == "silu"
         assert self.config.is_gated
+        self.swiglu_clamp_limit = self.config.swiglu_clamp_limit
 
     def run(
         self,
@@ -176,6 +177,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
+
+        if self.swiglu_clamp_limit is not None:
+            gateup_output = _apply_swiglu_clamp_limit(
+                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
+            )
 
         down_input = torch.empty(
             (
@@ -269,6 +275,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
+
+        if self.swiglu_clamp_limit is not None:
+            gateup_output = _apply_swiglu_clamp_limit(
+                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
+            )
 
         # Act
         scale_block_size = 128
@@ -612,3 +623,15 @@ def post_permute_deep_gemm_to_deepep_normal(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+def _apply_swiglu_clamp_limit(
+    gateup_output: torch.Tensor, swiglu_clamp_limit: float
+) -> torch.Tensor:
+    """Asymmetric clamp on swiglu pre-activation: gate to (-inf, lim], up to [-lim, lim].
+    Operates in-place on the last dim and accepts any leading shape."""
+    half = gateup_output.shape[-1] // 2
+    flat = gateup_output.view(-1, gateup_output.shape[-1])
+    flat[:, :half].clamp_(max=swiglu_clamp_limit)
+    flat[:, half:].clamp_(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+    return gateup_output

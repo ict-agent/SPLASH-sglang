@@ -48,7 +48,6 @@ _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
 class DpPaddingMode(IntEnum):
-
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -93,7 +92,6 @@ class DpPaddingMode(IntEnum):
 
 
 class _DpGatheredBufferWrapper:
-
     _hidden_size: int
     _dtype: torch.dtype
     _device: torch.device
@@ -133,10 +131,10 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
+    def get_local_dp_buffer(cls, n: int = 1) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
+                (cls._local_dp_buffer_len, cls._hidden_size * n),
                 dtype=cls._dtype,
                 device=cls._device,
             )
@@ -194,8 +192,8 @@ def get_global_dp_buffer() -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_global_dp_buffer()
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(n: int = 1) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(n)
 
 
 def get_global_dp_buffer_len() -> int:

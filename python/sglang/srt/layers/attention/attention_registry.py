@@ -185,7 +185,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     assert not (
         runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
-
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -221,6 +220,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
+            linear_attn_backend = KDAAttnBackend(runner)
+        elif runner.glm_linear_config is not None:
             linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)

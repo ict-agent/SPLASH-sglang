@@ -50,6 +50,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    BETA_SCALE: tl.constexpr = 1.0,
+    SAFE_GATE: tl.constexpr = False,
+    SAFE_GATE_LOWER_BOUND: tl.constexpr = -5.0,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -160,17 +163,20 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
         x = b_a + b_dt_bias
-        beta_x = softplus_beta * x
-        # Apply softplus with numerical stability
-        softplus_x = tl.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
-            x,
-        )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        if SAFE_GATE and IS_KDA:
+            b_g = SAFE_GATE_LOWER_BOUND * tl.sigmoid(tl.exp(b_A_log) * x)
+        else:
+            beta_x = softplus_beta * x
+            # Apply softplus with numerical stability
+            softplus_x = tl.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+                x,
+            )
+            b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = BETA_SCALE / (1.0 + tl.exp(-b_b))
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -262,6 +268,9 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    beta_scale: float = 1.0,
+    safe_gate: bool = False,
+    safe_gate_lower_bound: float = -5.0,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -346,6 +355,9 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        BETA_SCALE=beta_scale,
+        SAFE_GATE=safe_gate,
+        SAFE_GATE_LOWER_BOUND=safe_gate_lower_bound,
         num_warps=num_warps,
         num_stages=num_stages,
     )

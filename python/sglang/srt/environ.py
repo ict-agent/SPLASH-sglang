@@ -532,9 +532,21 @@ class Envs:
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
+    SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY = EnvBool(False)
 
     # GLM
     GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
+
+    # MHC (multi hyper-connection) operator backend selection (covers both
+    # mhc_pre and mhc_post).
+    #   - SGLANG_OPT_USE_TORCH_MHC=True    -> pure-torch native fallback.
+    #   - SGLANG_OPT_USE_TILELANG_MHC=True -> in-tree tilelang kernels ported
+    #     from deepseek_v4.
+    #   - both False (default)             -> tile_kernels package.
+    # Torch takes precedence over tilelang when both are set.
+    SGLANG_OPT_USE_TILELANG_MHC = EnvBool(False)
+    SGLANG_OPT_USE_TORCH_MHC = EnvBool(False)
+    SGLANG_DISABLE_KDA_FUSION = EnvBool(False)
 
 
 envs = Envs()

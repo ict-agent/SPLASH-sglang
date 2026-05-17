@@ -74,6 +74,7 @@ class RadixLinearAttention(nn.Module):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
@@ -89,6 +90,7 @@ class RadixLinearAttention(nn.Module):
                 b,
                 output,
                 self.layer_id,
+                **kwargs,
             )
             return output
         else:
@@ -98,6 +100,7 @@ class RadixLinearAttention(nn.Module):
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                **kwargs,
             )
 
 
@@ -109,6 +112,9 @@ def unified_linear_attention_with_output(
     b: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    beta_scale: float = 1.0,
+    safe_gate: bool = False,
+    safe_gate_lower_bound: float = -5.0,
 ) -> None:
     """
     Custom op wrapper for linear attention computation only.
@@ -124,6 +130,9 @@ def unified_linear_attention_with_output(
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
+        beta_scale=beta_scale,
+        safe_gate=safe_gate,
+        safe_gate_lower_bound=safe_gate_lower_bound,
     )
 
     assert (

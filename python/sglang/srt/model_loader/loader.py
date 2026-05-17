@@ -1256,6 +1256,54 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         return list(updated_params), is_last_update
 
 
+class DistcpModelLoader(BaseModelLoader):
+    """Loader for Megatron-style torch / torch_dist (PyTorch distributed
+    checkpoint) weights.
+
+    Builds the model on CPU and delegates the actual weight loading to the
+    model's `load_from_megatron(model_config)` method, which is expected to
+    wrap `sglang.srt.utils.load_mgt.load_megatron_weights`.
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        target_device = torch.device("cpu")
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config)
+
+            if not hasattr(model, "load_from_megatron"):
+                raise ValueError(
+                    f"Model {type(model).__name__} does not implement "
+                    "`load_from_megatron`, which is required by "
+                    "--load-format=distcp."
+                )
+
+            model.load_from_megatron(model_config)
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+        return model.eval()
+
+
 class DummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values."""
 
@@ -1748,7 +1796,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -1772,7 +1819,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -1782,7 +1828,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -1843,7 +1888,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -1855,8 +1900,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -2375,8 +2419,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             weight_info = seed_weight_info.get(name, None)
             if weight_info is None:
                 raise RuntimeError(
-                    f"ModelExpress: cannot find weight info for {name} "
-                    f"in seed metadata"
+                    f"ModelExpress: cannot find weight info for {name} in seed metadata"
                 )
             seed_ptr, seed_size = weight_info
             local_size = tensor.numel() * tensor.element_size()
@@ -2485,7 +2528,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -3110,6 +3153,20 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
+    # Backwards compatibility: legacy checkpoints encode the trigger as
+    # `hf_config.loading_distcp = True` rather than going through
+    # --load-format. Auto-promote so the dispatch below picks the right loader.
+    if (
+        load_config.load_format == LoadFormat.AUTO
+        and model_config is not None
+        and getattr(getattr(model_config, "hf_config", None), "loading_distcp", False)
+    ):
+        logger.info(
+            "Detected hf_config.loading_distcp=True; auto-promoting "
+            "load_format to 'distcp' for backwards compatibility."
+        )
+        load_config.load_format = LoadFormat.DISTCP
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
@@ -3149,6 +3206,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.DISTCP:
+        return DistcpModelLoader(load_config)
 
     # Check for FLASH_RL format early
     # FP8 approach: BF16/FP16 model with native FP8 quantization

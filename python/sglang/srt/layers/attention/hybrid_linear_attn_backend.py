@@ -902,7 +902,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
+            out = self.forward_decode(
                 layer,
                 forward_batch,
                 save_kv_cache,
@@ -915,7 +915,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            out = self.forward_extend(
                 layer,
                 forward_batch,
                 save_kv_cache,
@@ -927,6 +927,21 @@ class HybridLinearAttnBackend(AttentionBackend):
                 b,
                 **kwargs,
             )
+
+        # Under input_scattered or dp-attention, the full-attn (MLA) path runs
+        # FA3 on the padded [N_pad, ...] shape. FA3 only writes rows covered by
+        # cu_seqlens_q and leaves [n_valid, N_pad) as uninitialized GPU memory.
+        # If any NaN/Inf bit pattern survives there, the next layer's K row at
+        # those positions can bypass causal masking via `NaN + (-inf) = NaN`,
+        # propagating NaN back through the sequence one FA3 tile at a time.
+        # Zero the tail so downstream layers see clean zeros. KDA handles its
+        # own strip+repad inside the linear backend, so no scrub is needed
+        # there.
+        if not is_linear_attn:
+            n_valid = forward_batch.extend_num_valid_tokens
+            if n_valid is not None and out.shape[0] > n_valid:
+                out[n_valid:].zero_()
+        return out
 
     def update_mamba_state_after_mtp_verify(
         self,

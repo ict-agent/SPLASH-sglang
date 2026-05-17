@@ -7,6 +7,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.glm_linear import GlmLinearConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -63,4 +64,5 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",
+    "GlmLinearConfig",
 ]

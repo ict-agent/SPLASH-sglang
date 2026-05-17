@@ -32,6 +32,7 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    DISTCP = "distcp"
 
 
 @dataclass
@@ -52,6 +53,9 @@ class LoadConfig:
         "bitsandbytes" will load nf4 type weights.
         "flash_rl" will load weights with support for RL training
             with quantized models, enabling efficient weight reloading.
+        "distcp" will load Megatron-style torch / torch_dist (PyTorch
+            distributed checkpoint) weights by delegating to the model's
+            `load_from_megatron(model_config)` method.
     ignore_patterns: The list of patterns to ignore when loading the model.
         Default to "original/**/*" to avoid repeated loading of llama's
         checkpoints.

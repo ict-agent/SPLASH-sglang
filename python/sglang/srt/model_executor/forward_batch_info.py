@@ -432,6 +432,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    @property
+    def extend_num_valid_tokens(self) -> Optional[int]:
+        """Real prompt token count for extend, robust against the dp-attention
+        and input_scattered padding paths.
+
+        ``extend_num_tokens`` is set to the *padded* count under dp-attention
+        ([forward_batch_info.py:_pad_inputs_to_size]) and to the *unpadded*
+        count under input_scattered. Code that needs to know how many rows
+        the request actually occupies (e.g. to strip padding before a kernel
+        or zero the tail after) should prefer this property and avoid
+        ``extend_num_tokens`` directly.
+        """
+        if self.extend_seq_lens_cpu is not None:
+            return int(sum(self.extend_seq_lens_cpu))
+        return self.extend_num_tokens
+
     @classmethod
     def init_new(
         cls,

@@ -90,6 +90,7 @@ def set_mla_kv_buffer_triton(
 ):
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
+
     total_dim = nope_dim + rope_dim
     BLOCK = 128
     n_loc = loc.numel()
@@ -288,13 +289,14 @@ def get_mla_kv_buffer_kernel(
         nope_src,
     )
 
-    rope_offs = tl.arange(0, rope_dim)
-    rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
-    rope_src = tl.load(rope_src_ptr)
-    tl.store(
-        cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
-        rope_src,
-    )
+    if rope_dim > 0:
+        rope_offs = tl.arange(0, rope_dim)
+        rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
+        rope_src = tl.load(rope_src_ptr)
+        tl.store(
+            cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
+            rope_src,
+        )
 
 
 def get_mla_kv_buffer_triton(

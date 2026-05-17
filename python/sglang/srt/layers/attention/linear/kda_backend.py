@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -141,6 +141,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
+        # HybridLinearAttnBackend forwards full-attention args to every
+        # linear backend. KDA computes its own q/k/v from mixed_qkv via
+        # causal_conv1d_update, so absorb these here to keep them out of
+        # **kwargs — otherwise they collide with the explicit q=/k=/v=
+        # we pass to kernel_dispatcher.decode below.
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+        save_kv_cache: bool = True,
         **kwargs,
     ):
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
@@ -173,6 +183,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            **kwargs,
         )
 
     def forward_extend(
@@ -182,8 +193,32 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
         a: torch.Tensor,
         b: torch.Tensor,
+        # Same as forward_decode: absorb full-attention args that
+        # HybridLinearAttnBackend forwards to every linear backend, so they
+        # don't collide with the explicit q=/k=/v= passed to
+        # kernel_dispatcher.extend below.
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        save_kv_cache: bool = True,
         **kwargs,
     ):
+        # Under input_scattered or dp-attention, the model passes [N_pad, ...]
+        # tensors but query_start_loc still describes only [0, n_valid). The
+        # Triton kernels (causal_conv1d / chunk_kda) only schedule thread blocks
+        # for rows covered by query_start_loc, so output rows [n_valid, N_pad)
+        # are never written and keep whatever bit pattern torch.empty() left in
+        # GPU memory — often NaN/Inf. Strip to valid rows here, run the kernels
+        # on a smaller tensor, then re-pad core_attn_out with zeros so the
+        # caller sees the [N_pad, ...] shape it expects.
+        n_total = mixed_qkv.shape[0]
+        n_valid = forward_batch.extend_num_valid_tokens
+        needs_repad = n_valid is not None and n_valid < n_total
+        if needs_repad:
+            mixed_qkv = mixed_qkv[:n_valid]
+            a = a[:, :n_valid]
+            b = b[:, :n_valid]
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -252,6 +287,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            **kwargs,
         )
+
+        if needs_repad:
+            # core_attn_out comes back from chunk_kda as [1, n_valid, h, d]
+            # (token dim is dim 1 due to the unsqueeze(0) above). Re-pad along
+            # the token dim so the caller's `.squeeze(0).flatten(-2)` gives
+            # [n_total, h*d] as expected.
+            full = core_attn_out.new_zeros(
+                (
+                    core_attn_out.shape[0],
+                    n_total,
+                    *core_attn_out.shape[2:],
+                )
+            )
+            full[:, :n_valid] = core_attn_out
+            core_attn_out = full
 
         return core_attn_out

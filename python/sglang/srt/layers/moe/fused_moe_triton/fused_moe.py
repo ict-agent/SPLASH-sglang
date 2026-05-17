@@ -106,6 +106,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -136,6 +137,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        swiglu_clamp_limit,
     )
 
 
@@ -168,6 +170,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -198,6 +201,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        swiglu_clamp_limit=swiglu_clamp_limit,
     )
 
 
@@ -256,6 +260,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            moe_runner_config.swiglu_clamp_limit,
         )
         return hidden_states
     else:
@@ -287,6 +292,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            swiglu_clamp_limit=moe_runner_config.swiglu_clamp_limit,
         )
 
 
@@ -349,6 +355,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_clamp_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -506,6 +513,13 @@ def fused_experts_impl(
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
         )
+
+        if swiglu_clamp_limit and 0 < swiglu_clamp_limit:
+            half = N // 2
+            intermediate_cache1[..., :half].clamp_(max=swiglu_clamp_limit)
+            intermediate_cache1[..., half:].clamp_(
+                min=-swiglu_clamp_limit, max=swiglu_clamp_limit
+            )
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:

@@ -147,18 +147,22 @@ class ScatterMode(Enum):
 
 
 class AttentionInputs:
-
     def __init__(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_latent_func: Callable,
+        *,
+        is_pre_gathered: bool = False,
     ):
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
         self.hidden_states_ = None
         self.qkv_latent_ = None
+        # When True, hidden_states_local is already attn_tp-gathered upstream
+        # (e.g. by MHC's prepare_attn for NSA). fetch_* must NOT gather again.
+        self.is_pre_gathered = is_pre_gathered
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
@@ -173,7 +177,7 @@ class AttentionInputs:
         self.qkv_latent_ = self.qkv_latent_func(
             self.hidden_states_local, self.forward_batch
         )
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
@@ -183,7 +187,7 @@ class AttentionInputs:
         if self.hidden_states_ is not None:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
@@ -195,13 +199,17 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
+        self.is_nsa = False
 
-    def init_context(self, q_lora_rank, is_nsa):
+    def init_context(self, q_lora_rank, is_nsa, is_mhc=False):
+        # NSA + input_scattered requires hidden_states to be attn_tp-gathered
+        # before the attention call. Currently only MHC's prepare_attn does this
+        # pre-gather; hence is_mhc gates NSA's eligibility for input_scattered.
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_nsa
+            and (is_mhc or not is_nsa)
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -209,6 +217,11 @@ class AttnTpContext:
             and get_global_server_args().disable_piecewise_cuda_graph
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
+
+        # Tracked here so callers (e.g. MHC.prepare_attn) can decide whether to
+        # pre-gather hidden_states. AttentionInputs.fetch_* uses its own
+        # is_pre_gathered flag, not this.
+        self.is_nsa = is_nsa
         if get_global_server_args().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
                 logging.info(
@@ -309,8 +322,8 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
+                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
@@ -442,9 +455,10 @@ class LayerCommunicator:
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
-            hidden_states, residual = self._tp_reduce_scatter(
+            hidden_states, residual = tp_reduce_scatter(
                 hidden_states,
                 residual,
+                self._context,
             )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
@@ -483,7 +497,6 @@ class LayerCommunicator:
                             None,
                         )
                     elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-
                         hidden_states, _, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             self.input_layernorm.weight,
@@ -500,7 +513,6 @@ class LayerCommunicator:
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
@@ -546,25 +558,6 @@ class LayerCommunicator:
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
-
-    def _tp_reduce_scatter(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
-        local_tokens = hidden_states.shape[0] // self._context.tp_size
-        output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-        get_tp_group().reduce_scatter_tensor(output, hidden_states)
-        if residual is not None:
-            residual = residual.tensor_split(self._context.tp_size)[
-                self._context.tp_rank
-            ]
-        return output, residual
 
     def prepare_mlp(
         self,
@@ -692,6 +685,24 @@ class CommunicateContext:
         )
 
 
+def tp_reduce_scatter(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    context: "CommunicateContext",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    assert (
+        hidden_states.shape[0] % context.tp_size == 0
+    ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    local_tokens = hidden_states.shape[0] // context.tp_size
+    output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return output, residual
+
+
 class CommunicateSimpleFn:
     @staticmethod
     def get_fn(
@@ -764,8 +775,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
     2. Apply layer norm
     """
 
-    @staticmethod
+    @classmethod
     def get_fn(
+        cls,
         hidden_states_input_mode: ScatterMode,
         residual_input_mode: ScatterMode,
         hidden_states_output_mode: ScatterMode,
@@ -780,7 +792,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
-            return CommunicateWithAllReduceAndLayerNormFn._simple
+            return cls._simple
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -791,7 +803,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
             return partial(
-                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                cls._gather_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -804,7 +816,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
             return partial(
-                CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+                cls._scatter_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -948,8 +960,9 @@ class CommunicateSummableTensorPairFn:
             context=context,
         )(context=context, **kwargs)
 
-    @staticmethod
+    @classmethod
     def get_fn(
+        cls,
         hidden_states_input_mode: ScatterMode,
         residual_input_mode: ScatterMode,
         output_mode: ScatterMode,
@@ -958,28 +971,28 @@ class CommunicateSummableTensorPairFn:
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return CommunicateSummableTensorPairFn._trivial
+            return cls._trivial
 
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return CommunicateSummableTensorPairFn._scatter_hidden_states
+            return cls._scatter_hidden_states
 
         if (
             (hidden_states_input_mode == ScatterMode.SCATTERED)
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return CommunicateSummableTensorPairFn._gather
+            return cls._gather
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.SCATTERED)
         ):
-            return CommunicateSummableTensorPairFn._scatter
+            return cls._scatter
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"

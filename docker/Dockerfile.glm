@@ -69,10 +69,10 @@ EOF
 
 FROM scratch AS sglang-dependency
 RUN \
---mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
---mount=type=bind,target=/bin/grep,from=busybox,source=/bin/grep \
---mount=type=bind,target=sglang/pyproject.toml,source=python/pyproject.toml,readwrite=true \
-grep -v "sglang-kernel" sglang/pyproject.toml > pyproject.toml
+    --mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
+    --mount=type=bind,target=/bin/grep,from=busybox,source=/bin/grep \
+    --mount=type=bind,target=sglang/pyproject.toml,source=python/pyproject.toml,readwrite=true \
+    grep -v "sglang-kernel" sglang/pyproject.toml > pyproject.toml
 
 
 FROM scratch AS site-symlink
@@ -161,6 +161,11 @@ ADD https://github.com/flashinfer-ai/flashinfer.git#${FLASHINFER_COMMIT} /
 FROM scratch AS flashattn-source
 ARG FLASHATTN_COMMIT=bcf72ccc6816b36a5fae2c5a3c027604629785e0
 ADD https://github.com/sgl-project/sgl-attn.git#${FLASHATTN_COMMIT} /
+RUN \
+    --mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
+    --mount=type=bind,target=/bin/patch,from=busybox,source=/bin/patch \
+    --mount=type=bind,target=patches/flash-attn.patch,source=patches/flash-attn.patch \
+    patch -E -p1 -i patches/flash-attn.patch
 
 
 FROM scratch AS mscclpp-source
@@ -171,6 +176,11 @@ ADD https://github.com/microsoft/mscclpp.git#${MSCCLPP_COMMIT} /
 FROM scratch AS flashmla-source
 ARG FLASHMLA_COMMIT=9804b12079e4c873514d3457aa588d3ccf40da28
 ADD https://github.com/sgl-project/FlashMLA.git#${FLASHMLA_COMMIT} /
+RUN \
+    --mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
+    --mount=type=bind,target=/bin/patch,from=busybox,source=/bin/patch \
+    --mount=type=bind,target=patches/flashmla.patch,source=patches/flashmla.patch \
+    patch -E -p1 -i patches/flashmla.patch
 
 
 FROM scratch AS deepep-source
@@ -182,9 +192,9 @@ FROM scratch AS cuda-cudart
 ARG CUDA_VERSION=13.0.88
 ADD https://developer.download.nvidia.cn/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-${CUDA_VERSION}-archive.tar.xz /
 RUN \
---mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
---mount=type=bind,target=/bin/tar,from=busybox,source=/bin/tar \
-tar -x -v --strip-components 1 \
+    --mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
+    --mount=type=bind,target=/bin/tar,from=busybox,source=/bin/tar \
+    tar -x -v --strip-components 1 \
     -f cuda_cudart-linux-x86_64-${CUDA_VERSION}-archive.tar.xz \
     cuda_cudart-linux-x86_64-${CUDA_VERSION}-archive/lib/stubs
 
@@ -192,12 +202,12 @@ tar -x -v --strip-components 1 \
 FROM cuda-base AS pytorch
 
 RUN \
---mount=type=bind,target=/etc/apt/apt.conf.d/docker-clean,source=keep-cache,from=keep-cache \
---mount=type=bind,target=/etc/apt/sources.list.d/ubuntu.sources,source=ubuntu.sources,from=ubuntu-sources \
---mount=type=bind,target=/etc/apt/sources.list.d/cuda.list,source=empty,from=empty-file \
---mount=type=cache,target=/var/cache/apt,sharing=locked \
---mount=type=cache,target=/var/lib/apt,sharing=locked \
-<<-EOF
+    --mount=type=bind,target=/etc/apt/apt.conf.d/docker-clean,source=keep-cache,from=keep-cache \
+    --mount=type=bind,target=/etc/apt/sources.list.d/ubuntu.sources,source=ubuntu.sources,from=ubuntu-sources \
+    --mount=type=bind,target=/etc/apt/sources.list.d/cuda.list,source=empty,from=empty-file \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    <<-EOF
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
@@ -213,32 +223,32 @@ ARG TORCH_ENV=/opt/torch
 ENV PATH=${TORCH_ENV}/bin:$PATH
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-<<-EOF
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
 python3 -m venv ${TORCH_ENV}
 pip install --upgrade pip
 EOF
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=requirements.txt,source=requirements.txt,from=torch-requirements \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install -r requirements.txt
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=requirements.txt,source=requirements.txt,from=torch-requirements \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install -r requirements.txt
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=requirements.txt,source=requirements.txt,from=cuda-requirements \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install -r requirements.txt
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=requirements.txt,source=requirements.txt,from=cuda-requirements \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install -r requirements.txt
 
 RUN \
---mount=type=bind,target=libcuda.so,source=lib/stubs/libcuda.so,from=cuda-cudart \
---mount=type=bind,target=symlink.py,source=symlink.py,from=site-symlink \
-python symlink.py
+    --mount=type=bind,target=libcuda.so,source=lib/stubs/libcuda.so,from=cuda-cudart \
+    --mount=type=bind,target=symlink.py,source=symlink.py,from=site-symlink \
+    python symlink.py
 
 ARG CUDA_HOME=${TORCH_ENV}/lib/python3.12/site-packages/nvidia/cu13
 ENV PATH=${CUDA_HOME}/bin:$PATH
@@ -247,18 +257,18 @@ ENV PATH=${CUDA_HOME}/bin:$PATH
 FROM pytorch AS deepep-builder
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install build ninja
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install build ninja
 
 RUN \
---mount=type=bind,target=deepep,from=deepep-source,readwrite=true \
---mount=type=bind,target=deepep/timeout.patch,source=timeout.patch,from=deepep-patch \
---mount=type=cache,target=deepep/build,sharing=locked \
---mount=type=cache,target=/root/.cache/sccache,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-<<-EOF
+    --mount=type=bind,target=deepep,from=deepep-source,readwrite=true \
+    --mount=type=bind,target=deepep/timeout.patch,source=timeout.patch,from=deepep-patch \
+    --mount=type=cache,target=deepep/build,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
 export TORCH_CUDA_ARCH_LIST="9.0;10.0+PTX"
 patch -E -p 1 -i timeout.patch -d deepep
 pyproject-build --no-isolation --wheel --outdir /dist deepep
@@ -268,29 +278,30 @@ EOF
 FROM pytorch AS sgl-kernel-builder
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install build cmake ninja sccache scikit-build-core wheel
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install build cmake ninja sccache scikit-build-core wheel
 
 ARG MAX_JOBS=32
 ARG RECENT_VTAG=v0.5.10-pip
 
 RUN \
---mount=type=bind,target=sgl-kernel,source=sgl-kernel,readwrite=true \
---mount=type=bind,target=sgl-kernel/3rdparty/cutlass,from=cutlass-source \
---mount=type=bind,target=sgl-kernel/3rdparty/fmt,from=libfmt-source \
---mount=type=bind,target=sgl-kernel/3rdparty/deepgemm,from=deepgemm-source \
---mount=type=bind,target=sgl-kernel/3rdparty/triton,from=triton-source \
---mount=type=bind,target=sgl-kernel/3rdparty/flashinfer,from=flashinfer-source \
---mount=type=bind,target=sgl-kernel/3rdparty/flash-attention,from=flashattn-source \
---mount=type=bind,target=sgl-kernel/3rdparty/mscclpp,from=mscclpp-source \
---mount=type=bind,target=sgl-kernel/3rdparty/flashmla,from=flashmla-source,readwrite=true \
---mount=type=cache,target=sgl-kernel/build,sharing=locked,id=${RECENT_VTAG} \
---mount=type=cache,target=/root/.cache/sccache,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-<<-EOF
+    --mount=type=bind,target=sgl-kernel,source=sgl-kernel,readwrite=true \
+    --mount=type=bind,target=sgl-kernel/3rdparty/cutlass,from=cutlass-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/fmt,from=libfmt-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/deepgemm,from=deepgemm-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/triton,from=triton-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/flashinfer,from=flashinfer-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/flash-attention,from=flashattn-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/mscclpp,from=mscclpp-source \
+    --mount=type=bind,target=sgl-kernel/3rdparty/flashmla,from=flashmla-source,readwrite=true \
+    --mount=type=cache,target=sgl-kernel/build,sharing=locked,id=${RECENT_VTAG} \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
 sccache --start-server
+rm -rf sgl-kernel/build
 pyproject-build --no-isolation --wheel --outdir /dist sgl-kernel \
     -Ccmake.define.DISABLE_FETCH_CONTENT=ON \
     -Cbuild-dir=build
@@ -303,68 +314,80 @@ EOF
 FROM pytorch AS sglang-builder
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install build
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install build
 
 ARG MIRROR_BASE=mirrors.tuna.tsinghua.edu.cn
 ARG PIP_INDEX_URL=https://${MIRROR_BASE}/pypi/web/simple
 
 RUN \
---mount=type=bind,target=sglang,source=python,readwrite=true \
---mount=type=tmpfs,target=/tmp \
-pyproject-build --wheel --outdir /dist sglang
+    --mount=type=bind,target=sglang,source=python,readwrite=true \
+    --mount=type=tmpfs,target=/tmp \
+    pyproject-build --wheel --outdir /dist sglang
 
 
 FROM pytorch AS base
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=sglang/pyproject.toml,source=pyproject.toml,from=sglang-dependency \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-<<-EOF
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=sglang/pyproject.toml,source=pyproject.toml,from=sglang-dependency \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
 pip install --no-build-isolation --editable "sglang"
 pip uninstall --yes sglang
 EOF
 
 RUN \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-pip install mooncake-transfer-engine-cuda13==0.3.9
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install mooncake-transfer-engine-cuda13==0.3.9
 
 RUN \
---mount=type=bind,target=/etc/apt/apt.conf.d/docker-clean,source=keep-cache,from=keep-cache \
---mount=type=bind,target=/etc/apt/sources.list.d/ubuntu.sources,source=ubuntu.sources,from=ubuntu-sources \
---mount=type=bind,target=/etc/apt/sources.list.d/cuda.list,source=empty,from=empty-file \
---mount=type=cache,target=/var/cache/apt,sharing=locked \
---mount=type=cache,target=/var/lib/apt,sharing=locked \
-<<-EOF
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install tilelang==0.1.9 apache-tvm-ffi==0.1.10
+
+RUN \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install --no-deps tile-kernels
+
+RUN \
+    --mount=type=bind,target=/etc/apt/apt.conf.d/docker-clean,source=keep-cache,from=keep-cache \
+    --mount=type=bind,target=/etc/apt/sources.list.d/ubuntu.sources,source=ubuntu.sources,from=ubuntu-sources \
+    --mount=type=bind,target=/etc/apt/sources.list.d/cuda.list,source=empty,from=empty-file \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    <<-EOF
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     libcurl4t64 \
-    curl htop
+    curl htop \
+    openmpi-bin libopenmpi-dev openssh-server
 EOF
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=/dist,source=/dist,from=deepep-builder \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-find /dist -name "*.whl" -exec pip install "deep_ep @ file://{}" \;
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=/dist,source=/dist,from=deepep-builder \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    find /dist -name "*.whl" -exec pip install "deep_ep @ file://{}" \;
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=/dist,source=/dist,from=sgl-kernel-builder \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-find /dist -name "*.whl" -exec pip install "sglang-kernel @ file://{}" \;
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=/dist,source=/dist,from=sgl-kernel-builder \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    find /dist -name "*.whl" -exec pip install "sglang-kernel @ file://{}" \;
 
 RUN \
---mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
---mount=type=bind,target=/dist,source=/dist,from=sglang-builder \
---mount=type=cache,target=/root/.cache/pip,sharing=locked \
---mount=type=tmpfs,target=/tmp \
-find /dist -name "*.whl" -exec pip install "sglang @ file://{}" \;
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=/dist,source=/dist,from=sglang-builder \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    find /dist -name "*.whl" -exec pip install "sglang @ file://{}" \;

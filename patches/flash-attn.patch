@@ -1,0 +1,448 @@
+diff --git a/hopper/flash.h b/hopper/flash.h
+index 6df4317..812c6b2 100644
+--- a/hopper/flash.h
++++ b/hopper/flash.h
+@@ -150,6 +150,7 @@ struct Flash_fwd_params : public Qkv_params {
+ 
+     int num_splits;  // For split-KV version
+     bool pack_gqa;
++    bool only_qv;
+ 
+     int * __restrict__ tile_count_semaphore;
+     int * __restrict__ num_m_blocks_ptr;
+diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
+index 3060e87..12d0273 100644
+--- a/hopper/flash_api.cpp
++++ b/hopper/flash_api.cpp
+@@ -692,6 +692,26 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+     bool is_sm8x = dprops->major >= 8;
+     TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+ 
++    // Sentinel: a caller can request the "Qv@V only" decode path (skip Q@K^T entirely)
++    // by passing q (and k) with head_dim == 0. Used by MLA / DSA decode without Q/K rope.
++    // The HasQv kernel is hard-wired to kHeadDim == 64 (the rope channels), so we
++    // allocate placeholders of that shape; the kernel never reads from them under the
++    // OnlyQv template, but TMA descriptors still require valid CUDA buffers.
++    bool const only_qv = (q.size(-1) == 0);
++    if (only_qv) {
++        TORCH_CHECK(q_v_.has_value(),
++                    "q with head_dim == 0 (only_qv decode path) requires q_v to be provided");
++        TORCH_CHECK(k.size(-1) == 0,
++                    "When q has head_dim == 0, k must also have head_dim == 0");
++        constexpr int kOnlyQvHeadDim = 64;  // HasQv kernel constraint (rope channel width)
++        auto q_shape = q.sizes().vec();
++        q_shape.back() = kOnlyQvHeadDim;
++        q = torch::empty(q_shape, q.options());
++        auto k_shape = k.sizes().vec();
++        k_shape.back() = kOnlyQvHeadDim;
++        k = torch::empty(k_shape, k.options());
++    }
++
+     auto q_type = q.scalar_type();
+     TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16 || q_type == at::ScalarType::Float8_e4m3fn,
+                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+@@ -1029,6 +1049,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+             params.qv_batch_stride = q_v.stride(0);
+         }
+     }
++    params.only_qv = only_qv;
+ 
+     if (rotary_cos_.has_value()) {
+         TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+diff --git a/hopper/flash_api_stable.cpp b/hopper/flash_api_stable.cpp
+index 31a4dc1..1916aaf 100644
+--- a/hopper/flash_api_stable.cpp
++++ b/hopper/flash_api_stable.cpp
+@@ -761,6 +761,26 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
+     bool is_sm8x = dprops->major >= 8;
+     STD_TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+ 
++    // Sentinel: a caller can request the "Qv@V only" decode path (skip Q@K^T entirely)
++    // by passing q (and k) with head_dim == 0. Used by MLA / DSA decode without Q/K rope.
++    // The HasQv kernel is hard-wired to kHeadDim == 64 (the rope channels), so we
++    // allocate placeholders of that shape; the kernel never reads from them under the
++    // OnlyQv template, but TMA descriptors still require valid CUDA buffers.
++    bool const only_qv = (q.size(-1) == 0);
++    if (only_qv) {
++        STD_TORCH_CHECK(q_v_.has_value(),
++                    "q with head_dim == 0 (only_qv decode path) requires q_v to be provided");
++        STD_TORCH_CHECK(k.size(-1) == 0,
++                    "When q has head_dim == 0, k must also have head_dim == 0");
++        constexpr int64_t kOnlyQvHeadDim = 64;  // HasQv kernel constraint (rope channel width)
++        std::vector<int64_t> q_shape(q.sizes().begin(), q.sizes().end());
++        q_shape.back() = kOnlyQvHeadDim;
++        q = torch::stable::new_empty(q, q_shape);
++        std::vector<int64_t> k_shape(k.sizes().begin(), k.sizes().end());
++        k_shape.back() = kOnlyQvHeadDim;
++        k = torch::stable::new_empty(k, k_shape);
++    }
++
+     auto q_type = q.scalar_type();
+     STD_TORCH_CHECK(q_type == torch::headeronly::ScalarType::Half || q_type == torch::headeronly::ScalarType::BFloat16 || q_type == torch::headeronly::ScalarType::Float8_e4m3fn,
+                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
+@@ -1096,6 +1116,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
+             params.qv_batch_stride = q_v.stride(0);
+         }
+     }
++    params.only_qv = only_qv;
+ 
+     if (rotary_cos_.has_value()) {
+         STD_TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+diff --git a/hopper/flash_attn_interface.py b/hopper/flash_attn_interface.py
+index b5099d8..1b108de 100644
+--- a/hopper/flash_attn_interface.py
++++ b/hopper/flash_attn_interface.py
+@@ -1010,10 +1010,12 @@ def flash_attn_with_kvcache(
+     Note: Does not support backward pass.
+ 
+     Arguments:
+-        q: (batch_size, seqlen, nheads, headdim)
++        q: (batch_size, seqlen, nheads, headdim). Pass None to skip Q@K^T (only_qv mode,
++            requires qv); a placeholder is allocated internally.
+         k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no page_table,
+             or (num_blocks, page_block_size, nheads_k, headdim) if there's a page_table (i.e. paged KV cache)
+-            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.).
++            page_block_size can be arbitrary (e.g, 1, 2, 3, 64, etc.). Pass None alongside q=None to
++            skip K traffic entirely (only_qv mode); a placeholder is allocated internally.
+         v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim_v) if there's no page_table,
+             or (num_blocks, page_block_size, nheads_k, headdim_v) if there's a page_table (i.e. paged KV cache)
+         k [optional]: (batch_size, seqlen_new, nheads_k, headdim). If not None, we concatenate
+@@ -1052,13 +1054,31 @@ def flash_attn_with_kvcache(
+             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+             normalization factor).
+     """
+-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
++    if v_cache is None:
++        raise ValueError("v_cache must be provided")
+     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
++    # Sentinel: when the caller omits q and/or k_cache (MLA / DSA decode without Q/K rope),
++    # pass tensors of head_dim == 0 to the backend. The C++ side detects the sentinel and
++    # routes to the "Qv@V only" kernel path (the kernel never reads from q/k there).
++    if (q is None) or (k_cache is None):
++        if qv is None:
++            raise ValueError("qv must be provided when q or k_cache is None")
++        if k_cache is None:
++            k_cache = torch.empty(
++                (*v_cache.shape[:-1], 0), dtype=v_cache.dtype, device=v_cache.device
++            )
++        if q is None:
++            q = torch.empty(
++                (*qv.shape[:-1], 0), dtype=qv.dtype, device=qv.device
++            )
++        if softmax_scale is None:
++            softmax_scale = qv.shape[-1] ** (-0.5)
++    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+     if softmax_scale is None:
+         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+     if cache_seqlens is not None and isinstance(cache_seqlens, int):
+         cache_seqlens = torch.full(
+-            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
++            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=v_cache.device
+         )
+         cache_seqlens = maybe_contiguous(cache_seqlens)
+     out, softmax_lse, *rest = _flash_attn_forward(
+diff --git a/hopper/flash_fwd_launch_template.h b/hopper/flash_fwd_launch_template.h
+index 4d3ed32..2cad9a8 100644
+--- a/hopper/flash_fwd_launch_template.h
++++ b/hopper/flash_fwd_launch_template.h
+@@ -26,9 +26,10 @@
+ using namespace cute;
+ 
+ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
+-          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
++          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv, bool OnlyQv,
+           bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg>
+ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
++    static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
+     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
+     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
+     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
+@@ -53,7 +54,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
+     using CollectiveMainloop = std::conditional_t<
+         Arch >= 90,
+-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink>,
++        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSink>,
+         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSink>
+     >;
+     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
+@@ -218,11 +219,14 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
+                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen && !Use_one_mma_wg;
+                     BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
+                         static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
+-                        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+-                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+-                            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+-                                static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+-                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg>(params, stream);
++                        BOOL_SWITCH(params.only_qv, OnlyQv_, [&] {
++                            static constexpr bool OnlyQv = OnlyQv_ && HasQv;
++                            APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
++                                // Only use Cluster if number of tiles along seqlen_q is even and not varlen
++                                CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
++                                    static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
++                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg>(params, stream);
++                                });
+                             });
+                         });
+                     });
+diff --git a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+index 8f961bb..62f7ce7 100644
+--- a/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+@@ -30,7 +30,7 @@ using namespace cute;
+ 
+ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
+-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, int kBlockH_=1>
++        bool OnlyQv_, bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSink_, int kBlockH_=1>
+ struct CollectiveMainloopFwdSm90 {
+ 
+     static constexpr int kStages = Stages;
+@@ -50,6 +50,7 @@ struct CollectiveMainloopFwdSm90 {
+     static constexpr bool PagedKVNonTMA = PagedKVNonTMA_;
+     static constexpr bool AppendKV = AppendKV_;
+     static constexpr bool HasQv = HasQv_;
++    static constexpr bool OnlyQv = OnlyQv_;
+     static constexpr bool PackGQA = PackGQA_;
+     static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
+     static constexpr bool Split = Split_;
+@@ -59,6 +60,7 @@ struct CollectiveMainloopFwdSm90 {
+     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
+     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
+     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
++    static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
+     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
+     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+ 
+@@ -680,7 +682,9 @@ struct CollectiveMainloopFwdSm90 {
+         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
+         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
+         Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
+-        if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ); }
++        if constexpr (!OnlyQv) {
++            if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ); }
++        }
+         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
+         auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
+         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
+@@ -820,7 +824,7 @@ struct CollectiveMainloopFwdSm90 {
+             }
+             if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
+-            load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
++            if constexpr (!OnlyQv) { load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
+         }
+ 
+@@ -831,9 +835,11 @@ struct CollectiveMainloopFwdSm90 {
+             }
+ 
+             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
+-                shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
+-                copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+-                    tQgQ, tQsQ);
++                if constexpr (!OnlyQv) {
++                    shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
++                    copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
++                        tQgQ, tQsQ);
++                }
+                 if constexpr (HasQv) {
+                     shared_storage.pipelines.barrier_Qv.arrive_and_expect_tx(TmaTransactionBytesQv);
+                     copy(params.tma_load_Qv.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Qv), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+@@ -842,13 +848,15 @@ struct CollectiveMainloopFwdSm90 {
+             }
+         } else {  // Load Q with cp.async
+             cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+-            Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+-            Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+-            using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
+-            PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
+-            auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+-            cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
+-            barrier_Q.arrive();
++            if constexpr (!OnlyQv) {
++                Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
++                Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
++                using PackGQAt = flash::PackGQAManager<get<0>(TileShape_MNK{}), get<2>(TileShape_MNK{}), NumProducerThreads, Element>;
++                PackGQAt::load_Q(mQ, sQ_pi, params.qhead_per_khead_divmod, thread_idx, seqlen_info.seqlen_q, m_block);
++                auto &barrier_Q = shared_storage.pipelines.barrier_Q;
++                cutlass::arch::cpasync_barrier_arrive(reinterpret_cast<uint64_t*>(&barrier_Q));
++                barrier_Q.arrive();
++            }
+             if constexpr (HasQv) {
+                 Tensor mQv = make_tensor(make_gmem_ptr(params.ptr_Qv + seqlen_info.offset_q * get<0>(params.stride_Qv)), params.shape_Qv_packed, params.stride_Qv_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+                 Tensor sQv_pi = cute::as_position_independent_swizzle_tensor(sQv);
+@@ -883,7 +891,7 @@ struct CollectiveMainloopFwdSm90 {
+                     paged_kv_manager.load_page_table_TMA(n_block);
+                 }
+                 if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+-                load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
++                if constexpr (!OnlyQv) { load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                 if constexpr (!Transpose_V) {
+                     if constexpr (IntraWGOverlap) {
+                         load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
+@@ -920,7 +928,7 @@ struct CollectiveMainloopFwdSm90 {
+             *  Waits for all stages to either be released (all Consumer UNLOCKs), or if the stage was never used
+             *  then would just be acquired since the phase was still inverted from make_producer_start_state
+             */
+-            pipeline_k.producer_tail(smem_pipe_write);
++            if constexpr (!OnlyQv) { pipeline_k.producer_tail(smem_pipe_write); }
+             pipeline_v.producer_tail(smem_pipe_write);
+             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
+         }
+@@ -1110,38 +1118,40 @@ struct CollectiveMainloopFwdSm90 {
+             }
+         };
+ 
+-        auto &barrier_Q = shared_storage.pipelines.barrier_Q;
+-        if constexpr (!AppendKV) {
+-            barrier_Q.wait(work_idx % 2);
+-        } else {
+-            if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
+-                using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
+-                Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
+-                                params.ptr_rotary_sin, params.stride_rotary_sin,
+-                                params.is_rotary_interleaved, thread_idx, seqlen_q,
+-                                seqlen_info.seqlen_rotary);
+-                Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
+-                int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
+-                if (params.is_rotary_interleaved) {
+-                    auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
+-                        rotary.template load_cos_sin<true /*kInterleaved*/>(m_block),
+-                        rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
+-                    );
+-                    barrier_Q.wait(work_idx % 2);
+-                    rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block, qhead_per_khead);
++        if constexpr (!OnlyQv) {
++            auto &barrier_Q = shared_storage.pipelines.barrier_Q;
++            if constexpr (!AppendKV) {
++                barrier_Q.wait(work_idx % 2);
++            } else {
++                if (get<1>(params.shape_rotary) > 0) {  // Apply rotary to Q
++                    using Rotary_t = Rotary<kBlockM, kHeadDim, NumMmaThreadsQK, Element, !(Is_causal || Is_local) /*FixedPosition*/>;
++                    Rotary_t rotary(params.ptr_rotary_cos, params.shape_rotary, params.stride_rotary_cos,
++                                    params.ptr_rotary_sin, params.stride_rotary_sin,
++                                    params.is_rotary_interleaved, thread_idx, seqlen_q,
++                                    seqlen_info.seqlen_rotary);
++                    Tensor sQ_pi = cute::as_position_independent_swizzle_tensor(sQ);
++                    int const qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
++                    if (params.is_rotary_interleaved) {
++                        auto [tRrCos, tRrSin] = cute::conditional_return<!PackGQA>(
++                            rotary.template load_cos_sin<true /*kInterleaved*/>(m_block),
++                            rotary.template load_cos_sin_packgqa<true /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
++                        );
++                        barrier_Q.wait(work_idx % 2);
++                        rotary.apply_Q_interleaved(sQ_pi, tRrCos, tRrSin, m_block, qhead_per_khead);
++                    } else {
++                        auto [tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(
++                            rotary.template load_cos_sin<false /*kInterleaved*/>(m_block),
++                            rotary.template load_cos_sin_packgqa<false /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
++                        );
++                        barrier_Q.wait(work_idx % 2);
++                        rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block, qhead_per_khead);
++                    }
++                    // SMEM fence to make sure the rotated Q is visible to GMMA
++                    cutlass::arch::fence_view_async_shared();
++                    cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
+                 } else {
+-                    auto [tRrCosCont, tRrSinCont] = cute::conditional_return<!PackGQA>(
+-                        rotary.template load_cos_sin<false /*kInterleaved*/>(m_block),
+-                        rotary.template load_cos_sin_packgqa<false /*kInterleaved*/>(m_block, params.qhead_per_khead_divmod)
+-                    );
+                     barrier_Q.wait(work_idx % 2);
+-                    rotary.apply_Q_contiguous(sQ_pi, tRrCosCont, tRrSinCont, m_block, qhead_per_khead);
+                 }
+-                // SMEM fence to make sure the rotated Q is visible to GMMA
+-                cutlass::arch::fence_view_async_shared();
+-                cutlass::arch::NamedBarrier::sync(NumMmaThreadsQK, static_cast<uint32_t>(FwdNamedBarriers::QueryRotated) /*id*/);
+-            } else {
+-                barrier_Q.wait(work_idx % 2);
+             }
+         }
+ 
+@@ -1156,14 +1166,16 @@ struct CollectiveMainloopFwdSm90 {
+ 
+         if constexpr (IntraWGOverlap) {
+             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+-            consumer_wait(pipeline_k, smem_pipe_read);
+-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+-            warpgroup_wait<0>();
+-            pipeline_k.consumer_release(smem_pipe_read);
++            if constexpr (!OnlyQv) {
++                consumer_wait(pipeline_k, smem_pipe_read);
++                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
++                warpgroup_wait<0>();
++                pipeline_k.consumer_release(smem_pipe_read);
++            }
+             if constexpr (HasQv) {
+                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
+                 consumer_wait(pipeline_v, smem_pipe_read);
+-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
++                flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+             }
+             scoremod_premask_fn(tSrS);
+             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+@@ -1191,9 +1203,13 @@ struct CollectiveMainloopFwdSm90 {
+                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
+                 ++smem_pipe_read;
+                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+-                if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
+-                warp_scheduler_barrier_sync();
+-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
++                if constexpr (!OnlyQv) {
++                    if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
++                    warp_scheduler_barrier_sync();
++                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
++                } else {
++                    warp_scheduler_barrier_sync();
++                }
+                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+                 if constexpr(!HasQv) {
+                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
+@@ -1201,12 +1217,14 @@ struct CollectiveMainloopFwdSm90 {
+                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                 warp_scheduler_barrier_arrive();
+                 warpgroup_wait<1>();
+-                pipeline_k.consumer_release(smem_pipe_read);  // release K
++                if constexpr (!OnlyQv) {
++                    pipeline_k.consumer_release(smem_pipe_read);  // release K
++                }
+                 if constexpr (HasQv) {
+                     warpgroup_wait<0>();
+                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+                     consumer_wait(pipeline_v, smem_pipe_read);
+-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
++                    flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                 }
+                 scoremod_premask_fn(tSrS);
+                 mask_fn(tSrS, n_block);
+@@ -1288,21 +1306,23 @@ struct CollectiveMainloopFwdSm90 {
+                 auto smem_pipe_read_prev = smem_pipe_read;
+                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
+                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+-                consumer_wait(pipeline_k, smem_pipe_read);
+-                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
++                if constexpr (!OnlyQv) {
++                    consumer_wait(pipeline_k, smem_pipe_read);
++                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
++                }
+                 if constexpr (!HasQv) {
+                     warp_scheduler_barrier_arrive();
+                     warpgroup_wait<0>();
+-                    pipeline_k.consumer_release(smem_pipe_read);  // release K
++                    if constexpr (!OnlyQv) { pipeline_k.consumer_release(smem_pipe_read); }  // release K
+                 } else {
+                     if constexpr (Is_first_iter) {
+                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
+                     }
+                     consumer_wait(pipeline_v, smem_pipe_read);
+-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
++                    flash::gemm</*zero_init=*/OnlyQv, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                     warp_scheduler_barrier_arrive();
+                     warpgroup_wait<1>();
+-                    pipeline_k.consumer_release(smem_pipe_read);  // release K
++                    if constexpr (!OnlyQv) { pipeline_k.consumer_release(smem_pipe_read); }  // release K
+                     warpgroup_wait<0>();
+                 }
+                 scoremod_premask_fn(tSrS);

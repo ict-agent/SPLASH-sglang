@@ -829,19 +829,30 @@ class FlashAttentionBackend(AttentionBackend):
                 ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
+                # Use explicit num_blocks (not -1) so the view also works when
+                # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+                # other dim is 0. Empty rope cache is treated as "no rope" by
+                # flash_attn_with_kvcache.
+                num_blocks = kv_cache.shape[0] // self.page_size
                 k_rope_cache = k_rope.view(
-                    -1,
+                    num_blocks,
                     self.page_size,
                     layer.tp_k_head_num,
                     layer.head_dim - layer.v_head_dim,
                 )
                 c_kv_cache = c_kv.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    num_blocks, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                    # Use explicit num_tokens (not -1) so the view also works
+                    # when rope_dim==0 (MLA-no-rope); -1 inference is
+                    # ambiguous when any other dim is 0. Same fix as
+                    # k_rope_cache above.
                     q_rope = q_rope.view(
-                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                        q_nope.shape[0],
+                        layer.tp_q_head_num,
+                        layer.head_dim - layer.v_head_dim,
                     )
                 else:
                     q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1106,25 +1117,36 @@ class FlashAttentionBackend(AttentionBackend):
             )
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
+            # Use explicit num_blocks (not -1) so the view also works when
+            # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+            # other dim is 0. Empty rope cache is treated as "no rope" by
+            # flash_attn_with_kvcache.
+            num_blocks = kv_cache.shape[0] // self.page_size
             k_rope_cache = k_rope.view(
-                -1,
+                num_blocks,
                 self.page_size,
                 layer.tp_k_head_num,
                 layer.head_dim - layer.v_head_dim,
             )
             c_kv_cache = c_kv.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                num_blocks, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
             if q_rope is not None:
                 q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                # Use explicit num_tokens (not -1) so the view also works when
+                # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when
+                # any other dim is 0. Same fix as k_rope_cache above.
                 q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    q_nope.shape[0],
+                    layer.tp_q_head_num,
+                    layer.head_dim - layer.v_head_dim,
                 )
             else:
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
+
             max_seqlen_q = metadata.max_seq_len_q
 
             result = flash_attn_with_kvcache(

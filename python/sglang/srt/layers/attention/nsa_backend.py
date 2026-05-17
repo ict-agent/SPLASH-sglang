@@ -1815,15 +1815,37 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
+        # Auto-detect no-rope (MLA-no-rope) from q_all geometry: when the layer
+        # has no rope head dim, q_all carries only the nope segment and its last
+        # dim equals v_head_dim. Otherwise the rope tail is concatenated, making
+        # last dim > v_head_dim.
+        no_rope = q_all.shape[-1] == v_head_dim
+        if not no_rope:
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                tilelang_sparse_fwd,
+            )
 
-        return tilelang_sparse_fwd(
-            q=q_all,
-            kv=kv_cache,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+            return tilelang_sparse_fwd(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+        else:
+            from sglang.srt.layers.attention.nsa.tilelang_kernel_glm import (
+                sparse_mla_fwd_interface,
+            )
+
+            out, lse = sparse_mla_fwd_interface(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                return_p_sum=False,
+                d_v=v_head_dim,
+            )
+            return out
 
     def _forward_aiter(
         self,

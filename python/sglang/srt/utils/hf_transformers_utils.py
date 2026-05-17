@@ -73,6 +73,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    GlmLinearConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -125,6 +126,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetVLMConfig,
     KimiK25Config,
     Step3p5Config,
+    GlmLinearConfig,
 ]
 
 _CONFIG_REGISTRY = {

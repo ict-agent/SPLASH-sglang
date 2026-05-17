@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
@@ -864,17 +865,40 @@ def chunk_kda_fwd(
     chunk_size = 64
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
 
-    # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
-    w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g,
-        beta=beta,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size,
-    )
+    if envs.SGLANG_DISABLE_KDA_FUSION.get():
+        from sglang.srt.layers.attention.fla.solve_tril import solve_tril
+
+        A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
+            q=q,
+            k=k,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u, _, kg = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            gk=g,
+            cu_seqlens=cu_seqlens,
+        )
+        del A
+    else:
+        # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
+        w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+        )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,

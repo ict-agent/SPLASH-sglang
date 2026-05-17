@@ -838,8 +838,9 @@ def biased_grouped_topk_gpu(
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
         ) or (
-        # GLM NOTE: for Glm4Moe
-        _is_cuda and num_expert_group == 1
+        # GLM NOTE: for Glm4Moe — kernel only wires up specific num_experts values
+        # in the num_expert_group==1 path (see sgl-kernel moe_fused_gate.cu).
+        _is_cuda and num_expert_group == 1 and num_experts in (64, 96, 128, 160, 256)
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),

@@ -93,6 +93,7 @@ LOAD_FORMAT_CHOICES = [
     "fastsafetensors",
     "private",
     "runai_streamer",
+    "distcp",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -3697,7 +3698,10 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"distcp" loads Megatron-style torch / torch_dist (PyTorch '
+            "distributed checkpoint) weights via the model's "
+            "`load_from_megatron` method.",
         )
         parser.add_argument(
             "--model-loader-extra-config",
@@ -5916,21 +5920,21 @@ class ServerArgs:
             action="store_true",
             help="When using speculative decoding, the speculated accepted tokens will be merged into one event by default, therefore "
             "leading mis-calculation for token throughputs when using streaming event count for token estimation. This argument will "
-            "return tokens separately instead of merging them."
+            "return tokens separately instead of merging them.",
         )
         parser.add_argument(
             "--glm-nsa-shared-hicache",
             action="store_true",
             help="Enable shared-memory optimization for GLM-NSA Host KV Cache in Tensor Parallel mode. "
-                "Instead of saving replicaed data on each rank, all intra-node ranks directly access a single "
-                "shared host memory region. This reduces communication latency and maximizes PCIe bandwidth. "
-                "Note: Only works for single-node setups."
+            "Instead of saving replicaed data on each rank, all intra-node ranks directly access a single "
+            "shared host memory region. This reduces communication latency and maximizes PCIe bandwidth. "
+            "Note: Only works for single-node setups.",
         )
         parser.add_argument(
             "--glm-nsa-shared-layer-group-hicache",
             action="store_true",
             help="Enable shared-memory optimization for GLM-NSA Host KV Cache in Tensor Parallel mode. "
-                "Each rank saves part of the layers of the original model and shared with other ranks."
+            "Each rank saves part of the layers of the original model and shared with other ranks.",
         )
         parser.add_argument(
             "--glm-refuse-request-during-exit",

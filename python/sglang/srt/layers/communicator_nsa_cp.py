@@ -113,8 +113,9 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
     2. Apply layer norm
     """
 
-    @staticmethod
+    @classmethod
     def get_fn(
+        cls,
         hidden_states_input_mode: ScatterMode,
         residual_input_mode: ScatterMode,
         hidden_states_output_mode: ScatterMode,
@@ -125,11 +126,11 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         assert residual_input_mode == ScatterMode.SCATTERED
         assert residual_output_mode == ScatterMode.SCATTERED
         if hidden_states_output_mode == ScatterMode.SCATTERED:
-            return NSACPCommunicateWithAllReduceAndLayerNormFn._simple
+            return cls._simple
 
         if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
-                NSACPCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                cls._gather_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -167,8 +168,9 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    @staticmethod
+    @classmethod
     def get_fn(
+        cls,
         hidden_states_input_mode: ScatterMode,
         residual_input_mode: ScatterMode,
         output_mode: ScatterMode,
@@ -183,12 +185,12 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.SCATTERED)
         ):
-            return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
+            return cls._scatter_hidden_states
 
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return NSACPCommunicateSummableTensorPairFn._trivial
+            return cls._trivial
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
