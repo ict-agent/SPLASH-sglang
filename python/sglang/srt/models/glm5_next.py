@@ -37,7 +37,9 @@ from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
+    cp_plain_all_gather,
+    cp_plain_reduce_scatter,
+    cp_plain_split,
     cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -55,6 +57,9 @@ from sglang.srt.layers.communicator_mhc_hybrid_cp import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -62,8 +67,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelBatchedLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -149,8 +156,13 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.attn_tp_size = get_attention_tp_size()
+        if is_nsa_enable_prefill_cp():
+            head_shard_size = get_attention_cp_size()
+            head_shard_rank = get_attention_cp_rank()
+        else:
+            head_shard_size = get_attention_tp_size()
+            head_shard_rank = get_attention_tp_rank()
+
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -161,76 +173,108 @@ class Glm5NextLinearAttention(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.layer_idx = layer_idx
         self.prefix = prefix
-        assert self.num_heads % self.attn_tp_size == 0
-        self.local_num_heads = divide(self.num_heads, self.attn_tp_size)
+        assert self.num_heads % head_shard_size == 0
+        self.local_num_heads = divide(self.num_heads, head_shard_size)
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
         self.allow_neg_eigval = config.linear_allow_neg_eigval
         self.safe_gate = config.linear_attn_config.get("safe_gate", False)
 
-        # Unfused path: separate QKVParallelLinear
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.num_heads,
-            self.num_k_heads,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        # Attention is never quantized in Glm5Next; always fuse.
+        self.do_fuse_qkvbfg = envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.get()
+        if self.do_fuse_qkvbfg:
+            # Fuse q/k/v/beta (column-parallel) + f_a/g_a (replicated) into one
+            # projection, and f_b/g_b into one batched bmm.
+            self.qkvb_sizes = [
+                projection_size,
+                projection_size,
+                projection_size,
+                self.num_heads,
+            ]
+            self.fg_sizes = [self.head_dim, self.head_dim]
 
-        self.f_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_a_proj",
-        )
+            self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
+                self.hidden_size,
+                self.qkvb_sizes,
+                self.fg_sizes,
+                quant_config=quant_config,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+                prefix=f"{prefix}.fused_qkvbfg_a_proj",
+            )
+            self.split_sizes = [
+                3 * projection_size // head_shard_size,  # qkv
+                self.num_heads // head_shard_size,  # beta
+                2 * self.head_dim,  # f_a, g_a (replicated, no sharding)
+            ]
+            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                2,
+                self.head_dim,
+                projection_size,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.num_heads,
+                self.num_k_heads,
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+                prefix=f"{prefix}.qkv_proj",
+            )
 
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_b_proj",
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+            self.f_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_a_proj",
+            )
 
-        self.b_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.b_proj",
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+            self.f_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.f_b_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
 
-        self.g_a_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_a_proj",
-        )
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_dim,
-            projection_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_b_proj",
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+            self.b_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.b_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
+
+            self.g_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_a_proj",
+            )
+            self.g_b_proj = ColumnParallelLinear(
+                self.head_dim,
+                projection_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_b_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
+            )
 
         self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
+            torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
         )
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
@@ -241,8 +285,8 @@ class Glm5NextLinearAttention(nn.Module):
             bias=False,
             params_dtype=torch.float32,
             prefix=f"{prefix}.qkv_conv1d",
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=head_shard_rank,
+            tp_size=head_shard_size,
         )
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
@@ -271,8 +315,8 @@ class Glm5NextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=head_shard_rank,
+            tp_size=head_shard_size,
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -280,9 +324,9 @@ class Glm5NextLinearAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=self.num_k_heads // self.attn_tp_size,
-            num_k_heads=self.num_k_heads // self.attn_tp_size,
-            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            num_q_heads=self.local_num_heads,
+            num_k_heads=self.local_num_heads,
+            num_v_heads=self.local_num_heads,
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -292,34 +336,80 @@ class Glm5NextLinearAttention(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-    def _apply(self, fn, recurse=True):
-        # `attn.conv_weights` / `attn.bias` are plain Python attributes — views
-        # into `qkv_conv1d.weight` / `bias`, not registered params or buffers,
-        # so PyTorch's _apply walks past them. When the distcp loader runs
-        # `layer.to(device)` on a CPU-built layer, `qkv_conv1d.weight.data`
-        # gets rebound to fresh CUDA storage and the views go stale. Refresh
-        # them once per transform here, covering any future .to/.cuda/.half
-        # call as well.
-        result = super()._apply(fn, recurse)
-        if hasattr(self, "attn") and hasattr(self, "qkv_conv1d"):
-            self.attn.conv_weights = self.qkv_conv1d.weight.squeeze(1)
-            self.attn.bias = self.qkv_conv1d.bias
-        return result
-
-    def forward_qkvbfg(self, hidden_states: torch.Tensor):
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        # Compute beta, forget_gate, and g_proj_states
-        beta = self.b_proj(hidden_states)[0]
-        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
-
-        return (
-            qkv,
-            beta,
-            forget_gate,
-            g_proj_states,
+        self.attn.beta_scale = (
+            KDA_NEG_EIGVAL_BETA_SCALE
+            if self.allow_neg_eigval
+            else KDA_DEFAULT_BETA_SCALE
         )
+        self.attn.safe_gate = self.safe_gate
+        self.attn.safe_gate_lower_bound = KDA_SAFE_GATE_LOWER_BOUND
+
+        self._cp_fuse_symm_mem = envs.SGLANG_NSA_CP_FUSE_SYMM_MEM.get()
+
+    def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        cp_prefill = nsa_use_prefill_cp(forward_batch)
+        if cp_prefill and self._cp_fuse_symm_mem:
+            from torch.distributed._symmetric_memory import (
+                _fused_all_gather_matmul,
+            )
+
+            _, [qkv, beta, fa_out, ga_out] = _fused_all_gather_matmul(
+                hidden_states.contiguous(),
+                [
+                    p.weight.t()
+                    for p in (
+                        self.qkv_proj,
+                        self.b_proj,
+                        self.f_a_proj,
+                        self.g_a_proj,
+                    )
+                ],
+                gather_dim=0,
+                group_name=get_attention_cp_group().device_group.group_name,
+                return_A=False,
+            )
+        else:
+            if cp_prefill:
+                hidden_states = cp_plain_all_gather(
+                    hidden_states, get_attention_cp_size()
+                )
+            qkv = self.qkv_proj(hidden_states)[0]
+            beta = self.b_proj(hidden_states)[0]
+            fa_out = self.f_a_proj(hidden_states)[0]
+            ga_out = self.g_a_proj(hidden_states)[0]
+
+        forget_gate = self.f_b_proj(fa_out)[0]
+        g_proj_states = self.g_b_proj(ga_out)[0]
+        return qkv, beta, forget_gate, g_proj_states
+
+    def forward_qkvbfg_fused(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        cp_prefill = nsa_use_prefill_cp(forward_batch)
+        if cp_prefill and self._cp_fuse_symm_mem:
+            from torch.distributed._symmetric_memory import (
+                _fused_all_gather_matmul,
+            )
+
+            _, [fused_states] = _fused_all_gather_matmul(
+                hidden_states.contiguous(),
+                [self.fused_qkvbfg_a_proj.weight.t()],
+                gather_dim=0,
+                group_name=get_attention_cp_group().device_group.group_name,
+                return_A=False,
+            )
+        else:
+            if cp_prefill:
+                hidden_states = cp_plain_all_gather(
+                    hidden_states, get_attention_cp_size()
+                )
+            fused_states = self.fused_qkvbfg_a_proj(hidden_states)
+
+        qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
+        forget_gate, g_proj_states = self.fused_fg_b_proj(
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+        )
+        return qkv, beta, forget_gate, g_proj_states
 
     def forward(
         self,
@@ -332,7 +422,14 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(hidden_states)
+        if self.do_fuse_qkvbfg:
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                hidden_states, forward_batch
+            )
+        else:
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
+                hidden_states, forward_batch
+            )
 
         # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
         if not forward_batch.forward_mode.is_decode():
@@ -357,13 +454,6 @@ class Glm5NextLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=forget_gate,
             b=beta,
-            beta_scale=(
-                KDA_NEG_EIGVAL_BETA_SCALE
-                if self.allow_neg_eigval
-                else KDA_DEFAULT_BETA_SCALE
-            ),
-            safe_gate=self.safe_gate,
-            safe_gate_lower_bound=KDA_SAFE_GATE_LOWER_BOUND,
         )
 
         norm_gate = g_proj_states.unflatten(
@@ -372,7 +462,23 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
-        return self.o_proj(core_attn_out)[0]
+        cp_prefill = nsa_use_prefill_cp(forward_batch)
+        if cp_prefill and self._cp_fuse_symm_mem:
+            from torch.distributed._symmetric_memory import (
+                _fused_matmul_reduce_scatter,
+            )
+
+            return _fused_matmul_reduce_scatter(
+                core_attn_out.contiguous(),
+                self.o_proj.weight.t(),
+                reduce_op="sum",
+                scatter_dim=0,
+                group_name=get_attention_cp_group().device_group.group_name,
+            )
+        output = self.o_proj(core_attn_out)[0]
+        if cp_prefill:
+            output = cp_plain_reduce_scatter(output, get_attention_cp_size())
+        return output
 
 
 class Glm5NextDecoderLayer(nn.Module):
@@ -398,10 +504,6 @@ class Glm5NextDecoderLayer(nn.Module):
         rms_norm_eps = config.rms_norm_eps
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
-        else:
-            self.cp_size = None
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
@@ -526,6 +628,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if self.config.mhc and self.nsa_enable_prefill_cp:
             self.layer_communicator = MHCHybridNSACPLayerCommunicator(
                 **shared_kwargs,
+                is_first_layer=(self.layer_id == 0),
                 attn_hc=self.self_attention_hyper_connection,
                 mlp_hc=self.mlp_hyper_connection,
             )
@@ -537,6 +640,11 @@ class Glm5NextDecoderLayer(nn.Module):
                 mlp_hc=self.mlp_hyper_connection,
             )
         elif self.nsa_enable_prefill_cp:
+            assert not self.is_linear_attn, (
+                "nsa_enable_prefill_cp is not supported on KDA (linear attention) "
+                "layers yet; enable mhc to use the MHCHybridNSACP path which "
+                "handles the CP gather/split around KDA"
+            )
             self.layer_communicator = NSACPLayerCommunicator(**shared_kwargs)
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
@@ -662,7 +770,7 @@ class Glm5NextModel(nn.Module):
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -829,20 +937,22 @@ class Glm5NextModel(nn.Module):
                 _pre_split_positions = positions.clone()
 
             if self.pp_group.is_first_rank:
-                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+                # Plain cross-layer contract: scatter hidden_states as
+                # block-contiguous (rank i holds [i*K, (i+1)*K)) so KDA
+                # layers can use vanilla all_gather without rerange.
+                # `positions` stays in the scattered (round-robin/zigzag)
+                # layout below because MLA's CP attention -- the only
+                # consumer of positions -- aligns positions with its own
+                # scattered hidden_states after MLA prepare_attn converts
+                # h from plain to scattered.
+                hidden_states = cp_plain_split(hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
             if _check_rank_consistency:
-                _gathered_hidden = cp_all_gather_rerange_output(
-                    hidden_states,
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                _gathered_hidden = cp_plain_all_gather(hidden_states, self.cp_size)
                 assert torch.equal(_gathered_hidden, _pre_split_hidden_states), (
                     "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
-                    "cp_split_and_rebuild_data ∘ cp_all_gather_rerange_output is not identity on hidden_states. "
-                    "Round-robin split/gather helpers are inconsistent."
+                    "cp_plain_split ∘ cp_plain_all_gather is not identity on hidden_states."
                 )
                 _gathered_positions = cp_all_gather_rerange_output(
                     positions.unsqueeze(-1),
@@ -901,13 +1011,9 @@ class Glm5NextModel(nn.Module):
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(
             forward_batch, self.nsa_enable_prefill_cp
         ):
-            # allgather + rerrange
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            # Plain contract: rank-major all_gather output is already in
+            # natural sequential order, no rerange needed.
+            hidden_states = cp_plain_all_gather(hidden_states, self.cp_size)
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
@@ -918,6 +1024,18 @@ class Glm5NextForCausalLM(nn.Module):
     packed_modules_mapping = {}
 
     _STACKED_PARAMS_MAPPING = [
+        # Fused KDA "a" projections (used when do_fuse_qkvbfg=True).
+        # Listed first so .q_proj on a KDA layer routes to fused_qkvbfg_a_proj;
+        # the loader falls through to qkv_proj when the fused param is absent.
+        ("fused_qkvbfg_a_proj", "q_proj", 0),
+        ("fused_qkvbfg_a_proj", "k_proj", 1),
+        ("fused_qkvbfg_a_proj", "v_proj", 2),
+        ("fused_qkvbfg_a_proj", "b_proj", 3),
+        ("fused_qkvbfg_a_proj", "f_a_proj", 4),
+        ("fused_qkvbfg_a_proj", "g_a_proj", 5),
+        # Fused KDA "b" projections (used when do_fuse_qkvbfg=True).
+        ("fused_fg_b_proj", "f_b_proj", 0),
+        ("fused_fg_b_proj", "g_b_proj", 1),
         ("qkv_proj", "q_proj", "q"),
         ("qkv_proj", "k_proj", "k"),
         ("qkv_proj", "v_proj", "v"),
@@ -985,8 +1103,8 @@ class Glm5NextForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = self.cp_size = None
 

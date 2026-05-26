@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     get_attention_cp_group,
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -402,6 +403,156 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
+
+
+# ----------------------------------------------------------------------------
+# "Plain" CP layout: rank i holds the contiguous token slice
+# [i*S/cp, (i+1)*S/cp). This is the natural layout produced by a vanilla
+# all_gather on rank-major buffers, so KDA layers (which need natural-sequential
+# tokens for causal_conv1d / chunk_kda) can use plain all_gather / plain
+# reduce_scatter with zero rerange permute. At MLA boundaries the layout is
+# converted to/from the configured scattered mode (round-robin or zigzag) that
+# MLA's CP attention expects for load balance.
+#
+# Residual streams stay in plain throughout the layer stack and never need
+# conversion -- they are re-derived from hidden_states at each layer entry by
+# `mhc.attn_split`, so they inherit hidden_states' layer-input layout, which
+# under the plain cross-layer contract is always plain.
+# ----------------------------------------------------------------------------
+
+
+def cp_plain_split(input_tensor: torch.Tensor) -> torch.Tensor:
+    """Model entry scatter under the plain layout contract.
+
+    Slice the global [S_total, ...] tensor into this rank's contiguous chunk
+    [cp_rank * K, (cp_rank+1) * K). Pure local op; replaces
+    `cp_split_and_rebuild_data` at model entry when the plain contract is on.
+    """
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
+    assert input_tensor.shape[0] % cp_size == 0, (
+        f"cp_plain_split expects total tokens divisible by cp_size, "
+        f"got {input_tensor.shape[0]} % {cp_size} != 0"
+    )
+    chunk = input_tensor.shape[0] // cp_size
+    return input_tensor[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
+
+
+def cp_plain_all_gather(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
+    """Inverse of cp_plain_split: gather plain per-rank slices into the full
+    [S, ...] tensor in natural sequential order.
+
+    Under the plain contract the all_gather output [rank0_chunk | rank1_chunk |
+    ...] *is* the natural sequential ordering, so no rerange permute is needed.
+    Used at model exit and at KDA prepare_attn entry.
+    """
+    out_shape = (input_tensor.shape[0] * cp_size,) + tuple(input_tensor.shape[1:])
+    with use_symmetric_memory(
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+    ):
+        output_tensor = input_tensor.new_empty(out_shape)
+    attn_cp_all_gather_into_tensor(output_tensor, input_tensor)
+    return output_tensor
+
+
+def cp_plain_reduce_scatter(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
+    """Inverse of cp_plain_all_gather for KDA o_proj output.
+
+    Takes a CP-partial-sum [S, H] in natural sequential order and emits this
+    rank's contiguous slice [S/cp, H] via a single reduce_scatter. The plain
+    layout is rank-major contiguous, so reduce_scatter's default contiguous
+    split is exactly what we want -- no permute or view+transpose.
+
+    Comm cost: (N-1)/N * D, vs all_reduce + split which is 2*(N-1)/N * D
+    -- ~33% cheaper in NCCL ring traffic than the all_reduce path, and saves
+    the full-tensor permute that a round-robin reduce_scatter would need.
+    """
+    S = input_tensor.shape[0]
+    assert S % cp_size == 0, (
+        f"cp_plain_reduce_scatter expects S divisible by cp_size, "
+        f"got S={S}, cp_size={cp_size}"
+    )
+    out_shape = (S // cp_size,) + tuple(input_tensor.shape[1:])
+    with use_symmetric_memory(
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+    ):
+        output_tensor = input_tensor.new_empty(out_shape)
+    attn_cp_reduce_scatter_tensor(output_tensor, input_tensor.contiguous())
+    return output_tensor
+
+
+def cp_plain_to_scattered(
+    input_tensor: torch.Tensor,
+    forward_batch,
+    cp_size: int,
+) -> torch.Tensor:
+    """Convert a plain per-rank slice [S/cp, H] into the configured CP scatter
+    layout (round-robin or zigzag), suitable for MLA's CP attention kernel.
+
+    Used at MLA prepare_attn. Composes existing primitives:
+      1. plain all_gather: rank-major output IS natural sequential under the
+         plain contract, so no rerange needed.
+      2. cp_split_and_rebuild_data: local split per the active mode
+         (round-robin via stride-cp_size, or zigzag via metadata indices).
+
+    Fast path: for round-robin mode with K = S/cp divisible by cp, replace
+    AG + local stride-cp split with a single all_to_all_single. Each rank
+    sends K/cp rows to each destination instead of broadcasting all K rows --
+    cp x less NCCL traffic and no [S, H] intermediate.
+    """
+    K = input_tensor.shape[0]
+    if is_nsa_prefill_cp_round_robin_split() and K % cp_size == 0:
+        tail = input_tensor.shape[1:]
+        send = (
+            input_tensor.view(K // cp_size, cp_size, *tail).transpose(0, 1).contiguous()
+        )
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(
+            recv, send, group=get_attention_cp_group().device_group
+        )
+        return recv.flatten(0, 1)
+
+    full = cp_plain_all_gather(input_tensor, cp_size)
+    return cp_split_and_rebuild_data(forward_batch, full)
+
+
+def cp_scattered_to_plain(
+    input_tensor: torch.Tensor,
+    forward_batch,
+    cp_size: int,
+) -> torch.Tensor:
+    """Inverse of cp_plain_to_scattered. Takes a scattered (round-robin or
+    zigzag) per-rank slice [S/cp, H] (MLA's natural output layout) and emits
+    a plain per-rank slice.
+
+    Used at MLA prepare_mlp. Composes:
+      1. cp_all_gather_rerange_output: gather + rerange to natural sequential.
+      2. local contiguous slice [cp_rank * K, (cp_rank+1) * K).
+
+    Fast path: for round-robin mode with K = S/cp divisible by cp, replace
+    AG + rerange + slice with a single all_to_all_single. Each rank sends
+    K/cp contiguous rows to each destination -- send buffer is already laid
+    out correctly (no pre-copy), recv needs one transpose-contiguous to
+    interleave by source rank. cp x less NCCL traffic and no [S, H] alloc.
+    """
+    K = input_tensor.shape[0]
+    if is_nsa_prefill_cp_round_robin_split() and K % cp_size == 0:
+        tail = input_tensor.shape[1:]
+        send = input_tensor.view(cp_size, K // cp_size, *tail)
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(
+            recv, send, group=get_attention_cp_group().device_group
+        )
+        # recv[s, n] = global token at position r*K + n*cp + s on this rank r;
+        # plain out[n*cp + s] = recv[s, n], i.e. transpose dims 0 and 1.
+        return recv.transpose(0, 1).contiguous().view(K, *tail)
+
+    full = cp_all_gather_rerange_output(
+        input_tensor, cp_size, forward_batch, torch.cuda.current_stream()
+    )
+    cp_rank = get_attention_cp_rank()
+    chunk = full.shape[0] // cp_size
+    return full[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
 
 
 def calculate_cp_seq_idx(cp_chunks_len, seqs_len):

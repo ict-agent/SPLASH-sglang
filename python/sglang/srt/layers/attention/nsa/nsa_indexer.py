@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import os
 import torch
 from einops import rearrange
 
@@ -317,10 +317,11 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        if self.rope_head_dim > 0:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        query[..., : self.rope_head_dim] = q_rope.clone()
-        key[..., : self.rope_head_dim] = k_rope.clone()
+            query[..., : self.rope_head_dim] = q_rope.clone()
+            key[..., : self.rope_head_dim] = k_rope.clone()
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -376,8 +377,9 @@ class Indexer(MultiPlatformOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        key[..., : self.rope_head_dim] = k_rope.clone()
+        if self.rope_head_dim > 0:
+            _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+            key[..., : self.rope_head_dim] = k_rope.clone()
         key = rotate_activation(key)
 
         return key
@@ -517,7 +519,9 @@ class Indexer(MultiPlatformOp):
 
         # Logits should not exceed configured ratio of free memory or 30% of total memory
         ratio = float(os.getenv("GLM_NSA_CHUNK_MEM_RATIO", 0.5))
-        need_chunk = (logits_bytes > free_mem * ratio) or (logits_bytes > total_mem * 0.3)
+        need_chunk = (logits_bytes > free_mem * ratio) or (
+            logits_bytes > total_mem * 0.3
+        )
         return need_chunk, free_mem
 
     def _get_topk_ragged(

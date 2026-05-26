@@ -191,10 +191,23 @@ class GlmLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+        from sglang.srt.layers.dp_attention import (
+            get_attention_cp_size,
+            get_attention_tp_size,
+        )
+
+        # KDA shards heads along the CP group under NSA prefill CP, so the
+        # mamba state must shard with the same factor; otherwise the cache
+        # is replicated across CP ranks and consumes attn_cp_size× memory.
+        head_shard_size = (
+            get_attention_cp_size()
+            if is_nsa_enable_prefill_cp()
+            else get_attention_tp_size()
+        )
 
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=head_shard_size,
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

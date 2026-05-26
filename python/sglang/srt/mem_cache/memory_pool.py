@@ -1502,6 +1502,18 @@ class HybridLinearKVPool(KVCache):
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
+    @property
+    def nsa_kv_cache_store_fp8(self) -> bool:
+        # Forward to the inner NSA pool. Only meaningful when use_nsa is True
+        # (i.e. self.full_kv_pool is NSATokenToKVPool); for non-NSA inner
+        # pools this returns False.
+        return getattr(self.full_kv_pool, "nsa_kv_cache_store_fp8", False)
+
+    @property
+    def kv_cache_dim(self) -> Optional[int]:
+        # Forward to the inner pool; NSATokenToKVPool always defines this.
+        return getattr(self.full_kv_pool, "kv_cache_dim", None)
+
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1571,14 +1583,16 @@ class HybridLinearKVPool(KVCache):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ):
         assert self.use_nsa, "get_index_k_scale_buffer called when use_nsa is False"
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_scale_buffer(
-            layer_id, seq_len, page_indices
+            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
 

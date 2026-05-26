@@ -735,9 +735,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
 
+    @property
+    def use_mha(self) -> bool:
+        # Proxy to the wrapped full attention backend so dispatchers that key
+        # off `use_mha` (e.g. NSA's MHA_ONE_SHOT path) see the right value.
+        return getattr(self.full_attn_backend, "use_mha", False)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def get_indexer_metadata(self, layer_id, forward_batch):
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

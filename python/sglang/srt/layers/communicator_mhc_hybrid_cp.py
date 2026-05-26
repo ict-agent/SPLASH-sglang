@@ -16,8 +16,8 @@
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
+    cp_plain_to_scattered,
+    cp_scattered_to_plain,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
@@ -33,7 +33,8 @@ from sglang.srt.layers.communicator_nsa_cp import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_attention_tp_size,
+    get_attention_cp_group,
+    get_attention_cp_size,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -81,19 +82,9 @@ class MHCHybridNSACPLayerCommunicator(MHCLayerCommunicator):
             post_residual_addition,
         )
 
-        # KDA-style attention (no qkv_latent abstraction) has kernels that
-        # need the full-context tensor (causal_conv1d / chunk_kda are sequence-
-        # serial). Under CP, hidden_states arrives split across CP ranks; rerange-
-        # gather it here, then prepare_mlp will scatter+rebuild it back.
-        if (
-            nsa_use_prefill_cp(forward_batch)
-            and self.qkv_latent_func is None
-        ):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                get_attention_tp_size(),
-                forward_batch,
-                torch.cuda.current_stream(),
+        if nsa_use_prefill_cp(forward_batch) and self.qkv_latent_func is not None:
+            hidden_states = cp_plain_to_scattered(
+                hidden_states, forward_batch, get_attention_cp_size()
             )
 
         return hidden_states, residual
@@ -105,14 +96,20 @@ class MHCHybridNSACPLayerCommunicator(MHCLayerCommunicator):
         forward_batch: ForwardBatch,
         cache=None,
     ):
-        # Undo the CP gather done in prepare_attn for KDA layers: split the
-        # full-context output back into the per-CP-rank slice the MLP path
-        # expects.
-        if (
-            nsa_use_prefill_cp(forward_batch)
-            and self.qkv_latent_func is None
-        ):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+        # KDA heads are statically CP-sharded (head_shard_size = cp_size at
+        # init in glm5_next.py), so o_proj is always a per-rank partial sum;
+        # attn_tp=1 means TP reduce won't cover it, so CP reduce here is
+        # unconditional -- under CP-extend the reduce is performed inside
+        # Glm5NextLinearAttention (fused with o_proj via
+        # _fused_matmul_reduce_scatter, or a plain reduce_scatter fallback),
+        # so prepare_mlp only needs the DECODE all_reduce. MLA isn't
+        # CP-sharded, so MLA only needs the layout conversion under CP-extend.
+        cp_size = get_attention_cp_size()
+        if self.qkv_latent_func is None:
+            if not nsa_use_prefill_cp(forward_batch):
+                get_attention_cp_group().all_reduce(hidden_states)
+        elif nsa_use_prefill_cp(forward_batch):
+            hidden_states = cp_scattered_to_plain(hidden_states, forward_batch, cp_size)
 
         return super().prepare_mlp(
             hidden_states,

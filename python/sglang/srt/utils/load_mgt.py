@@ -1455,6 +1455,21 @@ def load_megatron_weights(
 
                 torch.cuda.empty_cache()
                 layer = layer.to(device)
+                # `RadixLinearAttention.conv_weights` / `.bias` are plain
+                # Python-attribute views into `qkv_conv1d.weight` / `.bias`.
+                # Building layers on CPU and only later moving them to GPU
+                # rebinds the underlying `.data`, so these views go stale.
+                # The HF loader path doesn't hit this because it builds on
+                # the target device. Refresh them here so the workaround
+                # stays out of the model code.
+                sa = getattr(layer, "self_attn", None)
+                if (
+                    sa is not None
+                    and hasattr(sa, "qkv_conv1d")
+                    and hasattr(sa, "attn")
+                ):
+                    sa.attn.conv_weights = sa.qkv_conv1d.weight.squeeze(1)
+                    sa.attn.bias = sa.qkv_conv1d.bias
                 for k in layer_sd:
                     layer_sd[k] = layer_sd[k].to(device)
                 missing_keys, unexpected_keys = layer.load_state_dict(

@@ -403,6 +403,10 @@ class Envs:
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # KDA under NSA prefill-CP: fuse cross-CP collectives with their
+    # adjacent matmuls (all_gather + projections before attn, o_proj +
+    # reduce_scatter after). Disable to fall back to plain collectives.
+    SGLANG_NSA_CP_FUSE_SYMM_MEM = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -536,6 +540,7 @@ class Envs:
 
     # GLM
     GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
+    SGLANG_GLM5_NEXT_FUSE_QKVBFG = EnvBool(True)
 
     # MHC (multi hyper-connection) operator backend selection (covers both
     # mhc_pre and mhc_post).

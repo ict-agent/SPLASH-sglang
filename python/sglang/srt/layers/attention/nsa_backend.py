@@ -1337,8 +1337,13 @@ class NativeSparseAttnBackend(
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            # Use explicit num_tokens (not -1) so the view also works when
+            # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+            # other dim is 0. Same fix as in flashattention_backend.py.
             q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
             )
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1519,8 +1524,13 @@ class NativeSparseAttnBackend(
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            # Use explicit num_tokens (not -1) so the view also works when
+            # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+            # other dim is 0. Same fix as in flashattention_backend.py.
             q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
             )
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1815,37 +1825,17 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        # Auto-detect no-rope (MLA-no-rope) from q_all geometry: when the layer
-        # has no rope head dim, q_all carries only the nope segment and its last
-        # dim equals v_head_dim. Otherwise the rope tail is concatenated, making
-        # last dim > v_head_dim.
-        no_rope = q_all.shape[-1] == v_head_dim
-        if not no_rope:
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
-                tilelang_sparse_fwd,
-            )
+        from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
 
-            return tilelang_sparse_fwd(
-                q=q_all,
-                kv=kv_cache,
-                indices=page_table_1.unsqueeze(1),
-                sm_scale=sm_scale,
-                d_v=v_head_dim,
-            )
-        else:
-            from sglang.srt.layers.attention.nsa.tilelang_kernel_glm import (
-                sparse_mla_fwd_interface,
-            )
-
-            out, lse = sparse_mla_fwd_interface(
-                q=q_all,
-                kv=kv_cache,
-                indices=page_table_1.unsqueeze(1),
-                sm_scale=sm_scale,
-                return_p_sum=False,
-                d_v=v_head_dim,
-            )
-            return out
+        return tilelang_sparse_fwd(
+            q=q_all,
+            kv=kv_cache,
+            indices=page_table_1.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+        )
 
     def _forward_aiter(
         self,
@@ -2001,8 +1991,13 @@ class NativeSparseAttnBackend(
 
         if merge_query:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            # Use explicit num_tokens (not -1) so the view also works when
+            # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+            # other dim is 0.
             q_rope_reshaped = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope.shape[0],
+                layer.tp_q_head_num,
+                layer.head_dim - layer.v_head_dim,
             )
             q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:

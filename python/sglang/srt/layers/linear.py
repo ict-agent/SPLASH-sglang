@@ -1551,6 +1551,8 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
         super().__init__(
@@ -1562,8 +1564,11 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            tp_rank = get_tensor_model_parallel_rank()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank, self.tp_size = tp_rank, tp_size
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1611,11 +1616,22 @@ class ColumnParallelBatchedLinear(nn.Module):
     """
 
     def __init__(
-        self, batch: int, input_size: int, output_size: int, dtype: torch.dtype
+        self,
+        batch: int,
+        input_size: int,
+        output_size: int,
+        dtype: Optional[torch.dtype] = None,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            tp_rank = get_tensor_model_parallel_rank()
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank, self.tp_size = tp_rank, tp_size
+        if dtype is None:
+            dtype = torch.get_default_dtype()
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

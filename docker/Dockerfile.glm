@@ -354,7 +354,7 @@ RUN \
 RUN \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
-    pip install --no-deps tile-kernels
+    pip install --no-deps tile-kernels==1.0.0
 
 RUN \
     --mount=type=bind,target=/etc/apt/apt.conf.d/docker-clean,source=keep-cache,from=keep-cache \

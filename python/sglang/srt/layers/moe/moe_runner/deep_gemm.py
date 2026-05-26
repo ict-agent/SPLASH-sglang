@@ -155,6 +155,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
+        if all_tokens == 0:
+            return torch.empty(
+                (0, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+
         w13_weight_fp8 = (
             quant_info.w13_weight,
             quant_info.w13_scale,
