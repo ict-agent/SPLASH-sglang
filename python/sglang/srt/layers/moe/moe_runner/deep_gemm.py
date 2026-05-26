@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -139,8 +140,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
+        from sglang.srt.layers.quantization.fp8_utils import (
+            fused_swiglu_per_token_cast,
         )
 
         hidden_states = runner_input.hidden_states
@@ -185,38 +186,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.swiglu_clamp_limit is not None:
-            gateup_output = _apply_swiglu_clamp_limit(
-                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
-            )
-
-        down_input = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
+        down_input_fp8, down_input_scale = fused_swiglu_per_token_cast(
+            gateup_output,
+            group_size=scale_block_size,
+            swiglu_clamp_value=self.swiglu_clamp_limit,
         )
-        silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
-
-        down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input,
-            scale_block_size,
-            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
-        del down_input
 
         down_output = torch.empty(
             (all_tokens, K),
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-            down_input_scale = tma_align_input_scale(down_input_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
@@ -283,52 +264,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.swiglu_clamp_limit is not None:
-            gateup_output = _apply_swiglu_clamp_limit(
-                gateup_output, swiglu_clamp_limit=self.swiglu_clamp_limit
-            )
-
         # Act
-        scale_block_size = 128
-        if _MASKED_GEMM_FAST_ACT:
-            down_input, down_input_scale = sglang_per_token_group_quant_8bit(
-                x=gateup_output,
-                dst_dtype=torch.float8_e4m3fn,
-                group_size=scale_block_size,
-                masked_m=masked_m,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                fuse_silu_and_mul=True,
-                enable_v2=True,
-            )
-        else:
-            down_input = torch.empty(
-                (
-                    gateup_output.shape[0],
-                    gateup_output.shape[1],
-                    gateup_output.shape[2] // 2,
-                ),
-                device=hidden_states_device,
-                dtype=torch.float8_e4m3fn,
-            )
-            down_input_scale = torch.empty(
-                (
-                    gateup_output.shape[0],
-                    gateup_output.shape[1],
-                    gateup_output.shape[2] // 2 // scale_block_size,
-                ),
-                device=hidden_states_device,
-                dtype=torch.float32,
-            )
-            silu_and_mul_masked_post_quant_fwd(
-                gateup_output,
-                down_input,
-                down_input_scale,
-                scale_block_size,
-                masked_m,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
+        down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
+            gateup_output,
+            masked_m,
+            group_size=128,
+            topk=self.config.top_k,
+            swiglu_limit=self.swiglu_clamp_limit,
+        )
         del gateup_output
 
         # GroupGemm-1
@@ -630,6 +573,92 @@ def post_permute_deep_gemm_to_deepep_normal(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+def _varlen_deep_gemm_silu_mul_quant(
+    gateup_output: torch.Tensor,
+    masked_m: Optional[torch.Tensor],
+    group_size: int,
+    topk: int,
+    swiglu_limit: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from sglang.jit_kernel.fused_silu_mul_quant import (
+        silu_and_mul_masked_post_quant,
+    )
+    from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_8bit,
+    )
+
+    if _MASKED_GEMM_FAST_ACT:
+        assert (
+            swiglu_limit is None
+        ), "swiglu_limit is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
+        return sglang_per_token_group_quant_8bit(
+            x=gateup_output,
+            dst_dtype=torch.float8_e4m3fn,
+            group_size=group_size,
+            masked_m=masked_m,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            enable_v2=True,
+        )
+
+    assert masked_m is not None
+    hidden_states_device = gateup_output.device
+    E, N, D_2 = gateup_output.shape
+    D = D_2 // 2
+    del D_2
+    G = D // group_size
+    down_input = torch.empty(
+        (E, N, D),
+        device=hidden_states_device,
+        dtype=torch.float8_e4m3fn,
+    )
+
+    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+        assert N % 4 == 0 and G % 4 == 0
+        packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        down_input_scale = torch.empty(
+            (E, G // 4, N) if packed_ue8m0 else (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.int32 if packed_ue8m0 else torch.float32,
+        )
+        silu_and_mul_masked_post_quant(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=packed_ue8m0,
+            topk=topk,
+            transposed=packed_ue8m0,
+            swiglu_limit=swiglu_limit,
+        )
+        if packed_ue8m0:
+            down_input_scale = down_input_scale.transpose(-1, -2)
+    else:
+        if swiglu_limit is not None:
+            gateup_output = _apply_swiglu_clamp_limit(
+                gateup_output, swiglu_clamp_limit=swiglu_limit
+            )
+
+        down_input_scale = torch.empty(
+            (E, N, G),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    return down_input, down_input_scale
 
 
 def _apply_swiglu_clamp_limit(

@@ -93,7 +93,9 @@ def _mhc_pre_dispatch(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    norm_weight: Optional[Tensor] = None,
+    norm_eps: Optional[float] = None,
+) -> Tuple[Tensor, Tensor, Tensor, bool]:
     """Run mhc_pre using the env-selected backend.
 
     Backend priority (torch > tilelang > tile_kernels):
@@ -101,11 +103,11 @@ def _mhc_pre_dispatch(
       - SGLANG_OPT_USE_TILELANG_MHC=True -> in-tree tilelang dsv4_mhc.
       - both False (default)             -> external tile_kernels package.
 
-    Returns: (post_mix=(s, n, 1), comb_mix=(s, n, n), layer_input=(s, h)).
+    Returns: (post_mix=(s, n, 1), comb_mix=(s, n, n), layer_input=(s, h), norm_fused=bool).
     """
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if envs.SGLANG_OPT_USE_TORCH_MHC.get():
-        return _mhc_pre_torch(
+        post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
             hc_scale=hc_scale,
@@ -116,10 +118,11 @@ def _mhc_pre_dispatch(
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
         )
+        return post_mix, comb_mix, layer_input, False
     if envs.SGLANG_OPT_USE_TILELANG_MHC.get():
         from sglang.srt.layers.mhc.dsv4_mhc import mhc_pre as _impl
 
-        return _impl(
+        post_mix, comb_mix, layer_input = _impl(
             residual=residual,
             fn=fn,
             hc_scale=hc_scale,
@@ -129,7 +132,10 @@ def _mhc_pre_dispatch(
             hc_sinkhorn_eps=hc_sinkhorn_eps,
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
         )
+        return post_mix, comb_mix, layer_input, norm_weight is not None
 
     from tile_kernels.modeling.mhc.functional import mhc_pre as _impl
 
@@ -146,7 +152,7 @@ def _mhc_pre_dispatch(
         sinkhorn_eps=hc_sinkhorn_eps,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-    return post_mix, comb_mix, layer_input
+    return post_mix, comb_mix, layer_input, False
 
 
 @torch._dynamo.disable
@@ -196,7 +202,9 @@ def hc_pre(
     sinkhorn_iters: int,
     post_mult_value: float = 2.0,
     hc_norm_weight: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor]:
+    out_norm_weight: Optional[Tensor] = None,
+    out_norm_eps: Optional[float] = None,
+) -> Tuple[Tensor, Tensor, Tensor, bool]:
     """Multi hyper-connection pre-processing for one sublayer (attn or ffn).
 
     x:        [s, n * hidden_size] bf16  (flattened multi-stream residual)
@@ -205,9 +213,15 @@ def hc_pre(
     hc_base:  [mix_hc] fp32
     hc_norm_weight: optional [n * hidden_size] fp32 RMSNorm weight; when
               provided, ``hc_fn`` is multiplied by it before the GEMM.
+    out_norm_weight: optional [hidden_size] RMSNorm weight applied to the
+              output ``layer_input``. When the active backend supports
+              kernel-level fusion, the norm is folded into the kernel and
+              the returned ``norm_fused`` is True.
+    out_norm_eps: epsilon for ``out_norm_weight``.
     Returns:  (layer_input [s, hidden_size],
                h_res       [s, n * n] fp32,
-               h_post      [s, n] fp32)
+               h_post      [s, n] fp32,
+               norm_fused  bool)
     """
     s, total = x.shape
     hidden_size = total // hc_mult
@@ -217,11 +231,11 @@ def hc_pre(
             (s, hc_mult * hc_mult), device=x.device, dtype=torch.float32
         )
         empty_h_post = torch.zeros((s, hc_mult), device=x.device, dtype=torch.float32)
-        return empty_layer_input, empty_h_res, empty_h_post
+        return empty_layer_input, empty_h_res, empty_h_post, False
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
-    post_mix, comb_mix, layer_input = _mhc_pre_dispatch(
+    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
         residual=residual_3d,
         fn=fn,
         hc_scale=hc_scale,
@@ -231,11 +245,14 @@ def hc_pre(
         hc_sinkhorn_eps=hc_eps,
         hc_post_mult_value=post_mult_value,
         sinkhorn_repeat=sinkhorn_iters,
+        norm_weight=out_norm_weight,
+        norm_eps=out_norm_eps,
     )
     return (
         layer_input,
         comb_mix.reshape(s, hc_mult * hc_mult),
         post_mix.reshape(s, hc_mult),
+        norm_fused,
     )
 
 

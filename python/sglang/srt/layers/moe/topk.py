@@ -832,6 +832,22 @@ def biased_grouped_topk_gpu(
 
         return topk_weights, topk_ids
 
+    elif _is_cuda and num_expert_group == 1:
+        from sglang.jit_kernel.tilelang.topk_sigmoid import topk_sigmoid
+
+        topk_weights, topk_ids = topk_sigmoid(
+            scores=gating_output,
+            bias=correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor=apply_routed_scaling_factor_on_output,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
+        return topk_weights, topk_ids
+
     elif (
         _is_cuda
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
@@ -960,8 +976,9 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape

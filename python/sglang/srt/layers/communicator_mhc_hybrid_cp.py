@@ -132,9 +132,9 @@ class MHCHybridNSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         mhc: MHCState,
     ):
-        hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-        if hidden_states.shape[0] != 0:
-            hidden_states = layernorm(hidden_states)
+        hidden_states, residual = mhc.attn_to_mlp(
+            hidden_states, residual, out_norm=layernorm
+        )
         return hidden_states, residual
 
     @staticmethod
@@ -148,9 +148,9 @@ class MHCHybridNSACPCommunicateWithAllReduceAndLayerNormFn(
         residual_input_mode,
         mhc: MHCState,
     ):
-        hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-        if hidden_states.shape[0] != 0:
-            hidden_states = layernorm(hidden_states)
+        hidden_states, residual = mhc.attn_to_mlp(
+            hidden_states, residual, out_norm=layernorm
+        )
 
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full

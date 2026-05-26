@@ -7,6 +7,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -974,20 +975,36 @@ def kda_gate_fwd_kernel(
     A,
     y,
     g_bias,
-    beta: tl.constexpr,
+    beta_in,
+    beta_out,
+    beta_in_stride,
+    softplus_beta: tl.constexpr,
     threshold: tl.constexpr,
+    lower_bound: tl.constexpr,
+    beta_scale: tl.constexpr,
     T,
     H,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    HAS_BETA: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
     b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
+    if SAFE_GATE:
+        # Prefer tldevice.exp (libdevice's __nv_expf) over tl.exp:
+        # tl.exp lowers to a plain ex2.approx(x*log2e), introducing a systematic
+        # ~1e-8 bias relative to torch eager.  The inner exp(-x) below dominates
+        # the error (per-element, switching that to libdevice reduces bias ~5×);
+        # this outer exp(A) is a per-head scalar so its individual contribution is
+        # small, but we use libdevice here for consistency.
+        b_a = tldevice.exp(b_a)
+    else:
+        b_a = -tl.exp(b_a)
 
     stride_row = H * D
     stride_col = 1
@@ -1020,15 +1037,33 @@ def kda_gate_fwd_kernel(
         )
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if SAFE_GATE:
+        # y = lower_bound * sigmoid(exp(A) * (g + g_bias))
+        #   = lower_bound / (1 + exp(-(exp(A) * (g + g_bias))))
+        # See note above for why tldevice.exp.
+        b_y = lower_bound / (1.0 + tldevice.exp(-(b_a * b_g)))
+    else:
+        # softplus(x, softplus_beta) = (1/softplus_beta) * log(1 + exp(softplus_beta * x))
+        # When softplus_beta * x > threshold, use linear approximation x
+        g_scaled = b_g * softplus_beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(
+            use_linear, b_g, (1.0 / softplus_beta) * log(1.0 + tl.exp(g_scaled))
+        )
+        b_y = b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
+
+    if HAS_BETA:
+        offs_t = n_t + tl.arange(0, BT)
+        beta_mask = offs_t < T
+        b_beta_in = tl.load(
+            beta_in + offs_t * beta_in_stride + i_h,
+            mask=beta_mask,
+            other=0.0,
+        ).to(tl.float32)
+        b_beta_out = beta_scale / (1.0 + tldevice.exp(-b_beta_in))
+        tl.store(beta_out + offs_t * H + i_h, b_beta_out, mask=beta_mask)
 
 
 def fused_kda_gate(
@@ -1036,16 +1071,30 @@ def fused_kda_gate(
     A: torch.Tensor,
     head_k_dim: int,
     g_bias: torch.Tensor | None = None,
-    beta: float = 1.0,
+    softplus_beta: float = 1.0,
     threshold: float = 20.0,
-) -> torch.Tensor:
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
+    beta: torch.Tensor | None = None,
+    beta_scale: float = 1.0,
+):
     """
     Forward pass for KDA gate:
       input g: [..., H*D]
       param A: [H] or [1, 1, H, 1]
-      beta: softplus beta parameter
-      threshold: softplus threshold parameter
-      return  : [..., H, D]
+      softplus_beta: softplus beta parameter (non-SAFE_GATE branch only)
+      threshold: softplus threshold parameter (non-SAFE_GATE branch only)
+      safe_gate: when False (default), compute
+                   y = -exp(A) * softplus(g + g_bias)
+                 when True, compute the bounded variant
+                   y = lower_bound * sigmoid(exp(A) * (g + g_bias))
+      beta: optional [..., H] tensor to fuse `beta_scale * sigmoid(beta)` into
+            the same kernel launch. Saves a separate pass + activation kernel
+            in the KDA prefill prologue.
+      beta_scale: scalar multiplier applied after sigmoid (e.g. 2.0 when
+                  ``allow_neg_eigval`` is on).
+      return: y of shape [..., H, D] when beta is None,
+              (y, beta_out) where beta_out is fp32 [..., H] otherwise.
     """
     orig_shape = g.shape[:-1]
 
@@ -1057,6 +1106,17 @@ def fused_kda_gate(
 
     y = torch.empty_like(g, dtype=torch.float32)
 
+    if beta is not None:
+        beta_flat = beta.reshape(-1, H)
+        assert beta_flat.shape[0] == T
+        assert beta_flat.stride(-1) == 1
+        beta_in_stride = beta_flat.stride(0)
+        beta_out = torch.empty((T, H), dtype=torch.float32, device=beta_flat.device)
+    else:
+        beta_flat = None
+        beta_out = None
+        beta_in_stride = 0
+
     def grid(meta):
         return (cdiv(T, meta["BT"]), H)
 
@@ -1065,14 +1125,23 @@ def fused_kda_gate(
         A,
         y,
         g_bias,
-        beta,
+        beta_flat,
+        beta_out,
+        beta_in_stride,
+        softplus_beta,
         threshold,
+        lower_bound,
+        beta_scale,
         T,
         H,
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        SAFE_GATE=safe_gate,
+        HAS_BETA=beta is not None,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)
-    return y
+    if beta is None:
+        return y
+    return y, beta_out.view(*orig_shape, H)

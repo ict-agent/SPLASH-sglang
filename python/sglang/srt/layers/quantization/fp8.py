@@ -670,6 +670,23 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def support_prequant(self, weight: torch.Tensor) -> bool:
+        """Whether `apply(x=(fp8, scale))` will route through DeepGEMM directly
+        without re-quantizing the input. Callers may then feed a `(fp8, scale)`
+        tuple produced by an upstream fused kernel."""
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        return (
+            self.block_quant
+            and self.w8a8_block_fp8_linear
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and list(self.quant_config.weight_block_size or ()) == [128, 128]
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] % 128 == 0
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,

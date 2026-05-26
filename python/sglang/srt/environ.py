@@ -552,6 +552,8 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC = EnvBool(False)
     SGLANG_OPT_USE_TORCH_MHC = EnvBool(False)
     SGLANG_DISABLE_KDA_FUSION = EnvBool(False)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
 
 
 envs = Envs()

@@ -106,6 +106,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import fused_swiglu_per_token_cast
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -232,6 +233,9 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.swiglu_clamp_limit = swiglu_clamp_limit
+        self.fused_swiglu_cast_supported = getattr(
+            self.down_proj.quant_method, "support_prequant", lambda _: False
+        )(self.down_proj.weight)
 
     def forward(
         self,
@@ -255,16 +259,22 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        if self.swiglu_clamp_limit is not None:
-            _split = gate_up.size(-1) // 2
-            gate_up[..., :_split].clamp_(max=self.swiglu_clamp_limit)
-            gate_up[..., _split:].clamp_(
-                min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit
+
+        if self.fused_swiglu_cast_supported:
+            down_input = fused_swiglu_per_token_cast(
+                gate_up, swiglu_clamp_value=self.swiglu_clamp_limit
             )
-        x = self.act_fn(gate_up)
+        else:
+            if self.swiglu_clamp_limit is not None:
+                _split = gate_up.size(-1) // 2
+                gate_up[..., :_split].clamp_(max=self.swiglu_clamp_limit)
+                gate_up[..., _split:].clamp_(
+                    min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit
+                )
+            down_input = self.act_fn(gate_up)
 
         x, _ = self.down_proj(
-            x,
+            down_input,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
         )
         return x

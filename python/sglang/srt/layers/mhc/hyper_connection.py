@@ -81,7 +81,8 @@ class HyperConnection(nn.Module):
         self,
         hidden_states: Tensor,
         residual: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        out_norm: Optional[nn.Module] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, bool]:
         """
         Pre-forward stage.
 
@@ -90,6 +91,7 @@ class HyperConnection(nn.Module):
             residual:    [S, N*C]
             h_res:       [S, N*N]
             h_post:      [S, N]
+            norm_fused:  bool
         """
         self._check_input(hidden_states)
 
@@ -98,7 +100,14 @@ class HyperConnection(nn.Module):
         else:
             self._check_input(residual)
 
-        layer_input, h_res, h_post = hc_pre(
+        if out_norm is not None:
+            out_norm_weight = out_norm.weight.data
+            out_norm_eps = out_norm.variance_epsilon
+        else:
+            out_norm_weight = None
+            out_norm_eps = None
+
+        layer_input, h_res, h_post, norm_fused = hc_pre(
             x=hidden_states,
             hc_fn=self.mapping_proj.weight,
             hc_scale=self.scale,
@@ -109,9 +118,11 @@ class HyperConnection(nn.Module):
             sinkhorn_iters=self.sinkhorn_iterations,
             post_mult_value=self.post_mult_value,
             hc_norm_weight=None if self.mhc_no_norm_weight else self.norm.weight,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
         )
 
-        return layer_input, residual, h_res, h_post
+        return layer_input, residual, h_res, h_post, norm_fused
 
     def post_forward(
         self,

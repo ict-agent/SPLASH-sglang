@@ -55,19 +55,27 @@ class MHCState:
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
-    def attn_split(self, hidden_states):
-        hidden_states, residual, self.h_res, self.h_post = self.attn_hc.pre_forward(
-            hidden_states
+    def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
+        hidden_states, residual, self.h_res, self.h_post, norm_fused = (
+            self.attn_hc.pre_forward(hidden_states, out_norm=out_norm)
         )
+        # If the backend didn't fuse the out-norm into the kernel, apply the
+        # caller's norm module here.
+        if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
+            hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
-    def attn_to_mlp(self, hidden_states, residual):
+    def attn_to_mlp(
+        self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
+    ):
         hidden_states = self.attn_hc.post_forward(
             hidden_states, residual, self.h_res, self.h_post
         )
-        hidden_states, residual, self.h_res, self.h_post = self.mlp_hc.pre_forward(
-            hidden_states
+        hidden_states, residual, self.h_res, self.h_post, norm_fused = (
+            self.mlp_hc.pre_forward(hidden_states, out_norm=out_norm)
         )
+        if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
+            hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
     def mlp_combine(self, hidden_states, residual):
@@ -108,9 +116,9 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                 context.attn_tp_rank
             ]
 
-        hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-        if hidden_states.shape[0] != 0:
-            hidden_states = layernorm(hidden_states)
+        hidden_states, residual = mhc.attn_to_mlp(
+            hidden_states, residual, out_norm=layernorm
+        )
         return hidden_states, residual
 
     @staticmethod
@@ -123,9 +131,9 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
         *,
         mhc: MHCState,
     ):
-        hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-        if hidden_states.shape[0] != 0:
-            hidden_states = layernorm(hidden_states)
+        hidden_states, residual = mhc.attn_to_mlp(
+            hidden_states, residual, out_norm=layernorm
+        )
         return hidden_states, residual
 
     @staticmethod
@@ -143,8 +151,9 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
         scatter_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         get_tp_group().reduce_scatter_tensor(scatter_states, hidden_states)
 
-        scatter_states, residual = mhc.attn_to_mlp(scatter_states, residual)
-        scatter_states = layernorm(scatter_states)
+        scatter_states, residual = mhc.attn_to_mlp(
+            scatter_states, residual, out_norm=layernorm
+        )
 
         attn_tp_all_gather_into_tensor(hidden_states, scatter_states)
 
@@ -182,8 +191,9 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states, residual = mhc.attn_to_mlp(
+                        hidden_states, residual, out_norm=layernorm
+                    )
             else:
                 hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
 
@@ -193,9 +203,9 @@ class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayer
             )
             dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         else:
-            hidden_states, residual = mhc.attn_to_mlp(hidden_states, residual)
-            if hidden_states.shape[0] != 0:
-                hidden_states = layernorm(hidden_states)
+            hidden_states, residual = mhc.attn_to_mlp(
+                hidden_states, residual, out_norm=layernorm
+            )
         return hidden_states, residual
 
 
@@ -370,9 +380,9 @@ class MHCLayerCommunicator(LayerCommunicator):
                 )
             hidden_states = self.mhc.attn_hc.expand_input(hidden_states)
 
-        hidden_states, residual = self.mhc.attn_split(hidden_states)
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, residual = self.mhc.attn_split(
+            hidden_states, out_norm=self.input_layernorm
+        )
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,

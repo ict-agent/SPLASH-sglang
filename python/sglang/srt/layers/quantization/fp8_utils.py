@@ -643,7 +643,23 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    # Fast path: caller already produced DeepGEMM-compatible (fp8, scale)
+    # — see `Fp8LinearMethod.support_prequant` for the shape contract.
+    if input_scale is not None:
+        output = w8a8_block_fp8_matmul_deepgemm(
+            input_2d,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
@@ -664,9 +680,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
-    input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
-
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
         block_size[1],
@@ -681,6 +694,29 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def fused_swiglu_per_token_cast(
+    gate_up: torch.Tensor,
+    group_size: int = 128,
+    swiglu_clamp_value: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse swiglu (+ optional clamp) and per-token fp8 cast into a single kernel,
+    returning (fp8, scale) ready for direct DeepGEMM consumption (column-major
+    TMA-aligned scales, optionally UE8M0-packed)."""
+    from tile_kernels.quant.swiglu_forward_and_per_token_cast_kernel import (
+        swiglu_forward_and_per_token_cast,
+    )
+
+    return swiglu_forward_and_per_token_cast(
+        gate_up,
+        fmt="e4m3",
+        num_per_channels=group_size,
+        use_tma_aligned_col_major_sf=True,
+        round_sf=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        use_packed_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        swiglu_clamp_value=swiglu_clamp_value,
+    )
 
 
 def _unpack_ue8m0_scale_for_triton(
@@ -1267,6 +1303,19 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
+    # of size-1 trailing dims to 1 (happens when packed_sf_k == 1, i.e.
+    # K <= block_k * 4). Restore the TMA-aligned stride so the deepgemm
+    # assertion sf.stride(-1) == get_tma_aligned_size(mn, element_size) holds.
+    if not use_torch_impl and sf.shape[-1] == 1:
+        from deep_gemm.utils import get_tma_aligned_size
+
+        aligned_mn = get_tma_aligned_size(sf.shape[-2], sf.element_size())
+        if sf.stride(-1) != aligned_mn:
+            new_stride = list(sf.stride())
+            new_stride[-1] = aligned_mn
+            sf = sf.as_strided(sf.shape, tuple(new_stride))
     return sf
 
 

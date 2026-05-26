@@ -143,11 +143,6 @@ ARG LIBFMT_COMMIT=407c905e45ad75fc29bf0f9bb7c5c2fd3475976f
 ADD https://github.com/fmtlib/fmt.git#${LIBFMT_COMMIT} /
 
 
-FROM scratch AS deepgemm-source
-ARG DEEPGEMM_COMMIT=ffe2b6b97420a9f8c58268ca55755168e6e2f360
-ADD https://github.com/sgl-project/DeepGEMM.git#${DEEPGEMM_COMMIT} /
-
-
 FROM scratch AS triton-source
 ARG TRITON_COMMIT=0add68262ab0a2e33b84524346cb27cbb2787356
 ADD https://github.com/triton-lang/triton.git#${TRITON_COMMIT} /
@@ -290,7 +285,6 @@ RUN \
     --mount=type=bind,target=sgl-kernel,source=sgl-kernel,readwrite=true \
     --mount=type=bind,target=sgl-kernel/3rdparty/cutlass,from=cutlass-source \
     --mount=type=bind,target=sgl-kernel/3rdparty/fmt,from=libfmt-source \
-    --mount=type=bind,target=sgl-kernel/3rdparty/deepgemm,from=deepgemm-source \
     --mount=type=bind,target=sgl-kernel/3rdparty/triton,from=triton-source \
     --mount=type=bind,target=sgl-kernel/3rdparty/flashinfer,from=flashinfer-source \
     --mount=type=bind,target=sgl-kernel/3rdparty/flash-attention,from=flashattn-source \

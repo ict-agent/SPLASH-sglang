@@ -129,20 +129,6 @@ KDA_NEG_EIGVAL_BETA_SCALE = 2.0
 KDA_DEFAULT_BETA_SCALE = 1.0
 
 
-def naive_kda_lowerbound_gate(
-    g: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float = KDA_SAFE_GATE_LOWER_BOUND,
-    output_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    g = g.float()
-    g = g + dt_bias.view(1, -1)
-    g = g.view(g.shape[0], A_log.numel(), -1)
-    g = lower_bound * torch.nn.functional.sigmoid(A_log.view(-1, 1).exp() * g)
-    return g.to(output_dtype)
-
-
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -433,19 +419,20 @@ class Glm5NextLinearAttention(nn.Module):
 
         # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
         if not forward_batch.forward_mode.is_decode():
-            if self.safe_gate:
-                forget_gate = naive_kda_lowerbound_gate(
-                    forget_gate,
-                    self.A_log,
-                    self.dt_bias,
-                )
-            else:
-                forget_gate = fused_kda_gate(
-                    forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
-                )
-            beta = beta.float().sigmoid()
-            if self.allow_neg_eigval:
-                beta = beta * KDA_NEG_EIGVAL_BETA_SCALE
+            forget_gate, beta = fused_kda_gate(
+                forget_gate,
+                self.A_log,
+                self.head_dim,
+                g_bias=self.dt_bias,
+                safe_gate=self.safe_gate,
+                lower_bound=KDA_SAFE_GATE_LOWER_BOUND,
+                beta=beta,
+                beta_scale=(
+                    KDA_NEG_EIGVAL_BETA_SCALE
+                    if self.allow_neg_eigval
+                    else KDA_DEFAULT_BETA_SCALE
+                ),
+            )
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
