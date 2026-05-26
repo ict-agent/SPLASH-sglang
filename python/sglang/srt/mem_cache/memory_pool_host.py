@@ -200,9 +200,13 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size or True # GLM NOTE: Skip this check
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "The host kv memory should be larger than the device memory with the current protocol, "
+                "but host_size=%s and device_size=%s.",
+                self.size,
+                device_pool.size,
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -1250,9 +1254,13 @@ class MambaPoolHost(HostKVCache):
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "The host mamba memory should be larger than the device memory with the current protocol, "
+                "but host_size=%s and device_size=%s.",
+                self.size,
+                device_pool.size,
+            )
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token

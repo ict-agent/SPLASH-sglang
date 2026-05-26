@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    InitLoadBackResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -122,7 +123,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError("HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -782,12 +783,19 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def write_backup(self, node: TreeNode, write_back=False):
+    def write_backup(self, node: TreeNode, write_back=False) -> int:
+        # Backup invariant (for write-through mode): backed-up nodes must form a
+        # contiguous prefix from root — no gaps.  Skip if parent isn't backed
+        # up yet.
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
+            return 0
+
         cache_write_kwargs = {
             "device_indices": node.value,
             "node_id": node.id,
         }
-
         if envs.GLM_USE_HICACHE_MTP_FIX.get():
             cache_write_kwargs["extra_pools"] = self._mtp_pool_transfers()
 
@@ -934,7 +942,7 @@ class HiRadixCache(RadixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -973,8 +981,10 @@ class HiRadixCache(RadixCache):
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
-                    num_evicted += self.write_backup(x, write_back=True)
-                    write_back_nodes.append(x)
+                    written = self.write_backup(x, write_back=True)
+                    num_evicted += written
+                    if written > 0:
+                        write_back_nodes.append(x)
                 else:
                     num_evicted += self._evict_regular(x)
             else:
@@ -1014,6 +1024,8 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
+        assert len(node.children) == 0, f"non-leaf, {node.id=}"
+
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
@@ -1136,14 +1148,17 @@ class HiRadixCache(RadixCache):
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values, last_node
+                return InitLoadBackResult(
+                    new_indices=loading_values,
+                    last_node=last_node,
+                )
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
-            last_node,
+        return InitLoadBackResult(
+            new_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node=last_node,
         )
 
     def ready_to_load_host_cache(self) -> int:

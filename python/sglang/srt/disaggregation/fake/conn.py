@@ -66,10 +66,11 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         self.has_sent = True
         logger.debug(
-            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
+            f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}, extra_indices: {extra_indices}"
         )
 
     def failure_exception(self):
@@ -105,10 +106,11 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         self.has_sent_metadata = True
         logger.debug(
-            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}, extra_indices: {extra_indices}"
         )
 
     def failure_exception(self):

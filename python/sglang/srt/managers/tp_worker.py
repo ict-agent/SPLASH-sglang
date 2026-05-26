@@ -77,6 +77,10 @@ class BaseTpWorker(ABC):
     def is_hybrid_swa(self) -> bool:
         return self.model_runner.is_hybrid_swa
 
+    @property
+    def is_hybrid_ssm(self) -> bool:
+        return self.model_runner.mambaish_config is not None
+
     def get_tokens_per_layer_info(self):
         return (
             self.model_runner.full_max_total_num_tokens,

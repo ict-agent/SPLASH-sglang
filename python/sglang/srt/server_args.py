@@ -1962,6 +1962,7 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
         elif model_arch in [
+            "Glm5NextForCausalLM",
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
@@ -1987,6 +1988,7 @@ class ServerArgs:
                     )
 
             if model_arch in [
+                "Glm5NextForCausalLM",
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
@@ -2200,6 +2202,13 @@ class ServerArgs:
                     == 0
                 ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
+            if self.page_size is not None and self.page_size != 1:
+                logger.warning(
+                    f"{model_arch} with radix cache requires page_size=1 in the current "
+                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
+                    "Automatically setting page_size=1."
+                )
+                self.page_size = 1
             if self.speculative_algorithm is None:
                 logger.warning(
                     "Disabling overlap schedule since mamba no_buffer is not compatible with "

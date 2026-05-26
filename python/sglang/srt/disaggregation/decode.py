@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_hybrid_mla_backend,
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
@@ -186,6 +187,30 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         mamba_size: int = None,
         start_layer: int = None,
     ):
+        # Each running and in-flight request consumes 1 main + ping-pong mamba slots.
+        # Shrink pre_alloc_size to fit the planner's mamba budget.
+        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
+        )
+        if mamba_size is not None:
+            max_pre_alloc = max(0, mamba_size // slots_per_req - size)
+            if pre_alloc_size > max_pre_alloc:
+                logger.info(
+                    "decode pre_alloc_size capped %d -> %d (mamba_size=%d, size=%d, slots per req=%d)",
+                    pre_alloc_size,
+                    max_pre_alloc,
+                    mamba_size,
+                    size,
+                    slots_per_req,
+                )
+                pre_alloc_size = max_pre_alloc
+        effective_mamba_size = (
+            mamba_size
+            if mamba_size is not None
+            else (size + pre_alloc_size) * slots_per_req
+        )
+
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
@@ -195,25 +220,12 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             pre_alloc_size=pre_alloc_size,
         )
 
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
-            if mamba_size > size + pre_alloc_size:
-                logger.warning(
-                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
-                    "capping effective_mamba_size to %d",
-                    mamba_size,
-                    size + pre_alloc_size,
-                    effective_mamba_size,
-                )
-        else:
-            effective_mamba_size = size + pre_alloc_size
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
-            size=effective_mamba_size,
+            mamba_size=effective_mamba_size,
             mamba_spec_state_size=size + pre_alloc_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -270,6 +282,7 @@ class DecodePreallocQueue:
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
+        self.is_hybrid_mla_backend = is_hybrid_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -363,6 +376,18 @@ class DecodePreallocQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
+
+                if hasattr(self.token_to_kv_pool.full_kv_pool, "get_state_buf_infos"):
+                    full_state_data_ptrs, full_state_data_lens, full_state_item_lens = (
+                        self.token_to_kv_pool.full_kv_pool.get_state_buf_infos()
+                    )
+                    kv_args.extra_data_ptrs = full_state_data_ptrs
+                    kv_args.extra_data_lens = full_state_data_lens
+                    kv_args.extra_item_lens = full_state_item_lens
+                else:
+                    kv_args.extra_data_ptrs = []
+                    kv_args.extra_data_lens = []
+                    kv_args.extra_item_lens = []
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
                 if self.draft_token_to_kv_pool is not None and isinstance(self.draft_token_to_kv_pool, NSATokenToKVPool):
@@ -378,6 +403,10 @@ class DecodePreallocQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+            kv_args.extra_data_ptrs = []
+            kv_args.extra_data_lens = []
+            kv_args.extra_item_lens = []
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -386,9 +415,14 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_hybrid_mla_backend,
         )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
-        if self.enable_staging and not self.is_mla_backend:
+        if (
+            self.enable_staging
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+        ):
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
                 kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
@@ -757,6 +791,7 @@ class DecodePreallocQueue:
                 page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
+            extra_indices = None
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 # Mamba hybrid model: single mamba state index
                 state_indices = [
@@ -766,6 +801,15 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 ]
+                if isinstance(self.token_to_kv_pool.full_kv_pool, NSATokenToKVPool):
+                    seq_len = len(decode_req.req.origin_input_ids)
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ]
+                    indexer_pages = kv_to_page_indices(
+                        kv_indices_full.cpu().numpy(), page_size
+                    )
+                    extra_indices = indexer_pages.tolist()
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
                 seq_len = len(decode_req.req.origin_input_ids)
@@ -803,7 +847,10 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                extra_indices,
             )
             if (
                 self.transfer_queue.enable_staging

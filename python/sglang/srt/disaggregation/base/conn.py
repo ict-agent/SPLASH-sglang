@@ -26,6 +26,10 @@ class KVArgs:
     state_type: str  # "none", "mamba", "swa"
     # for mamba state different tp slice transfer
     state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
+    state_dim_components_per_tensor: List[List[int]]
+    extra_data_ptrs: List[int]
+    extra_data_lens: List[int]
+    extra_item_lens: List[int]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -89,6 +93,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -136,6 +141,7 @@ class BaseKVReceiver(ABC):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

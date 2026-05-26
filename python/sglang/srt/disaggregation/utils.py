@@ -543,6 +543,14 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, MLATokenToKVPool)
 
 
+def is_hybrid_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+
+    return isinstance(target_kv_pool, HybridLinearKVPool) and isinstance(
+        target_kv_pool.full_kv_pool, MLATokenToKVPool
+    )
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

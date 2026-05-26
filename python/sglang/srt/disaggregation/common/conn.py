@@ -92,9 +92,11 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_hybrid_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
+        self.is_hybrid_mla_backend = is_hybrid_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -256,7 +258,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         elif self.attn_tp_size > info.attn_tp_size:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
@@ -267,7 +269,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         else:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
@@ -476,6 +478,7 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         pass
 
@@ -678,6 +681,7 @@ class CommonKVReceiver(BaseKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        extra_indices: Optional[List[int]] = None,
     ):
         raise NotImplementedError
 

@@ -207,27 +207,49 @@ class ModelRunnerKVCacheMixin:
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
         ):
-            # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+            # Each running request, plus each in-flight transfer in
+            # disagg-decode, occupies `slots_per_req` mamba slots — sum gives
+            # `peak_mamba_slots`, the exact slot count at fully utilized
+            # concurrency. Then cap by the `mamba_full_memory_ratio` share so
+            # a low-utilization / long-context workload doesn't over-reserve
+            # mamba and starve KV.
+            max_running_requests = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
-        else:
-            # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-
-            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
-            # solve the equations:
-            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
-            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
-            mamba_state_memory_raw = (
-                total_rest_memory
-                * server_args.mamba_full_memory_ratio
-                / (1 + server_args.mamba_full_memory_ratio)
+            slots_per_req = 1
+            peak_mamba_slots = max_running_requests * slots_per_req
+            if server_args.disaggregation_mode == "decode":
+                pre_alloc_size = self._resolve_pre_alloc_size(max_running_requests)
+                peak_mamba_slots += pre_alloc_size * slots_per_req
+            mamba_size_by_ratio = self._mamba_size_by_memory_ratio(total_rest_memory)
+            if peak_mamba_slots > mamba_size_by_ratio:
+                logger.warning(
+                    "Mamba pool capped by memory ratio: peak demand %d slots "
+                    "(max_running=%d, slots/req=%d%s) exceeds the "
+                    "mamba_full_memory_ratio=%.2f share (%d slots). The "
+                    "configured concurrency cannot be fully utilized; raise "
+                    "--mamba-full-memory-ratio or reduce --max-running-requests "
+                    "to remove the cap.",
+                    peak_mamba_slots,
+                    max_running_requests,
+                    slots_per_req,
+                    (
+                        f", pre_alloc={pre_alloc_size}"
+                        if server_args.disaggregation_mode == "decode"
+                        else ""
+                    ),
+                    server_args.mamba_full_memory_ratio,
+                    mamba_size_by_ratio,
+                )
+            server_args.max_mamba_cache_size = min(
+                peak_mamba_slots, mamba_size_by_ratio
             )
-            # calculate the max_mamba_cache_size based on the given total mamba memory
-            server_args.max_mamba_cache_size = int(
-                (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+        else:
+            # Use ratio-based calculation to auto-fit available memory.
+            # Allocates mamba_state_memory + full_kv_cache_memory == total_rest_memory
+            # with the split governed by `mamba_full_memory_ratio`.
+            server_args.max_mamba_cache_size = self._mamba_size_by_memory_ratio(
+                total_rest_memory
             )
 
         mamba_state_memory = (
@@ -370,6 +392,36 @@ class ModelRunnerKVCacheMixin:
         )
         return full_tokens, full_tokens, swa_tokens
 
+    def _resolve_pre_alloc_size(self: ModelRunner, max_num_reqs: int):
+        """In-flight transfer slot count reserved by the decode-side prealloc
+        queue. Defaults to 2× running batch for small batches so the P→D
+        pipeline stays deep; otherwise honors the env override.
+        """
+
+        env_default = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+        return max_num_reqs * 2 if max_num_reqs <= 32 else env_default
+
+    def _mamba_size_by_memory_ratio(self: ModelRunner, total_rest_memory: float) -> int:
+        """Mamba slot count corresponding to `mamba_full_memory_ratio`'s share
+        of the remaining memory. Used both as the standalone budget when the
+        ratio-based path applies and as the safety cap on top of an explicit
+        slot target when radix cache is disabled."""
+
+        config = self.mambaish_config
+        server_args = self.server_args
+        assert config.mamba2_cache_params.mamba_cache_per_req > 0
+        # Split: mamba_state_memory + full_kv_cache_memory == total_rest_memory
+        #        mamba_state_memory / full_kv_cache_memory == mamba_full_memory_ratio
+        mamba_state_memory_raw = (
+            total_rest_memory
+            * server_args.mamba_full_memory_ratio
+            / (1 + server_args.mamba_full_memory_ratio)
+        )
+        return int(
+            (mamba_state_memory_raw * (1 << 30))
+            // config.mamba2_cache_params.mamba_cache_per_req
+        )
+
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
             return 1
@@ -401,13 +453,7 @@ class ModelRunnerKVCacheMixin:
                     HybridMambaDecodeReqToTokenPool,
                 )
 
-                # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-
-                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
+                pre_alloc_size = self._resolve_pre_alloc_size(max_num_reqs)
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
@@ -548,7 +594,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_nsa_model and not self.mambaish_config:
             nsa_pool_kwargs = dict(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -651,6 +697,11 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                if is_nsa_model:
+                    extra_args["kv_cache_dim"] = self.calculate_mla_kv_cache_dim()
+                    extra_args["index_head_dim"] = get_nsa_index_head_dim(
+                        self.model_config.hf_config
+                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -674,6 +725,7 @@ class ModelRunnerKVCacheMixin:
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
+                    use_nsa=is_nsa_model,
                     start_layer=self.start_layer,
                     **extra_args,
                 )

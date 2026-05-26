@@ -138,6 +138,17 @@ class Mamba2StateShape:
     state_size: int
     conv_kernel: int
 
+    @property
+    def conv_dims(self) -> list[int]:
+        """Sub-component sizes along the conv feature dimension.
+
+        Returns ``[conv_dim]`` (single component), which is correct when the model's
+        conv1d uses ``ColumnParallelLinear`` (per-rank shard is a contiguous slice
+        of the global tensor, e.g. Qwen3-Next).
+        """
+
+        return [self.conv_dim]
+
     @staticmethod
     def create(
         *,
@@ -194,6 +205,19 @@ class KimiLinearStateShape:
     conv_kernel: int
     num_spec: int
 
+    @property
+    def conv_dims(self) -> list[int]:
+        """Sub-component sizes along the conv feature dimension: [Q, K, V].
+        Matches the per-rank ``[Q/tp | K/tp | V/tp]`` packed layout produce
+        by ``MergedColumnParallelLinear``.
+        """
+
+        return [
+            self.num_heads * self.head_dim,
+            self.num_k_heads * self.head_k_dim,
+            self.num_k_heads * self.head_k_dim,
+        ]
+
     @staticmethod
     def create(
         *,
@@ -218,8 +242,8 @@ class KimiLinearStateShape:
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
 
         conv_state_shape = (
-            conv_state_shape[1],
             conv_state_shape[0] + conv_state_k_shape[0] * 2,
+            conv_state_shape[1],
         )
 
         return KimiLinearStateShape(

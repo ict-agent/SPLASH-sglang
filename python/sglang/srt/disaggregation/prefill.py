@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_hybrid_mla_backend,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
@@ -111,6 +112,7 @@ class PrefillBootstrapQueue:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
+        self.is_hybrid_mla_backend = is_hybrid_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -157,7 +159,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        if not self.is_mla_backend:
+        if not self.is_mla_backend and not self.is_hybrid_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
@@ -187,6 +189,24 @@ class PrefillBootstrapQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
+                if hasattr(
+                    self.token_to_kv_pool, "get_state_dim_components_per_tensor"
+                ):
+                    kv_args.state_dim_components_per_tensor = (
+                        self.token_to_kv_pool.get_state_dim_components_per_tensor()
+                    )
+
+                if hasattr(self.token_to_kv_pool.full_kv_pool, "get_state_buf_infos"):
+                    full_state_data_ptrs, full_state_data_lens, full_state_item_lens = (
+                        self.token_to_kv_pool.full_kv_pool.get_state_buf_infos()
+                    )
+                    kv_args.extra_data_ptrs = full_state_data_ptrs
+                    kv_args.extra_data_lens = full_state_data_lens
+                    kv_args.extra_item_lens = full_state_item_lens
+                else:
+                    kv_args.extra_data_ptrs = []
+                    kv_args.extra_data_lens = []
+                    kv_args.extra_item_lens = []
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
                 if self.draft_token_to_kv_pool is not None and isinstance(self.draft_token_to_kv_pool, NSATokenToKVPool):
@@ -202,18 +222,24 @@ class PrefillBootstrapQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+            kv_args.extra_data_ptrs = []
+            kv_args.extra_data_lens = []
+            kv_args.extra_item_lens = []
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_hybrid_mla_backend,
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
         ):
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
@@ -801,6 +827,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         req.start_send_idx = end_idx
         state_indices = None
+        extra_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -816,6 +843,17 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
+
+                if isinstance(
+                    self.token_to_kv_pool_allocator.get_kvcache().full_kv_pool,
+                    NSATokenToKVPool,
+                ):
+                    seq_len = len(req.fill_ids)
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :seq_len
+                    ]
+                    extra_indices = kv_indices_full.cpu().numpy()
+                    extra_indices = kv_to_page_indices(extra_indices, page_size)
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
@@ -851,4 +889,4 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices, extra_indices)

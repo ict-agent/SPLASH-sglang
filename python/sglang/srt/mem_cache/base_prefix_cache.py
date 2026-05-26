@@ -9,7 +9,6 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
-    Tuple,
     runtime_checkable,
 )
 
@@ -129,11 +128,13 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
-        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
-                            number of evicted KV tokens on CPU. For hybrid Mamba models this
-                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
-                            host hit still triggers load-back without adding a separate field.
-                            0 if HiCache is not enabled.
+        host_hit_length :   Number of evicted KV tokens on CPU that need to be loaded
+                            back to GPU. 0 if HiCache is not enabled.
+        mamba_host_hit :    True when an ancestor of the deepest mamba-hit node has its
+                            mamba state evicted from GPU but backed up on host (i.e. a
+                            tombstone node with host mamba). Triggers a host→GPU mamba
+                            restore via init_load_back even when host_hit_length == 0,
+                            because the tombstone node's KV may still reside on GPU.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -143,8 +144,17 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+    mamba_host_hit: bool = False
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+
+
+class InitLoadBackResult(NamedTuple):
+    """Result of preparing host-to-device cache loading."""
+
+    new_indices: torch.Tensor
+    last_node: Any
+    device_trim: int = 0
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -227,7 +237,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> InitLoadBackResult:
         """
         Preparing KV cache loading from host to device.
         """

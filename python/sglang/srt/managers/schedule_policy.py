@@ -206,11 +206,13 @@ class SchedulePolicy:
                 r.last_node,
                 r.last_host_node,
                 r.host_hit_length,
+                r.mamba_host_hit,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
                 match_result.host_hit_length,
+                match_result.mamba_host_hit,
             )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
@@ -772,15 +774,22 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+            if req.host_hit_length > 0 or req.mamba_host_hit:
+                load_back_result = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                req.last_node = load_back_result.last_node
+                if load_back_result.device_trim > 0:
+                    req.prefix_indices = req.prefix_indices[
+                        : -load_back_result.device_trim
+                    ]
+                req.prefix_indices = torch.cat(
+                    [req.prefix_indices, load_back_result.new_indices]
+                )
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len

@@ -800,6 +800,10 @@ class MambaRadixCache(BasePrefixCache):
                 # 3. tombstone the node
                 self._tombstone_internal_node(x)
             else:
+                x_next = self.mamba_lru_list.get_prev_no_lock(x)
+                if x.full_lock_ref > 0:
+                    x = x_next
+                    continue
                 _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
                 mamba_num_evicted += mamba_evicted_delta
 
