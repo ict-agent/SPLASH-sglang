@@ -75,6 +75,11 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_enable_random_topk_ids = get_bool_env_var("SGLANG_ENABLE_RANDOM_TOPK_IDS")
+
+
+_RANDOM_TOPK_IDS_CACHE: dict = {}
+
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -770,6 +775,26 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+def _random_topk_ids(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    topk_ids = _RANDOM_TOPK_IDS_CACHE.get(num_tokens)
+    if topk_ids is None:
+        rand = torch.rand(
+            num_tokens,
+            num_experts,
+            device=device,
+        )
+        topk_ids = rand.argsort(dim=-1)[:, :topk].to(dtype)
+        _RANDOM_TOPK_IDS_CACHE[num_tokens] = topk_ids
+
+    return topk_ids.clone()
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1117,6 +1142,15 @@ def select_experts(
             gating_output=router_logits,
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
+        )
+
+    if _enable_random_topk_ids:
+        topk_ids = _random_topk_ids(
+            topk_ids.shape[0],
+            router_logits.shape[1],
+            top_k,
+            topk_ids.device,
+            topk_ids.dtype,
         )
 
     topk_ids, topk_weights = _post_process_topk_ids(
