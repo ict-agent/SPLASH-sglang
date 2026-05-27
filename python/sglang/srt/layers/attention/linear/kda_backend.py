@@ -57,24 +57,46 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = CuteDSLKDAKernel()
+        elif decode_backend.is_flash_kda():
+            # FlashKDA has no decode kernel — fall back to Triton so that
+            # `--linear-attn-backend flash_kda` (which fans out to both modes)
+            # still works end-to-end.
+            self.decode_kernel = triton_kernel
+            rank0_log(
+                "KDA decode backend 'flash_kda' has no decode kernel; "
+                "falling back to TritonKDAKernel for decode."
+            )
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA currently only supports 'triton'."
+                "KDA supports 'triton', 'cutedsl', or 'flash_kda' (decode "
+                "auto-falls back to triton)."
             )
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_flash_kda():
+            if not is_cuda():
+                raise ValueError("KDA FlashKDA backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_flash import (
+                FlashKDAKernel,
+            )
+
+            self.extend_kernel = FlashKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA currently only supports 'triton'."
+                "KDA supports 'triton' or 'flash_kda' for prefill."
             )
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}"
         )
+
+    @property
+    def extend_applies_gate_internally(self) -> bool:
+        return self.extend_kernel.applies_gate_internally
 
     def decode(
         self,
@@ -146,6 +168,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
+
+        # FlashKDA applies sigmoid(beta) internally with no post-sigmoid scale
+        # hook, so it can't honour allow_neg_eigval=True (which requires
+        # beta_scale=2.0). Fall back to Triton for extend in that case — same
+        # pattern as the FlashKDA-decode → Triton fallback inside the
+        # dispatcher. Read from hf_config so the rule is model-agnostic.
+        allow_neg_eigval = bool(
+            getattr(model_runner.model_config.hf_config, "linear_allow_neg_eigval", False)
+        )
+        if prefill_backend.is_flash_kda() and allow_neg_eigval:
+            rank0_log(
+                "KDA prefill backend 'flash_kda' is incompatible with "
+                "linear_allow_neg_eigval=True; falling back to TritonKDAKernel "
+                "for extend."
+            )
+            prefill_backend = LinearAttnKernelBackend.TRITON
+
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -304,6 +343,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
+        # Apply KDA gate activation here unless the extend kernel does it
+        # internally (e.g. FlashKDA). Model always passes raw g (a) and raw
+        # beta logits (b); backend decides based on the dispatched kernel.
+        if not self.kernel_dispatcher.extend_applies_gate_internally:
+            from sglang.srt.layers.attention.fla.kda import fused_kda_gate
+
+            a, b = fused_kda_gate(
+                a,
+                layer.A_log,
+                layer.head_k_dim,
+                g_bias=layer.dt_bias,
+                safe_gate=getattr(layer, "safe_gate", False),
+                lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
+                beta=b,
+                beta_scale=getattr(layer, "beta_scale", 1.0),
+            )
+
         core_attn_out, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -313,6 +369,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
         )
 
         if h is not None:

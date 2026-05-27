@@ -183,6 +183,25 @@ ARG DEEPEP_COMMIT=29d31c095796f3c8ece47ee9cdcc167051bbeed9
 ADD https://github.com/deepseek-ai/DeepEP.git#${DEEPEP_COMMIT} /
 
 
+FROM scratch AS flashkda-source
+# gitlab.glm.ai is private — pass creds via build arg, e.g.
+#   --build-arg FLASHKDA_REPO=https://oauth2:${TOKEN}@gitlab.glm.ai/glm-engine/FlashKDA.git
+# Submodules are handled separately (see flashkda-cutlass-source); BuildKit's
+# git ADD strips .git so submodule init isn't possible in this stage anyway.
+ARG CI_JOB_TOKEN
+ARG FLASHKDA_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.glm.ai/glm-engine/FlashKDA.git
+ARG FLASHKDA_COMMIT=b15dc08a21e37fb757b8c7b59bffbe4c1f0bb8fa
+ADD ${FLASHKDA_REPO}#${FLASHKDA_COMMIT} /
+
+
+FROM scratch AS flashkda-cutlass-source
+# FlashKDA pins cutlass to v4.3.2 (see FlashKDA/.gitmodules + `git submodule
+# status`). Distinct from sgl-kernel's cutlass (57e3cfb4) — they must NOT share.
+# Bump this whenever FlashKDA bumps its cutlass submodule.
+ARG FLASHKDA_CUTLASS_COMMIT=5c149f52a436782210263fb2f19b354443a61c6a
+ADD https://github.com/NVIDIA/cutlass.git#${FLASHKDA_CUTLASS_COMMIT} /
+
+
 FROM scratch AS cuda-cudart
 ARG CUDA_VERSION=13.0.88
 ADD https://developer.download.nvidia.cn/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-${CUDA_VERSION}-archive.tar.xz /
@@ -305,6 +324,26 @@ exit $ret
 EOF
 
 
+FROM pytorch AS flashkda-builder
+
+RUN \
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install build ninja
+
+RUN \
+    --mount=type=bind,target=flashkda,from=flashkda-source,readwrite=true \
+    --mount=type=bind,target=flashkda/cutlass,from=flashkda-cutlass-source \
+    --mount=type=cache,target=flashkda/build,sharing=locked \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
+export TORCH_CUDA_ARCH_LIST="9.0;10.0+PTX"
+pyproject-build --no-isolation --wheel --outdir /dist flashkda
+EOF
+
+
 FROM pytorch AS sglang-builder
 
 RUN \
@@ -378,6 +417,13 @@ RUN \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
     find /dist -name "*.whl" -exec pip install "sglang-kernel @ file://{}" \;
+
+RUN \
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=/dist,source=/dist,from=flashkda-builder \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    find /dist -name "*.whl" -exec pip install "flash_kda @ file://{}" \;
 
 RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \

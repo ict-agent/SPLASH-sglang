@@ -10,6 +10,18 @@ class LinearAttnKernelBase(ABC):
     and provides decode/extend/target_verify methods with a unified interface.
     """
 
+    @property
+    def applies_gate_internally(self) -> bool:
+        """Whether the kernel itself applies the KDA gate activation
+        (``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``) and
+        ``beta_scale * sigmoid(beta)``.
+
+        When True, callers must pass RAW pre-activation ``g`` and RAW
+        ``beta`` logits. When False (default), callers must pre-activate via
+        ``fused_kda_gate`` before invoking the kernel.
+        """
+        return False
+
     @abstractmethod
     def decode(
         self,

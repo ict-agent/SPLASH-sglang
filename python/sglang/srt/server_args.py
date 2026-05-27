@@ -228,7 +228,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flash_kda"]
 
 
 # Allow external code to add more choices
@@ -5136,7 +5136,9 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
             default=ServerArgs.linear_attn_prefill_backend,
             help="Override the kernel backend for linear attention prefill/extend. "
-            "If not set, uses --linear-attn-backend.",
+            "If not set, uses --linear-attn-backend. KDA models additionally "
+            "support 'flash_kda' here (CUDA-only, prefill-only; decode "
+            "auto-falls back to triton).",
         )
 
         # Hierarchical cache

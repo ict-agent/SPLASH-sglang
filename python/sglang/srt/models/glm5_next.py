@@ -33,7 +33,6 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -417,22 +416,11 @@ class Glm5NextLinearAttention(nn.Module):
                 hidden_states, forward_batch
             )
 
-        # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
+        # fused_kda_gate is fused into KimiLinearAttentionBackend for decode.
+        # For extend, the KDA backend applies it (or skips it for kernels that
+        # activate gate/beta internally, like FlashKDA). Model always passes
+        # raw forget_gate and raw beta — backend-agnostic.
         if not forward_batch.forward_mode.is_decode():
-            forget_gate, beta = fused_kda_gate(
-                forget_gate,
-                self.A_log,
-                self.head_dim,
-                g_bias=self.dt_bias,
-                safe_gate=self.safe_gate,
-                lower_bound=KDA_SAFE_GATE_LOWER_BOUND,
-                beta=beta,
-                beta_scale=(
-                    KDA_NEG_EIGVAL_BETA_SCALE
-                    if self.allow_neg_eigval
-                    else KDA_DEFAULT_BETA_SCALE
-                ),
-            )
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
