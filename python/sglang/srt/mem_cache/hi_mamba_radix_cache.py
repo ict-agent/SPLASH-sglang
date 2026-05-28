@@ -1014,9 +1014,9 @@ class HiMambaRadixCache(MambaRadixCache):
                 if prev_prefix_len < total_prefix_length + prefix_len:
                     start = max(0, prev_prefix_len - total_prefix_length)
                     self.token_to_kv_pool_allocator.free(value[start:prefix_len])
-                total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 
+            total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
 
