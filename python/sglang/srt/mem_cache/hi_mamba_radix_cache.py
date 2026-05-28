@@ -133,10 +133,29 @@ class HiMambaRadixCache(MambaRadixCache):
                 else MHATokenToKVPoolHost
             )
         )
+        # Split --hicache-size (total host budget in GB) between the full-attention
+        # host pool and the mamba-state host pool, using --mamba-full-memory-ratio
+        # (same semantics as the device-side split in model_runner_kv_cache_mixin).
+        # Without this split the same hicache_size value would be passed to both
+        # pools independently, doubling actual host memory usage on hybrid models.
+        if server_args.hicache_size > 0:
+            r = server_args.mamba_full_memory_ratio
+            mamba_host_size_gb = server_args.hicache_size * r / (1 + r)
+            full_host_size_gb = server_args.hicache_size - mamba_host_size_gb
+            logger.info(
+                f"hybrid host hicache split: full={full_host_size_gb:.2f} GB, "
+                f"mamba={mamba_host_size_gb:.2f} GB "
+                f"(hicache_size={server_args.hicache_size}, "
+                f"mamba_full_memory_ratio={r})"
+            )
+        else:
+            mamba_host_size_gb = 0
+            full_host_size_gb = 0
+
         self.full_kv_pool_host = kv_host_pool_cls(
             self.kvcache,
             server_args.hicache_ratio,
-            server_args.hicache_size,
+            full_host_size_gb,
             params.page_size,
             server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
@@ -144,7 +163,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.mamba_pool_host = MambaPoolHost(
             params.req_to_token_pool.mamba_pool,
             server_args.hicache_ratio,
-            server_args.hicache_size,
+            mamba_host_size_gb,
             allocator_type=server_args.hicache_storage_backend,
             layout=server_args.hicache_mem_layout,
         )

@@ -5090,7 +5090,9 @@ class ServerArgs:
             "--mamba-full-memory-ratio",
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
-            help="The ratio of mamba state memory to full kv cache memory.",
+            help="The ratio of mamba state memory to full kv cache memory. "
+            "Also used to split --hicache-size between the mamba and full-attention "
+            "host KV pools in hybrid models.",
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",
