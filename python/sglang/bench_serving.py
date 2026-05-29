@@ -1829,6 +1829,12 @@ def run_benchmark(args_: argparse.Namespace):
             not args.tokenize_prompt
         ), "`--tokenize-prompt` not compatible with image dataset"
 
+    if args.dataset_name == "random-ids-raw":
+        assert args.backend in ("sglang", "sglang-native"), (
+            "`--dataset-name random-ids-raw` sends raw token ids as `input_ids`, "
+            "which is only supported by the sglang native `/generate` backend."
+        )
+
     if args.lora_request_distribution in ["distinct", "skewed"]:
         assert (
             args.lora_name is not None and len(args.lora_name) > 1
@@ -1936,6 +1942,7 @@ if __name__ == "__main__":
             "openai",
             "random",
             "random-ids",
+            "random-ids-raw",
             "generated-shared-prefix",
             "mmmu",
             "image",
@@ -1998,6 +2005,17 @@ if __name__ == "__main__":
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
+    )
+    parser.add_argument(
+        "--random-ids-raw-shared-prefix-len",
+        type=int,
+        default=0,
+        help="If > 0, every random-ids-raw request is prefixed with the same "
+        "fixed token-id sequence of this length. Used to benchmark exact "
+        "cache-hit scenarios: the first request prefills the full input, "
+        "subsequent requests hit the prefix in radix cache and only prefill "
+        "the unique tail. The unique-tail length is (random-input-len - "
+        "random-ids-raw-shared-prefix-len).",
     )
     # image dataset args
     parser.add_argument(
