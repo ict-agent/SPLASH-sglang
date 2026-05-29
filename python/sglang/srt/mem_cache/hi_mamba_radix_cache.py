@@ -288,6 +288,15 @@ class HiMambaRadixCache(MambaRadixCache):
 
         super().__init__(params=params)
 
+    def _is_ancestor_node(
+        self, ancestor: Optional[TreeNode], node: Optional[TreeNode]
+    ) -> bool:
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent
+        return False
+
     def reset(self) -> None:
         TreeNode.counter = 0
         self._flush_pending_storage_backups_before_reset()
@@ -472,10 +481,21 @@ class HiMambaRadixCache(MambaRadixCache):
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
+                result_last_node = last_node
+                if (
+                    req is not None
+                    and len(loading_values) == 0
+                    and self._is_ancestor_node(last_node, req.last_node)
+                    and not req.last_node.evicted
+                ):
+                    # Mamba-only restore should not shorten the protected full-KV
+                    # prefix.  The request still depends on device-resident
+                    # descendants under last_node.
+                    result_last_node = req.last_node
                 logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    f"loading back {len(loading_values)} tokens for node {result_last_node.id}"
                 )
-                return InitLoadBackResult(loading_values, last_node)
+                return InitLoadBackResult(loading_values, result_last_node)
 
             while last_node is not self.root_node and (
                 last_node.evicted
