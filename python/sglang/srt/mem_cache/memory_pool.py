@@ -687,6 +687,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
+    def mamba_pool_has_space_for_reqs(self, num_reqs: int = 1):
+        need_size = num_reqs
+        if self.enable_mamba_extra_buffer:
+            need_size = need_size + num_reqs * self.mamba_ping_pong_track_buffer_size
+        # TODO Consider the space reserved for decode.
+
+        return need_size <= self.mamba_pool.available_size()
+
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()

@@ -2560,6 +2560,13 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            if (
+                self.tree_cache.is_mamba_cache()
+                and not self.tree_cache.req_to_token_pool.mamba_pool_has_space_for_reqs(
+                    len(can_run_list)
+                )
+            ):
+                self.tree_cache.check_hicache_events()
 
         new_batch.prepare_for_extend()
 
