@@ -33,7 +33,7 @@ from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer,
     is_allocation_symmetric,
 )
-from sglang.srt.layers.mhc import HyperConnection
+from sglang.srt.layers.mhc.functional import hc_contract, hc_expand
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -50,14 +50,34 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
 
 @dataclass
 class MHCState:
-    attn_hc: HyperConnection
-    mlp_hc: HyperConnection
+    """
+    Per-layer mHC runtime scratch.
+
+    The parameter-bearing pre/post stages live on the owning layer and
+    are injected here as callables (``hc_attn_pre`` / ``hc_ffn_pre`` /
+    ``hc_post``); this class only orchestrates the cross-stage scratch
+    (``h_res``, ``h_post``) and exposes the layer's ``hc_mult`` for the
+    few sites that need it as a raw scalar.
+    """
+
+    hc_mult: int
+    hc_attn_pre: Callable
+    hc_ffn_pre: Callable
+    hc_post: Callable
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
+    @staticmethod
+    def _resolve_out_norm(out_norm):
+        if out_norm is None:
+            return None, None
+        return out_norm.weight.data, out_norm.variance_epsilon
+
     def attn_split(self, hidden_states, out_norm: Optional[torch.nn.Module] = None):
-        hidden_states, residual, self.h_res, self.h_post, norm_fused = (
-            self.attn_hc.pre_forward(hidden_states, out_norm=out_norm)
+        residual = hidden_states
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        hidden_states, self.h_res, self.h_post, norm_fused = self.hc_attn_pre(
+            hidden_states, out_norm_weight, out_norm_eps
         )
         # If the backend didn't fuse the out-norm into the kernel, apply the
         # caller's norm module here.
@@ -68,20 +88,18 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
-        hidden_states = self.attn_hc.post_forward(
-            hidden_states, residual, self.h_res, self.h_post
-        )
-        hidden_states, residual, self.h_res, self.h_post, norm_fused = (
-            self.mlp_hc.pre_forward(hidden_states, out_norm=out_norm)
+        hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
+        residual = hidden_states
+        out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
+        hidden_states, self.h_res, self.h_post, norm_fused = self.hc_ffn_pre(
+            hidden_states, out_norm_weight, out_norm_eps
         )
         if out_norm is not None and not norm_fused and hidden_states.shape[0] != 0:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
     def mlp_combine(self, hidden_states, residual):
-        return self.mlp_hc.post_forward(
-            hidden_states, residual, self.h_res, self.h_post
-        )
+        return self.hc_post(hidden_states, residual, self.h_res, self.h_post)
 
     def reset_aux(self):
         self.h_res = None
@@ -230,7 +248,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         if not is_last_layer:
             return hidden_states, None
 
-        hidden_states = mhc.mlp_hc.contract_output(hidden_states)
+        hidden_states = hc_contract(hidden_states, mhc.hc_mult)
         if get_attn_tp_context().input_scattered:
             local_states = hidden_states
             hidden_states = local_states.new_empty(
@@ -266,7 +284,7 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         if not is_last_layer:
             return hidden_states, None
 
-        hidden_states = mhc.mlp_hc.contract_output(hidden_states)
+        hidden_states = hc_contract(hidden_states, mhc.hc_mult)
         return hidden_states, None
 
     @staticmethod
@@ -282,10 +300,10 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         hidden_states = mhc.mlp_combine(hidden_states, residual)
         if is_last_layer:
-            hidden_states = mhc.mlp_hc.contract_output(hidden_states)
+            hidden_states = hc_contract(hidden_states, mhc.hc_mult)
 
         hidden_states, local_hidden_states = (
-            get_local_dp_buffer(1 if is_last_layer else mhc.mlp_hc.n),
+            get_local_dp_buffer(1 if is_last_layer else mhc.hc_mult),
             hidden_states,
         )
 
@@ -324,11 +342,18 @@ class MHCLayerCommunicator(LayerCommunicator):
         qkv_latent_func: Optional[Callable] = None,
         *,
         is_first_layer: bool,
-        attn_hc: HyperConnection,
-        mlp_hc: HyperConnection,
+        hc_mult: int,
+        hc_attn_pre: Callable,
+        hc_ffn_pre: Callable,
+        hc_post: Callable,
     ):
         self.is_first_layer = is_first_layer
-        self.mhc = MHCState(attn_hc=attn_hc, mlp_hc=mlp_hc)
+        self.mhc = MHCState(
+            hc_mult=hc_mult,
+            hc_attn_pre=hc_attn_pre,
+            hc_ffn_pre=hc_ffn_pre,
+            hc_post=hc_post,
+        )
 
         super().__init__(
             layer_scatter_modes,
@@ -378,7 +403,7 @@ class MHCLayerCommunicator(LayerCommunicator):
                     None,
                     self._context,
                 )
-            hidden_states = self.mhc.attn_hc.expand_input(hidden_states)
+            hidden_states = hc_expand(hidden_states, self.mhc.hc_mult)
 
         hidden_states, residual = self.mhc.attn_split(
             hidden_states, out_norm=self.input_layernorm
@@ -397,9 +422,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         # mixed_qkv), so we must materialize the full hidden_states here.
         ctx = get_attn_tp_context()
         nsa_pre_gather = ctx.input_scattered and ctx.is_nsa
-        no_qkv_latent_pre_gather = (
-            ctx.input_scattered and self.qkv_latent_func is None
-        )
+        no_qkv_latent_pre_gather = ctx.input_scattered and self.qkv_latent_func is None
         if nsa_pre_gather or no_qkv_latent_pre_gather:
             hidden_states = tp_all_gather_hidden_states(hidden_states, forward_batch)
 

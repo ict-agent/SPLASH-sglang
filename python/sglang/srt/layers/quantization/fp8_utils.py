@@ -699,7 +699,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 def fused_swiglu_per_token_cast(
     gate_up: torch.Tensor,
     group_size: int = 128,
-    swiglu_clamp_value: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse swiglu (+ optional clamp) and per-token fp8 cast into a single kernel,
     returning (fp8, scale) ready for direct DeepGEMM consumption (column-major
@@ -715,7 +715,7 @@ def fused_swiglu_per_token_cast(
         use_tma_aligned_col_major_sf=True,
         round_sf=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         use_packed_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        swiglu_clamp_value=swiglu_clamp_value,
+        swiglu_clamp_value=swiglu_limit,
     )
 
 

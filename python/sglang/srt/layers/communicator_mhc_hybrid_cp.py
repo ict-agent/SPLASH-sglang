@@ -15,11 +15,7 @@
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import (
-    cp_plain_to_scattered,
-    cp_scattered_to_plain,
-    nsa_use_prefill_cp,
-)
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     ScatterMode,
@@ -33,10 +29,9 @@ from sglang.srt.layers.communicator_nsa_cp import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_attention_cp_group,
-    get_attention_cp_size,
     get_local_dp_buffer,
 )
+from sglang.srt.layers.mhc import hc_contract
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -64,58 +59,6 @@ class MHCHybridNSACPLayerCommunicator(MHCLayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
-        )
-
-    def prepare_attn(
-        self,
-        hidden_states,
-        residual,
-        forward_batch: ForwardBatch,
-        quant_format: str = "",
-        post_residual_addition=None,
-    ):
-        hidden_states, residual = super().prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            quant_format,
-            post_residual_addition,
-        )
-
-        if nsa_use_prefill_cp(forward_batch) and self.qkv_latent_func is not None:
-            hidden_states = cp_plain_to_scattered(
-                hidden_states, forward_batch, get_attention_cp_size()
-            )
-
-        return hidden_states, residual
-
-    def prepare_mlp(
-        self,
-        hidden_states,
-        residual,
-        forward_batch: ForwardBatch,
-        cache=None,
-    ):
-        # KDA heads are statically CP-sharded (head_shard_size = cp_size at
-        # init in glm5_next.py), so o_proj is always a per-rank partial sum;
-        # attn_tp=1 means TP reduce won't cover it, so CP reduce here is
-        # unconditional -- under CP-extend the reduce is performed inside
-        # Glm5NextLinearAttention (fused with o_proj via
-        # _fused_matmul_reduce_scatter, or a plain reduce_scatter fallback),
-        # so prepare_mlp only needs the DECODE all_reduce. MLA isn't
-        # CP-sharded, so MLA only needs the layout conversion under CP-extend.
-        cp_size = get_attention_cp_size()
-        if self.qkv_latent_func is None:
-            if not nsa_use_prefill_cp(forward_batch):
-                get_attention_cp_group().all_reduce(hidden_states)
-        elif nsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_scattered_to_plain(hidden_states, forward_batch, cp_size)
-
-        return super().prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache,
         )
 
 
@@ -185,7 +128,7 @@ class MHCHybridNSACPCommunicateSummableTensorPairFn(
         if not is_last_layer:
             return hidden_states, None
 
-        hidden_states = mhc.mlp_hc.contract_output(hidden_states)
+        hidden_states = hc_contract(hidden_states, mhc.hc_mult)
         return hidden_states, None
 
     @staticmethod
@@ -214,5 +157,5 @@ class MHCHybridNSACPCommunicateSummableTensorPairFn(
         if not is_last_layer:
             return hidden_states, None
 
-        hidden_states = mhc.mlp_hc.contract_output(hidden_states)
+        hidden_states = hc_contract(hidden_states, mhc.hc_mult)
         return hidden_states, None

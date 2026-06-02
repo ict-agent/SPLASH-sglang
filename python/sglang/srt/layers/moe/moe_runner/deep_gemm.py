@@ -115,7 +115,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         super().__init__(config)
         assert self.config.activation == "silu"
         assert self.config.is_gated
-        self.swiglu_clamp_limit = self.config.swiglu_clamp_limit
+        self.swiglu_limit = self.config.swiglu_limit
 
     def run(
         self,
@@ -189,7 +189,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_input_fp8, down_input_scale = fused_swiglu_per_token_cast(
             gateup_output,
             group_size=scale_block_size,
-            swiglu_clamp_value=self.swiglu_clamp_limit,
+            swiglu_limit=self.swiglu_limit,
         )
         del gateup_output
 
@@ -215,12 +215,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import (
-            silu_and_mul_masked_post_quant_fwd,
-        )
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_8bit,
-        )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -270,7 +264,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             group_size=128,
             topk=self.config.top_k,
-            swiglu_limit=self.swiglu_clamp_limit,
+            swiglu_limit=self.swiglu_limit,
         )
         del gateup_output
 
@@ -641,8 +635,8 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
     else:
         if swiglu_limit is not None:
-            gateup_output = _apply_swiglu_clamp_limit(
-                gateup_output, swiglu_clamp_limit=swiglu_limit
+            gateup_output = _apply_swiglu_limit(
+                gateup_output, swiglu_limit=swiglu_limit
             )
 
         down_input_scale = torch.empty(
@@ -661,13 +655,13 @@ def _varlen_deep_gemm_silu_mul_quant(
     return down_input, down_input_scale
 
 
-def _apply_swiglu_clamp_limit(
-    gateup_output: torch.Tensor, swiglu_clamp_limit: float
+def _apply_swiglu_limit(
+    gateup_output: torch.Tensor, swiglu_limit: float
 ) -> torch.Tensor:
     """Asymmetric clamp on swiglu pre-activation: gate to (-inf, lim], up to [-lim, lim].
     Operates in-place on the last dim and accepts any leading shape."""
     half = gateup_output.shape[-1] // 2
     flat = gateup_output.view(-1, gateup_output.shape[-1])
-    flat[:, :half].clamp_(max=swiglu_clamp_limit)
-    flat[:, half:].clamp_(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+    flat[:, :half].clamp_(max=swiglu_limit)
+    flat[:, half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
     return gateup_output

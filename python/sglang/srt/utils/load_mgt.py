@@ -19,6 +19,8 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -650,26 +652,47 @@ def load_megatron_weights(
                 }
 
                 if getattr(init_model.config, "mhc", False):
-                    hc_attrs = ["mapping_proj.weight", "scale", "bias"]
-
-                    mhc_no_norm_weight = getattr(
-                        init_model.config, "mhc_no_norm_weight", False
+                    # mcore mhtk ckpt layout: per-prefix {mapping_proj.weight,
+                    # norm_weight, scale, base}. The sglang model owns these
+                    # as plain nn.Parameter on the layer with names
+                    # hc_{attn,ffn}_{base, scale, fn}. When the training-time
+                    # config disabled the norm (mhc_no_norm_weight=True), the
+                    # ckpt still carries norm_weight but it was NOT used in
+                    # forward — so we must NOT fold it in. Only fold when the
+                    # config says the norm is active.
+                    mhc_fold_norm = not getattr(
+                        init_model.config, "mhc_no_norm_weight", True
                     )
-                    if not mhc_no_norm_weight:
-                        hc_attrs.append("norm.weight")
-
-                    for hc_prefix in (
-                        "self_attention_hyper_connection",
-                        "mlp_hyper_connection",
+                    for hc_prefix, dst_prefix in (
+                        ("self_attention_hyper_connection", "hc_attn"),
+                        ("mlp_hyper_connection", "hc_ffn"),
                     ):
-                        for attr in hc_attrs:
-                            layer_sd[f"{hc_prefix}.{attr}"] = dict_access_multi(
-                                mgt_tp_0, get_keys(f"{hc_prefix}.{attr}", i=i)
+                        base = dict_access_multi(
+                            mgt_tp_0, get_keys(f"{hc_prefix}.bias", i=i)
+                        )
+                        if base.numel() == 1:
+                            base = base.unsqueeze(0)
+                        layer_sd[f"{dst_prefix}_base"] = base
+
+                        scale = dict_access_multi(
+                            mgt_tp_0, get_keys(f"{hc_prefix}.scale", i=i)
+                        )
+                        if scale.numel() == 1:
+                            scale = scale.unsqueeze(0)
+                        layer_sd[f"{dst_prefix}_scale"] = scale
+
+                        fn_weight = dict_access_multi(
+                            mgt_tp_0, get_keys(f"{hc_prefix}.mapping_proj.weight", i=i)
+                        )
+                        if mhc_fold_norm:
+                            norm_keys = get_keys(f"{hc_prefix}.norm.weight", i=i)
+                            assert has_keys(mgt_tp_0, norm_keys), (
+                                f"[mHC fold] mhc_no_norm_weight=False but ckpt is "
+                                f"missing {norm_keys}"
                             )
-                            if layer_sd[f"{hc_prefix}.{attr}"].numel() == 1:
-                                layer_sd[f"{hc_prefix}.{attr}"] = layer_sd[
-                                    f"{hc_prefix}.{attr}"
-                                ].unsqueeze(0)
+                            norm_w = dict_access_multi(mgt_tp_0, norm_keys)
+                            fn_weight = fn_weight * norm_w
+                        layer_sd[f"{dst_prefix}_fn"] = fn_weight
 
                 if getattr(init_model.config, "use_qk_norm", False) and not getattr(
                     init_model.config, "mla", False
@@ -782,32 +805,35 @@ def load_megatron_weights(
 
                 if is_linear_layer:
                     logger.info(f"{i} loading linear layer")
-                    qkv_proj_weights = []
+                    # Mirrors the model's fusion switch in
+                    # Glm5NextLinearAttention.__init__: when fused, the
+                    # state_dict must carry the merged param names
+                    # (fused_qkvbfg_a_proj.weight, fused_fg_b_proj.weight)
+                    # instead of the per-proj names.
+                    from sglang.srt.environ import envs as _envs
+
+                    do_fuse_qkvbfg = _envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.get()
+
+                    # Mirror Glm5NextLinearAttention's head-shard choice:
+                    # KDA heads are sharded by CP when NSA prefill CP is on,
+                    # otherwise by attention TP. All KDA projections,
+                    # qkv_conv1d, A_log and dt_bias must use the same shard.
+                    if is_nsa_enable_prefill_cp():
+                        kda_shard_size = get_attention_cp_size()
+                        kda_shard_rank = get_attention_cp_rank()
+                    else:
+                        kda_shard_size = attn_tp_size
+                        kda_shard_rank = attn_tp_rank
+
                     qkv_conv_weights = []
                     for linear_key in "qkv":
-                        proj_weight = merge_tensors(
-                            tp_sd=mgt_sd[pp],
-                            model_key=model_key,
-                            keys=get_keys(f"{linear_key}_proj", i=i),
-                            original_tp=original_tp,
-                            target_tp=attn_tp_size,
-                            current_tp=attn_tp_rank,
-                            merge_fn=None,
-                            slice_dim=0,
-                        )
-                        if hasattr(layer.self_attn, "qkv_proj"):
-                            qkv_proj_weights.append(proj_weight)
-                        else:
-                            layer_sd[f"self_attn.{linear_key}_proj.weight"] = (
-                                proj_weight
-                            )
                         conv_weight = merge_tensors(
                             tp_sd=mgt_sd[pp],
                             model_key=model_key,
                             keys=get_keys(f"{linear_key}_conv1d", i=i),
                             original_tp=original_tp,
-                            target_tp=attn_tp_size,
-                            current_tp=attn_tp_rank,
+                            target_tp=kda_shard_size,
+                            current_tp=kda_shard_rank,
                             merge_fn=None,
                             slice_dim=0,
                         )
@@ -817,50 +843,148 @@ def load_megatron_weights(
                             layer_sd[f"self_attn.{linear_key}_conv1d.weight"] = (
                                 conv_weight
                             )
-                    if qkv_proj_weights:
-                        layer_sd["self_attn.qkv_proj.weight"] = torch.cat(
-                            qkv_proj_weights, dim=0
-                        )
                     if qkv_conv_weights:
                         layer_sd["self_attn.qkv_conv1d.weight"] = torch.cat(
                             qkv_conv_weights, dim=0
                         )
+
+                    if do_fuse_qkvbfg:
+                        # Order must match Glm5NextForCausalLM._STACKED_PARAMS_MAPPING
+                        # for fused_qkvbfg_a_proj: q, k, v, b (column-parallel)
+                        # then f_a, g_a (replicated).
+                        fused_a_parts = []
+                        for linear_key in ("q", "k", "v", "b"):
+                            fused_a_parts.append(
+                                merge_tensors(
+                                    tp_sd=mgt_sd[pp],
+                                    model_key=model_key,
+                                    keys=get_keys(f"{linear_key}_proj", i=i),
+                                    original_tp=original_tp,
+                                    target_tp=kda_shard_size,
+                                    current_tp=kda_shard_rank,
+                                    merge_fn=None,
+                                    slice_dim=0,
+                                )
+                            )
+                        for linear_key in ("f_a", "g_a"):
+                            fused_a_parts.append(
+                                merge_tensors(
+                                    tp_sd=mgt_sd[pp],
+                                    model_key=model_key,
+                                    keys=get_keys(f"{linear_key}_proj", i=i),
+                                    original_tp=original_tp,
+                                    target_tp=1,
+                                    current_tp=0,
+                                    merge_fn=None,
+                                    slice_dim=0,
+                                )
+                            )
+                        layer_sd["self_attn.fused_qkvbfg_a_proj.weight"] = torch.cat(
+                            fused_a_parts, dim=0
+                        )
+
+                        # fused_fg_b_proj: stack(f_b, g_b) along batch dim 0,
+                        # each column-parallel along its own output dim.
+                        f_b = merge_tensors(
+                            tp_sd=mgt_sd[pp],
+                            model_key=model_key,
+                            keys=get_keys("f_b_proj", i=i),
+                            original_tp=original_tp,
+                            target_tp=kda_shard_size,
+                            current_tp=kda_shard_rank,
+                            merge_fn=None,
+                            slice_dim=0,
+                        )
+                        g_b = merge_tensors(
+                            tp_sd=mgt_sd[pp],
+                            model_key=model_key,
+                            keys=get_keys("g_b_proj", i=i),
+                            original_tp=original_tp,
+                            target_tp=kda_shard_size,
+                            current_tp=kda_shard_rank,
+                            merge_fn=None,
+                            slice_dim=0,
+                        )
+                        layer_sd["self_attn.fused_fg_b_proj.weight"] = torch.stack(
+                            [f_b, g_b], dim=0
+                        )
+
+                        layer_sd["self_attn.o_proj.weight"] = merge_tensors(
+                            tp_sd=mgt_sd[pp],
+                            model_key=model_key,
+                            keys=get_keys("o_proj", i=i),
+                            original_tp=original_tp,
+                            target_tp=kda_shard_size,
+                            current_tp=kda_shard_rank,
+                            merge_fn=None,
+                            slice_dim=1,
+                        )
+                    else:
+                        qkv_proj_weights = []
+                        for linear_key in "qkv":
+                            proj_weight = merge_tensors(
+                                tp_sd=mgt_sd[pp],
+                                model_key=model_key,
+                                keys=get_keys(f"{linear_key}_proj", i=i),
+                                original_tp=original_tp,
+                                target_tp=kda_shard_size,
+                                current_tp=kda_shard_rank,
+                                merge_fn=None,
+                                slice_dim=0,
+                            )
+                            if hasattr(layer.self_attn, "qkv_proj"):
+                                qkv_proj_weights.append(proj_weight)
+                            else:
+                                layer_sd[f"self_attn.{linear_key}_proj.weight"] = (
+                                    proj_weight
+                                )
+                        if qkv_proj_weights:
+                            layer_sd["self_attn.qkv_proj.weight"] = torch.cat(
+                                qkv_proj_weights, dim=0
+                            )
+                        for linear_key in "g_a g_b f_a f_b b o".split():
+                            slice_dim = 1 if linear_key == "o" else 0
+                            layer_sd[f"self_attn.{linear_key}_proj.weight"] = (
+                                merge_tensors(
+                                    tp_sd=mgt_sd[pp],
+                                    model_key=model_key,
+                                    keys=get_keys(f"{linear_key}_proj", i=i),
+                                    original_tp=original_tp,
+                                    target_tp=(
+                                        kda_shard_size
+                                        if linear_key not in ["f_a", "g_a"]
+                                        else 1
+                                    ),
+                                    current_tp=(
+                                        kda_shard_rank
+                                        if linear_key not in ["f_a", "g_a"]
+                                        else 0
+                                    ),
+                                    merge_fn=None,
+                                    slice_dim=slice_dim,
+                                )
+                            )
+
                     layer_sd["self_attn.A_log"] = dict_access_multi(
                         mgt_tp_0,
                         get_keys("A_log", i=i),
                     ).view(1, 1, -1, 1)
-                    if attn_tp_size > 1:
+                    if kda_shard_size > 1:
                         layer_sd["self_attn.A_log"] = torch.chunk(
-                            layer_sd["self_attn.A_log"], attn_tp_size, dim=2
-                        )[attn_tp_rank].clone()
+                            layer_sd["self_attn.A_log"], kda_shard_size, dim=2
+                        )[kda_shard_rank].clone()
                     layer_sd["self_attn.dt_bias"] = dict_access_multi(
                         mgt_tp_0,
                         get_keys("dt_bias", i=i),
                     )
-                    if attn_tp_size > 1:
+                    if kda_shard_size > 1:
                         layer_sd["self_attn.dt_bias"] = torch.chunk(
-                            layer_sd["self_attn.dt_bias"], attn_tp_size, dim=0
-                        )[attn_tp_rank].clone()
+                            layer_sd["self_attn.dt_bias"], kda_shard_size, dim=0
+                        )[kda_shard_rank].clone()
                     layer_sd["self_attn.o_norm.weight"] = dict_access_multi(
                         mgt_tp_0,
                         get_keys("o_norm", i=i),
                     )
-                    for linear_key in "g_a g_b f_a f_b b o".split():
-                        slice_dim = 1 if linear_key == "o" else 0
-                        layer_sd[f"self_attn.{linear_key}_proj.weight"] = merge_tensors(
-                            tp_sd=mgt_sd[pp],
-                            model_key=model_key,
-                            keys=get_keys(f"{linear_key}_proj", i=i),
-                            original_tp=original_tp,
-                            target_tp=(
-                                attn_tp_size if linear_key not in ["f_a", "g_a"] else 1
-                            ),
-                            current_tp=(
-                                attn_tp_rank if linear_key not in ["f_a", "g_a"] else 0
-                            ),
-                            merge_fn=None,
-                            slice_dim=slice_dim,
-                        )
 
                 elif getattr(init_model.config, "mla", False):
                     if is_nsa_enable_prefill_cp():
@@ -1463,11 +1587,7 @@ def load_megatron_weights(
                 # the target device. Refresh them here so the workaround
                 # stays out of the model code.
                 sa = getattr(layer, "self_attn", None)
-                if (
-                    sa is not None
-                    and hasattr(sa, "qkv_conv1d")
-                    and hasattr(sa, "attn")
-                ):
+                if sa is not None and hasattr(sa, "qkv_conv1d") and hasattr(sa, "attn"):
                     sa.attn.conv_weights = sa.qkv_conv1d.weight.squeeze(1)
                     sa.attn.bias = sa.qkv_conv1d.bias
                 for k in layer_sd:

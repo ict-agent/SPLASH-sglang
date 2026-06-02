@@ -195,7 +195,7 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
-        swiglu_clamp_limit: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
@@ -232,7 +232,7 @@ class DeepseekV2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        self.swiglu_clamp_limit = swiglu_clamp_limit
+        self.swiglu_limit = swiglu_limit
         self.fused_swiglu_cast_supported = getattr(
             self.down_proj.quant_method, "support_prequant", lambda _: False
         )(self.down_proj.weight)
@@ -262,14 +262,14 @@ class DeepseekV2MLP(nn.Module):
 
         if self.fused_swiglu_cast_supported:
             down_input = fused_swiglu_per_token_cast(
-                gate_up, swiglu_clamp_value=self.swiglu_clamp_limit
+                gate_up, swiglu_limit=self.swiglu_limit
             )
         else:
-            if self.swiglu_clamp_limit is not None:
+            if self.swiglu_limit is not None:
                 _split = gate_up.size(-1) // 2
-                gate_up[..., :_split].clamp_(max=self.swiglu_clamp_limit)
+                gate_up[..., :_split].clamp_(max=self.swiglu_limit)
                 gate_up[..., _split:].clamp_(
-                    min=-self.swiglu_clamp_limit, max=self.swiglu_clamp_limit
+                    min=-self.swiglu_limit, max=self.swiglu_limit
                 )
             down_input = self.act_fn(gate_up)
 
@@ -433,7 +433,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
-            swiglu_clamp_limit=getattr(config, "swiglu_clamp_limit", None),
+            swiglu_limit=getattr(config, "swiglu_limit", None),
         )
 
         self.topk = TopK(
@@ -483,7 +483,7 @@ class DeepseekV2MoE(nn.Module):
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
-                swiglu_clamp_limit=getattr(config, "swiglu_clamp_limit", None),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
@@ -1650,7 +1650,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
-                swiglu_clamp_limit=getattr(config, "swiglu_clamp_limit", None),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

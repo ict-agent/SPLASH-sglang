@@ -36,7 +36,7 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
-    GlmLinearConfig,
+    Glm5NextConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -1893,9 +1893,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
-    def glm_linear_config(self):
+    def glm5_next_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, GlmLinearConfig):
+        if isinstance(config, Glm5NextConfig):
             return config
         return None
 
@@ -1906,7 +1906,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
-            or self.glm_linear_config
+            or self.glm5_next_config
         )
 
     def configure_kv_cache_dtype(self):

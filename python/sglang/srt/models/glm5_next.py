@@ -14,12 +14,12 @@
 import logging
 import re
 from contextlib import nullcontext
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
-from sglang.srt.configs.glm_linear import GlmLinearConfig
+from sglang.srt.configs.glm5_next import Glm5NextConfig
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -39,6 +39,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_plain_all_gather,
     cp_plain_reduce_scatter,
     cp_plain_split,
+    cp_plain_to_scattered,
+    cp_scattered_to_plain,
     cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -75,7 +77,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import HyperConnection
+from sglang.srt.layers.mhc import hc_post as _hc_post_fn
+from sglang.srt.layers.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -133,7 +136,7 @@ class Glm5NextLinearAttention(nn.Module):
         self,
         layer_idx: int,
         hidden_size: int,
-        config: GlmLinearConfig,
+        config: Glm5NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
@@ -155,7 +158,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.linear_value_head_dim
+        self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % head_shard_size == 0
@@ -330,6 +333,7 @@ class Glm5NextLinearAttention(nn.Module):
         self.attn.safe_gate_lower_bound = KDA_SAFE_GATE_LOWER_BOUND
 
         self._cp_fuse_symm_mem = envs.SGLANG_NSA_CP_FUSE_SYMM_MEM.get()
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         cp_prefill = nsa_use_prefill_cp(forward_batch)
@@ -453,13 +457,23 @@ class Glm5NextLinearAttention(nn.Module):
         output = self.o_proj(core_attn_out)[0]
         if cp_prefill:
             output = cp_plain_reduce_scatter(output, get_attention_cp_size())
+        elif self.nsa_enable_prefill_cp:
+            # KDA heads are statically CP-sharded (head_shard_size = cp_size
+            # at init), so o_proj is always a per-rank partial sum;
+            # attn_tp=1 means TP reduce won't cover it. Under CP-extend the
+            # reduce is fused with o_proj above (or done as a plain
+            # reduce_scatter), but decode still needs an explicit CP
+            # all_reduce here. Must rebind output because the group's
+            # all_reduce returns a NEW tensor when an out-of-place path is
+            # picked (custom AR, mscclpp, symm-mem, piecewise CUDA graph).
+            output = get_attention_cp_group().all_reduce(output)
         return output
 
 
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: GlmLinearConfig,
+        config: Glm5NextConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         moe_quant_config_override: Optional[QuantizationConfig] = None,
@@ -554,7 +568,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
-                swiglu_clamp_limit=config.swiglu_clamp_limit,
+                swiglu_limit=config.swiglu_limit,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -563,31 +577,27 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         if self.config.mhc:
-            self.self_attention_hyper_connection = HyperConnection(
-                config.hidden_size,
-                config.mhc_num_residual_streams,
-                layer_number=self.layer_id,
-                rms_norm_eps=self.config.rms_norm_eps,
-                hc_eps=self.config.hc_eps,
-                mhc_no_norm_weight=config.mhc_no_norm_weight,
-                sinkhorn_iterations=config.mhc_sinkhorn_iterations,
-                post_mult_value=config.mhc_post_mult_value,
-            )
-            self.mlp_hyper_connection = HyperConnection(
-                config.hidden_size,
-                config.mhc_num_residual_streams,
-                layer_number=self.layer_id,
-                rms_norm_eps=self.config.rms_norm_eps,
-                hc_eps=self.config.hc_eps,
-                mhc_no_norm_weight=config.mhc_no_norm_weight,
-                sinkhorn_iterations=config.mhc_sinkhorn_iterations,
-                post_mult_value=config.mhc_post_mult_value,
-            )
-        else:
-            self.self_attention_hyper_connection = None
-            self.mlp_hyper_connection = None
+            hc_mult = config.hc_mult
+            mix_hc = (2 + hc_mult) * hc_mult
+            hc_dim = hc_mult * config.hidden_size
 
-        shared_kwargs = dict(
+            # mHC params live directly on the decoder layer so their names
+            # (hc_{attn,ffn}_{base,scale,fn}) match the ckpt verbatim and
+            # default_weight_loader hits them without any rename. The
+            # communicator reads them at runtime via MHCState(layer=self).
+            self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self.hc_attn_fn = nn.Parameter(
+                torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+            )
+
+            self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+            self.hc_ffn_fn = nn.Parameter(
+                torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+            )
+
+        shared_kwargs: Dict[str, Any] = dict(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
@@ -604,25 +614,71 @@ class Glm5NextDecoderLayer(nn.Module):
             self.layer_communicator = MHCHybridNSACPLayerCommunicator(
                 **shared_kwargs,
                 is_first_layer=(self.layer_id == 0),
-                attn_hc=self.self_attention_hyper_connection,
-                mlp_hc=self.mlp_hyper_connection,
+                hc_mult=config.hc_mult,
+                hc_attn_pre=self.hc_attn_pre,
+                hc_ffn_pre=self.hc_ffn_pre,
+                hc_post=self.hc_post,
             )
         elif self.config.mhc:
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
                 is_first_layer=(self.layer_id == 0),
-                attn_hc=self.self_attention_hyper_connection,
-                mlp_hc=self.mlp_hyper_connection,
+                hc_mult=config.hc_mult,
+                hc_attn_pre=self.hc_attn_pre,
+                hc_ffn_pre=self.hc_ffn_pre,
+                hc_post=self.hc_post,
             )
         elif self.nsa_enable_prefill_cp:
-            assert not self.is_linear_attn, (
-                "nsa_enable_prefill_cp is not supported on KDA (linear attention) "
-                "layers yet; enable mhc to use the MHCHybridNSACP path which "
-                "handles the CP gather/split around KDA"
-            )
             self.layer_communicator = NSACPLayerCommunicator(**shared_kwargs)
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
+
+    def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
+        """mHC pre-stage for the attention sub-layer (reads hc_attn_* params)."""
+        assert self.config.mhc, "hc_attn_pre is only valid when config.mhc=True"
+        return _hc_pre_fn(
+            x=hidden_states,
+            hc_fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            hc_mult=self.config.hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            post_mult_value=self.config.hc_post_mult_value,
+            hc_norm_weight=None,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+        )
+
+    def hc_ffn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
+        """mHC pre-stage for the FFN sub-layer (reads hc_ffn_* params)."""
+        assert self.config.mhc, "hc_ffn_pre is only valid when config.mhc=True"
+        return _hc_pre_fn(
+            x=hidden_states,
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=self.config.hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            post_mult_value=self.config.hc_post_mult_value,
+            hc_norm_weight=None,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+        )
+
+    def hc_post(self, hidden_states, residual, h_res, h_post):
+        """mHC post-stage (parameter-free, scalar hc_mult only)."""
+        assert self.config.mhc, "hc_post is only valid when config.mhc=True"
+        return _hc_post_fn(
+            x=hidden_states,
+            residual=residual,
+            h_post=h_post,
+            h_res=h_res,
+            hc_mult=self.config.hc_mult,
+        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
@@ -675,6 +731,24 @@ class Glm5NextDecoderLayer(nn.Module):
             quant_format,
         )
 
+        # MLA's CP attention consumes the scattered (round-robin/zigzag)
+        # layout while the cross-layer contract is plain (block-contiguous,
+        # see Glm5NextModel.forward). KDA handles its own CP gather/scatter
+        # inside Glm5NextLinearAttention, so only MLA layers need this wrap.
+        # NOTE: prepare_attn already stored an AttentionInputs referencing the
+        # plain hidden_states for fetch_qkv_latent(); rebind that ref to the
+        # scattered tensor so q/kv latent and positions stay token-aligned.
+        mla_cp_wrap = not self.is_linear_attn and nsa_use_prefill_cp(
+            forward_batch, self.nsa_enable_prefill_cp
+        )
+        if mla_cp_wrap:
+            hidden_states = cp_plain_to_scattered(
+                hidden_states, forward_batch, get_attention_cp_size()
+            )
+            ctx = get_attn_tp_context()
+            if ctx.attn_inputs_ is not None:
+                ctx.attn_inputs_.hidden_states_local = hidden_states
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -687,6 +761,11 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
+
+        if mla_cp_wrap:
+            hidden_states = cp_scattered_to_plain(
+                hidden_states, forward_batch, get_attention_cp_size()
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
@@ -732,7 +811,7 @@ class Glm5NextDecoderLayer(nn.Module):
 class Glm5NextModel(nn.Module):
     def __init__(
         self,
-        config: GlmLinearConfig,
+        config: Glm5NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -1029,7 +1108,7 @@ class Glm5NextForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: GlmLinearConfig,
+        config: Glm5NextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -1318,14 +1397,6 @@ class Glm5NextForCausalLM(nn.Module):
 
             if ("k_scale" in name or "v_scale" in name) and name not in params_dict:
                 name = name.replace("_proj", "attn_mqa")
-
-            if "hyper_connection" in name and (
-                name.endswith(".norm.weight") or name.endswith(".norm_weight")
-            ):
-                if config.mhc_no_norm_weight:
-                    continue
-                if name.endswith(".norm_weight"):
-                    name = name[: -len(".norm_weight")] + ".norm.weight"
 
             if name not in params_dict:
                 logger.warning(f"Parameter {name} not found in params_dict")

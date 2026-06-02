@@ -3,13 +3,13 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
 
-class GlmLinearConfig(PretrainedConfig):
-    model_type = "glm4_moe"
+class Glm5NextConfig(PretrainedConfig):
+    model_type = "glm5_next"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        model_type="glm4_moe",
+        model_type="glm5_next",
         vocab_size=154880,
         hidden_size=4096,
         head_dim=None,
@@ -30,7 +30,7 @@ class GlmLinearConfig(PretrainedConfig):
         moe_renormalize: bool = True,
         scoring_func: str = "sigmoid",
         n_routed_experts: int | None = None,
-        num_experts_per_token: int | None = None,
+        num_experts_per_tok: int | None = None,
         n_shared_experts: int = 1,
         routed_scaling_factor: float = 2.5,
         first_k_dense_replace: int = 0,
@@ -38,6 +38,7 @@ class GlmLinearConfig(PretrainedConfig):
         use_grouped_topk: bool = True,
         n_group: int = 1,
         topk_group: int = 1,
+        norm_topk_prob: bool = True,
         mla: bool = True,
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = None,
@@ -58,14 +59,11 @@ class GlmLinearConfig(PretrainedConfig):
         linear_value_head_dim: int | None = None,
         linear_allow_neg_eigval: bool | None = False,
         mhc: bool | None = True,
-        mhc_num_residual_streams: int = 4,
+        hc_mult: int = 4,
         hc_eps: float | None = 1e-06,
-        mhc_tau: float = 0.05,
-        hres_vwnstyle: bool | None = True,
-        mhc_no_norm_weight: bool | None = False,
-        mhc_sinkhorn_iterations: int | None = 20,
-        mhc_post_mult_value: float | None = 2.0,
-        swiglu_clamp_limit: float | None = None,
+        hc_sinkhorn_iters: int | None = 20,
+        hc_post_mult_value: float | None = 2.0,
+        swiglu_limit: float | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -98,7 +96,8 @@ class GlmLinearConfig(PretrainedConfig):
         self.mla_nope = mla_nope
         # moe config
         self.n_routed_experts = n_routed_experts
-        self.num_experts_per_token = num_experts_per_token
+        self.num_experts_per_tok = num_experts_per_tok
+        self.norm_topk_prob = norm_topk_prob
         self.moe_renormalize = moe_renormalize
         self.n_shared_experts = n_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
@@ -131,15 +130,14 @@ class GlmLinearConfig(PretrainedConfig):
 
         # mhc config
         self.mhc = mhc
-        self.mhc_num_residual_streams = mhc_num_residual_streams
-        self.mhc_tau = mhc_tau
-        self.hres_vwnstyle = hres_vwnstyle
+        self.hc_mult = hc_mult
         self.hc_eps = hc_eps
-        self.mhc_no_norm_weight = mhc_no_norm_weight
-        self.mhc_sinkhorn_iterations = mhc_sinkhorn_iterations
-        self.mhc_post_mult_value = float(mhc_post_mult_value)
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_post_mult_value = (
+            float(hc_post_mult_value) if hc_post_mult_value is not None else None
+        )
 
-        self.swiglu_clamp_limit = swiglu_clamp_limit
+        self.swiglu_limit = swiglu_limit
 
         super().__init__(
             pad_token_id=pad_token_id,
