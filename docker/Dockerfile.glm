@@ -190,7 +190,7 @@ FROM scratch AS flashkda-source
 # git ADD strips .git so submodule init isn't possible in this stage anyway.
 ARG CI_JOB_TOKEN
 ARG FLASHKDA_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.glm.ai/glm-engine/FlashKDA.git
-ARG FLASHKDA_COMMIT=b15dc08a21e37fb757b8c7b59bffbe4c1f0bb8fa
+ARG FLASHKDA_COMMIT=0d1cefc71256816433ecbf360257131c2dc60bc3
 ADD ${FLASHKDA_REPO}#${FLASHKDA_COMMIT} /
 
 
