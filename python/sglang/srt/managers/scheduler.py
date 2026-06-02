@@ -2561,7 +2561,7 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
             if (
-                self.tree_cache.is_mamba_cache()
+                self.tree_cache.supports_mamba()
                 and not self.tree_cache.req_to_token_pool.mamba_pool_has_space_for_reqs(
                     len(can_run_list)
                 )
