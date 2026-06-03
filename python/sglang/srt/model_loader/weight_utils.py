@@ -1044,11 +1044,25 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+def sharded_weight_loader(
+    shard_axis: int,
+    tp_rank_getter=None,
+) -> LoaderFunction:
+    """Create a weight loader that shards the weights along the given axis.
+
+    By default uses get_attention_tp_rank() to pick the shard, which is
+    correct when the param was sized via attn_tp_size. Callers that shard by
+    a different axis (e.g. KDA shards by cp_size when CP=on, where
+    attn_tp_size collapses to 1) must pass `tp_rank_getter` matching the
+    rank the param was sized for, otherwise every rank loads the same shard
+    and the model silently produces wrong outputs on rank != 0.
+    """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_attention_tp_rank()
+        tp_rank = (
+            tp_rank_getter() if tp_rank_getter is not None
+            else get_attention_tp_rank()
+        )
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size

@@ -147,9 +147,11 @@ class Glm5NextLinearAttention(nn.Module):
         if is_nsa_enable_prefill_cp():
             head_shard_size = get_attention_cp_size()
             head_shard_rank = get_attention_cp_rank()
+            _head_shard_rank_getter = get_attention_cp_rank
         else:
             head_shard_size = get_attention_tp_size()
             head_shard_rank = get_attention_tp_rank()
+            _head_shard_rank_getter = get_attention_tp_rank
 
         self.hidden_size = hidden_size
         self.config = config
@@ -265,7 +267,7 @@ class Glm5NextLinearAttention(nn.Module):
             torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)})
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -289,7 +291,7 @@ class Glm5NextLinearAttention(nn.Module):
         def a_log_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
             if loaded_weight.dim() == 1:
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2)(param, loaded_weight)
+            return sharded_weight_loader(2, _head_shard_rank_getter)(param, loaded_weight)
 
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader})
 
