@@ -766,7 +766,14 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -796,7 +803,14 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                self.rem_chunk_tokens is None
+                and len(self.can_run_list) != 0
+                and input_tokens >= self.rem_input_tokens
+            ):
+                # If without chunked prefill:
+                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+                # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
