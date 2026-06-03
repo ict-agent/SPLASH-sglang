@@ -989,18 +989,24 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
-    def _should_skip_hybrid_mla(self, info: KVArgsRegisterInfo) -> bool:
-        """For hybrid MLA cross-TP, non-primary ranks skip KV and extra (DSA)
-        transfers since MLA latent is replicated across ranks. Mamba state
-        (TP-sharded) must still be sent from every rank."""
+    def _should_skip_hybrid_mla(self, info: KVArgsRegisterInfo) -> Tuple[bool, bool]:
+        skip_kv = False
+        skip_extra = False
         if not self.is_hybrid_mla_backend:
-            return False
-        if info is None or self.attn_tp_size <= info.dst_attn_tp_size:
-            return False
-        sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
-            self.attn_tp_size // info.dst_attn_tp_size
-        )
-        return sub_rank != 0
+            return skip_kv, skip_extra
+
+        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
+            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+                self.attn_tp_size // info.dst_attn_tp_size
+            )
+            if sub_rank != 0:
+                skip_kv = True
+                skip_extra = True
+
+        if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
+            skip_extra = True
+
+        return skip_kv, skip_extra
 
     def maybe_send_extra(
         self,
@@ -1047,21 +1053,42 @@ class MooncakeKVManager(CommonKVManager):
         """Mamba state (slot-indexed) + optional extra paged chunks beyond mamba prefix."""
 
         # 1) Send state data
-        if info is not None and self.attn_tp_size != info.dst_attn_tp_size:
+        if self.attn_cp_size > 1:
+            src_shard_size, src_shard_rank = self.attn_cp_size, self.attn_cp_rank
+        else:
+            src_shard_size, src_shard_rank = self.attn_tp_size, self.attn_tp_rank
+        dst_shard_size = info.dst_attn_tp_size
+        dst_shard_rank = info.dst_tp_rank % info.dst_attn_tp_size
+
+        if src_shard_size >= dst_shard_size:
+            heads_overlap = (
+                src_shard_rank * dst_shard_size // src_shard_size == dst_shard_rank
+            )
+        else:
+            heads_overlap = (
+                dst_shard_rank * src_shard_size // dst_shard_size == src_shard_rank
+            )
+
+        if not heads_overlap:
+            ret = 0
+        elif src_shard_size == dst_shard_size:
+            # Same head sharding on both sides: copy the whole state slot.
+            ret = self._send_mamba_state(
+                req,
+                chunk.state_indices,
+                info.dst_state_data_ptrs,
+            )
+        else:
             ret = self._send_mamba_state_slice(
                 req,
                 chunk.state_indices,
                 info.dst_state_data_ptrs,
                 info.dst_state_item_lens,
                 info.dst_state_dim_per_tensor,
-                info.dst_tp_rank,
-                info.dst_attn_tp_size,
-            )
-        else:
-            ret = self._send_mamba_state(
-                req,
-                chunk.state_indices,
-                info.dst_state_data_ptrs,
+                src_shard_size,
+                src_shard_rank,
+                dst_shard_size,
+                dst_shard_rank,
             )
         if ret != 0:
             logger.error(
@@ -1152,21 +1179,25 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_data_ptrs: list[int],
         dst_state_item_lens: list[int],
         dst_state_dim_per_tensor: list[int],
-        dst_tp_rank: int,
-        dst_attn_tp_size: int,
+        src_shard_size: int,
+        src_shard_rank: int,
+        dst_shard_size: int,
+        dst_shard_rank: int,
     ):
-        """Transfer Mamba states with TP slice support.
+        """Transfer Mamba states with head-shard slice support.
 
-        State layout: [num_layers, size+1, sliceable_dim/tp, ...trailing].
+        State layout: [num_layers, size+1, sliceable_dim/shard, ...trailing].
         The sliceable dim may pack heterogeneous components (e.g. [Q|K|V]
-        for KDA, exposed via ``state_dim_components_per_tensor``). When
-        packed, each component is transferred as its own block so the
-        per-rank packed layout stays correct after PD TP-resize. Tensors
-        without component info collapse to a single-component case.
+        when fused projections share one packed tensor, exposed via
+        ``state_dim_components_per_tensor``). When packed, each component
+        is transferred as its own block so the per-rank packed layout
+        stays correct after PD head-shard resize. Tensors without
+        component info collapse to a single-component case.
         """
         logger.warning_once(
-            "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
-            f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
+            "Using Mamba state slice transfer for different head-shard sizes between prefill and decode. "
+            f"Prefill src_shard_size={src_shard_size}, "
+            f"Decode dst_shard_size={dst_shard_size}. "
             "Performance may be affected."
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
@@ -1185,19 +1216,17 @@ class MooncakeKVManager(CommonKVManager):
 
         src_idx = int(prefill_mamba_index[0])
         dst_idx = int(req.dst_state_indices[0])
-        src_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        dst_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         # Decide which side gets sub-sliced inside each component
-        if self.attn_tp_size > dst_attn_tp_size:
+        if src_shard_size > dst_shard_size:
             # Multiple prefill ranks send to 1 decode rank
             # Each prefill sends all its dims to the appropriate offset in decode
-            sub_rank = src_rank_in_group % (self.attn_tp_size // dst_attn_tp_size)
+            sub_rank = src_shard_rank % (src_shard_size // dst_shard_size)
             src_inner_factor, dst_inner_factor = 0, 1
         else:
             # 1 prefill rank sends to multiple decode ranks
             # Prefill sends a slice of its dims to each decode rank
-            sub_rank = dst_rank_in_group % (dst_attn_tp_size // self.attn_tp_size)
+            sub_rank = dst_shard_rank % (dst_shard_size // src_shard_size)
             src_inner_factor, dst_inner_factor = 1, 0
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
@@ -1214,7 +1243,7 @@ class MooncakeKVManager(CommonKVManager):
                 else None
             )
             if not comps:
-                comps = [src_dim * self.attn_tp_size]
+                comps = [src_dim * src_shard_size]
 
             src_base = src_state_data_ptrs[i] + src_item_len * src_idx
             dst_base = dst_state_ptr + dst_item_len * dst_idx
@@ -1222,8 +1251,8 @@ class MooncakeKVManager(CommonKVManager):
             src_comp_offset = 0
             dst_comp_offset = 0
             for comp_size in comps:
-                comp_src = comp_size // self.attn_tp_size
-                comp_dst = comp_size // dst_attn_tp_size
+                comp_src = comp_size // src_shard_size
+                comp_dst = comp_size // dst_shard_size
                 chunk_dim = min(comp_src, comp_dst)
                 src_offset = (
                     src_comp_offset + src_inner_factor * sub_rank * chunk_dim
@@ -1328,10 +1357,10 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        should_skip = self._should_skip_hybrid_mla(
+                        skip_kv, skip_extra = self._should_skip_hybrid_mla(
                             target_rank_registration_info
                         )
-                        if should_skip:
+                        if skip_kv:
                             ret = 0
                         elif (
                             self.is_mla_backend
@@ -1419,7 +1448,7 @@ class MooncakeKVManager(CommonKVManager):
                                     kv_chunk,
                                     target_rank_registration_info,
                                     executor,
-                                    should_skip,
+                                    skip_extra,
                                 )
 
                             # Only the last chunk we need to send the aux data
