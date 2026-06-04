@@ -1706,6 +1706,13 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+            
+            if model_arch == "Glm5NextForCausalLM":
+                self._handle_mamba_radix_cache(
+                    model_arch=model_arch,
+                    support_mamba_cache=True,
+                    support_mamba_cache_extra_buffer=True,
+                )
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -1963,7 +1970,6 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
         elif model_arch in [
-            "Glm5NextForCausalLM",
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
@@ -1989,7 +1995,6 @@ class ServerArgs:
                     )
 
             if model_arch in [
-                "Glm5NextForCausalLM",
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
