@@ -474,6 +474,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.mamba_pool_idx.unsqueeze(-1)
             )
             req.mamba_pool_idx = None
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)

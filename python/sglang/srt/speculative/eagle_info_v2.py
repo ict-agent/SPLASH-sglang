@@ -9,7 +9,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ModelWorkerBatch,
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -234,12 +238,7 @@ class EagleVerifyInputV2Mixin:
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                batch.mamba_track_indices = torch.stack(
-                    [
-                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                        for req in batch.reqs
-                    ]
-                ).to(torch.int64)
+                set_mamba_track_indices_from_reqs(batch, req_to_token_pool)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 

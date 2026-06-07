@@ -362,20 +362,22 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        return select_index
+
+    def clear_slots(self, indices: torch.Tensor):
+        """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        need_size = len(indices)
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
-            t[:, select_index] = z
+            t[:, indices] = z
         t = self.mamba_cache.temporal
         z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
             t.shape[0], need_size, *t.shape[2:]
         )
-        t[:, select_index] = z
-
-        return select_index
+        t[:, indices] = z
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -396,13 +398,6 @@ class MambaPool:
             :, src_index
         ]
         return
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self.alloc(1)
-        if dst_index is None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
@@ -569,7 +564,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
             )
@@ -589,17 +584,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            mid = None
-            if req.mamba_pool_idx is not None:  # for radix cache
-                mid = req.mamba_pool_idx
+            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                pass
             else:
                 mid = self.mamba_pool.alloc(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
-                mid = mid[0]
-                req.mamba_pool_idx = mid
-            mamba_indices.append(mid)
+                req.mamba_pool_idx = mid[0]
+                req.mamba_needs_clear = True
+            mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -620,9 +614,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                dtype=torch.int32
-            )
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
                 ping_pong_tensor
             )
@@ -653,6 +645,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_pool.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
 
         if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_free = (
