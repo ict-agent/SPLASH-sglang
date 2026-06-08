@@ -27,7 +27,7 @@ import logging
 import sys
 import time
 from collections import defaultdict
-from functools import lru_cache, partial
+from functools import partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -170,7 +170,6 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
