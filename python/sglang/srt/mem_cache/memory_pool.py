@@ -186,6 +186,9 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(self.size))
 
+    def mamba_pool_has_space_for_reqs(self, num_reqs: int = 1):
+        return True
+
 
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
@@ -518,6 +521,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
+        )
+        self.slots_per_req = slots_per_req
+
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self.start_layer = start_layer if start_layer is not None else 0
@@ -691,11 +699,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.mamba_next_track_idx = None
 
     def mamba_pool_has_space_for_reqs(self, num_reqs: int = 1):
-        need_size = num_reqs
-        if self.enable_mamba_extra_buffer:
-            need_size = need_size + num_reqs * self.mamba_ping_pong_track_buffer_size
-        # TODO Consider the space reserved for decode.
-
+        need_size = num_reqs * self.slots_per_req
         return need_size <= self.mamba_pool.available_size()
 
     def clear(self):

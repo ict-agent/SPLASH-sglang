@@ -193,6 +193,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         slots_per_req = 1 + (
             self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
+        self.slots_per_req = slots_per_req
         if mamba_size is not None:
             max_pre_alloc = max(0, mamba_size // slots_per_req - size)
             if pre_alloc_size > max_pre_alloc:
@@ -748,6 +749,9 @@ class DecodePreallocQueue:
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                break
+
+            if not self.req_to_token_pool.mamba_pool_has_space_for_reqs(1):
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
