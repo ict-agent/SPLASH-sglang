@@ -97,7 +97,10 @@ def interleave_batch_token_id_out(func):
             dp_ranks = [] if recv_obj.dp_ranks else None
 
             for request_idx in range(len(recv_obj.rids)):
-                split_output_aligned = has_decode_status[request_idx]
+                split_output_aligned = (
+                    has_decode_status[request_idx]
+                    and recv_obj.finished_reasons[request_idx] is None
+                )
                 decode_len = (
                     len(recv_obj.decode_ids[request_idx]) if split_output_aligned else 1
                 )
