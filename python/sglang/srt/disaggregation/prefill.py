@@ -831,6 +831,14 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
+            # fill_ids includes the token sampled during prefill, but decode
+            # registers state pages over origin_input_ids (DecodePreallocQueue)
+            # and the main pool send is clamped to end_idx above. Matching that
+            # length here avoids emitting an extra state page when the sampled
+            # token crosses a page boundary, which mismatched src/dst lengths in
+            # group_concurrent_contiguous.
+            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
+
             # Prepare extra pool indices for hybrid models
             if isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
@@ -848,7 +856,6 @@ class SchedulerDisaggregationPrefillMixin:
                     self.token_to_kv_pool_allocator.get_kvcache().full_kv_pool,
                     NSATokenToKVPool,
                 ):
-                    seq_len = len(req.fill_ids)
                     kv_indices_full = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :seq_len
                     ]
@@ -856,7 +863,6 @@ class SchedulerDisaggregationPrefillMixin:
                     extra_indices = kv_to_page_indices(extra_indices, page_size)
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -876,7 +882,6 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
