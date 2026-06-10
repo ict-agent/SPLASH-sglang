@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.nsa.kpool.kernels import (
     topk_from_pooled_history_logits,
 )
 from sglang.srt.layers.attention.nsa.kpool.page_table import (
+    PAGE_SIZE,
     build_pooled_page_table_64,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
@@ -514,7 +515,8 @@ class IndexerKPool(Indexer):
         metadata: BaseIndexerMetadata,
         block_tables: torch.Tensor,
         seqlens_32: torch.Tensor,
-        blocksize: int,
+        block_kv: int,
+        slots_per_pool_page: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_metadata = metadata.attn_metadata
         pool_seqlens = attn_metadata.pooled_cache_seqlens_int32
@@ -530,19 +532,23 @@ class IndexerKPool(Indexer):
                 seqlens_32, self.index_kpool, rounding_mode="floor"
             ).to(torch.int32)
             pool_block_tables = build_pooled_page_table_64(
-                block_tables, self.index_kpool
+                block_tables, self.index_kpool, slots_per_pool_page
             ).contiguous()
             pool_schedule_metadata = None
         else:
+            # Anchor: gather stride = index_kpool (16); dense: stride = 1.
+            gather_stride = max(
+                1, self.index_kpool * slots_per_pool_page // PAGE_SIZE
+            )
             pool_seqlens = pool_seqlens[: seqlens_32.shape[0]]
             pool_block_tables = pool_block_tables[
                 : block_tables.shape[0],
-                : (block_tables.shape[1] + self.index_kpool - 1) // self.index_kpool,
+                : (block_tables.shape[1] + gather_stride - 1) // gather_stride,
             ]
 
         if pool_schedule_metadata is None:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                pool_seqlens.unsqueeze(-1), blocksize, self.sm_count
+                pool_seqlens.unsqueeze(-1), block_kv, self.sm_count
             )
 
         return pool_seqlens, pool_block_tables, pool_schedule_metadata
@@ -562,6 +568,7 @@ class IndexerKPool(Indexer):
         """
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
+        slots_per_pool_page = forward_batch.token_to_kv_pool.slots_per_pool_page
 
         block_tables = metadata.get_page_table_64()
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -572,7 +579,9 @@ class IndexerKPool(Indexer):
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
+        # Anchor: slots_per_pool_page=64 -> block_kv=64, row=8448 B/page
+        # Dense : slots_per_pool_page=4  -> block_kv=4,  row=528  B/page
+        block_kv = slots_per_pool_page
         num_heads_kv = 1
         head_dim_with_sf = 132
         kv_cache_fp8 = kv_cache_fp8.view(
@@ -583,10 +592,10 @@ class IndexerKPool(Indexer):
 
         pool_seqlens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
-                metadata, block_tables, seqlens_32, page_size
+                metadata, block_tables, seqlens_32, block_kv, slots_per_pool_page
             )
         )
-        pool_max_seq_len = pool_block_tables.shape[1] * page_size
+        pool_max_seq_len = pool_block_tables.shape[1] * block_kv
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,

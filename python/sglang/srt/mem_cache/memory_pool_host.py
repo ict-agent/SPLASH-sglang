@@ -1757,6 +1757,11 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
+        # Mirror device-side dense kpool-compress packing (slots_per_pool_page
+        # = page_size for anchor; page_size // index_kpool for dense).
+        self.slots_per_pool_page = getattr(
+            device_pool, "slots_per_pool_page", page_size
+        )
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -1769,7 +1774,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             override_kv_cache_dim=device_pool.kv_cache_dim,
         )
         self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.slots_per_pool_page
+            * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
@@ -1780,9 +1787,15 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     def get_size_per_token(self):
         base = super().get_size_per_token()
+        # Anchor: slots_per_pool_page=64 -> 132*L*64/64 = 132 L bytes/token
+        # Dense : slots_per_pool_page=4  -> 132*L*4/64  = 8.25 L bytes/token
         return (
             base
-            + self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+            + self.indexer_size_per_token
+            * self.layer_num
+            * self.indexer_dtype.itemsize
+            * self.slots_per_pool_page
+            // self.page_size
         )
 
     def _init_indexer_buffers(self):
@@ -2045,7 +2058,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         初始化共享内存 NSA Index Buffer。
         """
         # 计算 Shape
-        index_buffer_second_dim = self.page_size * (
+        index_buffer_second_dim = self.slots_per_pool_page * (
             self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
         )
         self.index_stride_size = (
@@ -2256,6 +2269,13 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         tp_group: Optional[dist.ProcessGroup] = None,
     ):
         logger.info("Using NSATokenToKVPoolHostShared (Per-Rank Distributed Shards) for zero-copy host cache (NSA).")
+
+        if getattr(device_pool, "slots_per_pool_page", page_size) != page_size:
+            raise NotImplementedError(
+                "NSATokenToKVPoolHostSharedLayerGroup does not support dense "
+                "kpool layout (slots_per_pool_page != page_size); use "
+                "NSATokenToKVPoolHost or NSATokenToKVPoolHostShared instead."
+            )
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()

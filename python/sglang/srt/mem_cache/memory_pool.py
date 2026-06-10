@@ -1395,6 +1395,9 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
+        self.slots_per_pool_page = getattr(
+            self.full_kv_pool, "slots_per_pool_page", self.page_size
+        )
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
@@ -2051,6 +2054,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 1
         else:
             assert self.page_size == 64
+        # Dense kpool-compress packs index_kpool pool entries per token page
+        # (slots_per_pool_page = page_size // index_kpool). Anchor mode keeps
+        # the legacy slots_per_pool_page = page_size = 64 layout.
+        self.slots_per_pool_page = (
+            self.page_size // index_kpool
+            if (index_kpool > 1 and index_kpool_compress)
+            else self.page_size
+        )
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -2060,13 +2071,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 torch.zeros(
                     # Layout:
                     #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
+                    #     shape: (num_pages, slots_per_pool_page * (head_dim + fp32_scale))
+                    #     anchor: slots_per_pool_page=64 -> row = 64*132 = 8448 B
+                    #     dense : slots_per_pool_page=4  -> row = 4*132  = 528 B
                     (
                         (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
+                        self.slots_per_pool_page
                         * (
                             index_head_dim + index_head_dim // self.quant_block_size * 4
                         ),

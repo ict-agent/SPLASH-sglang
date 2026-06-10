@@ -37,12 +37,20 @@ def build_pooled_page_table_64(
     a view whose .contiguous() short-circuits for shape==(1, 1), leaving
     stride(-1) == pool_size and breaking downstream kernels that require
     stride(-1) == 1 (e.g. deep_gemm.fp8_paged_mqa_logits).
+
+    The dense kpool-compress layout (``slots = PAGE_SIZE // pool_size``,
+    = 4 for kpool=16) makes ``stride = 1`` so the gather is identity --
+    each token page already holds its own pool entries. IndexerKPool
+    requires kpool>1 with compress=True (see indexer.py:104), so the
+    anchor layout is unreachable from this function.
     """
     assert (
         PAGE_SIZE % pool_size == 0
     ), f"pool_size ({pool_size}) must divide page_size ({PAGE_SIZE})"
+    slots_per_pool_page = PAGE_SIZE // pool_size
+    stride = max(1, pool_size * slots_per_pool_page // PAGE_SIZE)
     idx = torch.arange(
-        0, page_table_64.shape[-1], pool_size, device=page_table_64.device
+        0, page_table_64.shape[-1], stride, device=page_table_64.device
     )
     return page_table_64[..., idx]
 
@@ -52,14 +60,22 @@ def compute_pooled_write_locs(
     pool_ids: torch.Tensor,
     pool_size: int,
 ) -> torch.Tensor:
-    """Map logical pooled-K ids to packed physical index-cache locations."""
+    """Map logical pooled-K ids to packed physical index-cache locations.
+
+    Dense kpool-compress: ``slots = PAGE_SIZE // pool_size`` (= 4 for
+    kpool=16), each token page holds 4 slots, address arithmetic is
+    ``packed_page * 4 + pool_id % 4``. Anchor layout is unreachable from
+    this function (see ``build_pooled_page_table_64`` for details).
+    """
     assert page_table_64.ndim == 1
     pool_ids = pool_ids.to(torch.int64)
-    pool_page_group = torch.div(pool_ids, PAGE_SIZE, rounding_mode="floor")
-    token_page_row = pool_page_group * pool_size
+    slots_per_pool_page = PAGE_SIZE // pool_size
+    token_pages_per_pool_group = max(1, pool_size * slots_per_pool_page // PAGE_SIZE)
+    pool_page_group = torch.div(pool_ids, slots_per_pool_page, rounding_mode="floor")
+    token_page_row = pool_page_group * token_pages_per_pool_group
     packed_page = page_table_64.index_select(0, token_page_row.to(torch.int64))
-    return packed_page.to(torch.int64) * PAGE_SIZE + torch.remainder(
-        pool_ids, PAGE_SIZE
+    return packed_page.to(torch.int64) * slots_per_pool_page + torch.remainder(
+        pool_ids, slots_per_pool_page
     )
 
 
@@ -78,9 +94,11 @@ def compute_pooled_write_locs_batched(
     assert batch_idx.shape == pool_ids.shape
     pool_ids = pool_ids.to(torch.int64)
     batch_idx = batch_idx.to(torch.int64)
-    pool_page_group = torch.div(pool_ids, PAGE_SIZE, rounding_mode="floor")
-    token_page_row = pool_page_group * pool_size
+    slots_per_pool_page = PAGE_SIZE // pool_size
+    token_pages_per_pool_group = max(1, pool_size * slots_per_pool_page // PAGE_SIZE)
+    pool_page_group = torch.div(pool_ids, slots_per_pool_page, rounding_mode="floor")
+    token_page_row = pool_page_group * token_pages_per_pool_group
     packed_page = block_tables[batch_idx, token_page_row]
-    return packed_page.to(torch.int64) * PAGE_SIZE + torch.remainder(
-        pool_ids, PAGE_SIZE
+    return packed_page.to(torch.int64) * slots_per_pool_page + torch.remainder(
+        pool_ids, slots_per_pool_page
     )

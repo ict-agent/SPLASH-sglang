@@ -121,7 +121,10 @@ class _KPoolCpuPlan:
     ragged_pool_pages: List[int] = field(default_factory=list)
 
 
-def _kpool_cpu_plan(forward_batch: "ForwardBatch", pool_size: int) -> _KPoolCpuPlan:
+def _kpool_cpu_plan(
+    forward_batch: "ForwardBatch",
+    pool_size: int,
+) -> _KPoolCpuPlan:
     """Emit pool rows for every pool whose right boundary lies in
     ``(first_pos, seq_len]``, plus a tail row for batches with leftover
     chunk tokens (skipped when the chunk aligns to a pool boundary).
@@ -133,6 +136,9 @@ def _kpool_cpu_plan(forward_batch: "ForwardBatch", pool_size: int) -> _KPoolCpuP
     (``n_from_tail = 0``), so a single uniform code path covers both.
     """
     plan = _KPoolCpuPlan()
+    # IndexerKPool guards pool_size>1 ∧ compress=True (see indexer.py:104),
+    # so the dense layout is the only reachable case here.
+    slots_per_pool_page = PAGE_SIZE // pool_size
 
     extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
     if isinstance(extend_seq_lens_cpu, torch.Tensor):
@@ -157,7 +163,9 @@ def _kpool_cpu_plan(forward_batch: "ForwardBatch", pool_size: int) -> _KPoolCpuP
 
         plan.ragged_batch_idx.append(i)
         plan.ragged_q_len.append(q_len)
-        plan.ragged_pool_pages.append((pool_seq_len + PAGE_SIZE - 1) // PAGE_SIZE)
+        plan.ragged_pool_pages.append(
+            (pool_seq_len + slots_per_pool_page - 1) // slots_per_pool_page
+        )
 
         # ``list.extend`` over range/[x]*n stays on CPython's C-level
         # fastpath; ~2-3x faster than N Python appends for typical
@@ -213,8 +221,10 @@ def _kpool_plan_to_gpu(
     n_tail = len(cpu.tail_req)
     n_rag = len(cpu.ragged_batch_idx)
 
+    # IndexerKPool requires pool_size>1 ∧ compress=True (indexer.py:104).
+    slots_per_pool_page = PAGE_SIZE // pool_size
     total_pool_pages = sum(cpu.ragged_pool_pages)
-    ragged_total_k_rows = total_pool_pages * PAGE_SIZE
+    ragged_total_k_rows = total_pool_pages * slots_per_pool_page
 
     need_paged = (
         topk_transform_method == TopkTransformMethod.PAGED
@@ -294,12 +304,15 @@ def _kpool_plan_to_gpu(
             pool_batch_idx_t,
             pool_pool_id_t,
             pool_size,
+            slots_per_pool_page,
         )
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 
     pooled_page_table_all = build_pooled_page_table_64(
-        metadata.real_page_table, pool_size
+        metadata.real_page_table,
+        pool_size,
+        slots_per_pool_page,
     ).contiguous()
 
     pooled_seq_lens_expanded = torch.div(
@@ -328,7 +341,7 @@ def _kpool_plan_to_gpu(
             + intra
         )
 
-        q_ks_per_batch_t = cu_pages_excl * PAGE_SIZE
+        q_ks_per_batch_t = cu_pages_excl * slots_per_pool_page
         ragged_q_ks = torch.repeat_interleave(q_ks_per_batch_t, ragged_q_len_t)
 
         ragged_concat_page_table = (
@@ -451,7 +464,11 @@ def init_kpool_extend_metadata(
 
     cpu = _kpool_cpu_plan(forward_batch, pool_size)
     plan = _kpool_plan_to_gpu(
-        cpu, metadata, forward_batch, pool_size, topk_transform_method
+        cpu,
+        metadata,
+        forward_batch,
+        pool_size,
+        topk_transform_method,
     )
     object.__setattr__(metadata, "kpool_extend_plan", plan)
 
@@ -475,6 +492,7 @@ def init_pooled_paged_mqa_metadata(
     ):
         return
 
+    slots_per_pool_page = PAGE_SIZE // pool_size
     object.__setattr__(metadata, "pooled_index_kpool", pool_size)
     object.__setattr__(
         metadata,
@@ -494,7 +512,7 @@ def init_pooled_paged_mqa_metadata(
             "pooled_paged_mqa_schedule_metadata",
             deep_gemm.get_paged_mqa_logits_metadata(
                 metadata.pooled_cache_seqlens_int32.unsqueeze(-1),
-                64,
+                slots_per_pool_page,
                 deep_gemm.get_num_sms(),
             ),
         )
@@ -526,6 +544,7 @@ def update_pooled_paged_mqa_metadata(
         object.__setattr__(metadata, "pooled_paged_mqa_schedule_metadata", None)
         return
 
+    slots_per_pool_page = PAGE_SIZE // pool_size
     pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
         torch.int32
     )
@@ -550,7 +569,7 @@ def update_pooled_paged_mqa_metadata(
         import deep_gemm
 
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-            pool_seqlens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
+            pool_seqlens.unsqueeze(-1), slots_per_pool_page, deep_gemm.get_num_sms()
         )
         if metadata.pooled_paged_mqa_schedule_metadata is None:
             object.__setattr__(
