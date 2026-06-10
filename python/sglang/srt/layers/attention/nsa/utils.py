@@ -28,8 +28,16 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
-    return original_seq_lens.clamp(max=nsa_index_topk)
+def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int, index_kpool: int = 1):
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=nsa_index_topk)
+
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
+    )
+    selected_history_tokens = full_pool_tokens.clamp(max=nsa_index_topk)
+    tail_tokens = original_seq_lens - full_pool_tokens
+    return selected_history_tokens + tail_tokens
 
 
 def is_nsa_enable_prefill_cp():

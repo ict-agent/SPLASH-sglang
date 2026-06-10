@@ -101,6 +101,7 @@ from sgl_kernel.speculative import (
     verify_tree_greedy,
 )
 from sgl_kernel.top_k import (
+    fast_kpool_topk_transform_fused,
     fast_topk,
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
@@ -134,6 +135,7 @@ _DEBUG_EXPORT_NAMES = [
     "fast_topk_transform_fused",
     "fast_topk_transform_ragged_fused",
     "fast_topk_v2",
+    "fast_kpool_topk_transform_fused",
     "fp8_blockwise_scaled_grouped_mm",
     "fp8_blockwise_scaled_mm",
     "fp8_scaled_mm",

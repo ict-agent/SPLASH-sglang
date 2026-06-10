@@ -131,7 +131,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(
-            cache_seqlens, nsa_index_topk=self.nsa_index_topk
+            cache_seqlens,
+            nsa_index_topk=self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
@@ -212,7 +214,11 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        nsa_cache_seqlens = compute_nsa_seqlens(
+            seqlens_expanded,
+            self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
+        )
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum
@@ -289,7 +295,11 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        nsa_cache_seqlens = compute_nsa_seqlens(
+            seqlens_expanded,
+            self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
+        )
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum

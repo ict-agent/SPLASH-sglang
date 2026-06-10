@@ -166,6 +166,7 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        skip_rope: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -176,6 +177,7 @@ class Indexer(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.skip_rope = skip_rope
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -214,15 +216,18 @@ class Indexer(MultiPlatformOp):
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
-        self.rotary_emb = get_rope_wrapper(
-            rope_head_dim,
-            rotary_dim=rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,  # type: ignore
-            rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
-        )
+        if not self.skip_rope and self.rope_head_dim > 0:
+            self.rotary_emb = get_rope_wrapper(
+                rope_head_dim,
+                rotary_dim=rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,  # type: ignore
+                rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
+                device=get_global_server_args().device,
+            )
+        else:
+            self.rotary_emb = None
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
@@ -317,7 +322,7 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        if self.rope_head_dim > 0:
+        if not self.skip_rope and self.rope_head_dim > 0:
             q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
             query[..., : self.rope_head_dim] = q_rope.clone()
@@ -377,7 +382,7 @@ class Indexer(MultiPlatformOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        if self.rope_head_dim > 0:
+        if not self.skip_rope and self.rope_head_dim > 0:
             _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
             key[..., : self.rope_head_dim] = k_rope.clone()
         key = rotate_activation(key)

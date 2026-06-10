@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    get_nsa_index_kpool,
+    get_nsa_index_kpool_compress,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -618,6 +623,13 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
+                nsa_pool_kwargs["index_kpool"] = get_nsa_index_kpool(
+                    self.model_config.hf_config
+                )
+                nsa_pool_kwargs["index_kpool_compress"] = get_nsa_index_kpool_compress(
+                    self.model_config.hf_config
+                )
+                nsa_pool_kwargs["max_running_requests"] = max_num_reqs
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -702,6 +714,13 @@ class ModelRunnerKVCacheMixin:
                     extra_args["index_head_dim"] = get_nsa_index_head_dim(
                         self.model_config.hf_config
                     )
+                    extra_args["index_kpool"] = get_nsa_index_kpool(
+                        self.model_config.hf_config
+                    )
+                    extra_args["index_kpool_compress"] = get_nsa_index_kpool_compress(
+                        self.model_config.hf_config
+                    )
+                    extra_args["max_running_requests"] = max_num_reqs
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,

@@ -58,7 +58,7 @@ class Glm5NextConfig(PretrainedConfig):
         linear_key_head_dim: int | None = None,
         linear_value_head_dim: int | None = None,
         linear_allow_neg_eigval: bool | None = False,
-        mhc: bool | None = True,
+        mhc: bool | None = False,
         hc_mult: int = 4,
         hc_eps: float | None = 1e-06,
         hc_sinkhorn_iters: int | None = 20,

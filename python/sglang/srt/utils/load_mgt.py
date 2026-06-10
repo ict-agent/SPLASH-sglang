@@ -355,6 +355,17 @@ def load_megatron_weights(
         "dsa_k_norm": {
             "mcore": ["decoder.layers.{i}.self_attention.k_norm.{attr}"],
         },
+        "dsa_index_kpool_compress_ape": {
+            "mcore": ["decoder.layers.{i}.self_attention.index_kpool_compress_ape"],
+        },
+        "dsa_index_kpool_compress_gate": {
+            "mcore": ["decoder.layers.{i}.self_attention.index_kpool_compress_gate"],
+        },
+        "dsa_index_kpool_compress_gate_weight": {
+            "mcore": [
+                "decoder.layers.{i}.self_attention.index_kpool_compress_gate.weight"
+            ],
+        },
         "dense": {
             "mgt": [
                 "language_model",
@@ -1145,6 +1156,26 @@ def load_megatron_weights(
                                 [knorm_bias[64:], knorm_bias[:64]], dim=0
                             )
                             layer_sd["self_attn.indexer.k_norm.bias"] = knorm_bias
+                        if getattr(init_model.config, "index_kpool_compress", False):
+                            ape = dict_access_multi(
+                                mgt_tp_0,
+                                get_keys("dsa_index_kpool_compress_ape", i=i),
+                            )
+                            ape = torch.cat(
+                                [ape[:, 64:], ape[:, :64]], dim=-1
+                            ).contiguous()
+                            layer_sd["self_attn.indexer.index_kpool_compress_ape"] = ape
+
+                            gate_keys = get_keys("dsa_index_kpool_compress_gate", i=i)
+                            if not has_keys(mgt_tp_0, gate_keys):
+                                gate_keys = get_keys(
+                                    "dsa_index_kpool_compress_gate_weight", i=i
+                                )
+                            gate = dict_access_multi(mgt_tp_0, gate_keys)
+                            gate = torch.cat([gate[64:], gate[:64]], dim=0).contiguous()
+                            layer_sd["self_attn.indexer.index_kpool_compress_gate"] = (
+                                gate
+                            )
                 else:
                     keys = get_keys("query_key_value", i=i, attr="weight")
                     # if target_tp <= original_tp:

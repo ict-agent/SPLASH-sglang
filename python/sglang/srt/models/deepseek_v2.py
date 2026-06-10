@@ -53,6 +53,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.nsa.kpool.indexer import IndexerKPool
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -1197,7 +1198,10 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
+            indexer_cls = (
+                IndexerKPool if getattr(config, "index_kpool", 1) > 1 else Indexer
+            )
+            indexer_kwargs = dict(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
                 index_head_dim=get_nsa_index_head_dim(config),
@@ -1214,7 +1218,11 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+                skip_rope=skip_rope,
             )
+            if indexer_cls is IndexerKPool:
+                indexer_kwargs["config"] = config
+            self.indexer = indexer_cls(**indexer_kwargs)
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.

@@ -1314,6 +1314,9 @@ class HybridLinearKVPool(KVCache):
         index_head_dim: Optional[int] = None,
         kv_cache_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        max_running_requests: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1343,6 +1346,9 @@ class HybridLinearKVPool(KVCache):
                     start_layer=self.start_layer,
                     index_head_dim=index_head_dim,
                     kv_cache_dim=kv_cache_dim,
+                    index_kpool=index_kpool,
+                    index_kpool_compress=index_kpool_compress,
+                    max_running_requests=max_running_requests,
                 )
             else:
 
@@ -1529,6 +1535,11 @@ class HybridLinearKVPool(KVCache):
         # Forward to the inner pool; NSATokenToKVPool always defines this.
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
+    @property
+    def index_head_dim(self) -> Optional[int]:
+        # Forward to the inner pool; NSATokenToKVPool always defines this.
+        return getattr(self.full_kv_pool, "index_head_dim", None)
+
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1570,6 +1581,13 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
+
+    def get_compress_tail_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.use_nsa, "get_compress_tail_buffers called when use_nsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_compress_tail_buffers(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -1998,6 +2016,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        max_running_requests: Optional[int] = None,
     ):
 
         override_dim = (
@@ -2055,7 +2076,93 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+
+        self._init_kpool_compress_tail_buffers(
+            index_kpool=index_kpool,
+            index_kpool_compress=index_kpool_compress,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+            max_running_requests=max_running_requests,
+        )
+
         self._finalize_allocation_log(size)
+
+    def _init_kpool_compress_tail_buffers(
+        self,
+        index_kpool: int,
+        index_kpool_compress: bool,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        max_running_requests: Optional[int],
+    ) -> None:
+        """Allocate per-layer kpool-compress tail buffers.
+
+        These hold the raw bf16 key / score of the in-progress pool that
+        hasn't been compressed + flushed to the fp8 index cache yet.
+        Conceptually part of the index cache state, so they live on the
+        KV pool rather than on the per-layer Indexer module.
+        """
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self._kpool_use_compress = index_kpool > 1 and index_kpool_compress
+
+        if not self._kpool_use_compress:
+            self._compress_tail_k = None
+            self._compress_tail_score = None
+            return
+
+        assert (
+            max_running_requests is not None
+        ), "NSATokenToKVPool with kpool compress requires max_running_requests"
+        # +1 mirrors req_to_token_pool.size + 1 used by the indexer to
+        # provide an extra slot for invalid / sentinel req indices.
+        req_pool_size = max_running_requests + 1
+        tail_dtype = torch.bfloat16
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self._compress_tail_k: List[torch.Tensor] = [
+                torch.zeros(
+                    req_pool_size,
+                    index_kpool,
+                    index_head_dim,
+                    dtype=tail_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+            self._compress_tail_score: List[torch.Tensor] = [
+                torch.zeros(
+                    req_pool_size,
+                    index_kpool,
+                    index_head_dim,
+                    dtype=tail_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+
+    def get_compress_tail_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (tail_k, tail_score) for a single NSA layer.
+
+        Used by the kpool indexer to feed its compress/scatter kernels;
+        also useful for read-only sanity checks. Pool owns the storage --
+        callers must not free or replace the returned tensors.
+        """
+        assert (
+            self._kpool_use_compress
+        ), "get_compress_tail_buffers called when kpool compress is disabled"
+        idx = layer_id - self.start_layer
+        return (
+            self._compress_tail_k[idx],
+            self._compress_tail_score[idx],
+        )
 
     def _clear_buffers(self):
         super()._clear_buffers()

@@ -94,6 +94,18 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def get_nsa_index_kpool(config: PretrainedConfig) -> int:
+    return getattr(config, "index_kpool", 1)
+
+
+def get_nsa_index_kpool_always_select_tail(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_always_select_tail", False)
+
+
+def get_nsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
+
+
 class ModelConfig:
     def __init__(
         self,
