@@ -739,6 +739,15 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        if (
+            self.server_args.glm_check_total_num_tokens
+            and not self.server_args.allow_auto_truncate
+            and self.max_total_num_tokens < self.model_config.context_len
+        ):
+            raise ValueError(
+                f"Available max_total_num_tokens {self.max_total_num_tokens} less than context_len {self.model_config.context_len}, cannot handle request"
+            )
+
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.pp_size, 1

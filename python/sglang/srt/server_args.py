@@ -838,6 +838,7 @@ class ServerArgs:
     # GLM extended args
     glm_adaptive_max_tokens: bool = False
     glm_check_chat_prompt_length: bool = False
+    glm_check_total_num_tokens: bool = False
     glm_decoding_constraint_module: Optional[str] = None
     glm_ignore_decoding_constraint_exception: bool = False
 
@@ -7120,6 +7121,11 @@ class ServerArgs:
             "--glm-check-chat-prompt-length",
             action="store_true",
             help="Check input prompt tokenized tokens length before inference. If the length exceeded the maximum input length, server will return 413 error.",
+        )
+        parser.add_argument(
+            "--glm-check-total-num-tokens",
+            action="store_true",
+            help="Check max_total_num_tokens length before server launch. If max_total_num_tokens is smaller than context length and auto truncate is not allowed, the server will raise exception to notify user to check available CUDA memory",
         )
         parser.add_argument(
             "--glm-decoding-constraint-module",
