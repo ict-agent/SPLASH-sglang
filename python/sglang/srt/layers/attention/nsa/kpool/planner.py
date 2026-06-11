@@ -304,7 +304,6 @@ def _kpool_plan_to_gpu(
             pool_batch_idx_t,
             pool_pool_id_t,
             pool_size,
-            slots_per_pool_page,
         )
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
@@ -312,7 +311,6 @@ def _kpool_plan_to_gpu(
     pooled_page_table_all = build_pooled_page_table_64(
         metadata.real_page_table,
         pool_size,
-        slots_per_pool_page,
     ).contiguous()
 
     pooled_seq_lens_expanded = torch.div(
