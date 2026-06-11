@@ -328,7 +328,7 @@ RUN \
     pip install build cmake ninja sccache scikit-build-core wheel
 
 ARG MAX_JOBS=32
-ARG RECENT_VTAG=v0.5.10-pip
+ARG RECENT_VTAG=v0.5.10-glm-next
 
 RUN \
     --mount=type=bind,target=sgl-kernel,source=sgl-kernel,readwrite=true \
@@ -344,7 +344,6 @@ RUN \
     --mount=type=tmpfs,target=/tmp \
     <<-EOF
 sccache --start-server
-rm -rf sgl-kernel/build
 pyproject-build --no-isolation --wheel --outdir /dist sgl-kernel \
     -Ccmake.define.DISABLE_FETCH_CONTENT=ON \
     -Cbuild-dir=build
