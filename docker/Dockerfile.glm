@@ -202,6 +202,36 @@ ARG FLASHKDA_CUTLASS_COMMIT=5c149f52a436782210263fb2f19b354443a61c6a
 ADD https://github.com/NVIDIA/cutlass.git#${FLASHKDA_CUTLASS_COMMIT} /
 
 
+FROM scratch AS deepgemm-source
+# gitlab.glm.ai is private — pass creds via build arg, e.g.
+#   --build-arg DEEPGEMM_REPO=https://oauth2:${TOKEN}@gitlab.glm.ai/glm-engine/DeepGEMM.git
+# Submodules (third-party/cutlass, third-party/fmt) are handled separately
+# (see deepgemm-cutlass-source / libfmt-source); BuildKit's git ADD strips
+# .git so submodule init isn't possible in this stage anyway.
+ARG CI_JOB_TOKEN
+ARG DEEPGEMM_REPO=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.glm.ai/glm-engine/DeepGEMM.git
+ARG DEEPGEMM_REF=feature/glm5_next
+ADD ${DEEPGEMM_REPO}#${DEEPGEMM_REF} /
+
+
+FROM scratch AS deepgemm-cutlass-source
+# DeepGEMM pins its own cutlass via third-party/cutlass submodule.
+# Distinct from sgl-kernel's cutlass (57e3cfb4) and FlashKDA's
+# (5c149f52) — they must NOT share. Bump this to match
+# `git -C deepgemm submodule status third-party/cutlass` on the
+# feature/glm5_next branch.
+ARG DEEPGEMM_CUTLASS_COMMIT=f3fde58372d33e9a5650ba7b80fc48b3b49d40c8
+ADD https://github.com/NVIDIA/cutlass.git#${DEEPGEMM_CUTLASS_COMMIT} /
+
+
+FROM scratch AS deepgemm-fmt-source
+# DeepGEMM pins its own fmt via third-party/fmt submodule. Distinct
+# from sgl-kernel's libfmt-source (407c905e) — they must NOT share.
+# Bump this to match `git -C deepgemm submodule status third-party/fmt`.
+ARG DEEPGEMM_FMT_COMMIT=553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
+ADD https://github.com/fmtlib/fmt.git#${DEEPGEMM_FMT_COMMIT} /
+
+
 FROM scratch AS cuda-cudart
 ARG CUDA_VERSION=13.0.88
 ADD https://developer.download.nvidia.cn/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-${CUDA_VERSION}-archive.tar.xz /
@@ -344,6 +374,40 @@ pyproject-build --no-isolation --wheel --outdir /dist flashkda
 EOF
 
 
+FROM pytorch AS deepgemm-builder
+
+RUN \
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    pip install build ninja apache-tvm-ffi==0.1.10
+
+# Build the ``sgl-deep-gemm`` distribution (the one sglang pyproject pins as
+# ``sgl-deep-gemm==0.0.1``), NOT the legacy ``deep_gemm`` distribution. They
+# share the ``deep_gemm/`` import namespace, so installing both side-by-side
+# fights over files. ``build_sgl_deep_gemm.sh`` stages a clean package layout
+# under build/, compiles the tvm-ffi ``_C.so``, and emits ``sgl_deep_gemm-*.whl``.
+# The script's ``git submodule update --init --recursive`` is dropped because
+# Docker's ``ADD git+url`` strips ``.git``; submodules are bind-mounted instead.
+RUN \
+    --mount=type=bind,target=deepgemm,from=deepgemm-source,readwrite=true \
+    --mount=type=bind,target=deepgemm/third-party/cutlass,from=deepgemm-cutlass-source \
+    --mount=type=bind,target=deepgemm/third-party/fmt,from=deepgemm-fmt-source \
+    --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    <<-EOF
+# nvidia-smi is unavailable inside docker build; setup.py's _get_cuda_arch
+# falls back to "9.0", but DeepGEMM's _C.so + cute kernels need 9.0+10.0.
+export TORCH_CUDA_ARCH_LIST="9.0;10.0+PTX"
+export TVM_FFI_CUDA_ARCH_LIST="9.0;10.0+PTX"
+cd deepgemm
+sed -i '/git submodule update/d' build_sgl_deep_gemm.sh
+bash build_sgl_deep_gemm.sh
+mkdir -p /dist
+cp dist/sgl_deep_gemm-*.whl /dist/
+EOF
+
+
 FROM pytorch AS sglang-builder
 
 RUN \
@@ -431,3 +495,17 @@ RUN \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
     find /dist -name "*.whl" -exec pip install "sglang @ file://{}" \;
+
+# Install our gitlab sgl-deep-gemm LAST so it overrides the PyPI
+# ``sgl-deep-gemm==0.0.1`` that sglang pulls in transitively (see
+# python/pyproject.toml). Local VERSION=0.1.0 doesn't satisfy the ==0.0.1
+# pin, so ``--force-reinstall`` is required. ``--no-deps`` keeps the
+# already-installed apache-tvm-ffi==0.1.10 (sgl_deep_gemm/pyproject.toml
+# pins ==0.1.9 which would otherwise downgrade and break the _C.so ABI
+# baked into the wheel at build time).
+RUN \
+    --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
+    --mount=type=bind,target=/dist,source=/dist,from=deepgemm-builder \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    --mount=type=tmpfs,target=/tmp \
+    find /dist -name "sgl_deep_gemm-*.whl" -exec pip install --force-reinstall --no-deps "sgl-deep-gemm @ file://{}" \;
