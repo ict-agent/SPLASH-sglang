@@ -3,6 +3,11 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kda_cp_utils import (
+    KDAPrefillContextParallelMetadata,
+    is_kda_prefill_cp_plain_split,
+    kda_cp_owner_of_global_token,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
@@ -13,6 +18,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -91,13 +97,13 @@ class KDAKernelDispatcher:
             )
 
         # KDA verify kernel is only implemented in TritonKDAKernel
-        # (FlashKDA/CuteDSL will raise NotImplementedError). Hard-bind 
+        # (FlashKDA/CuteDSL will raise NotImplementedError). Hard-bind
         # so verify works even when extend_backend is flash_kda.
         self.verify_kernel = triton_kernel
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__},"
-            f"verify={self.verify_kernel.__class__.__name__} "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__}"
         )
 
     @property
@@ -157,7 +163,7 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
-    
+
     def target_verify(
         self,
         A_log: torch.Tensor,
@@ -244,6 +250,415 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+    def _use_kda_prefill_cp(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            is_kda_prefill_cp_plain_split()
+            and forward_batch.kda_cp_metadata is not None
+            and forward_batch.forward_mode.is_context_parallel_extend()
+        )
+
+    def _gather_full_kda_state(
+        self,
+        state: torch.Tensor,
+        cache_indices: torch.Tensor,
+        *,
+        shard_dim: int,
+        expected_dim: int,
+    ) -> torch.Tensor:
+        selected = state[cache_indices].contiguous()
+        if selected.shape[shard_dim] == expected_dim:
+            return selected
+
+        cp_group = get_attention_cp_group()
+        if (
+            cp_group.world_size > 1
+            and selected.shape[shard_dim] * cp_group.world_size == expected_dim
+        ):
+            return cp_group.all_gather(selected, dim=shard_dim)
+
+        raise RuntimeError(
+            "KDA-CP expected Prefix Cache state to be either full-head or "
+            "sharded across the attention CP group, but got "
+            f"shape={tuple(selected.shape)}, shard_dim={shard_dim}, "
+            f"expected_dim={expected_dim}, cp_size={cp_group.world_size}."
+        )
+
+    def _prepare_kda_cp_states(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        metadata: KDAPrefillContextParallelMetadata,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_segments = len(metadata.local_seq_lens_cpu)
+        local_cache_indices = torch.arange(
+            num_segments, dtype=cache_indices.dtype, device=cache_indices.device
+        )
+        has_initial_state = torch.ones(
+            num_segments, dtype=torch.bool, device=mixed_qkv.device
+        )
+
+        full_conv_by_req = self._gather_full_kda_state(
+            conv_states,
+            cache_indices,
+            shard_dim=1,
+            expected_dim=mixed_qkv.shape[-1],
+        )
+        full_ssm_by_req = self._gather_full_kda_state(
+            ssm_states,
+            cache_indices,
+            shard_dim=1,
+            expected_dim=layer.num_q_heads,
+        )
+
+        local_conv_states = mixed_qkv.new_zeros(
+            (num_segments, mixed_qkv.shape[-1], conv_states.shape[-1])
+        )
+        local_ssm_states = ssm_states.new_zeros(
+            (num_segments,) + tuple(full_ssm_by_req.shape[1:])
+        )
+
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        for local_idx, req_idx in enumerate(metadata.local_req_indices_cpu):
+            if (
+                metadata.local_req_extend_offsets_cpu[local_idx] == 0
+                and prefix_lens_cpu[req_idx] > 0
+            ):
+                local_conv_states[local_idx].copy_(full_conv_by_req[req_idx])
+                local_ssm_states[local_idx].copy_(full_ssm_by_req[req_idx])
+
+        recv_idx = self._kda_cp_recv_segment_index(metadata)
+        if recv_idx is not None:
+            cp_group = get_attention_cp_group()
+            prev_rank = kda_cp_owner_of_global_token(
+                metadata.local_segment_global_starts_cpu[recv_idx] - 1,
+                metadata.total_tokens,
+                metadata.cp_size,
+            )
+            torch.distributed.recv(
+                local_conv_states[recv_idx],
+                src=cp_group.ranks[prev_rank],
+                group=cp_group.device_group,
+            )
+            torch.distributed.recv(
+                local_ssm_states[recv_idx],
+                src=cp_group.ranks[prev_rank],
+                group=cp_group.device_group,
+            )
+
+        return (
+            local_conv_states,
+            local_ssm_states,
+            local_cache_indices,
+            has_initial_state,
+        )
+
+    def _kda_cp_recv_segment_index(
+        self, metadata: KDAPrefillContextParallelMetadata
+    ) -> Optional[int]:
+        for local_idx, (seg_start, req_start) in enumerate(
+            zip(
+                metadata.local_segment_global_starts_cpu,
+                metadata.local_req_global_starts_cpu,
+            )
+        ):
+            if seg_start > req_start:
+                return local_idx
+        return None
+
+    def _kda_cp_send_segment_index(
+        self, metadata: KDAPrefillContextParallelMetadata
+    ) -> Optional[int]:
+        for local_idx in range(len(metadata.local_seq_lens_cpu) - 1, -1, -1):
+            if (
+                metadata.local_segment_global_ends_cpu[local_idx]
+                < metadata.local_req_global_ends_cpu[local_idx]
+            ):
+                return local_idx
+        return None
+
+    def _send_kda_cp_boundary_state(
+        self,
+        metadata: KDAPrefillContextParallelMetadata,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+    ) -> None:
+        send_idx = self._kda_cp_send_segment_index(metadata)
+        if send_idx is None:
+            return
+
+        cp_group = get_attention_cp_group()
+        next_rank = kda_cp_owner_of_global_token(
+            metadata.local_segment_global_ends_cpu[send_idx],
+            metadata.total_tokens,
+            metadata.cp_size,
+        )
+        torch.distributed.send(
+            conv_states[send_idx].contiguous(),
+            dst=cp_group.ranks[next_rank],
+            group=cp_group.device_group,
+        )
+        torch.distributed.send(
+            ssm_states[send_idx].contiguous(),
+            dst=cp_group.ranks[next_rank],
+            group=cp_group.device_group,
+        )
+
+    def _track_kda_cp_state_extend(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        metadata: KDAPrefillContextParallelMetadata,
+        runtime_conv_states: torch.Tensor,
+        runtime_ssm_states: torch.Tensor,
+        persistent_conv_states: torch.Tensor,
+        persistent_ssm_states: torch.Tensor,
+    ) -> None:
+        if (
+            forward_batch.mamba_track_mask is None
+            or not forward_batch.mamba_track_mask.any()
+        ):
+            return
+
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        req_starts = [0]
+        for seq_len in forward_batch.extend_seq_lens_cpu[:-1]:
+            req_starts.append(req_starts[-1] + int(seq_len))
+
+        track_mask_cpu = forward_batch.mamba_track_mask.cpu().tolist()
+        track_seqlens_cpu = forward_batch.mamba_track_seqlens.cpu().tolist()
+        track_indices = forward_batch.mamba_track_indices
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+
+        conv_full_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        conv_state_len = persistent_conv_states.shape[-1]
+        ssm_full_shape = (layer.num_q_heads, layer.head_v_dim, layer.head_k_dim)
+
+        for req_idx, should_track in enumerate(track_mask_cpu):
+            if not should_track:
+                continue
+
+            current_chunk_track_len = (
+                int(track_seqlens_cpu[req_idx]) - int(prefix_lens_cpu[req_idx])
+            )
+            if current_chunk_track_len <= 0:
+                continue
+
+            req_start = req_starts[req_idx]
+            req_end = req_start + int(forward_batch.extend_seq_lens_cpu[req_idx])
+            boundary_end = req_start + current_chunk_track_len
+            if boundary_end > req_end:
+                continue
+
+            owner_rank = kda_cp_owner_of_global_token(
+                boundary_end - 1, metadata.total_tokens, metadata.cp_size
+            )
+            _, owner_end = self._plain_split_bounds_for_rank(
+                metadata.total_tokens, owner_rank, metadata.cp_size
+            )
+            owner_segment_end = min(owner_end, req_end)
+
+            # The minimal write-back path handles boundaries whose state is the
+            # final state of one KDA-CP local segment. Branching points inside a
+            # segment still need h-index based extraction, mirroring the
+            # non-CP path's _init_track_ssm_indices logic.
+            if boundary_end != owner_segment_end:
+                continue
+
+            full_conv_state = runtime_conv_states.new_empty(
+                (conv_full_dim, conv_state_len)
+            )
+            full_ssm_state = runtime_ssm_states.new_empty(ssm_full_shape)
+
+            if cp_rank == owner_rank:
+                local_idx = self._find_kda_cp_segment(
+                    metadata, req_idx=req_idx, segment_end=boundary_end
+                )
+                if local_idx is None:
+                    raise RuntimeError(
+                        "KDA-CP state owner could not find its local segment "
+                        f"for req_idx={req_idx}, boundary_end={boundary_end}."
+                    )
+                full_conv_state.copy_(runtime_conv_states[local_idx])
+                full_ssm_state.copy_(runtime_ssm_states[local_idx])
+
+            cp_group.broadcast(full_conv_state, src=owner_rank)
+            cp_group.broadcast(full_ssm_state, src=owner_rank)
+
+            dst = track_indices[req_idx]
+            conv_shard = self._local_state_shard(
+                full_conv_state,
+                local_dim=persistent_conv_states.shape[1],
+                shard_dim=0,
+                cp_rank=cp_rank,
+                cp_size=cp_group.world_size,
+            )
+            ssm_shard = self._local_state_shard(
+                full_ssm_state,
+                local_dim=persistent_ssm_states.shape[1],
+                shard_dim=0,
+                cp_rank=cp_rank,
+                cp_size=cp_group.world_size,
+            )
+            persistent_conv_states[dst].copy_(
+                conv_shard.to(persistent_conv_states.dtype, copy=False)
+            )
+            persistent_ssm_states[dst].copy_(
+                ssm_shard.to(persistent_ssm_states.dtype, copy=False)
+            )
+
+    def _writeback_kda_cp_final_states(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        metadata: KDAPrefillContextParallelMetadata,
+        runtime_conv_states: torch.Tensor,
+        runtime_ssm_states: torch.Tensor,
+        persistent_cache_indices: torch.Tensor,
+        persistent_conv_states: torch.Tensor,
+        persistent_ssm_states: torch.Tensor,
+    ) -> None:
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        req_starts = [0]
+        for seq_len in forward_batch.extend_seq_lens_cpu[:-1]:
+            req_starts.append(req_starts[-1] + int(seq_len))
+
+        conv_full_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        conv_state_len = persistent_conv_states.shape[-1]
+        ssm_full_shape = (layer.num_q_heads, layer.head_v_dim, layer.head_k_dim)
+
+        for req_idx, req_start in enumerate(req_starts):
+            req_end = req_start + int(forward_batch.extend_seq_lens_cpu[req_idx])
+            if req_end <= req_start:
+                continue
+
+            owner_rank = kda_cp_owner_of_global_token(
+                req_end - 1, metadata.total_tokens, metadata.cp_size
+            )
+            full_conv_state = runtime_conv_states.new_empty(
+                (conv_full_dim, conv_state_len)
+            )
+            full_ssm_state = runtime_ssm_states.new_empty(ssm_full_shape)
+
+            if cp_rank == owner_rank:
+                local_idx = self._find_kda_cp_segment(
+                    metadata, req_idx=req_idx, segment_end=req_end
+                )
+                if local_idx is None:
+                    raise RuntimeError(
+                        "KDA-CP final-state owner could not find its local "
+                        f"segment for req_idx={req_idx}, req_end={req_end}."
+                    )
+                full_conv_state.copy_(runtime_conv_states[local_idx])
+                full_ssm_state.copy_(runtime_ssm_states[local_idx])
+
+            cp_group.broadcast(full_conv_state, src=owner_rank)
+            cp_group.broadcast(full_ssm_state, src=owner_rank)
+
+            dst = persistent_cache_indices[req_idx]
+            conv_shard = self._local_state_shard(
+                full_conv_state,
+                local_dim=persistent_conv_states.shape[1],
+                shard_dim=0,
+                cp_rank=cp_rank,
+                cp_size=cp_group.world_size,
+            )
+            ssm_shard = self._local_state_shard(
+                full_ssm_state,
+                local_dim=persistent_ssm_states.shape[1],
+                shard_dim=0,
+                cp_rank=cp_rank,
+                cp_size=cp_group.world_size,
+            )
+            persistent_conv_states[dst].copy_(
+                conv_shard.to(persistent_conv_states.dtype, copy=False)
+            )
+            persistent_ssm_states[dst].copy_(
+                ssm_shard.to(persistent_ssm_states.dtype, copy=False)
+            )
+
+    def _scatter_kda_cp_runtime_states_to_persistent(
+        self,
+        cache_indices: torch.Tensor,
+        runtime_conv_states: torch.Tensor,
+        runtime_ssm_states: torch.Tensor,
+        persistent_conv_states: torch.Tensor,
+        persistent_ssm_states: torch.Tensor,
+    ) -> None:
+        cp_group = get_attention_cp_group()
+        conv_shard = self._local_state_shard(
+            runtime_conv_states,
+            local_dim=persistent_conv_states.shape[1],
+            shard_dim=1,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+        )
+        ssm_shard = self._local_state_shard(
+            runtime_ssm_states,
+            local_dim=persistent_ssm_states.shape[1],
+            shard_dim=1,
+            cp_rank=cp_group.rank_in_group,
+            cp_size=cp_group.world_size,
+        )
+        persistent_conv_states[cache_indices].copy_(
+            conv_shard.to(persistent_conv_states.dtype, copy=False)
+        )
+        persistent_ssm_states[cache_indices].copy_(
+            ssm_shard.to(persistent_ssm_states.dtype, copy=False)
+        )
+
+    @staticmethod
+    def _plain_split_bounds_for_rank(
+        total_tokens: int, cp_rank: int, cp_size: int
+    ) -> tuple[int, int]:
+        base = total_tokens // cp_size
+        rem = total_tokens % cp_size
+        start = cp_rank * base + min(cp_rank, rem)
+        end = start + base + (1 if cp_rank < rem else 0)
+        return start, end
+
+    @staticmethod
+    def _find_kda_cp_segment(
+        metadata: KDAPrefillContextParallelMetadata,
+        *,
+        req_idx: int,
+        segment_end: int,
+    ) -> Optional[int]:
+        for local_idx, (local_req_idx, local_segment_end) in enumerate(
+            zip(
+                metadata.local_req_indices_cpu,
+                metadata.local_segment_global_ends_cpu,
+            )
+        ):
+            if local_req_idx == req_idx and local_segment_end == segment_end:
+                return local_idx
+        return None
+
+    @staticmethod
+    def _local_state_shard(
+        full_state: torch.Tensor,
+        *,
+        local_dim: int,
+        shard_dim: int,
+        cp_rank: int,
+        cp_size: int,
+    ) -> torch.Tensor:
+        if full_state.shape[shard_dim] == local_dim:
+            return full_state
+        if full_state.shape[shard_dim] != local_dim * cp_size:
+            raise RuntimeError(
+                "KDA-CP state shard shape mismatch: "
+                f"full_shape={tuple(full_state.shape)}, local_dim={local_dim}, "
+                f"shard_dim={shard_dim}, cp_size={cp_size}."
+            )
+        start = cp_rank * local_dim
+        return full_state.narrow(shard_dim, start, local_dim).contiguous()
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -322,15 +737,27 @@ class KDAAttnBackend(MambaAttnBackendBase):
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
         query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
-        retrieve_next_token = forward_metadata.retrieve_next_token
-        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
-        retrieve_parent_token = forward_metadata.retrieve_parent_token
+        seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        persistent_cache_indices = forward_metadata.mamba_cache_indices
+        cache_indices = persistent_cache_indices
+
+        metadata = None
+        kda_cp_active = False
+        kda_cp_replicated_state = False
+        kda_cp_full_state_fallback = False
+        if not is_target_verify:
+            kda_cp_active = self._use_kda_prefill_cp(forward_batch)
+            kda_cp_replicated_state = is_kda_prefill_cp_plain_split()
+        if kda_cp_active:
+            metadata = forward_batch.kda_cp_metadata
+            query_start_loc = metadata.local_query_start_loc
+            seq_lens_cpu = metadata.local_seq_lens_cpu
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = mamba_cache_params.conv[0]
-
-        ssm_states = mamba_cache_params.temporal
+        persistent_conv_states = mamba_cache_params.conv[0]
+        persistent_ssm_states = mamba_cache_params.temporal
+        conv_states = persistent_conv_states
+        ssm_states = persistent_ssm_states
 
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
         if is_target_verify:
@@ -351,15 +778,58 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=mamba_cache_params.intermediate_conv_window[0],
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+                retrieve_next_token=forward_metadata.retrieve_next_token,
+                retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
+                retrieve_parent_token=forward_metadata.retrieve_parent_token,
             ).transpose(1, 2).reshape(seq_len, -1)
             q, k, v = mixed_qkv.split(splits, dim=-1)
         else:
-            has_initial_state = forward_batch.extend_prefix_lens > 0
+            if kda_cp_active:
+                assert metadata is not None
+                (
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    has_initial_state,
+                ) = self._prepare_kda_cp_states(
+                    layer,
+                    forward_batch,
+                    metadata,
+                    mixed_qkv,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                )
+            elif kda_cp_replicated_state:
+                kda_cp_full_state_fallback = True
+                local_cache_indices = torch.arange(
+                    cache_indices.shape[0],
+                    dtype=cache_indices.dtype,
+                    device=cache_indices.device,
+                )
+                conv_states = self._gather_full_kda_state(
+                    persistent_conv_states,
+                    cache_indices,
+                    shard_dim=1,
+                    expected_dim=mixed_qkv.shape[-1],
+                )
+                ssm_states = self._gather_full_kda_state(
+                    persistent_ssm_states,
+                    cache_indices,
+                    shard_dim=1,
+                    expected_dim=layer.num_q_heads,
+                )
+                cache_indices = local_cache_indices
+                has_initial_state = forward_batch.extend_prefix_lens > 0
+            else:
+                has_initial_state = forward_batch.extend_prefix_lens > 0
+
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if forward_metadata.has_mamba_track_mask:
+            if (
+                forward_metadata.has_mamba_track_mask
+                and not kda_cp_active
+                and not kda_cp_full_state_fallback
+            ):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
@@ -386,7 +856,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 has_initial_state=has_initial_state,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
             ).transpose(0, 1)
             k = causal_conv1d_fn(
                 k,
@@ -397,7 +867,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 has_initial_state=has_initial_state,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
             ).transpose(0, 1)
             v = causal_conv1d_fn(
                 v,
@@ -408,7 +878,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 has_initial_state=has_initial_state,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
             ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -430,7 +900,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
                 intermediate_state_indices=intermediate_state_indices,
                 cache_steps=draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
+                retrieve_parent_token=forward_metadata.retrieve_parent_token,
                 beta_scale=getattr(layer, "beta_scale", 1.0),
                 safe_gate=getattr(layer, "safe_gate", False),
                 safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
@@ -465,11 +935,41 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
                 safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
             )
 
-            if h is not None:
+            if kda_cp_active:
+                assert metadata is not None
+                self._send_kda_cp_boundary_state(metadata, conv_states, ssm_states)
+                self._writeback_kda_cp_final_states(
+                    layer,
+                    forward_batch,
+                    metadata,
+                    conv_states,
+                    ssm_states,
+                    persistent_cache_indices,
+                    persistent_conv_states,
+                    persistent_ssm_states,
+                )
+                self._track_kda_cp_state_extend(
+                    layer,
+                    forward_batch,
+                    metadata,
+                    conv_states,
+                    ssm_states,
+                    persistent_conv_states,
+                    persistent_ssm_states,
+                )
+            elif kda_cp_full_state_fallback:
+                self._scatter_kda_cp_runtime_states_to_persistent(
+                    persistent_cache_indices,
+                    conv_states,
+                    ssm_states,
+                    persistent_conv_states,
+                    persistent_ssm_states,
+                )
+            elif h is not None:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )

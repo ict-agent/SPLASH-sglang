@@ -44,6 +44,9 @@ from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
+from sglang.srt.layers.attention.linear.kda_cp_utils import (
+    KDAPrefillContextParallelMetadata,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
@@ -425,6 +428,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+    # Plain-split token metadata for GLM5-Next KDA prefill CP.
+    kda_cp_metadata: Optional[KDAPrefillContextParallelMetadata] = None
 
     # Scratch buffer for NSA/DSA topk_indices emitted by draft-extend/capture
     # paths. Cross-step MTP draft reuse carries the tensor on spec_info.

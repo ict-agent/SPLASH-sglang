@@ -35,6 +35,10 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attention.linear.kda_cp_utils import (
+    is_kda_prefill_cp_enabled,
+    prepare_kda_prefill_cp_metadata,
+)
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -166,7 +170,17 @@ class Glm5NextLinearAttention(nn.Module):
         # AllToAll(head→token) around the qkv GEMM (see
         # Glm5NextLinearAttention.forward).
         self.use_kda_qkvo_proj_tp_shard = is_glm_kda_qkvo_proj_tp_shard_enabled()
-        if is_nsa_enable_prefill_cp():
+        self.kda_prefill_cp_enabled = is_kda_prefill_cp_enabled()
+        if self.kda_prefill_cp_enabled:
+            # KDA-CP uses token/context parallelism for prefill and replicates
+            # KDA attention weights on every CP rank. This intentionally avoids
+            # current-token activation communication for q/k/v/gate/beta/output.
+            def _head_shard_rank_getter():
+                return 0
+
+            head_shard_size = 1
+            head_shard_rank = 0
+        elif is_nsa_enable_prefill_cp():
             head_shard_size = get_attention_cp_size()
             head_shard_rank = get_attention_cp_rank()
             _head_shard_rank_getter = get_attention_cp_rank
@@ -421,7 +435,8 @@ class Glm5NextLinearAttention(nn.Module):
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         cp_prefill = nsa_use_prefill_cp(forward_batch)
-        if cp_prefill and self._cp_fuse_symm_mem:
+        kda_cp_active = cp_prefill and self.kda_prefill_cp_enabled
+        if cp_prefill and self._cp_fuse_symm_mem and not kda_cp_active:
             from torch.distributed._symmetric_memory import (
                 _fused_all_gather_matmul,
             )
@@ -442,7 +457,7 @@ class Glm5NextLinearAttention(nn.Module):
                 return_A=False,
             )
         else:
-            if cp_prefill:
+            if cp_prefill and not kda_cp_active:
                 hidden_states = cp_plain_all_gather(
                     hidden_states, get_attention_cp_size()
                 )
@@ -459,7 +474,8 @@ class Glm5NextLinearAttention(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         cp_prefill = nsa_use_prefill_cp(forward_batch)
-        if cp_prefill and self._cp_fuse_symm_mem:
+        kda_cp_active = cp_prefill and self.kda_prefill_cp_enabled
+        if cp_prefill and self._cp_fuse_symm_mem and not kda_cp_active:
             from torch.distributed._symmetric_memory import (
                 _fused_all_gather_matmul,
             )
@@ -472,7 +488,7 @@ class Glm5NextLinearAttention(nn.Module):
                 return_A=False,
             )
         else:
-            if cp_prefill:
+            if cp_prefill and not kda_cp_active:
                 hidden_states = cp_plain_all_gather(
                     hidden_states, get_attention_cp_size()
                 )
@@ -597,7 +613,11 @@ class Glm5NextLinearAttention(nn.Module):
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         cp_prefill = nsa_use_prefill_cp(forward_batch)
-        if cp_prefill and self._cp_fuse_symm_mem:
+        if (
+            cp_prefill
+            and self._cp_fuse_symm_mem
+            and not self.kda_prefill_cp_enabled
+        ):
             from torch.distributed._symmetric_memory import (
                 _fused_matmul_reduce_scatter,
             )
@@ -629,9 +649,13 @@ class Glm5NextLinearAttention(nn.Module):
             return kda_qkvo_tp_reduce_scatter_hidden_sym(core_attn_global_shard)
 
         output = self.o_proj(core_attn_out)[0]
-        if cp_prefill:
+        if cp_prefill and self.kda_prefill_cp_enabled:
+            # Replicated KDA attention weights already produce full hidden
+            # output for this rank's local plain token slice.
+            pass
+        elif cp_prefill:
             output = cp_plain_reduce_scatter(output, get_attention_cp_size())
-        elif self.nsa_enable_prefill_cp:
+        elif self.nsa_enable_prefill_cp and not self.kda_prefill_cp_enabled:
             # KDA heads are statically CP-sharded (head_shard_size = cp_size
             # at init), so o_proj is always a per-rank partial sum;
             # attn_tp=1 means TP reduce won't cover it. Under CP-extend the
@@ -1339,6 +1363,51 @@ class Glm5NextForCausalLMBase(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+                if is_kda_prefill_cp_enabled():
+                    forward_batch.kda_cp_metadata = prepare_kda_prefill_cp_metadata(
+                        total_tokens=len(input_ids),
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                        cp_rank=self.cp_rank,
+                        cp_size=self.cp_size,
+                        device=input_ids.device,
+                    )
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     @property
     def start_layer(self):

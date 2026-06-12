@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
     get_kda_qkvo_tp_local_rank,
     get_kda_qkvo_tp_size,
 )
+from sglang.srt.layers.attention.linear.kda_cp_utils import (
+    is_kda_prefill_cp_enabled,
+)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
@@ -1209,8 +1212,14 @@ def _build_kda_attn_sd(ctx, layer_sd):
     logger.info(f"{i} loading linear layer")
     do_fuse_qkvbfg = _envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.get()
 
-    # KDA heads shard by CP under NSA prefill CP, otherwise by attn TP.
-    if is_nsa_enable_prefill_cp():
+    # Mirror Glm5NextLinearAttention's head-shard choice. Under KDA-CP,
+    # KDA attention weights are replicated on every CP rank to avoid
+    # current-token activation communication. Persistent recurrent states
+    # remain TP-sharded elsewhere; model weights are loaded full here.
+    if is_kda_prefill_cp_enabled():
+        shard_size = 1
+        shard_rank = 0
+    elif is_nsa_enable_prefill_cp():
         shard_size = get_attention_cp_size()
         shard_rank = get_attention_cp_rank()
     else:

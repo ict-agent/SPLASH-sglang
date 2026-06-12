@@ -163,6 +163,8 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
+KDA_PREFILL_CP_SPLIT_CHOICES = ["plain-split"]
+
 PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
@@ -683,6 +685,8 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "round-robin-split"
     # Split NSA GPU KV/indexer cache layers across CP ranks.
     enable_nsa_cache_layer_split: bool = False
+    enable_kda_prefill_context_parallel: bool = False
+    kda_prefill_cp_mode: str = "plain-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -3487,6 +3491,14 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if (
+            self.enable_kda_prefill_context_parallel
+            and self.disaggregation_mode != "prefill"
+        ):
+            raise ValueError(
+                "--enable-kda-prefill-context-parallel currently supports only "
+                "P-side prefill. Set --disaggregation-mode prefill."
+            )
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
@@ -5944,6 +5956,18 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_nsa_cache_layer_split,
             help="Enable NSA GPU KV/indexer cache layer split across CP ranks.",
+        )
+        parser.add_argument(
+            "--enable-kda-prefill-context-parallel",
+            action="store_true",
+            help="Enable KDA plain-split context parallelism for GLM5-Next prefill.",
+        )
+        parser.add_argument(
+            "--kda-prefill-cp-mode",
+            type=str,
+            default=ServerArgs.kda_prefill_cp_mode,
+            choices=KDA_PREFILL_CP_SPLIT_CHOICES,
+            help="Token splitting mode for KDA prefill context parallelism. Optional values: 'plain-split' (default).",
         )
         parser.add_argument(
             "--enable-prefill-context-parallel",
