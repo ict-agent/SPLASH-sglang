@@ -1392,6 +1392,9 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1460,6 +1463,35 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _has_retract_sensitive_recurrent_state(self) -> bool:
+        req_to_token_pool = self.tree_cache.req_to_token_pool
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+
+        return getattr(req_to_token_pool, "mamba_pool", None) is not None or getattr(
+            token_to_kv_pool, "kpool_use_compress", False
+        )
+
+    def _drain_pending_overlap_result_for_retract(self) -> bool:
+        """Before retracting under overlap, flush the in-flight decode result so
+        the request's output_ids/seqlen catch up to live per-request recurrent
+        state that the forward already advanced (by one decode step, or the
+        step's accepted tokens under spec). Otherwise offload_kv_cache would
+        snapshot recurrent state ahead of the KV it saves (``[:seqlen-1]``).
+        Clears last_batch so the loop's later pop does not double-process.
+        Returns True iff a result was consumed (caller re-checks the batch and
+        mem pressure).
+        """
+        if not self.enable_overlap or self.last_batch is None:
+            return False
+
+        if not self._has_retract_sensitive_recurrent_state():
+            return False
+
+        tmp_batch, tmp_result = self.result_queue.popleft()
+        self.process_batch_result(tmp_batch, tmp_result)
+        self.last_batch = None
+        return True
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -2613,10 +2645,32 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        # Check if decode out of memory. test_retract is constant within this
+        # call; only kv_full can change after a drain frees memory.
+        test_retract_flag = (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
-        ):
+        )
+        kv_full_retract_flag = not batch.check_decode_mem()
+
+        # Under overlap, the in-flight decode forward has already advanced the
+        # live mamba state, while this request's output_ids/seqlen still reflect
+        # the pre-result state (one decode step behind; under spec, the step's
+        # accepted tokens). Flush that result before retracting so offload sees
+        # a mamba state aligned with the KV it saves; the freed memory may also
+        # remove the need to retract. The drain may finish reqs, so re-filter
+        # and re-check.
+        if (
+            kv_full_retract_flag or test_retract_flag
+        ) and self._drain_pending_overlap_result_for_retract():
+            batch.filter_batch(v1_spec_info_filtered=True)
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            if self.enable_hierarchical_cache:
+                self.tree_cache.flush_write_through_acks()
+            kv_full_retract_flag = not batch.check_decode_mem()
+
+        if kv_full_retract_flag or test_retract_flag:
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)

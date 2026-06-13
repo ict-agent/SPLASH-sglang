@@ -484,8 +484,7 @@ class CommonKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
-        extra_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[List[int]]] = None,
     ):
         pass
 
@@ -687,8 +686,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
-        extra_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[List[int]]] = None,
     ):
         raise NotImplementedError
 

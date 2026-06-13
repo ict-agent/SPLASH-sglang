@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import enum
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -12,6 +14,13 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
+class StateType(str, enum.Enum):
+    MAMBA = "mamba"
+    SWA = "swa"
+    NSA = "nsa"
+    NSA_TAIL = "nsa_tail"  # NSA kpool compress-tail: one per-request slot index.
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -20,16 +29,24 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
-    state_data_ptrs: List[int]
-    state_data_lens: List[int]
-    state_item_lens: List[int]
-    state_type: str  # "none", "mamba", "swa"
-    # for mamba state different tp slice transfer
-    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
-    state_dim_components_per_tensor: List[List[int]]
-    extra_data_ptrs: List[int]
-    extra_data_lens: List[int]
-    extra_item_lens: List[int]
+    # Side state is a list of components; entry ``i`` is one ordered group of
+    # buffers (a "component") whose addressing is selected by ``state_types[i]``.
+    # A request's per-component indices ride the wire as a parallel list-of-lists
+    # so the two nodes never need to agree on a flat layout. Example layout for
+    # an MTP model whose target and draft are both NSA+kpool:
+    #
+    #     state_types = [MAMBA, NSA, NSA_TAIL, NSA, NSA_TAIL]
+    #                     mamba  tgt  tgt_tail  drf  drf_tail
+    state_types: List[StateType]
+    state_data_ptrs: List[List[int]]
+    state_data_lens: List[List[int]]
+    state_item_lens: List[List[int]]
+    # Per-component, per-tensor TP slice dim, used when prefill/decode attn_tp
+    # sizes differ (mamba head-shard transfer only).
+    state_dim_per_tensor: List[List[int]]
+    # Per-component, per-tensor packed sub-component sizes for the mamba slice
+    # path (e.g. fused [Q|K|V]). Local-only: never sent on the wire.
+    state_dim_components_per_tensor: List[List[List[int]]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -92,8 +109,7 @@ class BaseKVSender(ABC):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
-        extra_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[List[int]]] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -140,8 +156,7 @@ class BaseKVReceiver(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
-        extra_indices: Optional[List[int]] = None,
+        state_indices: Optional[List[List[int]]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

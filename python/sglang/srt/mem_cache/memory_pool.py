@@ -797,10 +797,12 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -997,7 +999,7 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1015,7 +1017,9 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1414,15 +1418,57 @@ class HybridLinearKVPool(KVCache):
         mamba_data_ptrs, mamba_data_lens, mamba_item_lens = (
             self.mamba_pool.get_contiguous_buf_infos()
         )
+
+        if self.use_nsa:
+            nsa_page_ptrs, nsa_page_lens, nsa_page_item_lens = (
+                self.full_kv_pool.get_state_buf_infos()
+            )
+            mamba_data_ptrs.extend(nsa_page_ptrs)
+            mamba_data_lens.extend(nsa_page_lens)
+            mamba_item_lens.extend(nsa_page_item_lens)
+
+            if self.full_kv_pool.kpool_use_compress:
+                tail_ptrs, tail_lens, tail_item_lens = (
+                    self.full_kv_pool.get_compress_tail_buf_infos()
+                )
+                mamba_data_ptrs.extend(tail_ptrs)
+                mamba_data_lens.extend(tail_lens)
+                mamba_item_lens.extend(tail_item_lens)
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
+    def get_mamba_state_count(self) -> int:
+        mamba_data_ptrs, _, _ = self.mamba_pool.get_contiguous_buf_infos()
+        return len(mamba_data_ptrs)
+
+    def get_nsa_page_state_count(self) -> int:
+        if not self.use_nsa:
+            return 0
+        nsa_page_ptrs, _, _ = self.full_kv_pool.get_state_buf_infos()
+        return len(nsa_page_ptrs)
 
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
-        return self.mamba_pool.get_state_dim_per_tensor()
+        dims = list(self.mamba_pool.get_state_dim_per_tensor())
+        if self.use_nsa:
+            nsa_page_ptrs, _, _ = self.full_kv_pool.get_state_buf_infos()
+            dims.extend([0] * len(nsa_page_ptrs))
+
+            if self.full_kv_pool.kpool_use_compress:
+                tail_ptrs, _, _ = self.full_kv_pool.get_compress_tail_buf_infos()
+                dims.extend([0] * len(tail_ptrs))
+        return dims
 
     def get_state_dim_components_per_tensor(self):
         """Get the packed sub-component sizes for each mamba state tensor."""
-        return self.mamba_pool.get_state_dim_components_per_tensor()
+        comps = list(self.mamba_pool.get_state_dim_components_per_tensor())
+        if self.use_nsa:
+            nsa_page_ptrs, _, _ = self.full_kv_pool.get_state_buf_infos()
+            comps.extend([[] for _ in nsa_page_ptrs])
+
+            if self.full_kv_pool.kpool_use_compress:
+                tail_ptrs, _, _ = self.full_kv_pool.get_compress_tail_buf_infos()
+                comps.extend([[] for _ in tail_ptrs])
+        return comps
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
@@ -1508,8 +1554,8 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        kv_cpu = self.full_kv_pool.get_cpu_copy(indices, req_pool_index=req_pool_index)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(mamba_indices)
             if mamba_indices is not None
@@ -1517,9 +1563,11 @@ class HybridLinearKVPool(KVCache):
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         kv_cpu, mamba_cpu = cache_cpu
-        self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
+        self.full_kv_pool.load_cpu_copy(kv_cpu, indices, req_pool_index=req_pool_index)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
 
@@ -1532,6 +1580,11 @@ class HybridLinearKVPool(KVCache):
         # (i.e. self.full_kv_pool is NSATokenToKVPool); for non-NSA inner
         # pools this returns False.
         return getattr(self.full_kv_pool, "nsa_kv_cache_store_fp8", False)
+
+    @property
+    def kpool_use_compress(self) -> bool:
+        # Forward to the inner NSA pool; False for non-NSA inner pools.
+        return getattr(self.full_kv_pool, "kpool_use_compress", False)
 
     @property
     def kv_cache_dim(self) -> Optional[int]:
@@ -1843,7 +1896,7 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1858,7 +1911,9 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -2156,6 +2211,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 for _ in range(layer_num)
             ]
 
+    @property
+    def kpool_use_compress(self) -> bool:
+        """True when this pool maintains kpool compress-tail buffers."""
+        return self._kpool_use_compress
+
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2264,7 +2324,27 @@ class NSATokenToKVPool(MLATokenToKVPool):
         ]
         return data_ptrs, data_lens, item_lens
 
-    def get_cpu_copy(self, indices):
+    def get_compress_tail_buf_infos(self):
+        """Buffer infos for the per-request kpool compress-tail buffers.
+
+        Returns (data_ptrs, data_lens, item_lens) covering the ``2 * layer_num``
+        tail tensors -- all ``_compress_tail_k`` layers first, then all
+        ``_compress_tail_score`` layers. Each buffer is indexed by
+        ``req_pool_idx`` (one slot per request), so ``item_lens[i]`` is the byte
+        size of a single request slot.
+
+        Returns empty lists when kpool compress is disabled, since the tail
+        buffers do not exist in that case.
+        """
+        if not self._kpool_use_compress:
+            return [], [], []
+        tail_buffers = self._compress_tail_k + self._compress_tail_score
+        data_ptrs = [buf.data_ptr() for buf in tail_buffers]
+        data_lens = [buf.nbytes for buf in tail_buffers]
+        item_lens = [buf[0].nbytes for buf in tail_buffers]
+        return data_ptrs, data_lens, item_lens
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # First, save the kv_buffer (inherited from MLATokenToKVPool)
         kv_cache_cpu = super().get_cpu_copy(indices)
 
@@ -2285,9 +2365,32 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
 
-        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+        result = {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
+        # kpool compress-tail is a per-request (req_pool_idx-indexed) recurrent buffer.
+        if self._kpool_use_compress and req_pool_index is not None:
+            torch.cuda.synchronize()
+            tail_k_cpu = [
+                self._compress_tail_k[layer_id][req_pool_index].to(
+                    "cpu", non_blocking=True
+                )
+                for layer_id in range(self.layer_num)
+            ]
+            tail_score_cpu = [
+                self._compress_tail_score[layer_id][req_pool_index].to(
+                    "cpu", non_blocking=True
+                )
+                for layer_id in range(self.layer_num)
+            ]
+            torch.cuda.synchronize()
+            result["tail_k"] = tail_k_cpu
+            result["tail_score"] = tail_score_cpu
+
+        return result
+
+    def load_cpu_copy(
+        self, kv_cache_cpu_dict, indices, mamba_indices=None, req_pool_index=None
+    ):
         # Restore the kv_buffer (inherited from MLATokenToKVPool)
         super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
 
@@ -2307,6 +2410,24 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
+
+        # Restore the kpool compress-tail into the (possibly newly allocated) req_pool_idx slot.
+        if (
+            self._kpool_use_compress
+            and req_pool_index is not None
+            and "tail_k" in kv_cache_cpu_dict
+        ):
+            tail_k_cpu = kv_cache_cpu_dict["tail_k"]
+            tail_score_cpu = kv_cache_cpu_dict["tail_score"]
+            torch.cuda.synchronize()
+            for layer_id in range(self.layer_num):
+                self._compress_tail_k[layer_id][req_pool_index] = tail_k_cpu[
+                    layer_id
+                ].to(self._compress_tail_k[layer_id].device, non_blocking=True)
+                self._compress_tail_score[layer_id][req_pool_index] = tail_score_cpu[
+                    layer_id
+                ].to(self._compress_tail_score[layer_id].device, non_blocking=True)
+            torch.cuda.synchronize()
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()

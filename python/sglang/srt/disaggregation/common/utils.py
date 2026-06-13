@@ -1,6 +1,7 @@
 import logging
 import os
 import resource
+import struct
 import threading
 import time
 from collections import OrderedDict, deque
@@ -17,6 +18,39 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
+    if not buffers:
+        return b""
+    n = len(buffers)
+    header = struct.pack(f"<{n+1}I", n, *(len(b) for b in buffers))
+    return header + b"".join(buffers)
+
+
+def unpack_list_of_buffers(buf: bytes) -> List[bytes]:
+    if buf == b"":
+        return []
+    (n,) = struct.unpack("<I", buf[:4])
+    lens = struct.unpack(f"<{n}I", buf[4 : 4 + 4 * n])
+    out = []
+    offset = 4 + 4 * n
+    for length in lens:
+        out.append(buf[offset : offset + length])
+        offset += length
+    return out
+
+
+def pack_int_lists(lists, fmt: str) -> bytes:
+    return pack_list_of_buffers([struct.pack(f"<{len(a)}{fmt}", *a) for a in lists])
+
+
+def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
+    width = struct.calcsize(fmt)
+    return [
+        list(struct.unpack(f"<{len(b)//width}{fmt}", b))
+        for b in unpack_list_of_buffers(buf)
+    ]
 
 
 ZMQ_SOCKET_SEND_TIMEOUT_MS = get_int_env_var(

@@ -629,7 +629,11 @@ class ModelRunnerKVCacheMixin:
                 nsa_pool_kwargs["index_kpool_compress"] = get_nsa_index_kpool_compress(
                     self.model_config.hf_config
                 )
-                nsa_pool_kwargs["max_running_requests"] = max_num_reqs
+                # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
+                # must cover the *full* request-pool capacity, not just max_running_requests.
+                nsa_pool_kwargs["max_running_requests"] = (
+                    self.req_to_token_pool.req_to_token.shape[0]
+                )
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -720,7 +724,11 @@ class ModelRunnerKVCacheMixin:
                     extra_args["index_kpool_compress"] = get_nsa_index_kpool_compress(
                         self.model_config.hf_config
                     )
-                    extra_args["max_running_requests"] = max_num_reqs
+                    # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
+                    # must cover the *full* request-pool capacity, not just max_running_requests.
+                    extra_args["max_running_requests"] = (
+                        self.req_to_token_pool.req_to_token.shape[0]
+                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,

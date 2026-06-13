@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_state_indices,
     get_kv_class,
     is_hybrid_mla_backend,
     is_mla_backend,
@@ -50,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    setup_state_kv_args,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -62,10 +64,8 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     KVCache,
-    NSATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -360,53 +360,9 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
-        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs = state_data_ptrs
-            kv_args.state_data_lens = state_data_lens
-            kv_args.state_item_lens = state_item_lens
-
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.state_type = "swa"
-            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.state_type = "mamba"
-                # Get state dimension info for cross-TP slice transfer
-                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
-                    kv_args.state_dim_per_tensor = (
-                        self.token_to_kv_pool.get_state_dim_per_tensor()
-                    )
-
-                if hasattr(self.token_to_kv_pool.full_kv_pool, "get_state_buf_infos"):
-                    full_state_data_ptrs, full_state_data_lens, full_state_item_lens = (
-                        self.token_to_kv_pool.full_kv_pool.get_state_buf_infos()
-                    )
-                    kv_args.extra_data_ptrs = full_state_data_ptrs
-                    kv_args.extra_data_lens = full_state_data_lens
-                    kv_args.extra_item_lens = full_state_item_lens
-                else:
-                    kv_args.extra_data_ptrs = []
-                    kv_args.extra_data_lens = []
-                    kv_args.extra_item_lens = []
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.state_type = "nsa"
-                if self.draft_token_to_kv_pool is not None and isinstance(self.draft_token_to_kv_pool, NSATokenToKVPool):
-                    draft_state_data_ptrs, draft_state_data_lens, draft_state_item_lens = self.draft_token_to_kv_pool.get_state_buf_infos()
-                    kv_args.state_data_ptrs += draft_state_data_ptrs
-                    kv_args.state_data_lens += draft_state_data_lens
-                    kv_args.state_item_lens += draft_state_item_lens
-            else:
-                kv_args.state_type = "none"
-        else:
-            kv_args.state_data_ptrs = []
-            kv_args.state_data_lens = []
-            kv_args.state_item_lens = []
-            kv_args.state_type = "none"
-
-            kv_args.extra_data_ptrs = []
-            kv_args.extra_data_lens = []
-            kv_args.extra_item_lens = []
+        setup_state_kv_args(
+            kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool
+        )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -794,56 +750,33 @@ class DecodePreallocQueue:
                 kv_indices = kv_indices_full.cpu().numpy()
                 page_size = self.token_to_kv_pool_allocator.page_size
 
-            # Prepare extra pool indices for hybrid models
-            extra_indices = None
+            # Build state_indices in component order (matching
+            # setup_state_kv_args), one index sublist per side-state component.
+            seq_len = len(decode_req.req.origin_input_ids)
+            req_pool_idx = decode_req.req.req_pool_idx
+
+            mamba_index = None
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                # Mamba hybrid model: single mamba state index
-                state_indices = [
+                mamba_index = int(
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-                if isinstance(self.token_to_kv_pool.full_kv_pool, NSATokenToKVPool):
-                    seq_len = len(decode_req.req.origin_input_ids)
-                    kv_indices_full = self.req_to_token_pool.req_to_token[
-                        decode_req.req.req_pool_idx, :seq_len
-                    ]
-                    indexer_pages = kv_to_page_indices(
-                        kv_indices_full.cpu().numpy(), page_size
-                    )
-                    extra_indices = indexer_pages.tolist()
-            elif isinstance(self.token_to_kv_pool, SWAKVPool):
-                # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
-                window_size = self.scheduler.sliding_window_size
-
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-
-                # Translate to SWA pool indices
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
+                        req_pool_idx
+                    ].item()
                 )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                seq_len = len(decode_req.req.origin_input_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                state_indices = kv_indices_full.cpu().numpy()
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                state_indices = kv_to_page_indices(state_indices, device_page_size)
-            else:
-                state_indices = None
+            state_indices = build_state_indices(
+                token_to_kv_pool=self.token_to_kv_pool,
+                draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_idx=req_pool_idx,
+                seq_len=seq_len,
+                page_size=page_size,
+                mamba_index=mamba_index,
+                swa_window_size=self.scheduler.sliding_window_size,
+                swa_translate_loc=getattr(
+                    self.token_to_kv_pool_allocator,
+                    "translate_loc_from_full_to_swa",
+                    None,
+                ),
+            )
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -854,7 +787,6 @@ class DecodePreallocQueue:
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                extra_indices,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1280,6 +1212,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
+
             # polling and allocating kv cache
             self.process_decode_queue()
 
