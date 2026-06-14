@@ -10,6 +10,11 @@ from sglang.srt.layers.attention.fla.op import exp2
 from sglang.srt.layers.attention.fla.utils import autotune_cache_kwargs
 
 
+@triton.jit
+def exp_e(x):
+    return exp2(x * 1.4426950408889634)
+
+
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -118,7 +123,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
         b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
         b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
 
-        b_kgj = b_kj * exp2(b_g - b_gj)
+        b_kgj = b_kj * exp_e(b_g - b_gj)
 
         b_kgj = tl.where(m_k[None, :], b_kgj, 0.0)
         # [BH]
