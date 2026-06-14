@@ -2319,6 +2319,14 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                # All prefill-only reqs have been drained. Sticky scheduling
+                # flags must be cleared, otherwise batch_is_full=True (set
+                # earlier in _get_new_batch_prefill_raw when the adder hit
+                # pp_max_micro_batch_size) plus is_prefill_only=True
+                # deadlock get_next_batch_to_run.
+                self.running_batch.batch_is_full = False
+                self.running_batch.is_prefill_only = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2361,8 +2369,7 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
+        res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
