@@ -445,7 +445,7 @@ class Indexer(MultiPlatformOp):
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        head_dim_with_sf = self.head_dim + 4  # +4 bytes for fp32 scale factor
         if _is_hip:
             kv_cache_fp8 = kv_cache_fp8.view(
                 -1, block_kv, num_heads_kv, head_dim_with_sf

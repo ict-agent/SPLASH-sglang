@@ -5,21 +5,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import NsaKpoolConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
+    INDEX_HEAD_DIM,
     all_gather_and_scatter_pool_slots,
     gather_index_k_scale_prefix_into,
     kpool_assemble_softmax_rotate_write_cache,
     kpool_decode_update_and_maybe_write_cache,
     scatter_kpool_tail_updates,
     topk_from_pooled_history_logits,
-)
-from sglang.srt.layers.attention.nsa.kpool.page_table import (
-    PAGE_SIZE,
-    build_pooled_page_table_64,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
@@ -30,8 +29,10 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    is_nsa_prefill_cp_in_seq_split,
     nsa_use_prefill_cp,
 )
+from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -96,28 +97,19 @@ class IndexerKPool(Indexer):
         )
 
         assert config is not None, "IndexerKPool requires the model config"
-        self.index_kpool = getattr(config, "index_kpool", 1)
-        self.index_kpool_always_select_tail = getattr(
-            config, "index_kpool_always_select_tail", False
-        )
-        self.index_kpool_compress = getattr(config, "index_kpool_compress", False)
-
+        self.nsa_kpool = NsaKpoolConfig.from_hf_config(config)
+        self.nsa_kpool.assert_indexer_compatible(self.index_topk)
+        # block_kv = page_size // pool_size = slots_per_page; on SM90 DeepGEMM
+        # accepts {4,8,16,32,64} so any pool_size dividing 64 works. SGLang's
+        # KV-cache page_size is fixed at 64 (FlashMLA decode requirement), so
+        # the divisibility check below is what actually gates pool_size.
         assert (
-            self.index_kpool > 1
-            and self.index_kpool_compress
-            and self.index_kpool_always_select_tail
-        ), (
-            "IndexerKPool requires index_kpool > 1, index_kpool_compress=True, "
-            "and index_kpool_always_select_tail=True."
-        )
-
-        assert self.index_topk % self.index_kpool == 0, (
-            f"index_topk ({self.index_topk}) must be divisible by "
-            f"index_kpool ({self.index_kpool})"
-        )
-        assert (
-            64 % self.index_kpool == 0
-        ), f"index_kpool ({self.index_kpool}) must divide page_size (64)"
+            64 % self.nsa_kpool.pool_size == 0
+        ), f"pool_size ({self.nsa_kpool.pool_size}) must divide DeepGEMM page_size (64)"
+        # Hot path reads `self.index_kpool` directly (compute_pooled_*,
+        # block_kv math, pool-seqlens, etc); keep the alias rather than
+        # touching every call site for now.
+        self.index_kpool = self.nsa_kpool.pool_size
 
         # Kpool-specific learned params: absolute positional embedding inside
         # each pool, and the gate projection for the per-token slot score.
@@ -200,6 +192,10 @@ class IndexerKPool(Indexer):
             offset += size
         return out
 
+    def _compute_gate_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Project ``x`` through the kpool compress-gate."""
+        return F.linear(x, self.index_kpool_compress_gate)
+
     def _compute_gate_score_if_missing(
         self, x, gate_score: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -210,7 +206,27 @@ class IndexerKPool(Indexer):
         """
         if gate_score is not None:
             return gate_score
-        return F.linear(x, self.index_kpool_compress_gate)
+        return self._compute_gate_score(x)
+
+    def _project_q(self, q_lora: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        q_rope, _ = torch.split(
+            query,
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+            dim=-1,
+        )
+        return query, q_rope
+
+    def _project_k(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        k_rope, _ = torch.split(
+            key,
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+            dim=-1,
+        )
+        return key, k_rope
 
     def _get_q_k_bf16(
         self,
@@ -234,8 +250,6 @@ class IndexerKPool(Indexer):
             Rotary embedding is applied locally before all-gather; this is
             safe because rope is a per-token op that commutes with gather.
         """
-        from einops import rearrange
-
         use_cp = (
             nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -259,42 +273,18 @@ class IndexerKPool(Indexer):
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.half_device_sm_count
             ):
-                query, _ = self.wq_b(q_lora)
-                query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-                q_rope, _ = torch.split(
-                    query,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
+                query, q_rope = self._project_q(q_lora)
             with torch.cuda.stream(self.alt_stream):
-                key, _ = self.wk(x)
-                key = self.k_norm(key)
-                k_rope, _ = torch.split(
-                    key,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )
+                key, k_rope = self._project_k(x)
 
             if precompute_compress_gate:
                 with torch.cuda.stream(self.compress_gate_stream):
-                    gate_score = F.linear(x, self.index_kpool_compress_gate)
+                    gate_score = self._compute_gate_score(x)
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            query, _ = self.wq_b(q_lora)
-            query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            q_rope, _ = torch.split(
-                query,
-                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                dim=-1,
-            )
-            key, _ = self.wk(x)
-            key = self.k_norm(key)
-            k_rope, _ = torch.split(
-                key,
-                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                dim=-1,
-            )
+            query, q_rope = self._project_q(q_lora)
+            key, k_rope = self._project_k(x)
 
         if not self.skip_rope and self.rope_head_dim > 0:
             # rotary_emb is in-place on the q_rope / k_rope views; no
@@ -304,11 +294,10 @@ class IndexerKPool(Indexer):
         query = rotate_activation(query)
 
         if use_cp:
-            # All-gather K and gate_score in one combined collective
-            # (they share N and dtype=bf16). Rerange handles both
-            # in-seq-split (zigzag) and round-robin layouts.
-            if gate_score is None:
-                gate_score = F.linear(x, self.index_kpool_compress_gate)
+            # Fused all-gather of K + gate_score (same N, both bf16). See
+            # ``_cp_gather_concat`` for layout. gate_score is None here:
+            # precompute_compress_gate is decode-only, CP is prefill-only.
+            gate_score = self._compute_gate_score(x)
             key, gate_score = self._cp_gather_concat(
                 [key, gate_score], self.cp_size, forward_batch
             )
@@ -323,14 +312,7 @@ class IndexerKPool(Indexer):
     ):
         """Override: kpool keeps key un-rotated; rotation is fused into the
         compress kernel."""
-        key, _ = self.wk(x)
-        key = self.k_norm(key)
-        k_rope, _ = torch.split(
-            key,
-            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-            dim=-1,
-        )
-
+        key, k_rope = self._project_k(x)
         if not self.skip_rope and self.rope_head_dim > 0:
             # rotary_emb is in-place on the k_rope view; no slice-assign
             # back into key is needed.
@@ -419,13 +401,11 @@ class IndexerKPool(Indexer):
 
         # --- assemble + compress (owned pools under CP, all otherwise) ---
         if not writes.is_empty:
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             # Fused gather + softmax + Hadamard + fp8 quant + cache write.
-            # Skips the intermediate (n_pools, pool_size, head_dim) slot
-            # tensors that the two-step (assemble_kpool_slots +
-            # kpool_softmax_rotate_write_cache) variant materializes.
             kpool_assemble_softmax_rotate_write_cache(
                 pool=pool,
-                buf=pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                buf=buf,
                 chunk_k=key,
                 chunk_score=gate_score,
                 tail_k=tail_k_buf,
@@ -436,17 +416,19 @@ class IndexerKPool(Indexer):
                 ape=self.index_kpool_compress_ape,
                 loc=writes.write_loc,
                 # CP: write only this rank's owned pools.
-                write_mask=(cp.owner_rank == cp.rank) if cp is not None else None,
+                write_mask=cp.local_write_mask if cp is not None else None,
                 round_scale=self.scale_fmt is not None,
             )
 
             # CP: replicate owned-pool writes so every rank's buf matches.
             if cp is not None and write_cache:
                 all_gather_and_scatter_pool_slots(
-                    buf=pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                    buf=buf,
                     local_locs=writes.write_loc,
                     owner_rank=cp.owner_rank,
                     cp_size=cp.size,
+                    cp_rank=cp.rank,
+                    slots_per_page=forward_batch.token_to_kv_pool.slots_per_page,
                 )
 
         # --- scatter tail updates --------------------------------------------
@@ -470,7 +452,17 @@ class IndexerKPool(Indexer):
         page_table: Optional[torch.Tensor] = None,
         topk_offsets: Optional[torch.Tensor] = None,
         row_starts: Optional[torch.Tensor] = None,
+        out_rows: Optional[int] = None,
     ) -> torch.Tensor:
+        """Run pooled-history topk; the fused kernel fills any
+        ``out_rows`` past ``logits.shape[0]`` with -1 in-kernel so the
+        caller doesn't pay a host-side ``torch.full`` + slice copy.
+
+        ``out_rows`` is used when the caller has q padding past the
+        plan's real-token count (mlp-sync TP/CP pad). The padded tail
+        is sentinel-filled so downstream sparse-attn treats those rows
+        as no-op. ``None`` (default) returns one row per logits row.
+        """
         return topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
@@ -480,35 +472,50 @@ class IndexerKPool(Indexer):
             topk_offsets=topk_offsets,
             seq_lens=seq_lens,
             row_starts=row_starts,
+            out_rows=out_rows,
         )
 
     @staticmethod
     def _kpool_fused_topk_mapping(
         metadata: BaseIndexerMetadata,
+        paged_page_table: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Resolve (page_table, topk_offsets) for the fused topk kernel.
+
+        ``paged_page_table`` overrides the PAGED-method page table when the
+        caller has a precomputed full-batch page table (ragged path uses
+        ``plan.ragged_paged_page_table``); otherwise the decode default
+        ``attn_metadata.page_table_1`` is used.
+        """
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
             return None, None
 
-        name = metadata.topk_transform_method.name
-        if name == "PAGED":
-            page_table_1 = metadata.attn_metadata.page_table_1
-            assert page_table_1 is not None
-            return page_table_1, None
-        if name == "RAGGED":
+        method = metadata.topk_transform_method
+        if method == TopkTransformMethod.PAGED:
+            page_table = (
+                paged_page_table
+                if paged_page_table is not None
+                else metadata.attn_metadata.page_table_1
+            )
+            assert page_table is not None
+            return page_table, None
+        if method == TopkTransformMethod.RAGGED:
             return None, metadata.attn_metadata.topk_indices_offset
         return None, None
 
     def _full_topk_for_short_sequence(
         self, metadata: BaseIndexerMetadata, device: torch.device
     ) -> torch.Tensor:
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        dummy_logits = torch.zeros(
-            seq_lens_expanded.shape[0],
+        # Any constant works as input -- when group_lengths <= group_topk
+        # the topk kernel returns arange (i.e. select-all), which is what
+        # the short-sequence path wants.
+        full_select_logits = torch.zeros(
+            metadata.get_seqlens_expanded().shape[0],
             self.index_topk,
             dtype=torch.float32,
             device=device,
         )
-        return metadata.topk_transform(dummy_logits, self.index_topk)
+        return metadata.topk_transform(full_select_logits, self.index_topk)
 
     def _get_kpool_decode_metadata(
         self,
@@ -519,32 +526,19 @@ class IndexerKPool(Indexer):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_metadata = metadata.attn_metadata
         pool_seqlens = attn_metadata.pooled_cache_seqlens_int32
-        pool_block_tables = attn_metadata.pooled_real_page_table
         pool_schedule_metadata = attn_metadata.pooled_paged_mqa_schedule_metadata
 
-        if (
-            pool_seqlens is None
-            or pool_block_tables is None
-            or attn_metadata.pooled_index_kpool != self.index_kpool
-        ):
+        if pool_seqlens is None or attn_metadata.pooled_index_kpool != self.index_kpool:
             pool_seqlens = torch.div(
                 seqlens_32, self.index_kpool, rounding_mode="floor"
             ).to(torch.int32)
-            pool_block_tables = build_pooled_page_table_64(
-                block_tables, self.index_kpool
-            ).contiguous()
             pool_schedule_metadata = None
         else:
-            # Anchor: gather stride = index_kpool (16); dense: stride = 1.
-            slots_per_pool_page = PAGE_SIZE // self.index_kpool
-            gather_stride = max(
-                1, self.index_kpool * slots_per_pool_page // PAGE_SIZE
-            )
             pool_seqlens = pool_seqlens[: seqlens_32.shape[0]]
-            pool_block_tables = pool_block_tables[
-                : block_tables.shape[0],
-                : (block_tables.shape[1] + gather_stride - 1) // gather_stride,
-            ]
+
+        # Dense kpool (pool_size | PAGE_SIZE): the pooled page table is
+        # bitwise identical to the real page table -- consume it directly.
+        pool_block_tables = block_tables
 
         if pool_schedule_metadata is None:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -567,7 +561,6 @@ class IndexerKPool(Indexer):
         modes raise NotImplementedError upstream), so we assume decode.
         """
         page_size = forward_batch.token_to_kv_pool.page_size
-        assert page_size == 64, "only support page size 64"
 
         block_tables = metadata.get_page_table_64()
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -580,9 +573,9 @@ class IndexerKPool(Indexer):
         assert len(kv_cache_fp8.shape) == 2
         # Anchor: index_kpool=1  -> block_kv=64, row=8448 B/page
         # Dense : index_kpool=16 -> block_kv=4,  row=528  B/page
-        block_kv = PAGE_SIZE // self.index_kpool
+        block_kv = page_size // self.index_kpool
         num_heads_kv = 1
-        head_dim_with_sf = 132
+        head_dim_with_sf = self.head_dim + 4  # +4 bytes for fp32 scale factor
         kv_cache_fp8 = kv_cache_fp8.view(
             kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
@@ -639,28 +632,35 @@ class IndexerKPool(Indexer):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        attn_metadata = metadata.attn_metadata
-        plan = attn_metadata.kpool_extend_plan
+        plan = metadata.attn_metadata.kpool_extend_plan
         assert (
             plan is not None
         ), "kpool extend plan is required; check _init_kpool_extend_metadata"
 
         device = q_fp8.device
         total_q = q_fp8.shape[0]
-        seq_lens_expanded = metadata.get_seqlens_expanded()
+        # plan.seq_lens_expanded / pool_lens / ks/ke are sized to match
+        # ``q_fp8`` (rank-local under CP round-robin-split, full-seq
+        # otherwise) -- topk consumes the rank-local layout directly,
+        # matching the community Indexer path.
+        seq_lens_expanded = plan.seq_lens_expanded
         pool_lens = plan.pooled_seq_lens_expanded
         ks_per_q = plan.ragged_q_ks
-        ke_per_q = ks_per_q + pool_lens
+        ke_per_q = plan.ragged_q_ke
         total_k_rows = plan.ragged_total_k_rows
 
-        # --- single fused gather of every batch's compressed K --------
-        # Page-aligned per-batch starts mean the kernel's
-        # ``page_indices[token_id // PAGE_SIZE]`` math is correct with a
-        # flat concatenated page table.
+        # The plan sizes ks/ke/seq_lens_expanded against real-token
+        # count; q_fp8 may be longer (mlp-sync pad and/or CP gather
+        # pad). fp8_mqa_logits requires q.size(0) == ks.size(0), so
+        # slice in the logits branch; the topk kernel re-pads to
+        # total_q with -1 via ``out_rows`` below.
+        n_real = seq_lens_expanded.shape[0]
+        assert (
+            n_real <= total_q
+        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
+
         if total_k_rows > 0:
-            # Reuse the per-forward workspace allocated by the planner;
-            # all NSA layers share the same (total_k_rows, head_dim)
-            # shape, so this saves ~2*64 allocations per forward.
+            # Layer-shared workspace allocated by the planner.
             k_u8 = plan.ragged_k_u8
             k_scale = plan.ragged_k_scale
             assert k_u8 is not None and k_scale is not None
@@ -676,37 +676,25 @@ class IndexerKPool(Indexer):
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
 
-            # --- single fp8_mqa_logits over the whole batch ----------
-            # Per-q ks/ke index into the flat K buffer. Rows with
-            # ks==ke (pool_seq_len==0) get no writes; cleaned to zero
-            # by ``clean_logits=True`` below.
+            # Rows with ks==ke (pool_seq_len==0) get no writes; cleaned
+            # to zero by ``clean_logits=True``.
             logits = deep_gemm.fp8_mqa_logits(
-                q_fp8.contiguous(),
+                q_fp8[:n_real].contiguous(),
                 (k_fp8.contiguous(), k_scale.contiguous()),
-                weights.contiguous(),
+                weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
                 clean_logits=True,
             )
         else:
-            # No batch has any pool history yet. Build a zero-width
-            # logits and let topk fall through to the tail-only path.
-            logits = torch.empty((total_q, 0), dtype=torch.float32, device=device)
+            # No batch has any pool history yet -- topk falls through
+            # to the tail-only path on a zero-width logits.
+            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
         # --- single fused topk over the whole batch -----------------
-        topk_method_name = metadata.topk_transform_method.name
-        topk_offsets = attn_metadata.topk_indices_offset
-        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
-
-        page_table_all = None
-        topk_offsets_all = None
-        if fuse_topk and topk_method_name == "PAGED":
-            page_table_all = plan.ragged_paged_page_table
-            assert (
-                page_table_all is not None
-            ), "kpool ragged topk under PAGED requires plan.ragged_paged_page_table"
-        elif fuse_topk and topk_method_name == "RAGGED" and topk_offsets is not None:
-            topk_offsets_all = topk_offsets
+        page_table_all, topk_offsets_all = self._kpool_fused_topk_mapping(
+            metadata, paged_page_table=plan.ragged_paged_page_table
+        )
 
         return self._topk_from_kpool_logits(
             logits,
@@ -715,6 +703,136 @@ class IndexerKPool(Indexer):
             page_table=page_table_all,
             topk_offsets=topk_offsets_all,
             row_starts=ks_per_q,
+            out_rows=total_q,
+        )
+
+    def _get_topk_ragged_with_cp(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        kv_len: int,
+        actual_seq_q: int,
+        cp_index: Optional[List[Tuple[int, int, int]]] = None,
+    ) -> torch.Tensor:
+        """Mirror of ``Indexer._get_topk_ragged_with_cp`` for the kpool path.
+
+        Used under ``--nsa-prefill-cp-mode in-seq-split``: the caller
+        splits q_fp8/weights into prev/next halves and invokes this
+        function once per half (each ``actual_seq_q``-long, attending to
+        ``kv_len`` history tokens). Topk is taken in pool-level logits
+        (``ke = pool_kv_len``) but expanded to token indices by
+        ``_topk_from_kpool_logits`` so the per-q result has the same
+        token-level layout as the non-CP path.
+
+        Currently only the single-batch path (``cp_index is None``) is
+        implemented; multi-batch CP has the same TODO as the community
+        ``Indexer`` version (accuracy issues; see nsa_indexer.py).
+        """
+        assert (
+            cp_index is None
+        ), "kpool path does not support multi-batch CP yet (mirrors community TODO)"
+
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        pool = forward_batch.token_to_kv_pool
+        pool_size = self.index_kpool
+        slots_per_page = pool.slots_per_page  # PAGE_SIZE // pool_size in dense mode
+        device = q_fp8.device
+
+        assert forward_batch.seq_lens_cpu is not None
+        assert forward_batch.extend_seq_lens_cpu is not None
+        # Mirror community arithmetic: prefix tokens already in cache, plus
+        # this rank's half-share of the current chunk.
+        kv_len_token = int(
+            forward_batch.seq_lens_cpu[0].item()
+            - forward_batch.extend_seq_lens_cpu[0]
+            + kv_len
+        )
+        # Pool-level history this q half can attend to. Floor division
+        # matches the planner's pooled_seq_lens math.
+        pool_kv_len = kv_len_token // pool_size
+
+        # Per-batch page table (this is a single-batch path; community
+        # code also takes block_tables[0]).
+        block_tables = metadata.get_page_table_64()
+        bt_row = block_tables[0]
+
+        # Token-level tail positions this rank's q rows attend to (right
+        # edge inclusive); reused as seq_lens_expanded below.
+        tail_tokens = torch.arange(
+            kv_len_token - actual_seq_q + 1,
+            kv_len_token + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        if pool_kv_len > 0:
+            # ``gather_index_k_scale_prefix_into`` expects one packed-page
+            # id per page (kernel does `token_id // slots_per_page` to
+            # index into page_indices), not per pool entry. Take the
+            # leading `n_pages` entries of this batch's page-table row.
+            n_pages = (pool_kv_len + slots_per_page - 1) // slots_per_page
+            packed_page_indices = bt_row[:n_pages].to(torch.int32).contiguous()
+            k_u8 = torch.empty(
+                (pool_kv_len, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
+            )
+            k_scale = torch.empty((pool_kv_len,), dtype=torch.float32, device=device)
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            gather_index_k_scale_prefix_into(
+                pool=pool,
+                buf=buf,
+                page_indices=packed_page_indices,
+                seq_len=pool_kv_len,
+                k_out=k_u8,
+                scale_out=k_scale,
+            )
+            k_fp8 = k_u8.view(torch.float8_e4m3fn)
+
+            # Pool-level ks/ke: ks all 0; ke = right-edge pool index
+            # (exclusive), i.e. tail_token // pool_size.
+            ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
+            ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
+                torch.int32
+            )
+
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8.contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
+                weights.contiguous(),
+                ks,
+                ke,
+                clean_logits=True,
+            )
+            pool_lens = ke  # per-q pool-history length
+        else:
+            # No pool history yet; topk degenerates to tail-only.
+            logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
+            pool_lens = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
+
+        seq_lens_expanded = tail_tokens
+
+        # Single-batch CP path. Resolve fuse-topk inputs for this batch:
+        # PAGED -> replicate batch 0's page_table to actual_seq_q rows.
+        # RAGGED -> topk_indices_offset is 0 for batch 0, so leave None
+        # (full-seq metadata copy would shape-mismatch logits.shape[0]).
+        page_table_all: Optional[torch.Tensor] = None
+        if (
+            envs.SGLANG_NSA_FUSE_TOPK.get()
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+        ):
+            page_table_all = bt_row.unsqueeze(0).expand(actual_seq_q, -1)
+
+        return self._topk_from_kpool_logits(
+            logits,
+            pool_lens,
+            seq_lens=seq_lens_expanded,
+            page_table=page_table_all,
+            topk_offsets=None,
+            row_starts=None,  # ks is all-zero in single-batch; kernel default = 0
+            out_rows=actual_seq_q,
         )
 
     def _forward_cuda_skip_logits(
@@ -733,7 +851,7 @@ class IndexerKPool(Indexer):
         key = self._get_k_bf16(x, positions)
         gate_score = None
         if use_cp:
-            gate_score = F.linear(x, self.index_kpool_compress_gate)
+            gate_score = self._compute_gate_score(x)
             key, gate_score = self._cp_gather_concat(
                 [key, gate_score], self.cp_size, forward_batch
             )
@@ -752,72 +870,13 @@ class IndexerKPool(Indexer):
             return None
 
         topk_full = self._full_topk_for_short_sequence(metadata, x.device)
-        if use_cp:
+        # in-seq-split: topk_full spans the full batch; reorder to this rank's
+        # q slice via zigzag. round-robin-split: metadata.seqlens_expanded is
+        # already rank-local upstream (nsa_backend), so topk_full is rank-local
+        # too -- no further split.
+        if use_cp and is_nsa_prefill_cp_in_seq_split():
             return cp_split_and_rebuild_data(forward_batch, topk_full)
         return topk_full
-
-    def _cp_topk_full(
-        self,
-        enable_dual_stream: bool,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
-        """CP topk for the kpool ragged path.
-
-        Under nsa_enable_prefill_cp this rank's q tensors only cover its
-        rank-local q slice, but the kpool topk path indexes into
-        full-sequence metadata (pool counts, page tables) everywhere.
-        The simplest correct fix is to all-gather q_fp8 / weights to the
-        full sequence, run the standard topk over all global q tokens,
-        then slice this rank's local tokens back out of the result.
-        Wastes O(cp_size x) topk compute on each rank but reuses the
-        non-CP indexing logic verbatim.
-
-        Gather is fused: q_fp8 (1 byte/elem) and weights (2 bytes/elem)
-        are dtype-aliased to uint8, concatenated, gathered in ONE NCCL
-        call, then sliced + viewed back. The scatter-back at the end
-        uses the same zigzag / round-robin layout the model applied to
-        hidden_states at entry.
-        """
-        n_local = q_fp8.shape[0]
-        assert weights.shape[0] == n_local, "q_fp8/weights N mismatch"
-        q_uint8 = q_fp8.contiguous().view(torch.uint8).reshape(n_local, -1)
-        w_uint8 = weights.contiguous().view(torch.uint8).reshape(n_local, -1)
-        q_bytes = q_uint8.shape[1]
-        w_bytes = w_uint8.shape[1]
-
-        # Single NCCL collective for both tensors -- _cp_gather_concat
-        # would also work but we already have a pre-concatenated buffer.
-        (combined_full,) = self._cp_gather_concat(
-            [torch.cat([q_uint8, w_uint8], dim=1)],
-            self.cp_size,
-            forward_batch,
-        )
-        n_full = combined_full.shape[0]
-        q_fp8_full = (
-            combined_full[:, :q_bytes]
-            .contiguous()
-            .view(torch.float8_e4m3fn)
-            .view(n_full, q_fp8.shape[1], q_fp8.shape[2])
-        )
-        weights_full = (
-            combined_full[:, q_bytes : q_bytes + w_bytes]
-            .contiguous()
-            .view(weights.dtype)
-            .view(n_full, *weights.shape[1:])
-        )
-        topk_full = self._get_topk_ragged(
-            enable_dual_stream=enable_dual_stream,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            q_fp8=q_fp8_full,
-            weights=weights_full,
-            metadata=metadata,
-        )
-        return cp_split_and_rebuild_data(forward_batch, topk_full)
 
     def forward_cuda(
         self,
@@ -847,7 +906,7 @@ class IndexerKPool(Indexer):
                 (x.shape[0], self.index_topk),
                 -1,
                 dtype=torch.int,
-                device="cuda",
+                device=x.device,
             )
 
         # Cache mode predicates: forward_mode methods are non-trivial and
@@ -911,14 +970,29 @@ class IndexerKPool(Indexer):
         #   (c) fallback (no alt_stream, CP enabled, or unknown mode):
         #       sequential.
         use_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
-        weights = None
-        if enable_dual_stream and is_decode:
+
+        if is_decode:
+            compress_fn = self._compress_write_decode
+        elif is_extend_prefill:
+            compress_fn = self._compress_write_extend
+        else:
+            raise NotImplementedError(
+                "index_kpool_compress currently supports decode and extend only."
+            )
+
+        overlap_decode = enable_dual_stream and is_decode
+        overlap_prefill = (
+            is_extend_prefill and self.alt_stream is not None and not use_cp
+        )
+        if overlap_decode or overlap_prefill:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if precompute_compress_gate:
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             with torch.cuda.stream(self.alt_stream):
-                self._compress_write_decode(
+                # Resolve gate_score on alt_stream so the fallback
+                # F.linear overlaps with q quant on the current stream.
+                compress_fn(
                     key=key,
                     gate_score=self._compute_gate_score_if_missing(x, gate_score),
                     positions=positions,
@@ -929,79 +1003,65 @@ class IndexerKPool(Indexer):
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             weights = self._get_logits_head_gate(x, q_scale)
             current_stream.wait_stream(self.alt_stream)
-        elif is_extend_prefill and self.alt_stream is not None and not use_cp:
-            # Compress (key + gate_score) runs on alt_stream concurrently
-            # with q quant + gate matmul on the current stream. Both
-            # depend only on prior projections, so the only sync is the
-            # join before topk reads the freshly written cache.
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.alt_stream):
-                self._compress_write_extend(
-                    key=key,
-                    gate_score=self._compute_gate_score_if_missing(x, gate_score),
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    metadata=metadata,
-                    write_cache=True,
-                )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            weights = self._get_logits_head_gate(x, q_scale)
-            current_stream.wait_stream(self.alt_stream)
-            # K-only fast path: caller wants the cache populated but
-            # not the topk indices.
-            if not return_indices:
-                return None
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            gate_score = self._compute_gate_score_if_missing(x, gate_score)
-            if is_decode:
-                self._compress_write_decode(
-                    key=key,
-                    gate_score=gate_score,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    metadata=metadata,
-                )
-            elif is_extend_prefill:
-                self._compress_write_extend(
-                    key=key,
-                    gate_score=gate_score,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    metadata=metadata,
-                    write_cache=True,
-                )
-                if not return_indices:
-                    return None
-            else:
-                raise NotImplementedError(
-                    "index_kpool_compress currently supports decode and extend only."
-                )
-
-        if weights is None:
+            compress_fn(
+                key=key,
+                gate_score=self._compute_gate_score_if_missing(x, gate_score),
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
+            )
             weights = self._get_logits_head_gate(x, q_scale)
 
+        # K-only fast path (extend only): caller wants the cache
+        # populated but not the topk indices.
+        if is_extend_prefill and not return_indices:
+            return None
+
         # Topk dispatch:
-        #   decode    -> paged kernel
-        #   prefill   -> ragged kernel (CP gathers q + slices result back)
+        #   decode               -> paged kernel
+        #   prefill (in-seq-split CP) -> ragged_with_cp on prev/next halves
+        #   prefill (otherwise)  -> ragged kernel; CP round-robin-split runs
+        #                           rank-local because the planner already
+        #                           produces rank-local ks/ke/page_table.
         if is_decode:
             return self._get_topk_paged(
                 forward_batch, layer_id, q_fp8, weights, metadata
             )
 
-        if use_cp:
-            return self._cp_topk_full(
-                enable_dual_stream,
+        if (
+            forward_batch.nsa_cp_metadata is not None
+            and is_nsa_prefill_cp_in_seq_split()
+        ):
+            cp_meta = forward_batch.nsa_cp_metadata
+            q_fp8_prev, q_fp8_next = torch.split(
+                q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
+            )
+            weights_prev, weights_next = torch.split(
+                weights, (weights.shape[0] + 1) // 2, dim=0
+            )
+            topk_prev = self._get_topk_ragged_with_cp(
                 forward_batch,
                 layer_id,
-                q_fp8,
-                weights,
+                q_fp8_prev,
+                weights_prev,
                 metadata,
+                kv_len=cp_meta.kv_len_prev,
+                actual_seq_q=cp_meta.actual_seq_q_prev,
             )
+            topk_next = self._get_topk_ragged_with_cp(
+                forward_batch,
+                layer_id,
+                q_fp8_next,
+                weights_next,
+                metadata,
+                kv_len=cp_meta.kv_len_next,
+                actual_seq_q=cp_meta.actual_seq_q_next,
+            )
+            return torch.cat([topk_prev, topk_next], dim=0)
+
         return self._get_topk_ragged(
             enable_dual_stream=enable_dual_stream,
             forward_batch=forward_batch,

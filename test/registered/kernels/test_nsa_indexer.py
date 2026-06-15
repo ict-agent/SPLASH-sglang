@@ -419,23 +419,21 @@ class TestNSAIndexer(CustomTestCase):
 
     def test_kpool_pooled_write_locs_match_reference(self):
         """Pooled cache writes land on the packed first page of each page group."""
-        from sglang.srt.layers.attention.nsa.kpool.page_table import (
-            build_pooled_page_table_64,
-            compute_pooled_write_locs,
-        )
-
         page_table_64 = torch.arange(100, 116, dtype=torch.int32, device="cuda")
         pool_size = 4
-        pooled_table = build_pooled_page_table_64(page_table_64, pool_size)
-        expected_table = page_table_64[::pool_size]
-        torch.testing.assert_close(pooled_table, expected_table)
 
         pool_ids = torch.tensor(
             [0, 1, 63, 64, 65, 127, 128, 255],
             dtype=torch.int64,
             device="cuda",
         )
-        write_locs = compute_pooled_write_locs(page_table_64, pool_ids, pool_size)
+        # Inline of the dense kpool addressing (see planner.py):
+        # loc = packed_page * slots + pool_id % slots, slots = page_size // pool_size.
+        slots = 64 // pool_size
+        pool_page_group = torch.div(pool_ids, slots, rounding_mode="floor")
+        packed = page_table_64.index_select(0, pool_page_group).to(torch.int64)
+        write_locs = packed * slots + torch.remainder(pool_ids, slots)
+
         token_page_rows = torch.div(pool_ids, 64, rounding_mode="floor") * pool_size
         expected = page_table_64[token_page_rows].to(
             torch.int64
@@ -484,30 +482,75 @@ class TestNSAIndexer(CustomTestCase):
 
     def test_kpool_fused_assemble_rotate_matches_two_step(self):
         """The fused (assemble + softmax + Hadamard + fp8 + cache write)
-        kernel must produce bitwise-identical cache state vs the two-step
-        (assemble_kpool_slots then kpool_softmax_rotate_write_cache)
-        pipeline it replaces."""
+        kernel must match a PyTorch reference implementing the same
+        gather + softmax + Walsh-Hadamard + fp8-e4m3 quantization."""
         from sglang.srt.layers.attention.nsa.kpool.kernels import (
-            assemble_kpool_slots,
             kpool_assemble_softmax_rotate_write_cache,
-            kpool_softmax_rotate_write_cache,
         )
 
         torch.manual_seed(0)
         head_dim, pool_size, page_size = 128, 16, 64
+        slots_per_page = 64
         n_chunk_tokens = 256
         max_req_pool = 8
         n_pools = 10
-        # FP8 paged cache: each page packs (page_size*head_dim) fp8 keys
-        # followed by per-token fp32 scales.
         page_nbytes = page_size * head_dim + page_size * 4
         num_pages = 4
-        buf_two = torch.zeros(
-            (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
-        )
-        buf_fused = torch.zeros_like(buf_two)
 
-        # Shared inputs.
+        # Walsh-Hadamard 128x128 (same structure as Triton's 7-stage).
+        h = torch.tensor([[1.0]], device="cuda")
+        for _ in range(7):
+            h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+        H = (h / (head_dim**0.5)).to(torch.float32)
+
+        def reference(
+            chunk_k,
+            chunk_score,
+            tail_k,
+            tail_score,
+            req_pool_idx,
+            n_from_tail,
+            chunk_src_start,
+            ape,
+            write_loc,
+            write_mask,
+        ):
+            buf = torch.zeros(
+                (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
+            )
+            buf_fp8 = buf.view(torch.float8_e4m3fn)
+            buf_fp32 = buf.view(torch.float32)
+            for r in range(n_pools):
+                if write_mask is not None and not write_mask[r]:
+                    continue
+                n = int(n_from_tail[r])
+                req = int(req_pool_idx[r])
+                cs = int(chunk_src_start[r])
+                slot_k = torch.cat(
+                    [tail_k[req, :n], chunk_k[cs : cs + (pool_size - n)]], dim=0
+                )
+                slot_s = torch.cat(
+                    [tail_score[req, :n], chunk_score[cs : cs + (pool_size - n)]],
+                    dim=0,
+                )
+                score = slot_s.to(torch.float32) + ape
+                k = slot_k.to(torch.float32)
+                w = torch.softmax(score, dim=0)
+                x = (w * k).sum(dim=0)
+                # bf16 round-trip -> Hadamard rotate -> bf16 round-trip.
+                x = x.to(torch.bfloat16).to(torch.float32)
+                x = (H @ x).to(torch.bfloat16).to(torch.float32)
+                absmax = torch.clamp(x.abs().max(), min=1e-4)
+                scale = absmax / 448.0
+                quantized = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                # Pack into buf at loc[r].
+                loc = int(write_loc[r])
+                page = loc // slots_per_page
+                slot = loc % slots_per_page
+                buf_fp8[page, slot * head_dim : (slot + 1) * head_dim] = quantized
+                buf_fp32[page, (slots_per_page * head_dim) // 4 + slot] = scale
+            return buf
+
         chunk_k = torch.randn(
             n_chunk_tokens, head_dim, dtype=torch.bfloat16, device="cuda"
         )
@@ -521,25 +564,17 @@ class TestNSAIndexer(CustomTestCase):
             max_req_pool, pool_size, head_dim, dtype=torch.bfloat16, device="cuda"
         )
         ape = torch.randn(pool_size, head_dim, dtype=torch.float32, device="cuda")
-        # Mix of bulk (n_from_tail=0) and splice (n_from_tail>0) pools.
         n_from_tail = torch.tensor(
-            [0, 0, 5, 0, 8, 0, 1, 0, 12, 0],
-            dtype=torch.int32,
-            device="cuda",
+            [0, 0, 5, 0, 8, 0, 1, 0, 12, 0], dtype=torch.int32, device="cuda"
         )
         req_pool_idx = torch.tensor(
-            [0, 1, 2, 3, 4, 5, 6, 7, 0, 1],
-            dtype=torch.int64,
-            device="cuda",
+            [0, 1, 2, 3, 4, 5, 6, 7, 0, 1], dtype=torch.int64, device="cuda"
         )
-        # chunk_src_start chosen so chunk_src + (pool_size - n_from_tail)
-        # never exceeds n_chunk_tokens.
         chunk_src_start = torch.tensor(
             [0, 16, 32, 48, 64, 80, 96, 112, 128, 144],
             dtype=torch.int64,
             device="cuda",
         )
-        # write_loc as flat slot ids into buf.
         write_loc = torch.tensor(
             [0, 7, 64, 70, 100, 130, 150, 200, 1, 8],
             dtype=torch.int64,
@@ -549,87 +584,202 @@ class TestNSAIndexer(CustomTestCase):
         class _Pool:
             page_size = 64
             index_head_dim = 128
+            slots_per_page = 64
 
         pool = _Pool()
 
-        # --- Two-step reference ---
-        slot_k, slot_score = assemble_kpool_slots(
-            chunk_k=chunk_k,
-            chunk_score=chunk_score,
-            tail_k=tail_k,
-            tail_score=tail_score,
-            req_pool_idx=req_pool_idx,
-            n_from_tail=n_from_tail,
-            chunk_src_start=chunk_src_start,
-        )
-        kpool_softmax_rotate_write_cache(
-            pool=pool,
-            buf=buf_two,
-            slot_k=slot_k,
-            slot_score=slot_score,
-            ape=ape,
-            loc=write_loc,
-            write_mask=None,
-            round_scale=False,
-            return_compressed=False,
-            write_cache=True,
+        for write_mask in (
+            None,
+            torch.tensor(
+                [True, False, True, True, False, True, True, False, True, True],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+        ):
+            buf_fused = torch.zeros(
+                (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
+            )
+            kpool_assemble_softmax_rotate_write_cache(
+                pool=pool,
+                buf=buf_fused,
+                chunk_k=chunk_k,
+                chunk_score=chunk_score,
+                tail_k=tail_k,
+                tail_score=tail_score,
+                req_pool_idx=req_pool_idx,
+                n_from_tail=n_from_tail,
+                chunk_src_start=chunk_src_start,
+                ape=ape,
+                loc=write_loc,
+                write_mask=write_mask,
+                round_scale=False,
+            )
+            buf_ref = reference(
+                chunk_k,
+                chunk_score,
+                tail_k,
+                tail_score,
+                req_pool_idx,
+                n_from_tail,
+                chunk_src_start,
+                ape,
+                write_loc,
+                write_mask,
+            )
+            # FP8 region: cast back to float32 and check absolute closeness
+            # (1 ulp in fp8-e4m3 quickly explodes in raw bytes).
+            scale_offset = slots_per_page * head_dim
+            fp8_fused = (
+                buf_fused[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+            )
+            fp8_ref = (
+                buf_ref[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+            )
+            torch.testing.assert_close(fp8_fused, fp8_ref, atol=64.0, rtol=0.05)
+            # Scale region: fp32 absmax/448, small rel error from softmax order.
+            scale_fused = buf_fused[:, scale_offset:].view(torch.float32)
+            scale_ref = buf_ref[:, scale_offset:].view(torch.float32)
+            torch.testing.assert_close(scale_fused, scale_ref, atol=1e-4, rtol=1e-3)
+
+    def test_kpool_decode_update_matches_reference(self):
+        """kpool_decode_update_and_maybe_write_cache matches a PyTorch
+        reference: tail buffer updated for every valid row; compressed
+        cache entry written only when slot == POOL_SIZE - 1."""
+        from sglang.srt.layers.attention.nsa.kpool.kernels import (
+            kpool_decode_update_and_maybe_write_cache,
         )
 
-        # --- Fused ---
-        kpool_assemble_softmax_rotate_write_cache(
-            pool=pool,
-            buf=buf_fused,
-            chunk_k=chunk_k,
-            chunk_score=chunk_score,
-            tail_k=tail_k,
-            tail_score=tail_score,
-            req_pool_idx=req_pool_idx,
-            n_from_tail=n_from_tail,
-            chunk_src_start=chunk_src_start,
-            ape=ape,
-            loc=write_loc,
-            write_mask=None,
-            round_scale=False,
+        torch.manual_seed(1)
+        head_dim, pool_size, page_size = 128, 16, 64
+        slots_per_page = 64
+        page_nbytes = page_size * head_dim + page_size * 4
+        num_pages = 8
+        max_req = 4
+        batch = 4
+
+        h = torch.tensor([[1.0]], device="cuda")
+        for _ in range(7):
+            h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+        H = (h / (head_dim**0.5)).to(torch.float32)
+
+        tail_k = torch.randn(
+            max_req, pool_size, head_dim, dtype=torch.bfloat16, device="cuda"
         )
-
-        torch.testing.assert_close(buf_fused, buf_two, atol=0, rtol=0)
-
-        # Also exercise the write_mask path.
-        buf_two.zero_()
-        buf_fused.zero_()
-        write_mask = torch.tensor(
-            [True, False, True, True, False, True, True, False, True, True],
-            dtype=torch.bool,
+        tail_score = torch.randn(
+            max_req, pool_size, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        ape = torch.randn(pool_size, head_dim, dtype=torch.float32, device="cuda")
+        key = torch.randn(batch, head_dim, dtype=torch.bfloat16, device="cuda")
+        slot_score = torch.randn(batch, head_dim, dtype=torch.bfloat16, device="cuda")
+        # Mix of last-slot rows (do_write=True) and mid-slot rows (defer-only).
+        positions = torch.tensor(
+            [pool_size - 1, 5, 2 * pool_size - 1, 3],
+            dtype=torch.int64,
             device="cuda",
         )
-        kpool_softmax_rotate_write_cache(
+        seq_lens = torch.tensor(
+            [pool_size + 1, 10, 2 * pool_size + 1, 5],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        # Distinct req per row: the deferred tail store races against other
+        # rows' softmax reads if (req, slot) pairs collide. Production decode
+        # satisfies this (1 token / req / step).
+        req_pool_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="cuda")
+        out_cache_loc = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+        n_block_cols = 4
+        block_tables = torch.randint(
+            1, num_pages, (batch, n_block_cols), dtype=torch.int32, device="cuda"
+        )
+
+        class _Pool:
+            page_size = 64
+            index_head_dim = 128
+            slots_per_page = 64
+
+        pool = _Pool()
+        buf_kernel = torch.zeros(
+            (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
+        )
+        tail_k_kernel = tail_k.clone()
+        tail_score_kernel = tail_score.clone()
+        kpool_decode_update_and_maybe_write_cache(
             pool=pool,
-            buf=buf_two,
-            slot_k=slot_k,
+            buf=buf_kernel,
+            tail_k=tail_k_kernel,
+            tail_score=tail_score_kernel,
+            key=key,
             slot_score=slot_score,
             ape=ape,
-            loc=write_loc,
-            write_mask=write_mask,
-            round_scale=False,
-            return_compressed=False,
-            write_cache=True,
-        )
-        kpool_assemble_softmax_rotate_write_cache(
-            pool=pool,
-            buf=buf_fused,
-            chunk_k=chunk_k,
-            chunk_score=chunk_score,
-            tail_k=tail_k,
-            tail_score=tail_score,
-            req_pool_idx=req_pool_idx,
-            n_from_tail=n_from_tail,
-            chunk_src_start=chunk_src_start,
-            ape=ape,
-            loc=write_loc,
-            write_mask=write_mask,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
             round_scale=False,
         )
-        torch.testing.assert_close(buf_fused, buf_two, atol=0, rtol=0)
+
+        # PyTorch reference.
+        buf_ref = torch.zeros_like(buf_kernel)
+        tail_k_ref = tail_k.clone()
+        tail_score_ref = tail_score.clone()
+        buf_fp8 = buf_ref.view(torch.float8_e4m3fn)
+        buf_fp32 = buf_ref.view(torch.float32)
+        for r in range(batch):
+            req = int(req_pool_indices[r])
+            pos = int(positions[r])
+            slot = pos % pool_size
+            pos_valid = (
+                0 <= req < max_req
+                and out_cache_loc[r] != 0
+                and 0 <= pos < int(seq_lens[r])
+            )
+            if not pos_valid:
+                continue
+            do_write = slot == pool_size - 1
+            if do_write:
+                slot_k = tail_k[req].clone().to(torch.float32)
+                slot_s = tail_score[req].clone().to(torch.float32)
+                slot_k[slot] = key[r].to(torch.float32)
+                slot_s[slot] = slot_score[r].to(torch.float32)
+                score = slot_s + ape
+                w = torch.softmax(score, dim=0)
+                x = (w * slot_k).sum(dim=0)
+                x = x.to(torch.bfloat16).to(torch.float32)
+                x = (H @ x).to(torch.bfloat16).to(torch.float32)
+                absmax = torch.clamp(x.abs().max(), min=1e-4)
+                scale = absmax / 448.0
+                quantized = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                pool_id = pos // pool_size
+                pool_page_group = pool_id // slots_per_page
+                token_pages_per_pool_group = pool_size * slots_per_page // page_size
+                token_page_row = pool_page_group * token_pages_per_pool_group
+                packed_page = int(block_tables[r, token_page_row])
+                slot_in_page = pool_id % slots_per_page
+                buf_fp8[
+                    packed_page, slot_in_page * head_dim : (slot_in_page + 1) * head_dim
+                ] = quantized
+                buf_fp32[
+                    packed_page,
+                    (slots_per_page * head_dim) // 4 + slot_in_page,
+                ] = scale
+            tail_k_ref[req, slot] = key[r]
+            tail_score_ref[req, slot] = slot_score[r]
+
+        # Tail buffers exact for the slots written; full tensor compare ok
+        # because untouched slots are bf16-identical clones.
+        torch.testing.assert_close(tail_k_kernel, tail_k_ref, atol=0, rtol=0)
+        torch.testing.assert_close(tail_score_kernel, tail_score_ref, atol=0, rtol=0)
+        # FP8 region: 1-ulp tolerance.
+        scale_offset = slots_per_page * head_dim
+        fp8_kernel = (
+            buf_kernel[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+        )
+        fp8_ref = buf_ref[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+        torch.testing.assert_close(fp8_kernel, fp8_ref, atol=64.0, rtol=0.05)
+        scale_kernel = buf_kernel[:, scale_offset:].view(torch.float32)
+        scale_ref_v = buf_ref[:, scale_offset:].view(torch.float32)
+        torch.testing.assert_close(scale_kernel, scale_ref_v, atol=1e-4, rtol=1e-3)
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):

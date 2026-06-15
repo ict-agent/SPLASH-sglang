@@ -8,8 +8,6 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
-    get_nsa_index_kpool,
-    get_nsa_index_kpool_compress,
     is_deepseek_nsa,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -103,6 +101,12 @@ class ModelRunnerKVCacheMixin:
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                # Anchor layout stores one slot per token (slots_per_page = page_size);
+                # dense kpool-compress packs page_size // pool_size pool slots per page,
+                # i.e. the per-token indexer overhead shrinks by 1/pool_size.
+                # Mirrors the buffer math in NSATokenToKVPool._alloc_index_k_with_scale_buffer.
+                nsa_kpool = self.model_config.nsa_kpool
+                slot_scale = 1.0 / nsa_kpool.pool_size if nsa_kpool.is_compress else 1.0
                 indexer_size_per_token = (
                     index_head_dim
                     + index_head_dim // NSATokenToKVPool.quant_block_size * 4
@@ -110,7 +114,9 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += int(
+                    indexer_size_per_token * num_layers * element_size * slot_scale
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -623,12 +629,7 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
-                nsa_pool_kwargs["index_kpool"] = get_nsa_index_kpool(
-                    self.model_config.hf_config
-                )
-                nsa_pool_kwargs["index_kpool_compress"] = get_nsa_index_kpool_compress(
-                    self.model_config.hf_config
-                )
+                nsa_pool_kwargs["nsa_kpool"] = self.model_config.nsa_kpool
                 # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
                 # must cover the *full* request-pool capacity, not just max_running_requests.
                 nsa_pool_kwargs["max_running_requests"] = (
@@ -718,12 +719,7 @@ class ModelRunnerKVCacheMixin:
                     extra_args["index_head_dim"] = get_nsa_index_head_dim(
                         self.model_config.hf_config
                     )
-                    extra_args["index_kpool"] = get_nsa_index_kpool(
-                        self.model_config.hf_config
-                    )
-                    extra_args["index_kpool_compress"] = get_nsa_index_kpool_compress(
-                        self.model_config.hf_config
-                    )
+                    extra_args["nsa_kpool"] = self.model_config.nsa_kpool
                     # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
                     # must cover the *full* request-pool capacity, not just max_running_requests.
                     extra_args["max_running_requests"] = (

@@ -65,6 +65,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import NsaKpoolConfig
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
@@ -1318,8 +1319,7 @@ class HybridLinearKVPool(KVCache):
         index_head_dim: Optional[int] = None,
         kv_cache_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
-        index_kpool: int = 1,
-        index_kpool_compress: bool = False,
+        nsa_kpool: Optional["NsaKpoolConfig"] = None,
         max_running_requests: Optional[int] = None,
     ):
         self.size = size
@@ -1350,8 +1350,7 @@ class HybridLinearKVPool(KVCache):
                     start_layer=self.start_layer,
                     index_head_dim=index_head_dim,
                     kv_cache_dim=kv_cache_dim,
-                    index_kpool=index_kpool,
-                    index_kpool_compress=index_kpool_compress,
+                    nsa_kpool=nsa_kpool,
                     max_running_requests=max_running_requests,
                 )
             else:
@@ -1399,8 +1398,8 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
-        self.slots_per_pool_page = getattr(
-            self.full_kv_pool, "slots_per_pool_page", self.page_size
+        self.slots_per_page = getattr(
+            self.full_kv_pool, "slots_per_page", self.page_size
         )
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
@@ -2074,8 +2073,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
-        index_kpool: int = 1,
-        index_kpool_compress: bool = False,
+        nsa_kpool: Optional["NsaKpoolConfig"] = None,
         max_running_requests: Optional[int] = None,
     ):
 
@@ -2109,13 +2107,102 @@ class NSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 1
         else:
             assert self.page_size == 64
-        # Dense kpool-compress packs index_kpool pool entries per token page
-        # (slots_per_pool_page = page_size // index_kpool). Anchor mode keeps
-        # the legacy slots_per_pool_page = page_size = 64 layout.
-        self.slots_per_pool_page = (
-            self.page_size // index_kpool
-            if (index_kpool > 1 and index_kpool_compress)
-            else self.page_size
+
+        # Two NSA index-cache modes share this pool; the only structural
+        # difference is the per-page slot count, so the layout math is
+        # threaded through `slots_per_page` and the mode-specific
+        # tail buffers live behind `_init_kpool_compress_tail_buffers`.
+        # `nsa_kpool` drives mode selection so the buffer math here and
+        # the profile-time cell-size estimator stay in sync via the same
+        # NsaKpoolConfig snapshot.
+        self._kpool_use_compress = nsa_kpool is not None and nsa_kpool.is_compress
+        if self._kpool_use_compress:
+            self._init_kpool_compress_mode(
+                index_buf_size=index_buf_size,
+                index_kpool=nsa_kpool.pool_size,
+                index_head_dim=index_head_dim,
+                layer_num=layer_num,
+                device=device,
+                max_running_requests=max_running_requests,
+            )
+        else:
+            self._init_anchor_mode(
+                index_buf_size=index_buf_size,
+                index_head_dim=index_head_dim,
+                layer_num=layer_num,
+                device=device,
+            )
+
+        self._finalize_allocation_log(size)
+
+    def _init_anchor_mode(
+        self,
+        *,
+        index_buf_size: int,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+    ) -> None:
+        """Anchor layout: one slot per token, ``slots_per_page == page_size``."""
+        self.slots_per_page = self.page_size
+        self._alloc_index_k_with_scale_buffer(
+            index_buf_size=index_buf_size,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+        )
+        # Anchor mode has no kpool tail state.
+        self.index_kpool = 1
+        self.index_kpool_compress = False
+        self._compress_tail_k = None
+        self._compress_tail_score = None
+
+    def _init_kpool_compress_mode(
+        self,
+        *,
+        index_buf_size: int,
+        index_kpool: int,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        max_running_requests: Optional[int],
+    ) -> None:
+        """Dense kpool-compress: pack ``page_size // index_kpool`` pool slots
+        per page; the addressing math (inlined in nsa/kpool/planner.py)
+        keys off ``slots_per_page``.
+        """
+        self.slots_per_page = self.page_size // index_kpool
+        self._alloc_index_k_with_scale_buffer(
+            index_buf_size=index_buf_size,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+        )
+        self._init_kpool_compress_tail_buffers(
+            index_kpool=index_kpool,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+            max_running_requests=max_running_requests,
+        )
+
+    def _alloc_index_k_with_scale_buffer(
+        self,
+        *,
+        index_buf_size: int,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+    ) -> None:
+        """Allocate the per-layer (num_pages, slots_per_page * row_bytes)
+        index_k+scale buffer. Row layout is documented in
+        ``test_attention.py :: kv_cache_cast_to_fp8``:
+            anchor: slots_per_page=64 -> row = 64*132 = 8448 B
+            dense : slots_per_page=4  -> row = 4*132  = 528 B
+        """
+        num_pages = (index_buf_size + self.page_size + 1) // self.page_size
+        row_bytes = self.slots_per_page * (
+            index_head_dim + index_head_dim // self.quant_block_size * 4
         )
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -2124,39 +2211,16 @@ class NSATokenToKVPool(MLATokenToKVPool):
         ):
             self.index_k_with_scale_buffer = [
                 torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, slots_per_pool_page * (head_dim + fp32_scale))
-                    #     anchor: slots_per_pool_page=64 -> row = 64*132 = 8448 B
-                    #     dense : slots_per_pool_page=4  -> row = 4*132  = 528 B
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.slots_per_pool_page
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
-                    ),
+                    (num_pages, row_bytes),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
                 for _ in range(layer_num)
             ]
 
-        self._init_kpool_compress_tail_buffers(
-            index_kpool=index_kpool,
-            index_kpool_compress=index_kpool_compress,
-            index_head_dim=index_head_dim,
-            layer_num=layer_num,
-            device=device,
-            max_running_requests=max_running_requests,
-        )
-
-        self._finalize_allocation_log(size)
-
     def _init_kpool_compress_tail_buffers(
         self,
         index_kpool: int,
-        index_kpool_compress: bool,
         index_head_dim: int,
         layer_num: int,
         device: str,
@@ -2168,15 +2232,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         hasn't been compressed + flushed to the fp8 index cache yet.
         Conceptually part of the index cache state, so they live on the
         KV pool rather than on the per-layer Indexer module.
+
+        Only called from the kpool-compress mode branch; the caller has
+        already established ``self._kpool_use_compress = True``.
         """
         self.index_kpool = index_kpool
-        self.index_kpool_compress = index_kpool_compress
-        self._kpool_use_compress = index_kpool > 1 and index_kpool_compress
-
-        if not self._kpool_use_compress:
-            self._compress_tail_k = None
-            self._compress_tail_score = None
-            return
+        self.index_kpool_compress = True
 
         assert (
             max_running_requests is not None

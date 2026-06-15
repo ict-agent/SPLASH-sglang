@@ -1,21 +1,28 @@
 """Kpool planner: build the layer-invariant kpool extend plan and the
-decode paged-MQA metadata once per forward batch. Mutates the
-caller-provided ``NSAMetadata`` via ``object.__setattr__`` (frozen
-dataclass).
+decode paged-MQA metadata once per forward batch.
+
+The ``init_*`` builders return a new ``NSAMetadata`` (frozen) via
+``dataclasses.replace``; the ``update_*`` variant mutates in place
+because cuda-graph replay requires the captured tensors to stay put.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.kpool.kernels import INDEX_HEAD_DIM
-from sglang.srt.layers.attention.nsa.kpool.page_table import (
-    PAGE_SIZE,
-    build_pooled_page_table_64,
-    compute_pooled_write_locs_batched,
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.kpool.kernels import (
+    INDEX_HEAD_DIM,
+    kpool_build_ragged_layout,
+)
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
 )
 from sglang.srt.utils import is_cuda
 
@@ -63,39 +70,53 @@ class KPoolCpInfo:
 
     Each row i is owned by ``owner_rank[i]`` -- the rank that writes its
     compressed slot. ``all_gather_and_scatter_pool_slots`` then
-    propagates writes so every rank's buf converges.
+    propagates writes so every rank's buf converges. ``local_write_mask``
+    is the per-row ``owner_rank == rank`` bool, materialized once per
+    forward so every NSA layer can reuse it.
     """
 
     size: int
     rank: int
     owner_rank: torch.Tensor  # int32 [N]
+    local_write_mask: torch.Tensor  # bool [N]
 
 
 @dataclass(frozen=True)
 class KPoolExtendPlan:
-    """Precomputed kpool extend metadata, layer-invariant."""
+    """Precomputed kpool extend metadata, layer-invariant.
+
+    Compress side (``writes`` / ``tails``) is always full-seq: K is
+    all-gathered before compress under CP, so write_locs index the full
+    pool table.
+
+    Local view (``ragged_*``, ``pooled_seq_lens_expanded``,
+    ``seq_lens_expanded``) is rank-local under CP round-robin-split,
+    full-seq otherwise. It is sized to match this rank's q
+    (``forward_cuda`` passes the rank-local ``q_fp8`` straight into
+    ``_get_topk_ragged`` without any all_gather).
+    """
 
     writes: PoolWriteRows
     tails: TailWriteRows
 
-    pooled_seq_lens_expanded: torch.Tensor  # int32 [sum(extend_seq_lens)]
+    pooled_seq_lens_expanded: torch.Tensor  # int32 [sum_q]
+    seq_lens_expanded: torch.Tensor  # int32 [sum_q]
 
-    # Concatenated per-batch pooled page table -- ``page_indices`` for a
-    # single ``gather_index_k_scale_prefix_into`` filling a flat
-    # ``[total_k_rows, head_dim]`` K buffer.
+    # page_indices for a single gather_index_k_scale_prefix_into into a
+    # flat [total_k_rows, head_dim] K buffer.
     ragged_concat_page_table: torch.Tensor  # int32 [sum_pool_pages]
-    # Per-q K start row in the flat K buffer, page-aligned so each
-    # batch's K starts at a PAGE_SIZE boundary (keeps the gather
-    # kernel's ``page_indices[token_id // PAGE_SIZE]`` lookup correct).
-    ragged_q_ks: torch.Tensor  # int32 [sum(extend_seq_lens)]
-    ragged_total_k_rows: int  # sum_pool_pages * PAGE_SIZE
-    # Per-layer scratch for the ragged gather. Allocated once here so all
-    # NSA layers share the same buffers (alloc + free out of the layer
-    # hot path). ``None`` when total_k_rows == 0.
+    # Per-q K start row; page-aligned so the gather kernel's
+    # page_indices[token_id // page_size] lookup is correct.
+    # Per-q K end row; equals ``ragged_q_ks + pooled_seq_lens_expanded``.
+    # Precomputed here so every NSA layer reuses the same tensor instead
+    # of re-adding the two each forward.
+    ragged_q_ks: torch.Tensor  # int32 [sum_q]
+    ragged_q_ke: torch.Tensor  # int32 [sum_q]
+    ragged_total_k_rows: int  # sum_pool_pages * page_size
+    # Layer-shared scratch (alloc out of the per-layer hot path).
     ragged_k_u8: Optional[torch.Tensor]  # uint8 [total_k_rows, head_dim]
     ragged_k_scale: Optional[torch.Tensor]  # fp32 [total_k_rows]
-    # ``req_to_token[req_pool_idx_of_q, :max_seq_len]`` row-replicated;
-    # None when topk_transform_method != PAGED or fuse-topk off.
+    # req_to_token row-replicated; None unless PAGED + fuse-topk on.
     ragged_paged_page_table: Optional[torch.Tensor]  # int32 [sum_q, max_seq_len]
 
     cp: Optional[KPoolCpInfo] = None
@@ -116,18 +137,34 @@ class _KPoolCpuPlan:
     tail_chunk_src: List[int] = field(default_factory=list)
     tail_n_write: List[int] = field(default_factory=list)
 
-    ragged_batch_idx: List[int] = field(default_factory=list)
     ragged_q_len: List[int] = field(default_factory=list)
     ragged_pool_pages: List[int] = field(default_factory=list)
+    # Exclusive prefix sums (per batch start offsets). Built on CPU and
+    # H2D'd alongside the other i32 counters so the Triton ragged-layout
+    # kernel can read them directly without a GPU cumsum.
+    cu_pages_excl: List[int] = field(default_factory=list)
+    cu_q_len_excl: List[int] = field(default_factory=list)
+    # Rolling sum of ragged_pool_pages, kept here so _kpool_plan_to_gpu
+    # avoids a redundant Python sum() pass.
+    total_pool_pages: int = 0
+    # n_rag = len(ragged_q_len) = batch_size (every batch contributes a row).
+    # ragged_batch_idx is therefore arange(batch_size); recomputed in
+    # _kpool_plan_to_gpu instead of being H2D'd as a redundant list.
 
 
-def _kpool_cpu_plan(
-    forward_batch: "ForwardBatch",
+def _append_compress_rows(
+    plan: _KPoolCpuPlan,
     pool_size: int,
-) -> _KPoolCpuPlan:
-    """Emit pool rows for every pool whose right boundary lies in
-    ``(first_pos, seq_len]``, plus a tail row for batches with leftover
-    chunk tokens (skipped when the chunk aligns to a pool boundary).
+    batch_size: int,
+    extend_seq_lens_cpu: List[int],
+    seq_lens_cpu: List[int],
+    req_pool_indices_cpu: List[int],
+) -> None:
+    """Compress side: per-pool write rows + per-batch tail rows.
+
+    Under CP round-robin-split, ``key`` is all-gathered to full-seq before
+    compress, so the compress side still operates on the *full* batch /
+    seq layout regardless of CP split mode.
 
     Row 0 may "splice" ``first_slot`` saved-tail tokens with
     ``pool_size - first_slot`` chunk tokens to close the mid-pool the
@@ -135,23 +172,10 @@ def _kpool_cpu_plan(
     ``first_slot == 0`` the splice degenerates to a plain bulk row
     (``n_from_tail = 0``), so a single uniform code path covers both.
     """
-    plan = _KPoolCpuPlan()
-    # IndexerKPool guards pool_size>1 ∧ compress=True (see indexer.py:104),
-    # so the dense layout is the only reachable case here.
-    slots_per_pool_page = PAGE_SIZE // pool_size
-
-    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-    if isinstance(extend_seq_lens_cpu, torch.Tensor):
-        extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
-    seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
-    req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
-
     q_offset = 0
-    for i in range(forward_batch.batch_size):
+    for i in range(batch_size):
         q_len = extend_seq_lens_cpu[i]
-        assert (
-            q_len > 0
-        ), f"extend_seq_lens_cpu[{i}] = {q_len}; expected > 0 in extend-prefill"
+        assert q_len > 0, f"extend_seq_lens_cpu[{i}] = {q_len}; expected > 0"
 
         seq_len = seq_lens_cpu[i]
         req = req_pool_indices_cpu[i]
@@ -161,15 +185,6 @@ def _kpool_cpu_plan(
         pool_seq_len = seq_len // pool_size
         n_pool = pool_seq_len - base_pool
 
-        plan.ragged_batch_idx.append(i)
-        plan.ragged_q_len.append(q_len)
-        plan.ragged_pool_pages.append(
-            (pool_seq_len + slots_per_pool_page - 1) // slots_per_pool_page
-        )
-
-        # ``list.extend`` over range/[x]*n stays on CPython's C-level
-        # fastpath; ~2-3x faster than N Python appends for typical
-        # low-B, high-q_len prefill where n_pool is large.
         if n_pool > 0:
             plan.pool_batch_idx.extend([i] * n_pool)
             plan.pool_req.extend([req] * n_pool)
@@ -182,15 +197,9 @@ def _kpool_cpu_plan(
                 range(bulk_start, bulk_start + (n_pool - 1) * pool_size, pool_size)
             )
 
-        # Tail: leftover chunk tokens that don't fill a pool. Skipped
-        # when n_remain == 0 (chunk aligned to a pool boundary); pool
-        # rows already covered all chunk tokens.
         consumed = max(0, n_pool * pool_size - first_slot)
         n_remain = q_len - consumed
         if n_remain > 0:
-            # When n_pool == 0 nothing closed the mid-pool, so tail
-            # extends it starting at first_slot; otherwise tail starts
-            # fresh at 0.
             dst_offset = first_slot if n_pool == 0 else 0
             plan.tail_req.append(req)
             plan.tail_dst_offset.append(dst_offset)
@@ -199,32 +208,119 @@ def _kpool_cpu_plan(
 
         q_offset += q_len
 
+
+def _append_local_rows(
+    plan: _KPoolCpuPlan,
+    pool_size: int,
+    page_size: int,
+    local_extend_seq_lens_cpu: List[int],
+    local_seq_lens_cpu: List[int],
+) -> None:
+    """Local view: per-batch ragged layout (q_len + pool_pages + prefix sums).
+
+    Under CP round-robin-split, these are the *rank-local* per-batch
+    counts (only batches present on this rank, with this rank's q
+    counts); under non-CP they equal the full-seq counts. q is NOT
+    gathered, so the ragged layout sizes match this rank's q footprint.
+    """
+    slots_per_page = page_size // pool_size
+    q_offset = 0
+    for q_len, seq_len in zip(
+        local_extend_seq_lens_cpu, local_seq_lens_cpu, strict=True
+    ):
+        assert q_len > 0, f"local_extend_seq_lens_cpu has non-positive {q_len = }"
+        plan.ragged_q_len.append(q_len)
+        pool_seq_len = seq_len // pool_size
+        pool_pages_i = (pool_seq_len + slots_per_page - 1) // slots_per_page
+        plan.ragged_pool_pages.append(pool_pages_i)
+        plan.cu_pages_excl.append(plan.total_pool_pages)
+        plan.cu_q_len_excl.append(q_offset)
+        plan.total_pool_pages += pool_pages_i
+        q_offset += q_len
+
+
+def _kpool_cpu_plan(
+    forward_batch: "ForwardBatch",
+    pool_size: int,
+    page_size: int = 64,
+    *,
+    local_extend_seq_lens_cpu: Optional[List[int]] = None,
+    local_seq_lens_cpu: Optional[List[int]] = None,
+) -> _KPoolCpuPlan:
+    """Build the combined compress + local CPU plan.
+
+    Compress side: always full-seq (K is all-gathered before compress
+    under CP, so write_locs index the full pool table).
+
+    Local view: same full layout when no override is provided; otherwise
+    the rank-local slice for CP round-robin-split, which lets
+    ``_get_topk_ragged`` build per-q ks/ke for this rank's tokens
+    instead of all-gathering q. ``local_*`` come paired (both None or
+    both set).
+    """
+    plan = _KPoolCpuPlan()
+
+    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+    if isinstance(extend_seq_lens_cpu, torch.Tensor):
+        extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
+    seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+    req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
+
+    _append_compress_rows(
+        plan,
+        pool_size,
+        forward_batch.batch_size,
+        extend_seq_lens_cpu,
+        seq_lens_cpu,
+        req_pool_indices_cpu,
+    )
+
+    if local_extend_seq_lens_cpu is None:
+        local_extend_seq_lens_cpu = extend_seq_lens_cpu
+        local_seq_lens_cpu = seq_lens_cpu
+
+    _append_local_rows(
+        plan,
+        pool_size,
+        page_size,
+        local_extend_seq_lens_cpu,
+        local_seq_lens_cpu,
+    )
     return plan
 
 
 def _kpool_plan_to_gpu(
     cpu: _KPoolCpuPlan,
-    metadata: "NSAMetadata",
     forward_batch: "ForwardBatch",
+    full_real_page_table: torch.Tensor,
+    local_real_page_table: torch.Tensor,
+    local_seqlens_expanded: torch.Tensor,
+    local_req_pool_indices: torch.Tensor,
+    local_max_seq_len: int,
     pool_size: int,
+    page_size: int,
     topk_transform_method: "TopkTransformMethod",
 ) -> KPoolExtendPlan:
     """Pack lists into two pinned tensors (int64 indices + int32 small
     counts) for one H2D each; ragged-topk ``src_idx`` is computed on
     GPU from per-batch ``pool_pages``.
+
+    ``full_real_page_table`` is used for the compress-side ``write_locs``
+    (the FP8 cache index is full-seq because K is gathered before
+    compress). ``local_real_page_table`` / ``local_seqlens_expanded`` are
+    rank-local under CP round-robin-split, matching this rank's q
+    footprint -- see ``_get_topk_ragged`` for how they're consumed.
     """
-    from sglang.srt.environ import envs
     from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
 
     device = forward_batch.seq_lens.device
     n_pool = len(cpu.pool_pool_id)
     n_tail = len(cpu.tail_req)
-    n_rag = len(cpu.ragged_batch_idx)
+    n_rag = len(cpu.ragged_q_len)
 
-    # IndexerKPool requires pool_size>1 ∧ compress=True (indexer.py:104).
-    slots_per_pool_page = PAGE_SIZE // pool_size
-    total_pool_pages = sum(cpu.ragged_pool_pages)
-    ragged_total_k_rows = total_pool_pages * slots_per_pool_page
+    slots_per_page = page_size // pool_size
+    total_pool_pages = cpu.total_pool_pages
+    ragged_total_k_rows = total_pool_pages * slots_per_page
 
     need_paged = (
         topk_transform_method == TopkTransformMethod.PAGED
@@ -233,8 +329,8 @@ def _kpool_plan_to_gpu(
     )
 
     # int64 H2D: pool_req | pool_pool_id | pool_chunk_src | pool_batch_idx
-    #          | tail_req | tail_chunk_src | ragged_batch_idx
-    i64_total = 4 * n_pool + 2 * n_tail + n_rag
+    #          | tail_req | tail_chunk_src
+    i64_total = 4 * n_pool + 2 * n_tail
     if i64_total > 0:
         i64_cpu = torch.tensor(
             cpu.pool_req
@@ -242,8 +338,7 @@ def _kpool_plan_to_gpu(
             + cpu.pool_chunk_src
             + cpu.pool_batch_idx
             + cpu.tail_req
-            + cpu.tail_chunk_src
-            + cpu.ragged_batch_idx,
+            + cpu.tail_chunk_src,
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -260,24 +355,24 @@ def _kpool_plan_to_gpu(
         tail_req_t = i64_gpu[c : c + n_tail]
         c += n_tail
         tail_chunk_src_t = i64_gpu[c : c + n_tail]
-        c += n_tail
-        ragged_batch_idx_t = i64_gpu[c : c + n_rag]
     else:
         empty_i64 = torch.empty((0,), dtype=torch.int64, device=device)
         pool_req_t = pool_pool_id_t = pool_chunk_src_t = pool_batch_idx_t = empty_i64
         tail_req_t = tail_chunk_src_t = empty_i64
-        ragged_batch_idx_t = empty_i64
 
     # int32 H2D: pool_n_from_tail | tail_dst_offset | tail_n_write
     #          | ragged_pool_pages | ragged_q_len
-    i32_total = n_pool + 2 * n_tail + 2 * n_rag
+    #          | cu_pages_excl | cu_q_len_excl
+    i32_total = n_pool + 2 * n_tail + 4 * n_rag
     if i32_total > 0:
         i32_cpu = torch.tensor(
             cpu.pool_n_from_tail
             + cpu.tail_dst_offset
             + cpu.tail_n_write
             + cpu.ragged_pool_pages
-            + cpu.ragged_q_len,
+            + cpu.ragged_q_len
+            + cpu.cu_pages_excl
+            + cpu.cu_q_len_excl,
             dtype=torch.int32,
             pin_memory=True,
         )
@@ -292,85 +387,84 @@ def _kpool_plan_to_gpu(
         ragged_pool_pages_t = i32_gpu[c : c + n_rag]
         c += n_rag
         ragged_q_len_t = i32_gpu[c : c + n_rag]
+        c += n_rag
+        cu_pages_excl_t = i32_gpu[c : c + n_rag]
+        c += n_rag
+        cu_q_len_excl_t = i32_gpu[c : c + n_rag]
     else:
         empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
         pool_n_from_tail_t = empty_i32
         tail_dst_offset_t = tail_n_write_t = empty_i32
         ragged_pool_pages_t = ragged_q_len_t = empty_i32
+        cu_pages_excl_t = cu_q_len_excl_t = empty_i32
+
+    # Compress side reads ``full_real_page_table``; local view reads
+    # ``local_real_page_table`` / ``local_seqlens_expanded``. They diverge
+    # under CP round-robin-split: K is gathered before compress (so the
+    # compress plan is full-seq), but q stays rank-local for topk.
 
     if n_pool > 0:
-        pool_write_locs = compute_pooled_write_locs_batched(
-            metadata.real_page_table,
-            pool_batch_idx_t,
-            pool_pool_id_t,
-            pool_size,
+        # Compressed pool slots are packed `page_size`-per-page (DeepGEMM's
+        # fp8_paged_mqa_logits historically expects 64-token pages). Each
+        # logical pooled-K id maps to `packed_page * slots_per_page +
+        # pool_id % slots_per_page`, with `packed_page` looked up via the
+        # per-batch page table row chosen by `pool_batch_idx_t`.
+        pool_page_group = torch.div(
+            pool_pool_id_t, slots_per_page, rounding_mode="floor"
+        )
+        packed_page = full_real_page_table[pool_batch_idx_t, pool_page_group].to(
+            torch.int64
+        )
+        pool_write_locs = packed_page * slots_per_page + torch.remainder(
+            pool_pool_id_t, slots_per_page
         )
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 
-    pooled_page_table_all = build_pooled_page_table_64(
-        metadata.real_page_table,
-        pool_size,
-    ).contiguous()
-
     pooled_seq_lens_expanded = torch.div(
-        metadata.nsa_seqlens_expanded, pool_size, rounding_mode="floor"
+        local_seqlens_expanded, pool_size, rounding_mode="floor"
     ).to(torch.int32)
 
     if n_rag > 0:
-        max_pool_pages = pooled_page_table_all.shape[1]
-        # src_idx[r] = ragged_batch_idx[k] * max_pool_pages + (r - cu_pages[k])
-        # for the k whose [cu_pages[k], cu_pages[k+1]) contains r.
-        cu_pages_excl = torch.cat(
-            (
-                torch.zeros(1, dtype=torch.int32, device=device),
-                torch.cumsum(ragged_pool_pages_t, dim=0, dtype=torch.int32),
-            )
-        )[:-1]
-        page_to_sel = torch.repeat_interleave(
-            torch.arange(n_rag, device=device, dtype=torch.int32),
-            ragged_pool_pages_t,
-        )
-        all_pages = torch.arange(total_pool_pages, device=device, dtype=torch.int32)
-        intra = all_pages - cu_pages_excl.index_select(0, page_to_sel)
-        src_idx_t = (
-            ragged_batch_idx_t.index_select(0, page_to_sel.to(torch.int64))
-            * max_pool_pages
-            + intra
-        )
-
-        q_ks_per_batch_t = cu_pages_excl * slots_per_pool_page
-        ragged_q_ks = torch.repeat_interleave(q_ks_per_batch_t, ragged_q_len_t)
-
-        ragged_concat_page_table = (
-            pooled_page_table_all.view(-1).index_select(0, src_idx_t).to(torch.int32)
+        # Single Triton kernel writes concat_page_table / ragged_q_ks / ragged_q_ke.
+        # Per-batch prefix sums (cu_pages_excl, cu_q_len_excl) were built on CPU
+        # and arrived via the i32 H2D above, so no GPU cumsum is needed here.
+        (
+            ragged_concat_page_table,
+            ragged_q_ks,
+            ragged_q_ke,
+        ) = kpool_build_ragged_layout(
+            full_page_table=local_real_page_table,
+            cu_pages_excl=cu_pages_excl_t,
+            ragged_pool_pages=ragged_pool_pages_t,
+            cu_q_len_excl=cu_q_len_excl_t,
+            ragged_q_len=ragged_q_len_t,
+            pooled_seq_lens_expanded=pooled_seq_lens_expanded,
+            slots_per_page=slots_per_page,
+            total_pool_pages=total_pool_pages,
+            total_q=pooled_seq_lens_expanded.shape[0],
         )
     else:
         empty_i32_dev = torch.empty((0,), dtype=torch.int32, device=device)
         ragged_concat_page_table = empty_i32_dev
         ragged_q_ks = empty_i32_dev
+        ragged_q_ke = empty_i32_dev
 
-    # Build once per forward (vs per-layer per-batch via .expand) to
-    # avoid an O(B*layers) Python loop in the indexer.
+    # Build once per forward to avoid an O(B*layers) Python loop in the indexer.
     ragged_paged_page_table = None
     if need_paged:
         req_to_token = forward_batch.req_to_token_pool.req_to_token
-        # max_seq_len varies per batch; use the global max and rely on
-        # consumer masking via per-row `lengths`.
-        max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
-        req_pool_indices_per_batch = forward_batch.req_pool_indices.to(
-            torch.int64
-        ).index_select(0, ragged_batch_idx_t)
+        # ``local_max_seq_len`` is the per-rank max already on CPU; saves a
+        # GPU sync over ``local_seqlens_expanded.max()``. Consumer masks
+        # via per-row ``lengths``.
         req_pool_indices_per_q = torch.repeat_interleave(
-            req_pool_indices_per_batch, ragged_q_len_t
+            local_req_pool_indices.to(torch.int64), ragged_q_len_t
         )
-        ragged_paged_page_table = req_to_token[req_pool_indices_per_q, :max_seq_len].to(
-            torch.int32
-        )
+        ragged_paged_page_table = req_to_token[
+            req_pool_indices_per_q, :local_max_seq_len
+        ].to(torch.int32)
 
-    # Layer-shared scratch for the ragged gather + fp8_mqa_logits.
-    # All NSA layers consume the same (total_k_rows, head_dim) shape,
-    # so alloc once and reuse.
+    # Layer-shared scratch (all NSA layers share these (total_k_rows, head_dim) buffers).
     if ragged_total_k_rows > 0:
         ragged_k_u8 = torch.empty(
             (ragged_total_k_rows, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
@@ -397,8 +491,10 @@ def _kpool_plan_to_gpu(
             n_write=tail_n_write_t,
         ),
         pooled_seq_lens_expanded=pooled_seq_lens_expanded,
+        seq_lens_expanded=local_seqlens_expanded,
         ragged_concat_page_table=ragged_concat_page_table,
         ragged_q_ks=ragged_q_ks,
+        ragged_q_ke=ragged_q_ke,
         ragged_total_k_rows=ragged_total_k_rows,
         ragged_k_u8=ragged_k_u8,
         ragged_k_scale=ragged_k_scale,
@@ -415,26 +511,26 @@ def _kpool_cp_owner_rank(
     """Owner rank = ``row_idx % cp_size``; balances writes by flat row
     index regardless of per-request pool distribution.
     """
-    from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
-
     if not nsa_use_prefill_cp(forward_batch):
         return None
-
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-    )
 
     cp_size = get_attention_cp_size()
     if cp_size <= 1:
         return None
 
-    owner = (
-        torch.arange(n_pool, dtype=torch.int32, device=device) % cp_size
-        if n_pool > 0
-        else torch.empty((0,), dtype=torch.int32, device=device)
+    cp_rank = get_attention_cp_rank()
+    if n_pool > 0:
+        owner = torch.arange(n_pool, dtype=torch.int32, device=device) % cp_size
+        local_write_mask = owner == cp_rank
+    else:
+        owner = torch.empty((0,), dtype=torch.int32, device=device)
+        local_write_mask = torch.empty((0,), dtype=torch.bool, device=device)
+    return KPoolCpInfo(
+        size=cp_size,
+        rank=cp_rank,
+        owner_rank=owner,
+        local_write_mask=local_write_mask,
     )
-    return KPoolCpInfo(size=cp_size, rank=get_attention_cp_rank(), owner_rank=owner)
 
 
 def init_kpool_extend_metadata(
@@ -444,11 +540,27 @@ def init_kpool_extend_metadata(
     pool_size: int,
     real_page_size: int,
     topk_transform_method: "TopkTransformMethod",
-) -> None:
+    full_real_page_table: torch.Tensor,
+    full_seqlens_expanded: torch.Tensor,
+    local_real_page_table: Optional[torch.Tensor] = None,
+    local_seqlens_expanded: Optional[torch.Tensor] = None,
+    local_extend_seq_lens_cpu: Optional[List[int]] = None,
+    local_seq_lens_cpu: Optional[List[int]] = None,
+    local_req_pool_indices: Optional[torch.Tensor] = None,
+    local_max_seq_len: Optional[int] = None,
+) -> "NSAMetadata":
     """Build the layer-invariant kpool extend plan once per forward.
 
-    No-op unless: pool_size > 1, extend_without_speculative, page_size
-    == 64, and 64 % pool_size == 0 (kpool kernel requirements).
+    Two views:
+      * Compress (full-seq) always reads ``full_real_page_table`` --
+        K is gathered before compress under CP, so write_locs index the
+        full pool table.
+      * Local view defaults to the full layout; under CP round-robin-split
+        the caller passes the rank-local ``local_*`` tensors and per-batch
+        counts so topk runs on this rank's q slice without a q all_gather.
+
+    Returns input unchanged when the gating fails (pool_size > 1,
+    extend_without_speculative, page_size == 64, and 64 % pool_size == 0).
     """
     if (
         pool_size <= 1
@@ -456,124 +568,126 @@ def init_kpool_extend_metadata(
         or forward_batch.extend_seq_lens_cpu is None
         or forward_batch.seq_lens_cpu is None
         or real_page_size != 64
-        or 64 % pool_size != 0
+        or real_page_size % pool_size != 0
     ):
-        return
+        return metadata
 
-    cpu = _kpool_cpu_plan(forward_batch, pool_size)
-    plan = _kpool_plan_to_gpu(
-        cpu,
-        metadata,
+    if local_real_page_table is None:
+        local_real_page_table = full_real_page_table
+    if local_seqlens_expanded is None:
+        local_seqlens_expanded = full_seqlens_expanded
+    if local_req_pool_indices is None:
+        local_req_pool_indices = forward_batch.req_pool_indices
+    if local_max_seq_len is None:
+        local_max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
+
+    cpu = _kpool_cpu_plan(
         forward_batch,
         pool_size,
+        real_page_size,
+        local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
+        local_seq_lens_cpu=local_seq_lens_cpu,
+    )
+    plan = _kpool_plan_to_gpu(
+        cpu,
+        forward_batch,
+        full_real_page_table,
+        local_real_page_table,
+        local_seqlens_expanded,
+        local_req_pool_indices,
+        local_max_seq_len,
+        pool_size,
+        real_page_size,
         topk_transform_method,
     )
-    object.__setattr__(metadata, "kpool_extend_plan", plan)
+    return dataclasses.replace(metadata, kpool_extend_plan=plan)
 
 
 def init_pooled_paged_mqa_metadata(
     metadata: "NSAMetadata",
     seqlens_32: torch.Tensor,
-    real_page_table: torch.Tensor,
     forward_mode: "ForwardMode",
     *,
     pool_size: int,
     real_page_size: int,
-) -> None:
-    """Build decode-side pooled cache seqlens + page table + deep_gemm schedule."""
+) -> "NSAMetadata":
+    """Build decode-side pooled cache seqlens + deep_gemm schedule.
+
+    Returns the (possibly updated) metadata.
+    """
     if (
         pool_size <= 1
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
         or real_page_size != 64
-        or 64 % pool_size != 0
+        or real_page_size % pool_size != 0
     ):
-        return
+        return metadata
 
-    slots_per_pool_page = PAGE_SIZE // pool_size
-    object.__setattr__(metadata, "pooled_index_kpool", pool_size)
-    object.__setattr__(
-        metadata,
-        "pooled_cache_seqlens_int32",
-        torch.div(seqlens_32, pool_size, rounding_mode="floor").to(torch.int32),
-    )
-    object.__setattr__(
-        metadata,
-        "pooled_real_page_table",
-        build_pooled_page_table_64(real_page_table, pool_size).contiguous(),
+    pooled_cache_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
+        torch.int32
     )
     try:
         import deep_gemm
 
-        object.__setattr__(
-            metadata,
-            "pooled_paged_mqa_schedule_metadata",
-            deep_gemm.get_paged_mqa_logits_metadata(
-                metadata.pooled_cache_seqlens_int32.unsqueeze(-1),
-                slots_per_pool_page,
-                deep_gemm.get_num_sms(),
-            ),
+        slots_per_page = real_page_size // pool_size
+        pooled_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            pooled_cache_seqlens.unsqueeze(-1),
+            slots_per_page,
+            deep_gemm.get_num_sms(),
         )
     except (ImportError, ModuleNotFoundError):
-        object.__setattr__(metadata, "pooled_paged_mqa_schedule_metadata", None)
+        pooled_schedule = None
+
+    return dataclasses.replace(
+        metadata,
+        pooled_index_kpool=pool_size,
+        pooled_cache_seqlens_int32=pooled_cache_seqlens,
+        pooled_paged_mqa_schedule_metadata=pooled_schedule,
+    )
 
 
 def update_pooled_paged_mqa_metadata(
     metadata: "NSAMetadata",
     seqlens_32: torch.Tensor,
-    real_page_table: torch.Tensor,
     forward_mode: "ForwardMode",
     *,
     pool_size: int,
     real_page_size: int,
-    page_tables_already_updated: bool = False,
 ) -> None:
-    """In-place refresh of decode-side pooled metadata (cuda-graph replay)."""
+    """In-place refresh of decode-side pooled metadata (cuda-graph replay).
+
+    Precondition: the pooled buffers were either both allocated (and
+    pooled_index_kpool set to pool_size) or both left None during cuda-graph
+    capture under the same gating conditions. Replay must observe the same
+    gating, otherwise the captured graph's tensor addresses are invalid --
+    so we either copy_ into the existing buffers or no-op; we never alloc /
+    reset fields here.
+    """
     if (
         pool_size <= 1
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
         or real_page_size != 64
-        or 64 % pool_size != 0
+        or real_page_size % pool_size != 0
     ):
-        object.__setattr__(metadata, "pooled_index_kpool", 1)
-        object.__setattr__(metadata, "pooled_cache_seqlens_int32", None)
-        object.__setattr__(metadata, "pooled_real_page_table", None)
-        object.__setattr__(metadata, "pooled_paged_mqa_schedule_metadata", None)
         return
 
-    slots_per_pool_page = PAGE_SIZE // pool_size
     pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
         torch.int32
     )
-
-    object.__setattr__(metadata, "pooled_index_kpool", pool_size)
-    if metadata.pooled_cache_seqlens_int32 is None:
-        object.__setattr__(metadata, "pooled_cache_seqlens_int32", pool_seqlens)
-    else:
-        metadata.pooled_cache_seqlens_int32[: pool_seqlens.shape[0]].copy_(pool_seqlens)
-
-    if not page_tables_already_updated or metadata.pooled_real_page_table is None:
-        pool_page_table = build_pooled_page_table_64(real_page_table, pool_size)
-        if metadata.pooled_real_page_table is None:
-            object.__setattr__(
-                metadata, "pooled_real_page_table", pool_page_table.contiguous()
-            )
-        else:
-            rows, cols = pool_page_table.shape
-            metadata.pooled_real_page_table[:rows, :cols].copy_(pool_page_table)
+    metadata.pooled_cache_seqlens_int32[: pool_seqlens.shape[0]].copy_(pool_seqlens)
 
     try:
         import deep_gemm
 
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-            pool_seqlens.unsqueeze(-1), slots_per_pool_page, deep_gemm.get_num_sms()
+            pool_seqlens.unsqueeze(-1),
+            real_page_size // pool_size,
+            deep_gemm.get_num_sms(),
         )
-        if metadata.pooled_paged_mqa_schedule_metadata is None:
-            object.__setattr__(
-                metadata, "pooled_paged_mqa_schedule_metadata", new_schedule
-            )
-        else:
-            metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
+        metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
     except (ImportError, ModuleNotFoundError):
-        object.__setattr__(metadata, "pooled_paged_mqa_schedule_metadata", None)
+        # deep_gemm availability at replay must match capture; if it was
+        # absent at capture the schedule buffer is None and nothing to do.
+        pass

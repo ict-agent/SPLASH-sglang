@@ -87,7 +87,14 @@ def transform_index_page_table_prefill_fast(
             result=result[offset : offset + l],
         )
         offset += l
-    assert offset == topk_indices.shape[0]
+    # Trailing pad rows (e.g. CP round-robin split with non-divisible
+    # seq_len: input_ids is upstream-padded to a cp multiple, but
+    # extend_lens_cpu reflects real token counts) get filled with -1,
+    # same convention as negative-topk handling in decode_ref.
+    if offset < topk_indices.shape[0]:
+        result[offset:].fill_(-1)
+    else:
+        assert offset == topk_indices.shape[0]
     return result
 
 
@@ -129,7 +136,14 @@ def transform_index_page_table_prefill_ref(
             result=result[offset : offset + l],
         )
         offset += l
-    assert offset == topk_indices.shape[0]
+    # Trailing pad rows (e.g. CP round-robin split with non-divisible
+    # seq_len: input_ids is upstream-padded to a cp multiple, but
+    # extend_lens_cpu reflects real token counts) get filled with -1,
+    # same convention as negative-topk handling in decode_ref.
+    if offset < topk_indices.shape[0]:
+        result[offset:].fill_(-1)
+    else:
+        assert offset == topk_indices.shape[0]
     return result
 
 

@@ -361,5 +361,78 @@ def test_kpool_topk_transform_kernel(
     torch.testing.assert_close(out_our, out_ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("pool_size,group_topk", [(16, 128), (8, 256)])
+@pytest.mark.parametrize("mode", ["raw", "paged", "ragged"])
+@pytest.mark.parametrize("append_tail", [False, True])
+@pytest.mark.parametrize("pad_rows", [1, 7])
+@torch.inference_mode()
+def test_kpool_topk_transform_out_rows_pad(
+    pool_size: int, group_topk: int, mode: str, append_tail: bool, pad_rows: int
+) -> None:
+    """When out_rows > score.shape[0], the trailing rows are -1-filled
+    by the kernel; the leading rows must match the no-pad reference.
+    """
+    torch.manual_seed(42)
+    bs = 17
+    topk = pool_size * group_topk
+    num_groups = 4096
+    score = torch.randn(bs, num_groups, dtype=torch.float32, device="cuda")
+    lengths = torch.randint(
+        group_topk + 1, num_groups + 1, (bs,), dtype=torch.int32, device="cuda"
+    )
+
+    page_table = None
+    topk_indices_offset = None
+    seq_lens = None
+    if append_tail:
+        tail_counts = torch.randint(
+            0, pool_size, (bs,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens = lengths * pool_size + tail_counts
+    if mode == "paged":
+        page_table = torch.arange(
+            bs * (num_groups * pool_size + pool_size),
+            dtype=torch.int32,
+            device="cuda",
+        ).view(bs, num_groups * pool_size + pool_size)
+    elif mode == "ragged":
+        topk_indices_offset = torch.randint(
+            0, 2048, (bs,), dtype=torch.int32, device="cuda"
+        )
+
+    out_no_pad = fast_kpool_topk_transform_fused(
+        score,
+        lengths,
+        pool_size,
+        topk,
+        page_table=page_table,
+        topk_indices_offset=topk_indices_offset,
+        seq_lens=seq_lens,
+    )
+    out_padded = fast_kpool_topk_transform_fused(
+        score,
+        lengths,
+        pool_size,
+        topk,
+        page_table=page_table,
+        topk_indices_offset=topk_indices_offset,
+        seq_lens=seq_lens,
+        out_rows=bs + pad_rows,
+    )
+
+    assert out_padded.shape[0] == bs + pad_rows
+    assert out_padded.shape[1] == out_no_pad.shape[1]
+    # fast_topk uses atomicAdd, so per-row index order is non-deterministic
+    # across calls -- compare on the sorted set, like the no-pad test.
+    torch.testing.assert_close(
+        torch.sort(out_padded[:bs], dim=-1).values,
+        torch.sort(out_no_pad, dim=-1).values,
+        atol=0,
+        rtol=0,
+    )
+    expected_pad = torch.full_like(out_padded[bs:], -1)
+    torch.testing.assert_close(out_padded[bs:], expected_pad, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

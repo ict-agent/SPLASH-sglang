@@ -407,6 +407,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
     const int32_t pool_size,
     const int32_t token_topk,
     const int32_t out_cols,
+    const int32_t real_rows,
     const int32_t* __restrict__ page_table,
     const int64_t page_table_stride,
     const int32_t* __restrict__ topk_indices_offset,
@@ -414,10 +415,19 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
+  const auto dst = dst_token_indices + bid * dst_stride;
+  // Padding row (caller asked for more output rows than score rows):
+  // every column is invalid. Mirrors the column-suffix sentinel below
+  // so downstream sparse-attn treats these rows as no-op.
+  if (bid >= static_cast<uint64_t>(real_rows)) {
+    for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+      dst[col] = -1;
+    }
+    return;
+  }
   const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
   const auto length = lengths[bid];
   const auto score = input + bid * input_stride;
-  const auto dst = dst_token_indices + bid * dst_stride;
   const auto page_table_entry = page_table == nullptr ? nullptr : page_table + bid * page_table_stride;
   const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
   const auto full_pool_token_len = length * pool_size;
@@ -510,6 +520,7 @@ void launch_kpool_topk_transform_kernel(
     int32_t pool_size,
     int32_t token_topk,
     int32_t out_cols,
+    int32_t real_rows,
     const int32_t* page_table,
     int64_t page_table_stride,
     const int32_t* topk_indices_offset,
@@ -525,6 +536,7 @@ void launch_kpool_topk_transform_kernel(
       pool_size,
       token_topk,
       out_cols,
+      real_rows,
       page_table,
       page_table_stride,
       topk_indices_offset,
@@ -682,7 +694,11 @@ void fast_kpool_topk_transform_interface(
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(dst_token_indices.dim() == 2 && dst_token_indices.is_contiguous());
-  TORCH_CHECK(dst_token_indices.size(0) == B);
+  // dst.size(0) may exceed B when the caller's q is right-padded
+  // (mlp-sync TP/CP pad). Extra rows are filled with -1 inside the
+  // kernel so callers don't pay a separate torch.full + slice copy.
+  TORCH_CHECK(dst_token_indices.size(0) >= B);
+  const auto dst_rows = dst_token_indices.size(0);
   const auto tail_cols = seq_lens_opt.has_value() ? pool_size - 1 : 0;
   TORCH_CHECK(dst_token_indices.size(1) > tail_cols);
   const auto token_topk = dst_token_indices.size(1) - tail_cols;
@@ -723,12 +739,13 @@ void fast_kpool_topk_transform_interface(
   }
 
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto grid = dim3{static_cast<uint32_t>(dst_rows)};
   const auto block = dim3{kThreadsPerBlock};
   const auto dst_stride = dst_token_indices.stride(0);
   const auto token_topk_i32 = static_cast<int32_t>(token_topk);
   const auto out_cols = static_cast<int32_t>(dst_token_indices.size(1));
   const auto pool_size_i32 = static_cast<int32_t>(pool_size);
+  const auto real_rows_i32 = static_cast<int32_t>(B);
 
   auto* dst_token_indices_ptr = dst_token_indices.data_ptr<int32_t>();
 #define DISPATCH_KPOOL_TOPK(K)             \
@@ -740,6 +757,7 @@ void fast_kpool_topk_transform_interface(
         pool_size_i32,                     \
         token_topk_i32,                    \
         out_cols,                          \
+        real_rows_i32,                     \
         page_table_ptr,                    \
         page_table_stride,                 \
         topk_indices_offset_ptr,           \

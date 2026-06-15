@@ -52,6 +52,9 @@ class Glm5NextConfig(PretrainedConfig):
         index_topk: int | None = None,
         index_n_heads: int | None = None,
         index_dsa_use_layernorm: bool = True,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        index_kpool_always_select_tail: bool = False,
         linear_conv_kernel_dim: int = 4,
         linear_num_key_heads: int | None = None,
         linear_num_value_heads: int | None = None,
@@ -127,6 +130,9 @@ class Glm5NextConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_dsa_use_layernorm = index_dsa_use_layernorm
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self.index_kpool_always_select_tail = index_kpool_always_select_tail
 
         # mhc config
         self.mhc = mhc

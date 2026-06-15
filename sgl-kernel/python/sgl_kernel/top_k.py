@@ -126,6 +126,7 @@ def fast_kpool_topk_transform_fused(
     topk_indices_offset: Optional[torch.Tensor] = None,
     row_starts: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    out_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Pool-level radix top-k for NSA kpool indexer.
@@ -133,6 +134,11 @@ def fast_kpool_topk_transform_fused(
     Selects pool groups from ``score`` at pool granularity, expands each selected
     group to ``pool_size`` token indices, and optionally transforms those token
     indices through a page table or a ragged offset.
+
+    ``out_rows`` lets the caller request more rows than ``score.shape[0]``; the
+    extra trailing rows are filled with -1 inside the kernel. Used when the q
+    upstream is right-padded for mlp-sync (TP/CP) and the caller wants the
+    output sized against the padded q rather than the real-token count.
     """
     assert topk % pool_size == 0
     group_topk = topk // pool_size
@@ -146,8 +152,15 @@ def fast_kpool_topk_transform_fused(
         assert seq_lens.dim() == 1
         assert seq_lens.shape[0] == score.shape[0]
 
+    n_real = score.shape[0]
+    if out_rows is None:
+        out_rows = n_real
+    else:
+        assert (
+            out_rows >= n_real
+        ), f"out_rows ({out_rows}) must be >= score rows ({n_real})"
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
-    dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
+    dst_token_indices = score.new_empty((out_rows, out_cols), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_kpool_topk_transform_fused(
         score,
         lengths,

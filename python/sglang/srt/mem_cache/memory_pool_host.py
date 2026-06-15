@@ -11,13 +11,14 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
-import numpy as np
 import os
-import psutil
 import time
+import uuid
+
+import numpy as np
+import psutil
 import torch
 import torch.distributed as dist
-import uuid
 
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
@@ -43,6 +44,12 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.glm.hugepage_utils import (
+    GLM_HICACHE_SHM_DIR,
+    _align_up,
+    _hugepage_enabled,
+    _hugepage_size,
+)
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
@@ -51,13 +58,6 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
-from sglang.srt.mem_cache.glm.hugepage_utils import (
-    GLM_HICACHE_SHM_DIR,
-    _align_up,
-    _hugepage_enabled,
-    _hugepage_size,
-)
-from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -535,7 +535,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
         pool_transfers=None,
     ):
         if io_backend == "kernel":
@@ -947,7 +951,12 @@ class MLATokenToKVPoolHost(HostKVCache):
         return buffer
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
         pool_transfers=None,
     ):
         if io_backend == "kernel":
@@ -1031,7 +1040,11 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
         pool_transfers=None,
     ):
         if io_backend == "kernel":
@@ -1757,11 +1770,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
         )
-        # Mirror device-side dense kpool-compress packing (slots_per_pool_page
+        # Mirror device-side dense kpool-compress packing (slots_per_page
         # = page_size for anchor; page_size // index_kpool for dense).
-        self.slots_per_pool_page = getattr(
-            device_pool, "slots_per_pool_page", page_size
-        )
+        self.slots_per_page = getattr(device_pool, "slots_per_page", page_size)
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -1775,7 +1786,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token
-            * self.slots_per_pool_page
+            * self.slots_per_page
             * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
@@ -1787,14 +1798,14 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     def get_size_per_token(self):
         base = super().get_size_per_token()
-        # Anchor: slots_per_pool_page=64 -> 132*L*64/64 = 132 L bytes/token
-        # Dense : slots_per_pool_page=4  -> 132*L*4/64  = 8.25 L bytes/token
+        # Anchor: slots_per_page=64 -> 132*L*64/64 = 132 L bytes/token
+        # Dense : slots_per_page=4  -> 132*L*4/64  = 8.25 L bytes/token
         return (
             base
             + self.indexer_size_per_token
             * self.layer_num
             * self.indexer_dtype.itemsize
-            * self.slots_per_pool_page
+            * self.slots_per_page
             // self.page_size
         )
 
@@ -2011,7 +2022,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         allocator_type: str = "default",
         tp_group: Optional[dist.ProcessGroup] = None,
     ):
-        logger.info("Using NSATokenToKVPoolHostShared for zero-copy shared host cache (NSA).")
+        logger.info(
+            "Using NSATokenToKVPoolHostShared for zero-copy shared host cache (NSA)."
+        )
 
         # 初始化 TP/DP 信息
         if is_dp_attention_enabled():
@@ -2058,20 +2071,20 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         初始化共享内存 NSA Index Buffer。
         """
         # 计算 Shape
-        index_buffer_second_dim = self.slots_per_pool_page * (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+        index_buffer_second_dim = self.slots_per_page * (
+            self.index_head_dim
+            + self.index_head_dim // self.indexer_quant_block_size * 4
         )
         self.index_stride_size = (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+            self.index_head_dim
+            + self.index_head_dim // self.indexer_quant_block_size * 4
         ) * self.indexer_dtype.itemsize
 
         # Shape: (LayerNum, PageNum, ElementDim)
         index_dims = (self.layer_num, self.page_num, index_buffer_second_dim)
 
         full_index_buffer = self._allocate_shared_buffer(
-            "index",
-            index_dims,
-            self.indexer_dtype
+            "index", index_dims, self.indexer_dtype
         )
 
         # 切分为 list 以兼容父类接口: [tensor(layer_0), tensor(layer_1), ...]
@@ -2094,7 +2107,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
             device=self.device_pool.device,
         )
 
-    def _allocate_shared_buffer(self, name_suffix: str, shape: tuple, dtype: torch.dtype):
+    def _allocate_shared_buffer(
+        self, name_suffix: str, shape: tuple, dtype: torch.dtype
+    ):
         """
         通用的共享内存分配辅助函数（已针对 cudaHostRegister 的 Page Fault 瓶颈进行优化，包含耗时打点）。
         """
@@ -2107,7 +2122,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         t_start_all = time.perf_counter()
 
         if self.tp_rank == 0:
-            logger.info(f"[{name_suffix}] Allocating shared memory buffer: {size_gb:.2f} GB")
+            logger.info(
+                f"[{name_suffix}] Allocating shared memory buffer: {size_gb:.2f} GB"
+            )
 
         # 1. 协商文件名
         shared_filename = None
@@ -2121,7 +2138,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                     os.posix_fallocate(f.fileno(), 0, total_bytes)
                 except (AttributeError, OSError):
                     f.truncate(total_bytes)
-            logger.info(f"[{name_suffix}] Rank 0 created shared file in {time.perf_counter() - t_file_start:.3f}s")
+            logger.info(
+                f"[{name_suffix}] Rank 0 created shared file in {time.perf_counter() - t_file_start:.3f}s"
+            )
 
         object_list = [shared_filename]
         dist.broadcast_object_list(object_list, src=0, group=self.tp_group)
@@ -2140,7 +2159,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                 device="cpu",
             )
             if self.tp_rank == 0:
-                logger.info(f"[{name_suffix}] Memory mapping took {time.perf_counter() - t_map_start:.3f}s")
+                logger.info(
+                    f"[{name_suffix}] Memory mapping took {time.perf_counter() - t_map_start:.3f}s"
+                )
 
             # =================================================================
             # 3. 并行缺页中断 (Parallel Page Faulting)
@@ -2149,18 +2170,24 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
 
             chunk_size = numel // self.tp_size
             start_idx = self.tp_rank * chunk_size
-            end_idx = numel if self.tp_rank == self.tp_size - 1 else start_idx + chunk_size
+            end_idx = (
+                numel if self.tp_rank == self.tp_size - 1 else start_idx + chunk_size
+            )
 
             # 强制操作系统真正分配物理内存页
             flat_tensor[start_idx:end_idx].zero_()
 
             t_zero_end = time.perf_counter()
-            logger.info(f"[{name_suffix}] Rank {self.tp_rank} finished zeroing chunk in {t_zero_end - t_zero_start:.3f}s")
+            logger.info(
+                f"[{name_suffix}] Rank {self.tp_rank} finished zeroing chunk in {t_zero_end - t_zero_start:.3f}s"
+            )
 
             # 等待所有进程都完成
             dist.barrier(group=self.tp_group)
             if self.tp_rank == 0:
-                logger.info(f"[{name_suffix}] Parallel page faulting (all ranks) completed in {time.perf_counter() - t_zero_start:.3f}s")
+                logger.info(
+                    f"[{name_suffix}] Parallel page faulting (all ranks) completed in {time.perf_counter() - t_zero_start:.3f}s"
+                )
 
             buffer = flat_tensor.view(shape)
 
@@ -2176,10 +2203,14 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                     )
                 t_pin_end = time.perf_counter()
                 if self.tp_rank == 0:
-                    logger.info(f"[{name_suffix}] cudaHostRegister took {t_pin_end - t_pin_start:.3f}s")
+                    logger.info(
+                        f"[{name_suffix}] cudaHostRegister took {t_pin_end - t_pin_start:.3f}s"
+                    )
 
             if self.tp_rank == 0:
-                logger.info(f"[{name_suffix}] Total allocation pipeline took {time.perf_counter() - t_start_all:.3f}s")
+                logger.info(
+                    f"[{name_suffix}] Total allocation pipeline took {time.perf_counter() - t_start_all:.3f}s"
+                )
 
             return buffer
         finally:
@@ -2201,7 +2232,9 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                 self.kv_cache_dim,
             )
         else:
-            raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
+            raise ValueError(
+                f"Shared pool currently only supports layer_first layout, got {self.layout}"
+            )
 
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
@@ -2214,7 +2247,12 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
     # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
     # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
         pool_transfers=None,
     ):
         """
@@ -2226,11 +2264,15 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         # 2. self._load_indexer_to_device_per_layer (负责 Indexer)
         # 因为所有 Rank 都映射了共享内存，所以 standard load 逻辑 = 并行读取 = 正确。
         super().load_to_device_per_layer(
-             device_pool, host_indices, device_indices, layer_id, io_backend
+            device_pool, host_indices, device_indices, layer_id, io_backend
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
         pool_transfers=None,
     ) -> None:
         """
@@ -2268,12 +2310,14 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         allocator_type: str = "default",
         tp_group: Optional[dist.ProcessGroup] = None,
     ):
-        logger.info("Using NSATokenToKVPoolHostShared (Per-Rank Distributed Shards) for zero-copy host cache (NSA).")
+        logger.info(
+            "Using NSATokenToKVPoolHostShared (Per-Rank Distributed Shards) for zero-copy host cache (NSA)."
+        )
 
-        if getattr(device_pool, "slots_per_pool_page", page_size) != page_size:
+        if getattr(device_pool, "slots_per_page", page_size) != page_size:
             raise NotImplementedError(
                 "NSATokenToKVPoolHostSharedLayerGroup does not support dense "
-                "kpool layout (slots_per_pool_page != page_size); use "
+                "kpool layout (slots_per_page != page_size); use "
                 "NSATokenToKVPoolHost or NSATokenToKVPoolHostShared instead."
             )
 
@@ -2315,7 +2359,9 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             allocator_type,
         )
 
-        self.index_data_refs = [self.index_k_with_scale_buffer[i] for i in range(self.layer_num)]
+        self.index_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
         self.index_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.index_data_refs],
             dtype=torch.uint64,
@@ -2338,7 +2384,9 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         my_files = self._shared_my_files
 
         index_buffer_second_dim = self.page_size * self.indexer_size_per_token
-        self.index_stride_size = self.indexer_size_per_token * self.indexer_dtype.itemsize
+        self.index_stride_size = (
+            self.indexer_size_per_token * self.indexer_dtype.itemsize
+        )
 
         self.index_k_with_scale_buffer = [None] * self.layer_num
 
@@ -2364,15 +2412,24 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             idx_mapped_numel = (
                 _align_up(idx_numel * self.indexer_dtype.itemsize)
                 // self.indexer_dtype.itemsize
-                if _hugepage_enabled() else idx_numel
+                if _hugepage_enabled()
+                else idx_numel
             )
             idx_tensor = torch.from_file(
-                files["index"], shared=True, size=idx_mapped_numel, dtype=self.indexer_dtype, device="cpu"
+                files["index"],
+                shared=True,
+                size=idx_mapped_numel,
+                dtype=self.indexer_dtype,
+                device="cpu",
             )[:idx_numel].view(idx_shape)
             if self.pin_memory and is_cuda():
-                torch.cuda.cudart().cudaHostRegister(idx_tensor.data_ptr(), idx_numel * self.indexer_dtype.itemsize, 0)
+                torch.cuda.cudart().cudaHostRegister(
+                    idx_tensor.data_ptr(), idx_numel * self.indexer_dtype.itemsize, 0
+                )
 
-            logger.info(f"Rank {self.tp_rank} finish Indexer cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s")
+            logger.info(
+                f"Rank {self.tp_rank} finish Indexer cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s"
+            )
 
             for i in range(r_num):
                 global_layer_idx = r_rel_start + i
@@ -2406,10 +2463,14 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
     def init_kv_buffer(self):
         if self.layout != "layer_first":
-            raise ValueError(f"Shared pool currently only supports layer_first layout, got {self.layout}")
+            raise ValueError(
+                f"Shared pool currently only supports layer_first layout, got {self.layout}"
+            )
 
         if _hugepage_enabled():
-            logger.info(f"HugePage enabled. Using shared host cache directory: {GLM_HICACHE_SHM_DIR}, PageSize = {_hugepage_size()}.")
+            logger.info(
+                f"HugePage enabled. Using shared host cache directory: {GLM_HICACHE_SHM_DIR}, PageSize = {_hugepage_size()}."
+            )
 
         # 计算 Element Dimensions
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
@@ -2417,7 +2478,8 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         kv_element_dim = self.kv_cache_dim
 
         index_buffer_second_dim = self.page_size * (
-            self.index_head_dim + self.index_head_dim // self.indexer_quant_block_size * 4
+            self.index_head_dim
+            + self.index_head_dim // self.indexer_quant_block_size * 4
         )
 
         # === Step 1: 当前 Rank 在本地 /dev/shm 创建并分配自己负责的那块 Cache 空间 ===
@@ -2429,8 +2491,15 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             kv_name = f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_kv_{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
             idx_name = f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_idx_{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
 
-            kv_bytes = self.my_num_layers * self.size * kv_element_dim * self.dtype.itemsize
-            idx_bytes = self.my_num_layers * self.page_num * index_buffer_second_dim * self.indexer_dtype.itemsize
+            kv_bytes = (
+                self.my_num_layers * self.size * kv_element_dim * self.dtype.itemsize
+            )
+            idx_bytes = (
+                self.my_num_layers
+                * self.page_num
+                * index_buffer_second_dim
+                * self.indexer_dtype.itemsize
+            )
             kv_alloc_bytes = _align_up(kv_bytes) if _hugepage_enabled() else kv_bytes
             idx_alloc_bytes = _align_up(idx_bytes) if _hugepage_enabled() else idx_bytes
 
@@ -2446,7 +2515,9 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                     os.posix_fallocate(f.fileno(), 0, idx_alloc_bytes)
                 except (AttributeError, OSError):
                     f.truncate(idx_alloc_bytes)
-            logger.info(f"Rank {self.tp_rank} cache file creation finished in {time.perf_counter()-t_zero_alloc:.3f}s")
+            logger.info(
+                f"Rank {self.tp_rank} cache file creation finished in {time.perf_counter()-t_zero_alloc:.3f}s"
+            )
 
             # 在 Step 1 就原地将文件映射到内存并执行 zero_()。
             # 此时各个 Rank 之间完全并行，物理内存分配（触发缺页中断）会落在此 Rank 绑定的 NUMA 节点上。
@@ -2454,16 +2525,26 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             t_zero_alloc = time.perf_counter()
             my_kv_numel = self.my_num_layers * self.size * 1 * kv_element_dim
             tmp_kv_numel = kv_alloc_bytes // self.dtype.itemsize
-            tmp_kv = torch.from_file(kv_name, shared=True, size=tmp_kv_numel, dtype=self.dtype, device="cpu")
+            tmp_kv = torch.from_file(
+                kv_name, shared=True, size=tmp_kv_numel, dtype=self.dtype, device="cpu"
+            )
             tmp_kv[:my_kv_numel].zero_()
             del tmp_kv  # 释放临时映射句柄
 
             my_idx_numel = self.my_num_layers * self.page_num * index_buffer_second_dim
             tmp_idx_numel = idx_alloc_bytes // self.indexer_dtype.itemsize
-            tmp_idx = torch.from_file(idx_name, shared=True, size=tmp_idx_numel, dtype=self.indexer_dtype, device="cpu")
+            tmp_idx = torch.from_file(
+                idx_name,
+                shared=True,
+                size=tmp_idx_numel,
+                dtype=self.indexer_dtype,
+                device="cpu",
+            )
             tmp_idx[:my_idx_numel].zero_()
-            del tmp_idx # 释放临时映射句柄
-            logger.info(f"Rank {self.tp_rank} allocated and zeroed its own physical memory locally in {time.perf_counter()-t_zero_alloc:.3f}s")
+            del tmp_idx  # 释放临时映射句柄
+            logger.info(
+                f"Rank {self.tp_rank} allocated and zeroed its own physical memory locally in {time.perf_counter()-t_zero_alloc:.3f}s"
+            )
 
             my_files = {"kv": kv_name, "index": idx_name}
 
@@ -2496,15 +2577,24 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             kv_numel = r_num * self.size * 1 * kv_element_dim
             kv_mapped_numel = (
                 _align_up(kv_numel * self.dtype.itemsize) // self.dtype.itemsize
-                if _hugepage_enabled() else kv_numel
+                if _hugepage_enabled()
+                else kv_numel
             )
             kv_tensor = torch.from_file(
-                files["kv"], shared=True, size=kv_mapped_numel, dtype=self.dtype, device="cpu"
+                files["kv"],
+                shared=True,
+                size=kv_mapped_numel,
+                dtype=self.dtype,
+                device="cpu",
             )[:kv_numel].view(kv_shape)
             if self.pin_memory and is_cuda():
-                torch.cuda.cudart().cudaHostRegister(kv_tensor.data_ptr(), kv_numel * self.dtype.itemsize, 0)
+                torch.cuda.cudart().cudaHostRegister(
+                    kv_tensor.data_ptr(), kv_numel * self.dtype.itemsize, 0
+                )
 
-            logger.info(f"Rank {self.tp_rank} finish KV cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s")
+            logger.info(
+                f"Rank {self.tp_rank} finish KV cudaHostRegister for Rank {file_idx}'s file in {time.perf_counter()-t_pin:.3f}s"
+            )
 
             for i in range(r_num):
                 global_layer_idx = r_rel_start + i
@@ -2526,15 +2616,24 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
     # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
     # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
         pool_transfers=None,
     ):
         super().load_to_device_per_layer(
-             device_pool, host_indices, device_indices, layer_id, io_backend
+            device_pool, host_indices, device_indices, layer_id, io_backend
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend,
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
         pool_transfers=None,
     ) -> None:
         if self.my_num_layers == 0:
@@ -2542,7 +2641,9 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
         # 1. Backup KV Buffer
         if io_backend == "kernel":
-            src_ptrs = device_pool.data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            src_ptrs = device_pool.data_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
             dst_ptrs = self.data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
 
             transfer_kv_all_layer_mla(
@@ -2555,7 +2656,8 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             )
         elif io_backend == "direct":
             src_layers = [
-                device_pool.kv_buffer[i] for i in range(self.my_rel_start, self.my_rel_end)
+                device_pool.kv_buffer[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
             ]
             dst_layers = [
                 self.data_refs[i] for i in range(self.my_rel_start, self.my_rel_end)
@@ -2575,8 +2677,12 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         page_indices_device = device_indices[:: self.page_size] // self.page_size
 
         if io_backend == "kernel":
-            src_ptrs = self.index_k_device_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
-            dst_ptrs = self.index_data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            src_ptrs = self.index_k_device_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
+            dst_ptrs = self.index_data_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
 
             transfer_kv_all_layer_mla(
                 src_layers=src_ptrs,

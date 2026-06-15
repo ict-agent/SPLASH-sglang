@@ -156,7 +156,6 @@ class NSAMetadata:
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
-    pooled_real_page_table: Optional[torch.Tensor] = None
     pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
     pooled_index_kpool: int = 1
     # The sum of sequence lengths for key, prefill only
@@ -428,13 +427,11 @@ class NativeSparseAttnBackend(
         self,
         metadata: NSAMetadata,
         seqlens_32: torch.Tensor,
-        real_page_table: torch.Tensor,
         forward_mode: ForwardMode,
-    ) -> None:
-        _init_pooled_paged_mqa_metadata_impl(
+    ) -> NSAMetadata:
+        return _init_pooled_paged_mqa_metadata_impl(
             metadata,
             seqlens_32,
-            real_page_table,
             forward_mode,
             pool_size=self.nsa_index_kpool,
             real_page_size=self.real_page_size,
@@ -444,18 +441,14 @@ class NativeSparseAttnBackend(
         self,
         metadata: NSAMetadata,
         seqlens_32: torch.Tensor,
-        real_page_table: torch.Tensor,
         forward_mode: ForwardMode,
-        page_tables_already_updated: bool = False,
     ) -> None:
         _update_pooled_paged_mqa_metadata_impl(
             metadata,
             seqlens_32,
-            real_page_table,
             forward_mode,
             pool_size=self.nsa_index_kpool,
             real_page_size=self.real_page_size,
-            page_tables_already_updated=page_tables_already_updated,
         )
 
     def _init_kpool_extend_metadata(
@@ -463,13 +456,30 @@ class NativeSparseAttnBackend(
         metadata: NSAMetadata,
         forward_batch: ForwardBatch,
         topk_transform_method: TopkTransformMethod,
-    ) -> None:
-        _init_kpool_extend_metadata_impl(
+        *,
+        full_real_page_table: torch.Tensor,
+        full_seqlens_expanded: torch.Tensor,
+        local_real_page_table: Optional[torch.Tensor] = None,
+        local_seqlens_expanded: Optional[torch.Tensor] = None,
+        local_extend_seq_lens_cpu: Optional[List[int]] = None,
+        local_seq_lens_cpu: Optional[List[int]] = None,
+        local_req_pool_indices: Optional[torch.Tensor] = None,
+        local_max_seq_len: Optional[int] = None,
+    ) -> NSAMetadata:
+        return _init_kpool_extend_metadata_impl(
             metadata,
             forward_batch,
             pool_size=self.nsa_index_kpool,
             real_page_size=self.real_page_size,
             topk_transform_method=topk_transform_method,
+            full_real_page_table=full_real_page_table,
+            full_seqlens_expanded=full_seqlens_expanded,
+            local_real_page_table=local_real_page_table,
+            local_seqlens_expanded=local_seqlens_expanded,
+            local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
+            local_seq_lens_cpu=local_seq_lens_cpu,
+            local_req_pool_indices=local_req_pool_indices,
+            local_max_seq_len=local_max_seq_len,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -507,6 +517,23 @@ class NativeSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+
+        # Kpool gating: pool_size > 1 on a 64-page backend with a
+        # divisible pool size. Mode-specific work fires inside the
+        # branches below (extend / decode are mutually exclusive).
+        use_kpool = (
+            self.nsa_index_kpool > 1
+            and self.real_page_size == 64
+            and self.real_page_size % self.nsa_index_kpool == 0
+        )
+        # Built inside the is_extend() branch when kpool is on. Compress
+        # side is always full-seq (K is gathered before compress);
+        # ``kpool_cp_overrides`` is populated only under CP round-robin-split
+        # to carry this rank's local view (empty otherwise so the planner
+        # falls back to the compress layout for topk too).
+        kpool_full_real_page_table: Optional[torch.Tensor] = None
+        kpool_full_seqlens_expanded: Optional[torch.Tensor] = None
+        kpool_cp_overrides: dict = {}
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -598,6 +625,14 @@ class NativeSparseAttnBackend(
                     )
                 ]
             )
+            # Kpool planner inputs. Snapshot the pre-CP-split real page
+            # table and seqlens for the compress side (K is gathered
+            # before compress, so write_locs index the full pool table).
+            if use_kpool:
+                kpool_full_real_page_table = self._transform_table_1_to_real(
+                    page_table
+                )
+                kpool_full_seqlens_expanded = seqlens_expanded
 
             if can_nsa_prefill_cp_round_robin_split(forward_batch):
                 seqlens_expanded = nsa_cp_round_robin_split_data(seqlens_expanded)
@@ -616,6 +651,21 @@ class NativeSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
+                if use_kpool:
+                    # CP round-robin-split: build the rank-local view.
+                    # page_table / seqlens_expanded / extend_seq_lens_cpu /
+                    # indexer_seq_lens_cpu are already rebound above.
+                    local_seq_lens_cpu = indexer_seq_lens_cpu.tolist()
+                    kpool_cp_overrides = dict(
+                        local_real_page_table=self._transform_table_1_to_real(
+                            page_table
+                        ),
+                        local_seqlens_expanded=seqlens_expanded,
+                        local_extend_seq_lens_cpu=list(extend_seq_lens_cpu),
+                        local_seq_lens_cpu=local_seq_lens_cpu,
+                        local_req_pool_indices=forward_batch.req_pool_indices[bs_idx],
+                        local_max_seq_len=max(local_seq_lens_cpu, default=0),
+                    )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -752,13 +802,23 @@ class NativeSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
-        self._init_pooled_paged_mqa_metadata(
-            metadata=metadata,
-            seqlens_32=cache_seqlens_int32,
-            real_page_table=metadata.real_page_table,
-            forward_mode=forward_batch.forward_mode,
-        )
-        self._init_kpool_extend_metadata(metadata, forward_batch, topk_transform_method)
+        if use_kpool:
+            mode = forward_batch.forward_mode
+            if is_cuda() and mode.is_decode_or_idle():
+                metadata = self._init_pooled_paged_mqa_metadata(
+                    metadata=metadata,
+                    seqlens_32=cache_seqlens_int32,
+                    forward_mode=mode,
+                )
+            elif mode.is_extend_without_speculative():
+                metadata = self._init_kpool_extend_metadata(
+                    metadata,
+                    forward_batch,
+                    topk_transform_method,
+                    full_real_page_table=kpool_full_real_page_table,
+                    full_seqlens_expanded=kpool_full_seqlens_expanded,
+                    **kpool_cp_overrides,
+                )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -1034,10 +1094,9 @@ class NativeSparseAttnBackend(
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
-        self._init_pooled_paged_mqa_metadata(
+        metadata = self._init_pooled_paged_mqa_metadata(
             metadata=metadata,
             seqlens_32=cache_seqlens_int32,
-            real_page_table=metadata.real_page_table,
             forward_mode=forward_mode,
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -1080,11 +1139,9 @@ class NativeSparseAttnBackend(
                 self.nsa_index_kpool > 1
                 and is_cuda()
                 and self.real_page_size == 64
-                and 64 % self.nsa_index_kpool == 0
-                and metadata.pooled_real_page_table is not None
+                and self.real_page_size % self.nsa_index_kpool == 0
                 and metadata.page_table_1.is_contiguous()
                 and metadata.real_page_table.is_contiguous()
-                and metadata.pooled_real_page_table.is_contiguous()
             )
             if can_update_kpool_tables_fused:
                 update_kpool_decode_cuda_graph_page_tables(
@@ -1092,9 +1149,9 @@ class NativeSparseAttnBackend(
                     req_pool_indices=req_pool_indices,
                     page_table_1=metadata.page_table_1,
                     real_page_table=metadata.real_page_table,
-                    pooled_real_page_table=metadata.pooled_real_page_table,
                     max_len=max_len,
                     pool_size=self.nsa_index_kpool,
+                    page_size=self.real_page_size,
                 )
                 page_tables_already_updated = True
             else:
@@ -1220,23 +1277,18 @@ class NativeSparseAttnBackend(
         # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
 
         assert self.real_page_size == metadata.page_size
-        if page_tables_already_updated:
-            real_table = metadata.real_page_table
-        elif self.real_page_size > 1:
+        if not page_tables_already_updated and self.real_page_size > 1:
             real_table = self._transform_table_1_to_real(page_indices)
             new_rows = real_table.shape[0]
             new_cols = real_table.shape[1]
             metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
-        else:
+        elif self.real_page_size == 1:
             assert metadata.real_page_table is metadata.page_table_1
-            real_table = metadata.real_page_table
 
         self._update_pooled_paged_mqa_metadata(
             metadata=metadata,
             seqlens_32=metadata.cache_seqlens_int32,
-            real_page_table=real_table,
             forward_mode=forward_mode,
-            page_tables_already_updated=page_tables_already_updated,
         )
 
         if self.nsa_decode_impl == "flashmla_kv":
@@ -1397,15 +1449,10 @@ class NativeSparseAttnBackend(
                 metadata.real_page_table[:rows, :cols].copy_(
                     precomputed.real_page_table
                 )
-                real_table = precomputed.real_page_table
-            else:
-                # real_page_table is same as page_table_1 (already copied)
-                real_table = metadata.real_page_table
 
             self._update_pooled_paged_mqa_metadata(
                 metadata=metadata,
                 seqlens_32=metadata.cache_seqlens_int32,
-                real_page_table=real_table,
                 forward_mode=forward_mode,
             )
 
