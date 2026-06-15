@@ -1122,6 +1122,38 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
+_LOG_LEVEL_COLORS = {
+    logging.DEBUG: "\033[36m",  # cyan
+    logging.WARNING: "\033[33m",  # yellow
+    logging.ERROR: "\033[31m",  # red
+    logging.CRITICAL: "\033[1;31m",  # bold red
+}
+_LOG_COLOR_RESET = "\033[0m"
+
+
+class _ColoredFormatter(logging.Formatter):
+    def __init__(self, *args, enable_color: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enable_color = enable_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if not self.enable_color:
+            return message
+        color = _LOG_LEVEL_COLORS.get(record.levelno)
+        if color is None:
+            return message
+        return f"{color}{message}{_LOG_COLOR_RESET}"
+
+
+def _enable_log_color(stream) -> bool:
+    # Explicit SGLANG_LOGGING_COLORFUL forces on/off; otherwise auto-detect a
+    # TTY so we don't write ANSI escapes when piped to a file or CI.
+    if envs.SGLANG_LOGGING_COLORFUL.is_set():
+        return envs.SGLANG_LOGGING_COLORFUL.get()
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1134,11 +1166,20 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    log_format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    # Bind the handler to stderr explicitly so the isatty check below targets
+    # the same stream the records are written to.
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        _ColoredFormatter(
+            log_format,
+            datefmt="%Y-%m-%d %H:%M:%S",
+            enable_color=_enable_log_color(handler.stream),
+        )
+    )
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[handler],
         force=True,
     )
 
