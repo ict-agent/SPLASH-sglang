@@ -629,9 +629,7 @@ class NativeSparseAttnBackend(
             # table and seqlens for the compress side (K is gathered
             # before compress, so write_locs index the full pool table).
             if use_kpool:
-                kpool_full_real_page_table = self._transform_table_1_to_real(
-                    page_table
-                )
+                kpool_full_real_page_table = self._transform_table_1_to_real(page_table)
                 kpool_full_seqlens_expanded = seqlens_expanded
 
             if can_nsa_prefill_cp_round_robin_split(forward_batch):
@@ -1870,8 +1868,12 @@ class NativeSparseAttnBackend(
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
-        k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
-        c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        # Use explicit num_blocks (not -1) so the view also works when
+        # qk_rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when any
+        # other dim is 0. Same fix as in flashattention_backend.py.
+        num_blocks = kv_cache.shape[0] // page_size
+        k_rope_cache = k_rope_cache.view(num_blocks, page_size, 1, qk_rope_dim)
+        c_kv_cache = c_kv_cache.view(num_blocks, page_size, 1, v_head_dim)
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
