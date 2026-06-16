@@ -14,7 +14,36 @@ diff --git a/hopper/flash_api.cpp b/hopper/flash_api.cpp
 index 3060e87..12d0273 100644
 --- a/hopper/flash_api.cpp
 +++ b/hopper/flash_api.cpp
-@@ -692,6 +692,26 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
+@@ -442,10 +442,24 @@ inline int get_num_splits(Flash_fwd_params const& params) {
+     int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+     int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+     // Always enable PackGQA for Split
+-    // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
+-    // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
+-    // that batch = 1.
+-    int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
++    // For varlen, the previous "pretend batch = 1" heuristic underestimates
++    // total_mblocks when the batch contains many short segments (e.g. NSA
++    // sparse attention with cu_seqlens_q = arange(N+1), where every query
++    // is its own 1-token segment). That underestimation makes the SM
++    // occupancy look starved → heuristic picks many splits → fp32 out_accum
++    // workspace blows up (14.5 GiB OOM observed for DeepSeek-V3.2 NSA prefill
++    // with qo_len=4096, num_heads=64, v_head_dim=512, splits=29).
++    // Use total_q directly so the heuristic sees the real total tile count
++    // regardless of how the batch is segmented. Falls back to params.b *
++    // params.seqlen_q when total_q is not populated (non-varlen path keeps
++    // identical behavior since total_q = b * seqlen_q).
++    int const effective_total_q = params.total_q > 0
++                                  ? params.total_q
++                                  : params.b * params.seqlen_q;
++    int const packgqa_factor = params.h / params.h_k;
++    int const total_m_blocks_real =
++        (effective_total_q * packgqa_factor + kBlockM - 1) / kBlockM;
++    int total_mblocks = total_m_blocks_real * params.h_k;
+     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
+     #endif
+ }
+@@ -692,6 +706,26 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
      bool is_sm8x = dprops->major >= 8;
      TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
  
