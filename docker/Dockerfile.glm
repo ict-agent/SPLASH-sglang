@@ -463,8 +463,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     libcurl4t64 \
-    curl htop \
-    openmpi-bin libopenmpi-dev openssh-server
+    curl htop
 EOF
 
 RUN \
