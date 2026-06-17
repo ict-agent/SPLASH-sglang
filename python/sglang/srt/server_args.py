@@ -671,6 +671,8 @@ class ServerArgs:
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
+    # Split NSA GPU KV/indexer cache layers across CP ranks.
+    enable_nsa_cache_layer_split: bool = False
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -1511,6 +1513,14 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        is_nsa_model = is_deepseek_nsa(hf_config)
+
+        if self.enable_nsa_cache_layer_split and not is_nsa_model:
+            logger.warning(
+                "Disabling NSA cache layer split because it is only supported "
+                "for NSA models."
+            )
+            self.enable_nsa_cache_layer_split = False
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -1527,7 +1537,7 @@ class ServerArgs:
             "Glm5NextForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_nsa_model:  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
@@ -1608,6 +1618,34 @@ class ServerArgs:
                     assert (
                         self.disaggregation_mode != "decode"
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                if (
+                    self.enable_nsa_cache_layer_split
+                    and self.disaggregation_mode != "prefill"
+                ):
+                    if self.disaggregation_mode == "decode":
+                        logger.warning(
+                            "Disabling NSA cache layer split on decode workers. "
+                            "This flag is a prefill-CP optimization; decode should "
+                            "receive full cache shards through PD transfer."
+                        )
+                    else:
+                        logger.warning(
+                            "Disabling NSA cache layer split because it is only "
+                            "supported on PD prefill workers. Non-PD workers also "
+                            "run decode and require ordinary local decode cache "
+                            "semantics."
+                        )
+                    self.enable_nsa_cache_layer_split = False
+                if self.enable_nsa_cache_layer_split and (
+                    not self.enable_nsa_prefill_context_parallel
+                    or self.nsa_prefill_cp_mode != "round-robin-split"
+                ):
+                    logger.warning(
+                        "Disabling NSA cache layer split because it requires "
+                        "--enable-nsa-prefill-context-parallel and "
+                        "--nsa-prefill-cp-mode round-robin-split."
+                    )
+                    self.enable_nsa_cache_layer_split = False
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -5700,6 +5738,12 @@ class ServerArgs:
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+        )
+        parser.add_argument(
+            "--enable-nsa-cache-layer-split",
+            action="store_true",
+            default=ServerArgs.enable_nsa_cache_layer_split,
+            help="Enable NSA GPU KV/indexer cache layer split across CP ranks.",
         )
         parser.add_argument(
             "--enable-prefill-context-parallel",

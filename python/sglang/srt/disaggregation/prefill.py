@@ -142,12 +142,28 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        layer_shard_enabled = getattr(
+            self.token_to_kv_pool, "layer_shard_enabled", False
+        )
+        layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
+        layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
+        transfer_draft_cache = (
+            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+        )
+        kv_args.prefill_start_layer = (
+            getattr(
+                self.token_to_kv_pool,
+                "layer_shard_start",
+                self.token_to_kv_pool.start_layer,
+            )
+            if layer_shard_enabled
+            else self.token_to_kv_pool.start_layer
+        )
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if self.draft_token_to_kv_pool is not None:
+        if self.draft_token_to_kv_pool is not None and transfer_draft_cache:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -174,7 +190,9 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
 
         setup_state_kv_args(
-            kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool
+            kv_args,
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool if transfer_draft_cache else None,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

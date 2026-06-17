@@ -315,6 +315,8 @@ class CommonKVManager(BaseKVManager):
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
             else:
+                # With layer-split prefill, every CP rank owns a distinct
+                # layer shard, so decode must receive one response from each.
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
         # PP rank mapping — decode pp size should be equal to prefill pp size or 1

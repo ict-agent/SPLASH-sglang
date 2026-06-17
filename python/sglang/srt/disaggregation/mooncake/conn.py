@@ -989,7 +989,11 @@ class MooncakeKVManager(CommonKVManager):
                 skip_kv = True
                 skip_state = True
 
-        if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
+        if (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not self.server_args.enable_nsa_cache_layer_split
+        ):
             skip_state = True
 
         return skip_kv, skip_state
@@ -1765,7 +1769,10 @@ class MooncakeKVManager(CommonKVManager):
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
                 if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
+                    if (
+                        bootstrap_room in self.request_status
+                        and self.check_status(bootstrap_room) != KVPoll.Failed
+                    ):
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
@@ -1947,8 +1954,13 @@ class MooncakeKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        # Special handling for cp
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        # Special handling for cp. In layer-split mode each CP rank owns a
+        # distinct layer shard, so every rank must transfer the full page list
+        # for its local layers instead of partitioning pages across CP ranks.
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not self.kv_mgr.server_args.enable_nsa_cache_layer_split
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,

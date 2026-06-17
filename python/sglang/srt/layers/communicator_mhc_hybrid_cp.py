@@ -13,6 +13,8 @@
 # ==============================================================================
 
 
+from typing import Optional
+
 import torch
 
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -25,6 +27,7 @@ from sglang.srt.layers.communicator_nsa_cp import (
     NSACPCommunicateSimpleFn,
     NSACPCommunicateSummableTensorPairFn,
     NSACPCommunicateWithAllReduceAndLayerNormFn,
+    maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
@@ -59,6 +62,15 @@ class MHCHybridNSACPLayerCommunicator(MHCLayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
 

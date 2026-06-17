@@ -236,6 +236,27 @@ class HostKVCache(abc.ABC):
     def get_size_per_token(self):
         raise NotImplementedError()
 
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(getattr(device_pool, "layer_shard_enabled", False))
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        if not self._is_device_layer_sharded(device_pool):
+            return True
+        return device_pool._is_layer_owned(
+            getattr(device_pool, "start_layer", 0) + layer_id
+        )
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        layer_num = getattr(device_pool, "layer_num", self.layer_num)
+        if not self._is_device_layer_sharded(device_pool):
+            return list(range(layer_num))
+        return [
+            layer_id
+            for layer_id in range(layer_num)
+            if self._is_device_layer_owned(device_pool, layer_id)
+        ]
+
     @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()
@@ -425,6 +446,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         io_backend,
         pool_transfers=None,
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -534,6 +557,72 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_buffer[layer_id],
+                        v_cache_dst=self.v_buffer[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=device_pool.k_buffer[layer_id],
+                        dst_k=self.k_buffer[layer_id],
+                        src_v=device_pool.v_buffer[layer_id],
+                        dst_v=self.v_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_data_refs[layer_id],
+                        v_cache_dst=self.v_data_refs[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded MHA HiCache backup with page_first layout "
+                        "requires the JIT one-layer kernel."
+                    )
+            else:
+                raise ValueError(
+                    f"Layer-sharded HiCache backup does not support layout: {self.layout}"
+                )
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    dst_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct HiCache backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
+
     def backup_from_device_all_layer(
         self,
         device_pool,
@@ -542,6 +631,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         io_backend,
         pool_transfers=None,
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -959,6 +1055,8 @@ class MLATokenToKVPoolHost(HostKVCache):
         io_backend,
         pool_transfers=None,
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1039,6 +1137,63 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.kv_buffer[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=device_pool.kv_buffer[layer_id],
+                        dst=self.kv_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.data_refs[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded MLA HiCache backup with page_first layout "
+                        "requires the JIT one-layer kernel."
+                    )
+            else:
+                raise ValueError(
+                    f"Layer-sharded HiCache backup does not support layout: {self.layout}"
+                )
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.kv_buffer[layer_id]],
+                    dst_layers=[self.kv_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct HiCache backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
+
     def backup_from_device_all_layer(
         self,
         device_pool,
@@ -1047,6 +1202,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         io_backend,
         pool_transfers=None,
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1869,6 +2031,8 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
     def _load_indexer_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -1917,9 +2081,55 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_indexer_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if use_kernel:
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=device_pool.index_k_with_scale_buffer[layer_id],
+                    dst=self.index_k_with_scale_buffer[layer_id],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
+            elif self.layout == "page_first":
+                raise ValueError(
+                    "Layer-sharded NSA indexer HiCache backup with page_first "
+                    "layout is not supported without a per-layer LF->PF kernel."
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct NSA indexer backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def _backup_indexer_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_indexer_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -2279,9 +2489,10 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         Backup 数据。仅 Rank 0 写回共享内存。
         同时处理 KV Buffer 和 Index Buffer。
         """
-        if self.tp_rank == 0:
+        if self._is_device_layer_sharded(device_pool) or self.tp_rank == 0:
             # 调用父类 backup，父类会依次处理 KV 和 Indexer 的写回。
-            # 只有 Rank 0 执行此操作，避免写入冲突。
+            # 非 layer-split 时只有 Rank 0 执行此操作，避免写入冲突；
+            # layer-split 时每个 rank 只写自己 owned layers。
             super().backup_from_device_all_layer(
                 device_pool, host_indices, device_indices, io_backend
             )
@@ -2636,15 +2847,22 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         io_backend,
         pool_transfers=None,
     ) -> None:
-        if self.my_num_layers == 0:
+        layer_ids = [
+            layer_id
+            for layer_id in range(self.my_rel_start, self.my_rel_end)
+            if self._is_device_layer_owned(device_pool, layer_id)
+        ]
+        if not layer_ids:
             return
+        layer_index = torch.tensor(
+            layer_ids, dtype=torch.long, device=device_pool.data_ptrs.device
+        )
+        transfer_layer_num = len(layer_ids)
 
         # 1. Backup KV Buffer
         if io_backend == "kernel":
-            src_ptrs = device_pool.data_ptrs[
-                self.my_rel_start : self.my_rel_end
-            ].contiguous()
-            dst_ptrs = self.data_ptrs[self.my_rel_start : self.my_rel_end].contiguous()
+            src_ptrs = device_pool.data_ptrs.index_select(0, layer_index).contiguous()
+            dst_ptrs = self.data_ptrs.index_select(0, layer_index).contiguous()
 
             transfer_kv_all_layer_mla(
                 src_layers=src_ptrs,
@@ -2652,15 +2870,14 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 src_indices=device_indices,
                 dst_indices=host_indices,
                 item_size=self.token_stride_size,
-                num_layers=self.my_num_layers,
+                num_layers=transfer_layer_num,
             )
         elif io_backend == "direct":
             src_layers = [
-                device_pool.kv_buffer[i]
-                for i in range(self.my_rel_start, self.my_rel_end)
+                device_pool.kv_buffer[i] for i in layer_ids
             ]
             dst_layers = [
-                self.data_refs[i] for i in range(self.my_rel_start, self.my_rel_end)
+                self.data_refs[i] for i in layer_ids
             ]
             transfer_kv_direct(
                 src_layers=src_layers,
@@ -2677,12 +2894,10 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         page_indices_device = device_indices[:: self.page_size] // self.page_size
 
         if io_backend == "kernel":
-            src_ptrs = self.index_k_device_ptrs[
-                self.my_rel_start : self.my_rel_end
-            ].contiguous()
-            dst_ptrs = self.index_data_ptrs[
-                self.my_rel_start : self.my_rel_end
-            ].contiguous()
+            src_ptrs = self.index_k_device_ptrs.index_select(
+                0, layer_index
+            ).contiguous()
+            dst_ptrs = self.index_data_ptrs.index_select(0, layer_index).contiguous()
 
             transfer_kv_all_layer_mla(
                 src_layers=src_ptrs,
@@ -2690,16 +2905,16 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 src_indices=page_indices_device,
                 dst_indices=page_indices_host,
                 item_size=self.index_stride_size * self.page_size,
-                num_layers=self.my_num_layers,
+                num_layers=transfer_layer_num,
             )
         elif io_backend == "direct":
             src_layers = [
                 device_pool.index_k_with_scale_buffer[i]
-                for i in range(self.my_rel_start, self.my_rel_end)
+                for i in layer_ids
             ]
             dst_layers = [
                 self.index_k_with_scale_buffer[i]
-                for i in range(self.my_rel_start, self.my_rel_end)
+                for i in layer_ids
             ]
             transfer_kv_direct(
                 src_layers=src_layers,

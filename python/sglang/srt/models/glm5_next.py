@@ -698,6 +698,7 @@ class Glm5NextDecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -768,6 +769,10 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states = cp_scattered_to_plain(
                 hidden_states, forward_batch, get_attention_cp_size()
             )
+
+        self.layer_communicator.maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
@@ -881,6 +886,17 @@ class Glm5NextModel(nn.Module):
                     else []
                 ),
             ),
+        )
+        local_full_attention_layer_ids = [
+            layer_id
+            for layer_id in config.full_attention_layer_ids
+            if self.start_layer <= layer_id < self.end_layer
+        ]
+        self.next_full_attention_layer_id = dict(
+            zip(
+                local_full_attention_layer_ids,
+                local_full_attention_layer_ids[1:],
+            )
         )
 
         if self.pp_group.is_last_rank:
@@ -1048,6 +1064,9 @@ class Glm5NextModel(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     prev_topk_indices=topk_indices,
+                    next_full_attention_layer_id=(
+                        self.next_full_attention_layer_id.get(i)
+                    ),
                 )
 
         if not self.pp_group.is_last_rank:

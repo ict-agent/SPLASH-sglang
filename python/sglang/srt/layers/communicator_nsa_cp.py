@@ -46,6 +46,20 @@ def nsa_enable_prefill_cp():
     return is_nsa_enable_prefill_cp()
 
 
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: ForwardBatch,
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    if next_full_attention_layer_id is None or not nsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_mla_kv = getattr(
+        forward_batch.token_to_kv_pool, "prefetch_mla_kv_buffer", None
+    )
+    if prefetch_mla_kv is not None:
+        prefetch_mla_kv(next_full_attention_layer_id)
+
+
 class NSACPLayerCommunicator(LayerCommunicator):
     def __init__(
         self,
@@ -89,6 +103,15 @@ class NSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
 
