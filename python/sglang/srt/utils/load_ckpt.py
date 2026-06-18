@@ -429,10 +429,17 @@ def load_distcp(
     local_plan = LoadPlan(requests)
     planner = RefineLoadPlanner(local_plan)
 
+    # Route DCP's planning collectives (gather_object/scatter_object) through
+    # the TP group's gloo CPU backend. Default PG is NCCL, which forces the
+    # coordinator (rank 0) to allocate per-rank CUDA staging buffers for
+    # gather_object — those buffers stay resident and cause rank 0 to permanently
+    # hold ~2 GB more GPU than the other ranks, which then shrinks the
+    # min-reduced KV cache pool for everyone.
     dist_cp.load(
         state_dict=state_dict,
         storage_reader=WrappedStorageReader(meta_file_path),
         planner=planner,
+        process_group=get_tensor_model_parallel_group().cpu_group,
     )
     return state_dict, keys, dicts
 
