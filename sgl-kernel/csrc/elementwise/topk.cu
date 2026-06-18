@@ -410,6 +410,7 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
     const int32_t real_rows,
     const int32_t* __restrict__ page_table,
     const int64_t page_table_stride,
+    const int32_t* __restrict__ page_table_row_index,
     const int32_t* __restrict__ topk_indices_offset,
     const int32_t* __restrict__ seq_lens) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
@@ -428,7 +429,13 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
   const auto length = lengths[bid];
   const auto score = input + bid * input_stride;
-  const auto page_table_entry = page_table == nullptr ? nullptr : page_table + bid * page_table_stride;
+  // Per-row page-table base: default is row `bid`; when `page_table_row_index`
+  // is given (kpool ragged path) the caller passes a compact page table (e.g.
+  // the full ``req_to_token``) shared across q-tokens, so the row is looked up
+  // indirectly -- avoids materializing a dense [sum_q, max_seq_len] copy.
+  const auto pt_row =
+      page_table_row_index == nullptr ? bid : static_cast<uint64_t>(page_table_row_index[bid]);
+  const auto page_table_entry = page_table == nullptr ? nullptr : page_table + pt_row * page_table_stride;
   const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
   const auto full_pool_token_len = length * pool_size;
   const auto history_len = full_pool_token_len < token_topk ? full_pool_token_len : token_topk;
@@ -523,6 +530,7 @@ void launch_kpool_topk_transform_kernel(
     int32_t real_rows,
     const int32_t* page_table,
     int64_t page_table_stride,
+    const int32_t* page_table_row_index,
     const int32_t* topk_indices_offset,
     const int32_t* seq_lens,
     dim3 grid,
@@ -539,6 +547,7 @@ void launch_kpool_topk_transform_kernel(
       real_rows,
       page_table,
       page_table_stride,
+      page_table_row_index,
       topk_indices_offset,
       seq_lens);
 }
@@ -666,7 +675,8 @@ void fast_kpool_topk_transform_interface(
     std::optional<at::Tensor> page_table_opt,
     std::optional<at::Tensor> topk_indices_offset_opt,
     std::optional<at::Tensor> row_starts_opt,
-    std::optional<at::Tensor> seq_lens_opt) {
+    std::optional<at::Tensor> seq_lens_opt,
+    std::optional<at::Tensor> page_table_row_index_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_token_indices);
@@ -682,7 +692,12 @@ void fast_kpool_topk_transform_interface(
   if (seq_lens_opt.has_value()) {
     CHECK_CUDA(seq_lens_opt.value());
   }
+  if (page_table_row_index_opt.has_value()) {
+    CHECK_CUDA(page_table_row_index_opt.value());
+  }
   TORCH_CHECK(!page_table_opt.has_value() || !topk_indices_offset_opt.has_value());
+  // row_index only makes sense as an indirection into a page_table.
+  TORCH_CHECK(!page_table_row_index_opt.has_value() || page_table_opt.has_value());
   TORCH_CHECK(pool_size > 1);
   TORCH_CHECK(score.scalar_type() == at::ScalarType::Float);
   TORCH_CHECK(lengths.scalar_type() == at::ScalarType::Int);
@@ -711,10 +726,24 @@ void fast_kpool_topk_transform_interface(
 
   const int32_t* page_table_ptr = nullptr;
   int64_t page_table_stride = 0;
+  const int32_t* page_table_row_index_ptr = nullptr;
+  if (page_table_row_index_opt.has_value()) {
+    const auto& row_index = page_table_row_index_opt.value();
+    TORCH_CHECK(row_index.dim() == 1 && row_index.is_contiguous());
+    TORCH_CHECK(row_index.size(0) == B);
+    TORCH_CHECK(row_index.scalar_type() == at::ScalarType::Int);
+    page_table_row_index_ptr = row_index.data_ptr<int32_t>();
+  }
   if (page_table_opt.has_value()) {
     const auto& page_table = page_table_opt.value();
     TORCH_CHECK(page_table.dim() == 2 && page_table.stride(1) == 1);
-    TORCH_CHECK(page_table.size(0) == B);
+    // Without an explicit row index the kernel uses output row `bid` to index
+    // the page table, so it must have one row per output. With a row index the
+    // page table is a compact shared table (rows looked up via the index), so
+    // only its width/stride matter -- size(0) need not equal B.
+    if (page_table_row_index_ptr == nullptr) {
+      TORCH_CHECK(page_table.size(0) == B);
+    }
     TORCH_CHECK(page_table.scalar_type() == at::ScalarType::Int);
     page_table_ptr = page_table.data_ptr<int32_t>();
     page_table_stride = page_table.stride(0);
@@ -760,6 +789,7 @@ void fast_kpool_topk_transform_interface(
         real_rows_i32,                     \
         page_table_ptr,                    \
         page_table_stride,                 \
+        page_table_row_index_ptr,          \
         topk_indices_offset_ptr,           \
         seq_lens_ptr,                      \
         grid,                              \

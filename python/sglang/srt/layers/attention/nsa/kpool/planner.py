@@ -116,8 +116,13 @@ class KPoolExtendPlan:
     # Layer-shared scratch (alloc out of the per-layer hot path).
     ragged_k_u8: Optional[torch.Tensor]  # uint8 [total_k_rows, head_dim]
     ragged_k_scale: Optional[torch.Tensor]  # fp32 [total_k_rows]
-    # req_to_token row-replicated; None unless PAGED + fuse-topk on.
-    ragged_paged_page_table: Optional[torch.Tensor]  # int32 [sum_q, max_seq_len]
+    # Zero-copy reference to ``req_to_token`` ([pool_size, max_context_len]);
+    # None unless PAGED + fuse-topk on. The fused topk kernel looks up each
+    # q-token's row via ``ragged_paged_page_table_row_index`` (below) instead
+    # of a dense [sum_q, max_seq_len] per-q replication.
+    ragged_paged_page_table: Optional[torch.Tensor]  # int32 [pool_size, max_ctx]
+    # Per-q page-table row = its request's req_pool_index; int32 [sum_q].
+    ragged_paged_page_table_row_index: Optional[torch.Tensor]  # int32 [sum_q]
 
     cp: Optional[KPoolCpInfo] = None
 
@@ -452,17 +457,14 @@ def _kpool_plan_to_gpu(
 
     # Build once per forward to avoid an O(B*layers) Python loop in the indexer.
     ragged_paged_page_table = None
+    ragged_paged_page_table_row_index = None
     if need_paged:
         req_to_token = forward_batch.req_to_token_pool.req_to_token
-        # ``local_max_seq_len`` is the per-rank max already on CPU; saves a
-        # GPU sync over ``local_seqlens_expanded.max()``. Consumer masks
-        # via per-row ``lengths``.
-        req_pool_indices_per_q = torch.repeat_interleave(
-            local_req_pool_indices.to(torch.int64), ragged_q_len_t
+        # repeat_interleave with GPU repeats stays on-device (no CPU sync).
+        ragged_paged_page_table_row_index = torch.repeat_interleave(
+            local_req_pool_indices.to(torch.int32), ragged_q_len_t
         )
-        ragged_paged_page_table = req_to_token[
-            req_pool_indices_per_q, :local_max_seq_len
-        ].to(torch.int32)
+        ragged_paged_page_table = req_to_token
 
     # Layer-shared scratch (all NSA layers share these (total_k_rows, head_dim) buffers).
     if ragged_total_k_rows > 0:
@@ -499,6 +501,7 @@ def _kpool_plan_to_gpu(
         ragged_k_u8=ragged_k_u8,
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
+        ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
         cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
     )
 

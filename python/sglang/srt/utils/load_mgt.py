@@ -213,9 +213,9 @@ def load_megatron_weights(
             layer=init_model.config.num_hidden_layers,
         )
         mgt_sd[0][0]["model"] = attn_state_dict
-        mgt_sd[0][0]["args"] = torch.load(
-            os.path.join(checkpoint_path, "common.pt"), weights_only=False
-        )["args"]
+        common_pt = os.path.join(checkpoint_path, "common.pt")
+        if os.path.exists(common_pt):
+            mgt_sd[0][0]["args"] = torch.load(common_pt, weights_only=False)["args"]
         # communicate for attention
         communicate_for_attn(mgt_sd[0][0]["model"], attn_keys, target_tp, tp)
         del attn_state_dict
@@ -1764,4 +1764,5 @@ def load_megatron_weights(
                     )
                     f.write(json.dumps(meta))
         except:
-            pass
+            init_model.model.consumed_train_samples = None
+            init_model.model.consumed_train_tokens = None

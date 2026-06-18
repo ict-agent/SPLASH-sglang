@@ -108,7 +108,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
   m.def(
       "fast_kpool_topk_transform_fused(Tensor score, Tensor lengths, Tensor(a!) dst_token_indices, int pool_size, "
-      "Tensor? page_table, Tensor? topk_indices_offset, Tensor? row_starts=None, Tensor? seq_lens=None) -> ()");
+      "Tensor? page_table, Tensor? topk_indices_offset, Tensor? row_starts=None, Tensor? seq_lens=None, "
+      "Tensor? page_table_row_index=None) -> ()");
   m.impl("fast_kpool_topk_transform_fused", torch::kCUDA, &fast_kpool_topk_transform_interface);
 
   /*

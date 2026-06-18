@@ -171,7 +171,8 @@ void fast_kpool_topk_transform_interface(
     std::optional<at::Tensor> page_table_opt = std::nullopt,
     std::optional<at::Tensor> topk_indices_offset_opt = std::nullopt,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> seq_lens_opt = std::nullopt);
+    std::optional<at::Tensor> seq_lens_opt = std::nullopt,
+    std::optional<at::Tensor> page_table_row_index_opt = std::nullopt);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);

@@ -457,6 +457,7 @@ def topk_from_pooled_history_logits(
     seq_lens: torch.Tensor | None = None,
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select full-pool groups, expand to tokens, and optionally append tail.
 
@@ -510,6 +511,7 @@ def topk_from_pooled_history_logits(
             row_starts=row_starts,
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             out_rows=out_rows,
+            page_table_row_index=page_table_row_index,
         )
 
     # Slow path: ``fast_topk_v2`` + manual expand. The fused fast_kpool
@@ -517,6 +519,14 @@ def topk_from_pooled_history_logits(
     # host-side -1 pad so callers see the same contract regardless of
     # which path runs.
     from sgl_kernel import fast_topk_v2
+
+    # The slow path's expand/append helpers gather through ``page_table``
+    # directly and have no row-index indirection. The kpool ragged extend
+    # path (the only caller passing page_table_row_index) always lands on
+    # the fast group_topk in (128..512) branch above, so this never fires.
+    assert (
+        page_table_row_index is None
+    ), "page_table_row_index requires the fused fast_kpool group_topk path"
 
     selected_groups = fast_topk_v2(
         logits,

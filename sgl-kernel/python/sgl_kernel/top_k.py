@@ -127,6 +127,7 @@ def fast_kpool_topk_transform_fused(
     row_starts: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     out_rows: Optional[int] = None,
+    page_table_row_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Pool-level radix top-k for NSA kpool indexer.
@@ -139,6 +140,11 @@ def fast_kpool_topk_transform_fused(
     extra trailing rows are filled with -1 inside the kernel. Used when the q
     upstream is right-padded for mlp-sync (TP/CP) and the caller wants the
     output sized against the padded q rather than the real-token count.
+
+    ``page_table_row_index`` (int32 ``[n_real]``) indirects the per-row page-table
+    lookup: output row ``i`` reads page-table row ``page_table_row_index[i]``
+    instead of row ``i``. Lets the caller pass a compact page table shared across
+    q-tokens (e.g. the full ``req_to_token``) instead of a dense per-q copy.
     """
     assert topk % pool_size == 0
     group_topk = topk // pool_size
@@ -148,6 +154,7 @@ def fast_kpool_topk_transform_fused(
     )
     assert score.dim() == 2
     assert page_table is None or topk_indices_offset is None
+    assert page_table_row_index is None or page_table is not None
     if seq_lens is not None:
         assert seq_lens.dim() == 1
         assert seq_lens.shape[0] == score.shape[0]
@@ -170,5 +177,6 @@ def fast_kpool_topk_transform_fused(
         topk_indices_offset,
         row_starts,
         seq_lens,
+        page_table_row_index,
     )
     return dst_token_indices

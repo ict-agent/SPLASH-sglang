@@ -453,6 +453,7 @@ class IndexerKPool(Indexer):
         topk_offsets: Optional[torch.Tensor] = None,
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
+        page_table_row_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run pooled-history topk; the fused kernel fills any
         ``out_rows`` past ``logits.shape[0]`` with -1 in-kernel so the
@@ -462,7 +463,12 @@ class IndexerKPool(Indexer):
         plan's real-token count (mlp-sync TP/CP pad). The padded tail
         is sentinel-filled so downstream sparse-attn treats those rows
         as no-op. ``None`` (default) returns one row per logits row.
+
+        ``page_table_row_index`` indirects the per-row page-table lookup
+        (output row ``i`` reads page-table row ``page_table_row_index[i]``),
+        letting the caller share a compact page table across q-tokens.
         """
+
         return topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
@@ -473,22 +479,29 @@ class IndexerKPool(Indexer):
             seq_lens=seq_lens,
             row_starts=row_starts,
             out_rows=out_rows,
+            page_table_row_index=page_table_row_index,
         )
 
     @staticmethod
     def _kpool_fused_topk_mapping(
         metadata: BaseIndexerMetadata,
         paged_page_table: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Resolve (page_table, topk_offsets) for the fused topk kernel.
+        paged_page_table_row_index: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Resolve (page_table, topk_offsets, page_table_row_index) for the
+        fused topk kernel.
 
         ``paged_page_table`` overrides the PAGED-method page table when the
         caller has a precomputed full-batch page table (ragged path uses
         ``plan.ragged_paged_page_table``); otherwise the decode default
-        ``attn_metadata.page_table_1`` is used.
+        ``attn_metadata.page_table_1`` is used. ``paged_page_table_row_index``
+        (ragged path) indirects the per-row page-table lookup so a compact
+        page table (the full ``req_to_token``) can be shared across q-tokens
+        instead of densely replicated per q-token.
         """
+
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
-            return None, None
+            return None, None, None
 
         method = metadata.topk_transform_method
         if method == TopkTransformMethod.PAGED:
@@ -498,10 +511,14 @@ class IndexerKPool(Indexer):
                 else metadata.attn_metadata.page_table_1
             )
             assert page_table is not None
-            return page_table, None
+            # Row index is only valid alongside the precomputed paged table.
+            row_index = (
+                paged_page_table_row_index if paged_page_table is not None else None
+            )
+            return page_table, None, row_index
         if method == TopkTransformMethod.RAGGED:
-            return None, metadata.attn_metadata.topk_indices_offset
-        return None, None
+            return None, metadata.attn_metadata.topk_indices_offset, None
+        return None, None, None
 
     def _full_topk_for_short_sequence(
         self, metadata: BaseIndexerMetadata, device: torch.device
@@ -599,7 +616,7 @@ class IndexerKPool(Indexer):
             clean_logits=False,
         )
 
-        page_table_1, topk_offsets = self._kpool_fused_topk_mapping(metadata)
+        page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         return self._topk_from_kpool_logits(
             logits,
             pool_seqlens,
@@ -692,8 +709,12 @@ class IndexerKPool(Indexer):
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
         # --- single fused topk over the whole batch -----------------
-        page_table_all, topk_offsets_all = self._kpool_fused_topk_mapping(
-            metadata, paged_page_table=plan.ragged_paged_page_table
+        page_table_all, topk_offsets_all, page_table_row_index = (
+            self._kpool_fused_topk_mapping(
+                metadata,
+                paged_page_table=plan.ragged_paged_page_table,
+                paged_page_table_row_index=plan.ragged_paged_page_table_row_index,
+            )
         )
 
         return self._topk_from_kpool_logits(
@@ -704,6 +725,7 @@ class IndexerKPool(Indexer):
             topk_offsets=topk_offsets_all,
             row_starts=ks_per_q,
             out_rows=total_q,
+            page_table_row_index=page_table_row_index,
         )
 
     def _get_topk_ragged_with_cp(
