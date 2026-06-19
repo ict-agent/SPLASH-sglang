@@ -363,7 +363,16 @@ class SchedulerMetricsMixin:
             ]
 
         if self.is_hybrid_ssm:
-            num_used_m, _, full_tok_m, mamba_usage, *_ = self._get_mamba_token_info()
+            (
+                num_used_m,
+                _,
+                full_tok_m,
+                mamba_usage,
+                _,
+                full_evictable_size,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
             num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
             token_usage = (
                 max(token_usage, mamba_usage)
@@ -371,6 +380,7 @@ class SchedulerMetricsMixin:
                 else max(full_tok_m, mamba_usage)
             )
             if full_token_usage is None:
+                evictable_size = full_evictable_size
                 full_token_usage = full_tok_m
                 msg_parts.append(f"full token usage: {full_tok_m:.2f}")
             msg_parts.append(f"mamba usage: {mamba_usage:.2f}")
@@ -583,9 +593,16 @@ class SchedulerMetricsMixin:
             ]
 
         if self.is_hybrid_ssm:
-            num_used_m, mamba_num, full_tok_m, mamba_usage, *_ = (
-                self._get_mamba_token_info()
-            )
+            (
+                num_used_m,
+                mamba_num,
+                full_tok_m,
+                mamba_usage,
+                _,
+                full_evictable_size,
+                _,
+                _,
+            ) = self._get_mamba_token_info()
             num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
             token_usage = (
                 max(token_usage, mamba_usage)
@@ -593,6 +610,7 @@ class SchedulerMetricsMixin:
                 else max(full_tok_m, mamba_usage)
             )
             if full_token_usage is None:
+                evictable_size = full_evictable_size
                 full_token_usage = full_tok_m
                 msg_parts += [
                     f"#full token: {num_used_m}",

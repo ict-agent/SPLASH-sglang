@@ -314,7 +314,7 @@ class SchedulerRuntimeCheckerMixin:
                     token_usage,
                     _,
                     _,
-                    _,
+                    evictable_size,
                     _,
                     _,
                 ) = self._get_mamba_token_info()
