@@ -267,7 +267,10 @@ class Glm5NextLinearAttention(nn.Module):
             torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
         )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+        )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -291,7 +294,9 @@ class Glm5NextLinearAttention(nn.Module):
         def a_log_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
             if loaded_weight.dim() == 1:
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2, _head_shard_rank_getter)(param, loaded_weight)
+            return sharded_weight_loader(2, _head_shard_rank_getter)(
+                param, loaded_weight
+            )
 
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader})
 
@@ -1096,8 +1101,6 @@ class Glm5NextModel(nn.Module):
 
 class Glm5NextForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
-    packed_modules_mapping = {}
-
     _STACKED_PARAMS_MAPPING = [
         # Fused KDA "a" projections (used when do_fuse_qkvbfg=True).
         # Listed first so .q_proj on a KDA layer routes to fused_qkvbfg_a_proj;
@@ -1120,6 +1123,25 @@ class Glm5NextForCausalLM(nn.Module):
         ("gate_up_proj", "gate_proj", 0),
         ("gate_up_proj", "up_proj", 1),
     ]
+
+    # Fused → unfused shards for is_layer_skipped (HF FP8 configs list only
+    # unfused names in modules_to_not_convert). Class-level so the loader
+    # captures the final mapping before quant_config is built.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
     _NEXTN_SPEC_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
     _EAGLE_IGNORE_NAMES = ("eagle_draft_tokens_map", "eagle_lm_head.weight")
     _SHARED_EXPERTS_PATTERN = re.compile(
@@ -1136,11 +1158,6 @@ class Glm5NextForCausalLM(nn.Module):
         super().__init__()
 
         self.fuse_qkv_a_proj = config.q_lora_rank is not None
-        if self.fuse_qkv_a_proj:
-            self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
-                "q_a_proj",
-                "kv_a_proj_with_mqa",
-            ]
 
         self.pp_group = get_pp_group()
         self.config = config
