@@ -61,11 +61,17 @@ def _dequantize_k_cache_fast_wrapped(
         quant_k_cache = quant_k_cache.unsqueeze(1)
     num_blocks, block_size, _, dim_quant = quant_k_cache.shape
     assert dv == 512
-    assert dim_quant == 656
     assert tile_size == 128
+    scale_bytes = dv // tile_size * 4
+    rope_bytes = dim_quant - dv - scale_bytes
+    assert rope_bytes >= 0 and rope_bytes % torch.bfloat16.itemsize == 0
+    dim_rope = rope_bytes // torch.bfloat16.itemsize
+    assert dim_rope in (0, 64)
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
-    output = _dequantize_k_cache_fast(quant_k_cache)
+    output = _dequantize_k_cache_fast(
+        quant_k_cache, group_size=tile_size, dim_rope=dim_rope
+    )
 
     if original_ndim == 3:
         return output.view(num_blocks, 1, -1)
@@ -73,14 +79,16 @@ def _dequantize_k_cache_fast_wrapped(
         return output.view(num_blocks, block_size, 1, -1)
 
 
-def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
+def _dequantize_k_cache_fast(
+    quant_k_cache, group_size: int = 128, dim_rope: int = 64
+):
     num_tokens, dim_quant = quant_k_cache.shape
 
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
+    assert dim_rope in (0, 64)
     num_tiles = dim_nope // group_size
-    assert dim_quant == 656
+    assert dim_quant == dim_nope + num_tiles * 4 + dim_rope * 2
 
     output = torch.empty(
         (num_tokens, dim_nope + dim_rope),
@@ -89,15 +97,18 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     )
 
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
-
     assert dim_nope % group_size == 0
 
     input_nope_q = quant_k_cache[:, :dim_nope]
     input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
         torch.float32
     )
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    if dim_rope == 0:
+        input_rope = quant_k_cache[:, :2].view(torch.bfloat16)
+    else:
+        input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(
+            torch.bfloat16
+        )
 
     _dequantize_k_cache_fast_kernel[(num_tokens, num_blocks_per_token)](
         output,
@@ -179,9 +190,6 @@ def dequantize_k_cache_paged(
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
-    assert (
-        dim_quant == 656
-    ), f"dim_quant: {dim_quant} != 656 detected in dequantize_k_cache_paged"
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
@@ -189,8 +197,15 @@ def dequantize_k_cache_paged(
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512
-    dim_rope = 64
     num_tiles = dim_nope // group_size  # 512 // 128 = 4
+    scale_bytes = num_tiles * 4
+    rope_bytes = dim_quant - dim_nope - scale_bytes
+    assert rope_bytes >= 0 and rope_bytes % torch.bfloat16.itemsize == 0
+    dim_rope = rope_bytes // torch.bfloat16.itemsize
+    assert dim_rope in (
+        0,
+        64,
+    ), f"Unsupported rope dimension {dim_rope} for packed MLA KV cache"
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),
@@ -198,9 +213,7 @@ def dequantize_k_cache_paged(
         device=quant_k_cache.device,
     )
 
-    # cdiv(512 + 64, 128) = 5
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
 
     assert dim_nope % group_size == 0
 
@@ -210,7 +223,12 @@ def dequantize_k_cache_paged(
         torch.float32
     )
     # [:, 528:]
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    if dim_rope == 0:
+        input_rope = quant_k_cache[:, :2].view(torch.bfloat16)
+    else:
+        input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(
+            torch.bfloat16
+        )
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,

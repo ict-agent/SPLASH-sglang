@@ -1483,8 +1483,11 @@ class HybridLinearKVPool(KVCache):
         enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
+        use_nsa: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        index_head_dim: int = None,
+        kv_cache_dim: int = None,
         start_layer: Optional[int] = None,
     ):
         self.size = size
@@ -1500,6 +1503,8 @@ class HybridLinearKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
+        self.use_nsa = use_nsa
+        assert not use_nsa or use_mla, "NSA requires an MLA KV pool"
         if not use_mla:
 
             TokenToKVPoolClass = MHATokenToKVPool
@@ -1523,6 +1528,30 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
             )
+        elif use_nsa:
+            assert index_head_dim is not None
+            assert kv_cache_dim is not None
+            self.full_kv_pool = NSATokenToKVPool(
+                size=size,
+                page_size=self.page_size,
+                dtype=dtype,
+                layer_num=self.full_layer_nums,
+                device=device,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                index_head_dim=index_head_dim,
+                kv_cache_dim=kv_cache_dim,
+                enable_memory_saver=enable_memory_saver,
+            )
+            self.use_fp8_index_k_cache = (
+                self.full_kv_pool.use_fp8_index_k_cache
+            )
+            self.index_head_dim = self.full_kv_pool.index_head_dim
+            self.index_k_buffer_dtype = self.full_kv_pool.index_k_buffer_dtype
+            self.nsa_kv_cache_store_fp8 = (
+                self.full_kv_pool.nsa_kv_cache_store_fp8
+            )
+            self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1571,6 +1600,11 @@ class HybridLinearKVPool(KVCache):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
 
+    def get_nsa_state_buf_infos(self):
+        if not self.use_nsa:
+            return [], [], []
+        return self.full_kv_pool.get_state_buf_infos()
+
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
 
@@ -1597,6 +1631,11 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
+
+    def get_key_buffer_DeepSeekV2(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_buffer_DeepSeekV2(layer_id)
 
     def get_value_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
@@ -1693,6 +1732,81 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def _get_nsa_layer_id(self, layer_id: int) -> int:
+        assert self.use_nsa, "NSA index cache called when use_nsa is False"
+        self._wait_for_layer(layer_id)
+        return self._transfer_full_attention_id(layer_id)
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_index_k_with_scale_buffer(
+            self._get_nsa_layer_id(layer_id)
+        )
+
+    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_index_k_buffer(
+            self._get_nsa_layer_id(layer_id)
+        )
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        return self.full_kv_pool.get_index_k_continuous(
+            self._get_nsa_layer_id(layer_id), seq_len, page_indices
+        )
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        return self.full_kv_pool.get_index_k_scale_continuous(
+            self._get_nsa_layer_id(layer_id), seq_len, page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        return self.full_kv_pool.get_index_k_scale_buffer(
+            self._get_nsa_layer_id(layer_id),
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        self.full_kv_pool.set_index_k_scale_buffer(
+            self._get_nsa_layer_id(layer_id),
+            loc,
+            index_k,
+            index_k_scale,
+        )
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        self.full_kv_pool.set_index_k_buffer(
+            self._get_nsa_layer_id(layer_id), loc, index_k
+        )
 
 
 class MLATokenToKVPool(KVCache):
@@ -1876,8 +1990,9 @@ class MLATokenToKVPool(KVCache):
                 fp8_dtype,
             )
         elif self.nsa_kv_cache_store_fp8:
-            if _is_dcu:
+            if _is_dcu and self.qk_rope_head_dim > 0:
                 from lightop import op
+
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope, 
                     cache_k_rope, 

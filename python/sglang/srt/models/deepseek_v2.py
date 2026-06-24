@@ -2027,7 +2027,12 @@ class DeepseekV2AttentionMLA(
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-        global _use_fused_rmsnorm_rope
+
+        use_fused_rmsnorm_rope = (
+            _use_fused_rmsnorm_rope
+            and self.rotary_emb is not None
+            and hasattr(forward_batch.token_to_kv_pool, "kv_buffer")
+        )
 
         q_lora = None
         topk_indices = None
@@ -2042,7 +2047,7 @@ class DeepseekV2AttentionMLA(
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode() and not _use_fused_rmsnorm_rope and not _use_fused_rms_quant:
+            if self.alt_stream is not None and get_is_capture_mode() and not use_fused_rmsnorm_rope and not _use_fused_rms_quant:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -2096,7 +2101,7 @@ class DeepseekV2AttentionMLA(
                     else:
                         if not _use_fused_rms_quant:
                             q = self.q_a_layernorm(q)
-                        if not _use_fused_rmsnorm_rope:
+                        if not use_fused_rmsnorm_rope:
                             k_nope = self.kv_a_layernorm(k_nope)
             # q_lora needed by indexer
             if self.use_nsa:
@@ -2130,7 +2135,7 @@ class DeepseekV2AttentionMLA(
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
-                if not _use_fused_rmsnorm_rope:
+                if not use_fused_rmsnorm_rope:
                     k_nope = k_nope.unsqueeze(1)
                 if not _use_fused_rms_quant:
                     q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -2158,12 +2163,12 @@ class DeepseekV2AttentionMLA(
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            if not _use_fused_rmsnorm_rope:
+            if not use_fused_rmsnorm_rope:
                 k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
-        if _use_fused_rmsnorm_rope:
+        if use_fused_rmsnorm_rope:
             k_nope_normed = torch.empty(k_nope.shape, dtype=k_nope.dtype, device=k_nope.device)
             weight = self.kv_a_layernorm.weight
             variance_epsilon = self.kv_a_layernorm.variance_epsilon
@@ -2242,7 +2247,7 @@ class DeepseekV2AttentionMLA(
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
-            and not _use_fused_rmsnorm_rope
+            and not use_fused_rmsnorm_rope
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 

@@ -527,7 +527,10 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+
+    if isinstance(target_kv_pool, HybridLinearKVPool):
+        target_kv_pool = target_kv_pool.full_kv_pool
 
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
@@ -589,6 +592,17 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
+            if token_to_kv_pool.use_nsa:
+                nsa_ptrs, nsa_lens, nsa_item_lens = (
+                    token_to_kv_pool.get_nsa_state_buf_infos()
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.NSA,
+                    nsa_ptrs,
+                    nsa_lens,
+                    nsa_item_lens,
+                )
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
                 draft_token_to_kv_pool, NSATokenToKVPool

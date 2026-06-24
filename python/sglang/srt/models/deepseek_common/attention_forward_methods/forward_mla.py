@@ -696,6 +696,9 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+        if self.rotary_emb is None:
+            return False
+
         if self.current_attention_backend == "nsa":
             return (
                 get_global_server_args().nsa_decode_backend == "trtllm"
@@ -717,7 +720,8 @@ class DeepseekMLAForwardMixin:
         """
         server_args = get_global_server_args()
         return (
-            _use_aiter_gfx95
+            self.rotary_emb is not None
+            and _use_aiter_gfx95
             and self.current_attention_backend == "nsa"
             and (
                 server_args.nsa_decode_backend == "tilelang"
@@ -732,7 +736,8 @@ class DeepseekMLAForwardMixin:
         that calls fused_qk_rope_cat_and_cache_mla).
         """
         return (
-            _use_aiter_gfx95
+            self.rotary_emb is not None
+            and _use_aiter_gfx95
             and self.current_attention_backend
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )

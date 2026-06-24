@@ -47,6 +47,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=kwargs.get("lower_bound", None),
+            beta_scale=kwargs.get("beta_scale", 1.0),
         )
 
     def extend(

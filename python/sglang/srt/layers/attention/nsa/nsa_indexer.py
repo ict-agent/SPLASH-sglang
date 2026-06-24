@@ -199,6 +199,19 @@ def rotate_activation(x: torch.Tensor, apply_scale: bool = True) -> torch.Tensor
     else:
         return hadamard_transform(x, scale=scale)
 
+
+class NoOpRotaryEmbedding:
+    is_neox_style = False
+
+    def __init__(self, max_position_embeddings: int, device: str):
+        self.cos_sin_cache = torch.empty(
+            (max_position_embeddings, 0), dtype=torch.float32, device=device
+        )
+
+    def __call__(self, positions, query, key):
+        return query, key
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -274,15 +287,20 @@ class Indexer(MultiPlatformOp):
         self.k_norm = LayerNorm(
             self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
         )
-        self.rotary_emb = get_rope_wrapper(
-            rope_head_dim,
-            rotary_dim=rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,  # type: ignore
-            rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
-            device=get_global_server_args().device,
-        )
+        if rope_head_dim > 0:
+            self.rotary_emb = get_rope_wrapper(
+                rope_head_dim,
+                rotary_dim=rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,  # type: ignore
+                rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
+                device=get_global_server_args().device,
+            )
+        else:
+            self.rotary_emb = NoOpRotaryEmbedding(
+                max_position_embeddings, get_global_server_args().device
+            )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
@@ -411,21 +429,24 @@ class Indexer(MultiPlatformOp):
             if key.ndim == 2:
                 key = key.view(key.shape[0], -1, self.head_dim)
 
-            op.fuse_layernorm_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_dim,
-                self.rotary_emb.cos_sin_cache,
-                False,
-                None,
-                None,
-                self.k_norm.weight,
-                getattr(self.k_norm, 'bias', None),
-                None,
-                None,
-                1e-6,
-            )
+            if self.rope_head_dim > 0:
+                op.fuse_layernorm_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_dim,
+                    self.rotary_emb.cos_sin_cache,
+                    False,
+                    None,
+                    None,
+                    self.k_norm.weight,
+                    getattr(self.k_norm, "bias", None),
+                    None,
+                    None,
+                    1e-6,
+                )
+            else:
+                key = self.k_norm(key)
         else:
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()

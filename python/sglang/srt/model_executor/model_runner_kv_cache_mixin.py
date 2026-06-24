@@ -65,10 +65,16 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
+            mla_kv_cache_dim = (
+                self.calculate_mla_kv_cache_dim()
+                if is_deepseek_nsa(self.model_config.hf_config)
+                else (
+                    self.model_config.kv_lora_rank
+                    + self.model_config.qk_rope_head_dim
+                )
+            )
             cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
+                mla_kv_cache_dim * num_layers * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -296,7 +302,11 @@ class ModelRunnerKVCacheMixin:
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
-        elif self.use_mla_backend and is_nsa_model:
+        elif (
+            self.use_mla_backend
+            and is_nsa_model
+            and not self.mambaish_config
+        ):
             unsupported_pool_family = "NSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
@@ -577,7 +587,11 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif (
+            self.use_mla_backend
+            and is_nsa_model
+            and not self.mambaish_config
+        ):
             PoolCls = (
                 HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
             )
@@ -667,6 +681,18 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                    if is_nsa_model:
+                        if self.enable_hisparse:
+                            raise NotImplementedError(
+                                "HiSparse is not supported for hybrid NSA + linear attention models."
+                            )
+                        extra_args.update(
+                            use_nsa=True,
+                            index_head_dim=get_nsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,

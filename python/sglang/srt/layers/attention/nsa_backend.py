@@ -354,6 +354,19 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        if self.nsa_kv_cache_store_fp8:
+            quant_block_size = 128
+            expected_kv_cache_dim = (
+                self.kv_lora_rank
+                + self.kv_lora_rank
+                // quant_block_size
+                * torch.float32.itemsize
+                + self.qk_rope_head_dim * torch.bfloat16.itemsize
+            )
+            assert self.kv_cache_dim == expected_kv_cache_dim, (
+                f"Invalid packed NSA KV cache width: expected "
+                f"{expected_kv_cache_dim}, got {self.kv_cache_dim}"
+            )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token

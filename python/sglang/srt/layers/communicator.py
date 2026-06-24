@@ -262,13 +262,14 @@ class AttnTpContext:
         self.attn_inputs_: Optional[AttentionInputs] = None
         self.is_nsa = False
 
-    def init_context(self, q_lora_rank, is_nsa):
+    def init_context(self, q_lora_rank, is_nsa, mhc: bool = False):
         self.is_nsa = is_nsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_nsa
+            and not mhc
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()

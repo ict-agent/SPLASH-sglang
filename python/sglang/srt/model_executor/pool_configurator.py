@@ -28,7 +28,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.utils.common import is_float4_e2m1fn_x2
+from sglang.srt.utils.common import (
+    is_dcu,
+    is_dcu_native_fp8_supported,
+    is_float4_e2m1fn_x2,
+)
 
 
 @dataclass
@@ -132,10 +136,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
+            is_nsa = is_deepseek_nsa(model_config.hf_config)
+            kv_cache_dim = (
+                mr.calculate_mla_kv_cache_dim()
+                if is_nsa
+                else model_config.kv_lora_rank + model_config.qk_rope_head_dim
+            )
             cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
+                kv_cache_dim * num_layers * kv_size
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -150,15 +158,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(model_config.hf_config):
+            if is_nsa:
                 index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                use_bf16_index_cache = is_dcu() and (
+                    kv_cache_dtype
+                    not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    or not is_dcu_native_fp8_supported()
                 )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
+                if use_bf16_index_cache:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch._utils._element_size(torch.bfloat16)
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
             cell_size = (

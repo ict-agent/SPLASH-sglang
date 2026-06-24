@@ -14,9 +14,9 @@ from sglang.srt.utils import get_bool_env_var, is_dcu
 _is_dcu = is_dcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 if _is_dcu and _use_aiter_tilelang_mhc:
-    from aiter.ops.tilelang import pre_big_fuse_tilelang
-    
-    
+    from aiter.ops.tilelang import mhc_post_fwd, pre_big_fuse_tilelang
+
+
 tilelang.set_log_level("WARNING")
 
 
@@ -1078,3 +1078,88 @@ def mhc_post(
         residual.shape[-1],
     )
     return out
+
+
+def hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult_value: float = 2.0,
+    hc_norm_weight: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_norm_eps: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """ModelNext-facing wrapper around the existing flattened mHC kernels."""
+    s, total_hidden = x.shape
+    assert total_hidden % hc_mult == 0
+    hidden_size = total_hidden // hc_mult
+    if x.numel() == 0:
+        return (
+            x.new_zeros((s, hidden_size)),
+            torch.zeros((s, hc_mult * hc_mult), dtype=torch.float32, device=x.device),
+            torch.zeros((s, hc_mult), dtype=torch.float32, device=x.device),
+            False,
+        )
+
+    fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    norm_fused = out_norm_weight is not None and not (
+        _is_dcu and _use_aiter_tilelang_mhc
+    )
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual=x.view(s, hc_mult, hidden_size),
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_mult_value,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_weight=out_norm_weight,
+        norm_eps=out_norm_eps,
+    )
+    return (
+        layer_input,
+        comb_mix.reshape(s, hc_mult * hc_mult),
+        post_mix.reshape(s, hc_mult),
+        norm_fused,
+    )
+
+
+def hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+    hc_mult: int,
+) -> torch.Tensor:
+    """ModelNext-facing wrapper around mhc_post using flattened residual state."""
+    s, hidden_size = x.shape
+    if s == 0:
+        return x.new_zeros((s, hc_mult * hidden_size))
+    residual = residual.view(s, hc_mult, hidden_size)
+    h_post = h_post.view(s, hc_mult)
+    h_res = h_res.view(s, hc_mult, hc_mult)
+    if _is_dcu and _use_aiter_tilelang_mhc:
+        out = mhc_post_fwd(x, residual, h_post, h_res)
+    else:
+        out = mhc_post(
+            x=x,
+            residual=residual,
+            post_layer_mix=h_post.unsqueeze(-1),
+            comb_res_mix=h_res,
+        )
+    return out.view(s, hc_mult * hidden_size)
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.repeat(1, n)
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.unflatten(-1, (n, -1)).mean(dim=-2)

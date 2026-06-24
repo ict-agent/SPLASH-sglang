@@ -22,13 +22,13 @@ def quantize_k_cache_separate(
         k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope)
                 Must have dim_nope=512 for FP8 MLA quantization
         k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope)
-                Must have dim_rope=64 for FP8 MLA quantization
+                Supports dim_rope=0 or dim_rope=64
         tile_size: quantization tile size (default 128)
 
     Returns:
         Tuple of (nope_part, rope_part) where:
         - nope_part: (num_tokens, 1, 528) as uint8 view, contains [nope_fp8(512) | scales(16)]
-        - rope_part: (num_tokens, 1, 128) as uint8 view, contains [rope_bf16_bytes(128)]
+        - rope_part: (num_tokens, 1, dim_rope * 2) as uint8 view, contains raw BF16 rope bytes
 
         These two tensors can be directly passed to set_mla_kv_buffer_triton(kv_buffer, loc, nope_part, rope_part)
     """
@@ -43,8 +43,8 @@ def quantize_k_cache_separate(
     # Validate dimensions for FP8 MLA
     if dim_nope != 512:
         raise ValueError(f"Expected dim_nope=512 for FP8 MLA, got {dim_nope}")
-    if dim_rope != 64:
-        raise ValueError(f"Expected dim_rope=64 for FP8 MLA, got {dim_rope}")
+    if dim_rope not in (0, 64):
+        raise ValueError(f"Expected dim_rope=0 or 64 for FP8 MLA, got {dim_rope}")
     if k_rope_2d.shape[0] != num_tokens:
         raise ValueError(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
@@ -117,13 +117,13 @@ def _quantize_k_cache_fast_wrapped(
     # TODO the final API may be 2D instead of 4D, thus we convert them here
     num_blocks, block_size, _, dim_nope_and_rope = input_k_cache.shape
     assert dv == 512
-    assert dim_nope_and_rope == 512 + 64
     assert tile_size == 128
     input_k_cache = input_k_cache.view((-1, dim_nope_and_rope))
 
     # TODO deliberately split into two tensors, then upstream can provide the two tensors instead of concat into one
     k_nope = input_k_cache[:, :dv]
     k_rope = input_k_cache[:, dv:]
+    assert k_rope.shape[-1] in (0, 64)
 
     output = _quantize_k_cache_fast(k_nope=k_nope, k_rope=k_rope)
 
@@ -133,7 +133,7 @@ def _quantize_k_cache_fast_wrapped(
 def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     """
     :param k_nope: (num_tokens, dim_nope 512)
-    :param k_rope: (num_tokens, dim_rope 64)
+    :param k_rope: (num_tokens, dim_rope 0 or 64)
     """
 
     assert k_nope.dtype == torch.bfloat16
@@ -143,7 +143,7 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     num_tokens_, dim_rope = k_rope.shape
     assert num_tokens == num_tokens_
     assert dim_nope == 512
-    assert dim_rope == 64
+    assert dim_rope in (0, 64)
     assert k_nope.dtype == k_rope.dtype
     num_tiles = dim_nope // group_size
 
@@ -157,11 +157,14 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     )
     output_nope_q = output[..., :dim_nope]
     output_nope_s = output[..., dim_nope : dim_nope + num_tiles * 4].view(torch.float32)
-    output_rope = output[..., dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    if dim_rope == 0:
+        output_rope = output[..., :2].view(torch.bfloat16)
+        k_rope_kernel = k_nope[:, :1]
+    else:
+        output_rope = output[..., dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+        k_rope_kernel = k_rope
 
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
-
     assert dim_nope % group_size == 0
     NUM_NOPE_BLOCKS = dim_nope // group_size
 
@@ -170,12 +173,12 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
         output_nope_s,
         output_rope,
         k_nope,
-        k_rope,
+        k_rope_kernel,
         output_nope_q.stride(0),
         output_nope_s.stride(0),
         output_rope.stride(0),
         k_nope.stride(0),
-        k_rope.stride(0),
+        k_rope_kernel.stride(0),
         NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
@@ -194,7 +197,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     This avoids packing/unpacking and enables direct use with set_mla_kv_buffer_triton.
 
     :param k_nope: (num_tokens, dim_nope 512) bfloat16
-    :param k_rope: (num_tokens, dim_rope 64) bfloat16
+    :param k_rope: (num_tokens, dim_rope 0 or 64) bfloat16
     :param group_size: quantization tile size (default 128, kernel is tuned for this value)
     :return: Tuple of (nope_part_u8, rope_part_u8)
         - nope_part_u8: (num_tokens, 1, nope_part_bytes) uint8, layout [nope_fp8(dim_nope) | scales(num_tiles*4)]
@@ -229,12 +232,20 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         (num_tokens, rope_part_bytes), dtype=torch.uint8, device=k_rope.device
     )
 
-    # Create typed views for the kernel to write into
+    # Create typed views for the kernel to write into.
     # Fixed byte layout for nope_part: [nope_fp8 (dim_nope bytes) | scales_fp32 (num_tiles*4 bytes)]
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
     nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
-    rope_view = rope_part_u8.view(torch.bfloat16)
+    if dim_rope == 0:
+        # Triton pointer arguments cannot rely on a zero-sized tensor having a
+        # usable data pointer. DIM_ROPE=0 and the four-block launch guarantee
+        # these dummy views are never accessed.
+        rope_view = nope_part_u8[:, :2].view(torch.bfloat16)
+        k_rope_kernel = k_nope[:, :1]
+    else:
+        rope_view = rope_part_u8.view(torch.bfloat16)
+        k_rope_kernel = k_rope
 
     # Kernel launch parameters
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
@@ -246,12 +257,12 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         nope_s_view,
         rope_view,
         k_nope,
-        k_rope,
+        k_rope_kernel,
         nope_q_view.stride(0),
         nope_s_view.stride(0),
         rope_view.stride(0),
         k_nope.stride(0),
-        k_rope.stride(0),
+        k_rope_kernel.stride(0),
         NUM_NOPE_BLOCKS=NUM_NOPE_BLOCKS,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,

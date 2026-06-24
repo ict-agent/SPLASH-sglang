@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
+    get_attention_cp_rank,
     get_attention_cp_size,
     is_allocation_symmetric,
 )
@@ -63,6 +64,77 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         return True
     else:
         return False
+
+
+def _cp_size(cp_size: Optional[int] = None) -> int:
+    return cp_size if cp_size is not None else get_attention_cp_size()
+
+
+def cp_plain_split(input_: torch.Tensor, cp_size: Optional[int] = None):
+    """Split a full sequence into rank-contiguous CP chunks."""
+    cp_size = _cp_size(cp_size)
+    cp_rank = get_attention_cp_rank()
+    if cp_size == 1:
+        return input_
+    return input_.tensor_split(cp_size, dim=0)[cp_rank].contiguous()
+
+
+def cp_plain_all_gather(input_: torch.Tensor, cp_size: Optional[int] = None):
+    """Gather rank-contiguous CP chunks back into natural sequence order."""
+    cp_size = _cp_size(cp_size)
+    if cp_size == 1:
+        return input_
+
+    group = get_attention_cp_group()
+    local_len = int(input_.shape[0])
+    sizes = group.all_gather_object(local_len)
+    if all(size == sizes[0] for size in sizes):
+        return group.all_gather(input_, dim=0)
+
+    max_len = max(sizes)
+    if local_len < max_len:
+        pad_shape = (max_len - local_len, *input_.shape[1:])
+        padding = input_.new_zeros(pad_shape)
+        gather_input = torch.cat([input_, padding], dim=0)
+    else:
+        gather_input = input_
+
+    gathered = group.all_gather(gather_input, dim=0)
+    chunks = gathered.tensor_split(cp_size, dim=0)
+    return torch.cat([chunk[:size] for chunk, size in zip(chunks, sizes)], dim=0)
+
+
+def cp_plain_reduce_scatter(input_: torch.Tensor, cp_size: Optional[int] = None):
+    """Sum full-sequence partial results across CP ranks and return this rank's chunk."""
+    cp_size = _cp_size(cp_size)
+    if cp_size == 1:
+        return input_
+    reduced = get_attention_cp_group().all_reduce(input_)
+    return cp_plain_split(reduced, cp_size)
+
+
+def cp_plain_to_scattered(
+    input_: torch.Tensor, forward_batch, cp_size: Optional[int] = None
+):
+    """Convert this rank's plain CP chunk to the attention-scattered CP chunk."""
+    cp_size = _cp_size(cp_size)
+    if cp_size == 1:
+        return input_
+    gathered = cp_plain_all_gather(input_, cp_size)
+    return cp_split_and_rebuild_data(forward_batch, gathered)
+
+
+def cp_scattered_to_plain(
+    input_: torch.Tensor, forward_batch, cp_size: Optional[int] = None
+):
+    """Convert this rank's attention-scattered CP chunk back to plain layout."""
+    cp_size = _cp_size(cp_size)
+    if cp_size == 1:
+        return input_
+    gathered = cp_all_gather_rerange_output(
+        input_, cp_size, forward_batch, torch.cuda.current_stream()
+    )
+    return cp_plain_split(gathered, cp_size)
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
