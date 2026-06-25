@@ -210,6 +210,9 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            # Rooms cancelled by D; checked by transfer_worker before each chunk.
+            self.cancelled_rooms: set = set()
+            self.cancelled_rooms_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -255,6 +258,8 @@ class MooncakeKVManager(CommonKVManager):
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
+            self.cancel_wait_rooms: set = set()
+            self.cancel_wait_rooms_lock = threading.Lock()
             if self.enable_staging:
                 self._init_staging_allocator()
                 self._staging_handler = None
@@ -1416,6 +1421,28 @@ class MooncakeKVManager(CommonKVManager):
                     + self.pp_rank * self.attn_cp_size
                     + self.attn_cp_rank
                 )
+                # D cancelled this room: convert to Failed via the existing path.
+                with self.cancelled_rooms_lock:
+                    is_cancelled = kv_chunk.room in self.cancelled_rooms
+                    if is_cancelled:
+                        self.cancelled_rooms.discard(kv_chunk.room)
+                if is_cancelled:
+                    self.record_failure(
+                        kv_chunk.room,
+                        f"Cancelled by decode for room={kv_chunk.room}",
+                    )
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
+                    for req in reqs_to_be_processed:
+                        if not req.is_dummy:
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                    self.transfer_infos.pop(kv_chunk.room, None)
+                    continue
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -1602,6 +1629,8 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                    with self.cancelled_rooms_lock:
+                        self.cancelled_rooms.discard(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1675,6 +1704,17 @@ class MooncakeKVManager(CommonKVManager):
                             stg_session,
                         )
                     continue
+                # D cancel: mark only if room is still active (live and not Failed).
+                if room == "CANCEL":
+                    cancel_room = int(waiting_req_bytes[1].decode("ascii"))
+                    live = (
+                        cancel_room in self.transfer_infos
+                        and self.request_status.get(cancel_room) != KVPoll.Failed
+                    )
+                    if live:
+                        with self.cancelled_rooms_lock:
+                            self.cancelled_rooms.add(cancel_room)
+                    continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     self.decode_kv_args_table[mooncake_session_id] = (
@@ -1695,6 +1735,9 @@ class MooncakeKVManager(CommonKVManager):
                     room = int(room)
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
+                        # Fresh metadata for this room: drop any stale cancel mark.
+                        with self.cancelled_rooms_lock:
+                            self.cancelled_rooms.discard(room)
 
                     self.transfer_infos[room][mooncake_session_id] = (
                         TransferInfo.from_zmq(waiting_req_bytes)
@@ -1767,6 +1810,8 @@ class MooncakeKVManager(CommonKVManager):
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
+                with self.cancel_wait_rooms_lock:
+                    is_cancel_waiting = bootstrap_room in self.cancel_wait_rooms
 
                 if status == KVPoll.Success:
                     if (
@@ -1786,8 +1831,32 @@ class MooncakeKVManager(CommonKVManager):
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
+                            if is_cancel_waiting:
+                                self.record_failure(
+                                    bootstrap_room,
+                                    "KV transfer succeeded after decode cancellation",
+                                )
+                                self.update_status(bootstrap_room, KVPoll.Failed)
+                            else:
+                                self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
+                    if is_cancel_waiting and bootstrap_room in self.request_status:
+                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                        expected_response_num = (
+                            self.required_prefill_response_num_table[bootstrap_room]
+                        )
+                        arrived_response_num = len(
+                            self.prefill_response_tracker[bootstrap_room]
+                        )
+                        if arrived_response_num == expected_response_num:
+                            self.record_failure(
+                                bootstrap_room,
+                                "KV transfer cancelled by decode; all prefill ranks are terminal",
+                            )
+                            if self.enable_staging:
+                                self._chunk_writer_counts.pop(bootstrap_room, None)
+                            self.update_status(bootstrap_room, KVPoll.Failed)
+                        continue
                     self.record_failure(
                         bootstrap_room,
                         "Failed to get kvcache from prefill instance, it might be dead",
@@ -2051,6 +2120,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.cancel_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self):
@@ -2176,6 +2246,41 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         self.init_time = time.time()
 
+    def send_cancel(self) -> None:
+        # Tell every P rank to drop this room; they reply via the existing Failed path.
+        if not self.bootstrap_infos:
+            return
+        for bootstrap_info in self.bootstrap_infos:
+            send_multipart_by_req_socket(
+                CommonKVReceiver._ctx,
+                bootstrap_info["rank_ip"],
+                bootstrap_info["rank_port"],
+                multipart_data=[
+                    b"CANCEL",
+                    str(self.bootstrap_room).encode("ascii"),
+                ],
+                non_blocking=True,
+                max_retries=3,
+                retry_delay_ms=10,
+                desc="Send CANCEL to prefill instance",
+                bootstrap_room=self.bootstrap_room,
+            )
+
+    def enter_cancelled(self) -> None:
+        # Idempotent: send CANCEL once and mark conclude_state.
+        if self.conclude_state is not None:
+            return
+        with self.kv_mgr.cancel_wait_rooms_lock:
+            self.kv_mgr.cancel_wait_rooms.add(self.bootstrap_room)
+        try:
+            self.send_cancel()
+        except Exception as e:
+            logger.error(
+                "send_cancel failed for room=%s: %s", self.bootstrap_room, e
+            )
+        self.cancel_time = time.time()
+        self.conclude_state = KVPoll.Cancelled
+
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2190,14 +2295,31 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
                             "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
-                        self.kv_mgr.record_failure(
-                            self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
-                        )
-                        self.conclude_state = KVPoll.Failed
-                        return KVPoll.Failed
+                        self.enter_cancelled()
+                        return KVPoll.Cancelled
 
             return status
+
+        elif self.conclude_state == KVPoll.Cancelled:
+            # Any terminal (Success or Failed) from P collapses to Failed once cancelled.
+            status = self.kv_mgr.check_status(self.bootstrap_room)
+            if status in (KVPoll.Success, KVPoll.Failed):
+                if status == KVPoll.Success:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"Request {self.bootstrap_room} succeeded after CANCEL; releasing.",
+                    )
+                self.conclude_state = KVPoll.Failed
+                return KVPoll.Failed
+            now = time.time()
+            if now - getattr(self, "cancel_time", now) >= self.kv_mgr.cancel_timeout:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Request {self.bootstrap_room} cancel timed out; force-releasing KV.",
+                )
+                self.conclude_state = KVPoll.Failed
+                return KVPoll.Failed
+            return KVPoll.Cancelled
 
         else:
             return self.conclude_state
@@ -2211,6 +2333,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
+
+        if hasattr(self.kv_mgr, "cancel_wait_rooms"):
+            with self.kv_mgr.cancel_wait_rooms_lock:
+                self.kv_mgr.cancel_wait_rooms.discard(self.bootstrap_room)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -2230,8 +2356,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        # Explicitly set the status to failure since this request has been aborted
-        self.conclude_state = KVPoll.Failed
+        # If metadata was sent (init_time set), prefill may still be writing, so
+        # route through CANCEL handshake before releasing; otherwise fail directly.
+        if self.init_time is not None:
+            self.enter_cancelled()
+        else:
+            self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

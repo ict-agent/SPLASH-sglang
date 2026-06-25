@@ -62,10 +62,11 @@ class KVArgs:
 
 class KVPoll:
     Failed = 0
-    Bootstrapping = 1
-    WaitingForInput = 2
-    Transferring = 3
-    Success = 4
+    Cancelled = 1
+    Bootstrapping = 2
+    WaitingForInput = 3
+    Transferring = 4
+    Success = 5
 
 
 class BaseKVManager(ABC):

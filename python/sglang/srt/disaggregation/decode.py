@@ -570,6 +570,8 @@ class DecodePreallocQueue:
                 )
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+            elif poll == KVPoll.Cancelled:
+                pass
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -1148,6 +1150,10 @@ class DecodeTransferQueue:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
+            elif poll == KVPoll.Cancelled:
+                # MIN propagated Cancelled from some D rank: every rank must
+                # also send CANCEL to its own P set so all of P stops writing.
+                decode_req.kv_receiver.enter_cancelled()
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
