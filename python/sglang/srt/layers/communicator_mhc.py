@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -28,12 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class MHCLayerCommunicator(LayerCommunicator):
-    """Communication helpers for a decoder layer whose residual is mHC state.
-
-    mHC pre/post math stays in the decoder layer, matching DeepSeek V4. This
-    class only handles attention output reduction and token-layout changes
-    around MoE.
-    """
+    """Communication and residual-state handling for an mHC decoder layer."""
 
     def __init__(
         self,
@@ -43,7 +38,21 @@ class MHCLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func=None,
+        is_first_layer: bool = False,
+        hc_mult: int = 1,
+        hc_attn_pre: Optional[Callable] = None,
+        hc_ffn_pre: Optional[Callable] = None,
+        hc_post: Optional[Callable] = None,
+        is_layer_sparse: bool = False,
     ):
+        self.is_first_layer = is_first_layer
+        self.hc_mult = hc_mult
+        self.hc_attn_pre = hc_attn_pre
+        self.hc_ffn_pre = hc_ffn_pre
+        self.hc_post = hc_post
+        self.is_layer_sparse = is_layer_sparse
+        self._h_res = None
+        self._h_post = None
         self._mlp_comm_kind = None
         self._a2a_scatter_chunks = None
         super().__init__(
@@ -56,36 +65,100 @@ class MHCLayerCommunicator(LayerCommunicator):
         )
 
     def _post_init_communicate(self):
-        # mHC owns residual mixing and normalization, so the generic
-        # residual-add/layernorm communication functions are not applicable.
         pass
 
-    def prepare_attention_input(
+    def prepare_attn(
         self,
         hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        is_linear_attn: bool,
-    ) -> torch.Tensor:
-        del is_linear_attn
+        quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        del residual, quant_format, post_residual_addition
+        assert self.hc_attn_pre is not None
+
+        if (
+            self.is_first_layer
+            and hidden_states.shape[-1] == self.input_layernorm.weight.shape[0]
+        ):
+            hidden_states = hidden_states.repeat(1, self.hc_mult)
+
+        residual = hidden_states
+        hidden_states, self._h_res, self._h_post, norm_fused = self.hc_attn_pre(
+            hidden_states,
+            self.input_layernorm.weight,
+            self.input_layernorm.variance_epsilon,
+        )
+        if not norm_fused and hidden_states.shape[0] != 0:
+            hidden_states = self.input_layernorm(hidden_states)
+
         if self.qkv_latent_func is not None:
             get_attn_tp_context().set_attn_inputs(
                 AttentionInputs(hidden_states, forward_batch, self.qkv_latent_func)
             )
-        return hidden_states
+        return hidden_states, residual
 
-    def restore_attention_output(
+    def prepare_mlp(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         forward_batch: ForwardBatch,
-        is_linear_attn: bool,
-    ) -> torch.Tensor:
-        del forward_batch, is_linear_attn
-        return hidden_states
+        cache=None,
+    ):
+        del cache
+        assert self.hc_ffn_pre is not None
+        assert self.hc_post is not None
+        assert self._h_res is not None and self._h_post is not None
 
-    def reduce_attention_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] != 0:
             hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
-        return hidden_states
+        hidden_states = self.hc_post(
+            hidden_states,
+            residual,
+            self._h_res,
+            self._h_post,
+        )
+
+        residual = hidden_states
+        hidden_states, self._h_res, self._h_post, norm_fused = self.hc_ffn_pre(
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        if not norm_fused and hidden_states.shape[0] != 0:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states = self.prepare_mlp_input(
+            hidden_states,
+            forward_batch,
+            self.is_layer_sparse,
+        )
+        return hidden_states, residual
+
+    def postprocess_layer(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        assert self.hc_post is not None
+        assert self._h_res is not None and self._h_post is not None
+
+        hidden_states = self.restore_mlp_output(hidden_states, forward_batch)
+        hidden_states = self.hc_post(
+            hidden_states,
+            residual,
+            self._h_res,
+            self._h_post,
+        )
+        if self.is_last_layer:
+            hidden_states = hidden_states.unflatten(
+                -1, (self.hc_mult, -1)
+            ).mean(dim=-2)
+        self._h_res = None
+        self._h_post = None
+        return hidden_states, None
 
     def prepare_mlp_input(
         self,

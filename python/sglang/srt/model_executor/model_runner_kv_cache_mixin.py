@@ -262,11 +262,18 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank % quant_block_size == 0
             ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
-            return (
+            kv_cache_dim = (
                 kv_lora_rank
                 + kv_lora_rank // quant_block_size * 4
                 + qk_rope_head_dim * rope_storage_dtype.itemsize
             )
+            if _is_dcu and qk_rope_head_dim == 0 and (
+                self.server_args.nsa_prefill_backend
+                in ("flashmla_auto", "flashmla_kv")
+                or self.server_args.nsa_decode_backend == "flashmla_kv"
+            ):
+                kv_cache_dim += 64 * rope_storage_dtype.itemsize
+            return kv_cache_dim
 
         return kv_cache_dim
 

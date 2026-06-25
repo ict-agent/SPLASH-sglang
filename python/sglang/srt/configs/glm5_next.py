@@ -58,13 +58,13 @@ def _default_linear_attn_config():
     }
 
 
-class ModelNextConfig(PretrainedConfig):
-    model_type = "model_next"
+class Glm5NextConfig(PretrainedConfig):
+    model_type = "glm5_next"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        model_type="model_next",
+        model_type="glm5_next",
         vocab_size=154880,
         hidden_size=4096,
         intermediate_size=12288,
@@ -202,7 +202,6 @@ class ModelNextConfig(PretrainedConfig):
 
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        self.architectures = architectures or ["ModelNextForCausalLM"]
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -211,6 +210,7 @@ class ModelNextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        self.architectures = architectures or ["Glm5NextForCausalLM"]
 
     @property
     def is_mla(self):
@@ -274,9 +274,9 @@ class ModelNextConfig(PretrainedConfig):
 
 register_linear_attn_model(
     LinearAttnModelSpec(
-        config_class=ModelNextConfig,
+        config_class=Glm5NextConfig,
         backend_class_name="sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend",
-        arch_names=["ModelNextForCausalLM"],
+        arch_names=["Glm5NextForCausalLM"],
         uses_mamba_radix_cache=True,
         support_mamba_cache=False,
         support_mamba_cache_extra_buffer=False,
@@ -284,6 +284,6 @@ register_linear_attn_model(
 )
 
 try:
-    CONFIG_MAPPING.register("model_next", ModelNextConfig)
+    CONFIG_MAPPING.register("glm5_next", Glm5NextConfig)
 except Exception:
-    CONFIG_MAPPING._extra_content["model_next"] = ModelNextConfig
+    CONFIG_MAPPING._extra_content["glm5_next"] = Glm5NextConfig

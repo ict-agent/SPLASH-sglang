@@ -821,6 +821,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
 
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
+
     def forward_decode(
         self,
         layer: RadixAttention,

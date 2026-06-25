@@ -14,7 +14,11 @@ from sglang.srt.utils import get_bool_env_var, is_dcu
 _is_dcu = is_dcu()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")
 if _is_dcu and _use_aiter_tilelang_mhc:
-    from aiter.ops.tilelang import mhc_post_fwd, pre_big_fuse_tilelang
+    from aiter.ops.tilelang import (
+        mhc_post_fwd,
+        mhc_pre_big_fuse,
+        pre_big_fuse_tilelang,
+    )
 
 
 tilelang.set_log_level("WARNING")
@@ -239,13 +243,9 @@ def mhc_pre_torch(
     pre = torch.sigmoid(
         mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
     ) + hc_pre_eps
-    post = (
-        2
-        * torch.sigmoid(
-            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
-            + hc_base[hc_mult : 2 * hc_mult]
-        )
-        * hc_post_mult_value
+    post = hc_post_mult_value * torch.sigmoid(
+        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
     )
     comb = mixes[:, 2 * hc_mult :].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
     comb = comb + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
@@ -273,9 +273,11 @@ def mhc_post_torch(
             device=x.device,
         )
 
-    out = post_layer_mix.unsqueeze(-1) * x.unsqueeze(1)
-    out = out + torch.einsum("nij,njk->nik", comb_res_mix, residual)
-    return out
+    out = post_layer_mix.float().unsqueeze(-1) * x.float().unsqueeze(1)
+    out = out + torch.einsum(
+        "nij,njk->nik", comb_res_mix.float(), residual.float()
+    )
+    return out.to(x.dtype)
 
 
 @tilelang.jit(
@@ -1107,6 +1109,50 @@ def hc_pre(
         )
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        post_mix, comb_mix, layer_input = mhc_pre_torch(
+            residual=x.view(s, hc_mult, hidden_size),
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_eps,
+            hc_sinkhorn_eps=hc_eps,
+            hc_post_mult_value=post_mult_value,
+            sinkhorn_repeat=sinkhorn_iters,
+            hc_mult=hc_mult,
+        )
+        return (
+            layer_input,
+            comb_mix.reshape(s, hc_mult * hc_mult),
+            post_mix.reshape(s, hc_mult),
+            False,
+        )
+
+    if (
+        _is_dcu
+        and _use_aiter_tilelang_mhc
+        and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+    ):
+        post_mix, comb_mix, layer_input = mhc_pre_big_fuse(
+            residual=x.view(s, hc_mult, hidden_size),
+            fn=fn,
+            mhc_scale=hc_scale,
+            mhc_base=hc_base,
+            rms_eps=rms_eps,
+            mhc_pre_eps=hc_eps,
+            mhc_sinkhorn_eps=hc_eps,
+            mhc_post_mult_value=post_mult_value,
+            sinkhorn_repeat=sinkhorn_iters,
+            n_splits=16,
+        )
+        return (
+            layer_input,
+            comb_mix.reshape(s, hc_mult * hc_mult),
+            post_mix.reshape(s, hc_mult),
+            False,
+        )
+
     norm_fused = out_norm_weight is not None and not (
         _is_dcu and _use_aiter_tilelang_mhc
     )
@@ -1145,7 +1191,9 @@ def hc_post(
     residual = residual.view(s, hc_mult, hidden_size)
     h_post = h_post.view(s, hc_mult)
     h_res = h_res.view(s, hc_mult, hc_mult)
-    if _is_dcu and _use_aiter_tilelang_mhc:
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        out = mhc_post_torch(x, residual, h_post, h_res)
+    elif _is_dcu and _use_aiter_tilelang_mhc:
         out = mhc_post_fwd(x, residual, h_post, h_res)
     else:
         out = mhc_post(

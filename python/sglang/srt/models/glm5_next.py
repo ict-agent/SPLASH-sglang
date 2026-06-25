@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs.Model_next import ModelNextConfig
+from sglang.srt.configs.glm5_next import Glm5NextConfig as ModelNextConfig
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -69,7 +69,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import hc_contract, hc_expand
+from sglang.srt.layers.mhc import hc_contract
 from sglang.srt.layers.mhc import hc_post as _hc_post_fn
 from sglang.srt.layers.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -97,7 +97,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
-    sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -157,11 +156,19 @@ class ModelNextLinearAttention(nn.Module):
         if is_nsa_enable_prefill_cp():
             head_shard_size = get_attention_cp_size()
             head_shard_rank = get_attention_cp_rank()
-            _head_shard_rank_getter = get_attention_cp_rank
         else:
             head_shard_size = get_attention_tp_size()
             head_shard_rank = get_attention_tp_rank()
-            _head_shard_rank_getter = get_attention_tp_rank
+
+        def head_sharded_weight_loader(shard_axis: int):
+            def loader(param: torch.Tensor, loaded_weight: torch.Tensor):
+                shard_size = param.data.shape[shard_axis]
+                loaded_weight = loaded_weight.narrow(
+                    shard_axis, head_shard_rank * shard_size, shard_size
+                )
+                return default_weight_loader(param, loaded_weight)
+
+            return loader
 
         self.hidden_size = hidden_size
         self.config = config
@@ -287,7 +294,7 @@ class ModelNextLinearAttention(nn.Module):
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, _head_shard_rank_getter)},
+            {"weight_loader": head_sharded_weight_loader(0)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -312,7 +319,7 @@ class ModelNextLinearAttention(nn.Module):
         def a_log_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor):
             if loaded_weight.dim() == 1:
                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
-            return sharded_weight_loader(2, _head_shard_rank_getter)(param, loaded_weight)
+            return head_sharded_weight_loader(2)(param, loaded_weight)
 
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader})
 
@@ -640,10 +647,24 @@ class ModelNextDecoderLayer(nn.Module):
 
         if self.config.mhc and self.nsa_enable_prefill_cp:
             self.layer_communicator = MHCHybridNSACPLayerCommunicator(
-                **shared_kwargs
+                **shared_kwargs,
+                is_first_layer=self.is_first_layer,
+                hc_mult=config.hc_mult,
+                hc_attn_pre=self.hc_attn_pre,
+                hc_ffn_pre=self.hc_ffn_pre,
+                hc_post=self.hc_post,
+                is_layer_sparse=self.is_layer_sparse,
             )
         elif self.config.mhc:
-            self.layer_communicator = MHCLayerCommunicator(**shared_kwargs)
+            self.layer_communicator = MHCLayerCommunicator(
+                **shared_kwargs,
+                is_first_layer=self.is_first_layer,
+                hc_mult=config.hc_mult,
+                hc_attn_pre=self.hc_attn_pre,
+                hc_ffn_pre=self.hc_ffn_pre,
+                hc_post=self.hc_post,
+                is_layer_sparse=self.is_layer_sparse,
+            )
         elif self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(**shared_kwargs)
         else:
@@ -703,104 +724,6 @@ class ModelNextDecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
-    def forward_mhc(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        gemm_output_zero_allocator: BumpAllocator = None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
-        next_full_attention_layer_id: Optional[int] = None,
-    ):
-        if self.is_first_layer and hidden_states.shape[-1] == self.hidden_size:
-            hidden_states = hc_expand(hidden_states, self.config.hc_mult)
-        expected_width = self.config.hc_mult * self.hidden_size
-        assert hidden_states.shape[-1] == expected_width, (
-            f"ModelNext mHC layer {self.layer_id} expected hidden width "
-            f"{expected_width}, got {hidden_states.shape[-1]}"
-        )
-
-        residual = hidden_states
-        hidden_states, h_res, h_post, norm_fused = self.hc_attn_pre(
-            hidden_states,
-            self.input_layernorm.weight,
-            self.input_layernorm.variance_epsilon,
-        )
-        if not norm_fused and hidden_states.shape[0] != 0:
-            hidden_states = self.input_layernorm(hidden_states)
-
-        hidden_states = self.layer_communicator.prepare_attention_input(
-            hidden_states,
-            forward_batch,
-            self.is_linear_attn,
-        )
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            layer_scatter_modes=self.layer_scatter_modes,
-            prev_topk_indices=prev_topk_indices,
-        )
-        if isinstance(hidden_states, tuple):
-            hidden_states, topk_indices = hidden_states
-        else:
-            topk_indices = None
-        hidden_states = self.layer_communicator.restore_attention_output(
-            hidden_states,
-            forward_batch,
-            self.is_linear_attn,
-        )
-        hidden_states = self.layer_communicator.reduce_attention_output(hidden_states)
-        hidden_states = self.hc_post(
-            hidden_states,
-            residual,
-            h_res,
-            h_post,
-        )
-
-        self.layer_communicator.maybe_prefetch_next_full_attention_kv(
-            forward_batch, next_full_attention_layer_id
-        )
-
-        residual = hidden_states
-        hidden_states, h_res, h_post, norm_fused = self.hc_ffn_pre(
-            hidden_states,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.variance_epsilon,
-        )
-        if not norm_fused and hidden_states.shape[0] != 0:
-            hidden_states = self.post_attention_layernorm(hidden_states)
-
-        hidden_states = self.layer_communicator.prepare_mlp_input(
-            hidden_states,
-            forward_batch,
-            self.is_layer_sparse,
-        )
-        if isinstance(self.mlp, ModelNextMLP):
-            gemm_output_zero_allocator = None
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            False,
-            False,
-            gemm_output_zero_allocator,
-        )
-        hidden_states = self.layer_communicator.restore_mlp_output(
-            hidden_states,
-            forward_batch,
-        )
-        hidden_states = self.hc_post(
-            hidden_states,
-            residual,
-            h_res,
-            h_post,
-        )
-        if self.is_last_layer:
-            hidden_states = hc_contract(hidden_states, self.config.hc_mult)
-        return hidden_states, None, topk_indices
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -812,17 +735,6 @@ class ModelNextDecoderLayer(nn.Module):
         prev_topk_indices: Optional[torch.Tensor] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
-        if self.config.mhc:
-            return self.forward_mhc(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                zero_allocator=zero_allocator,
-                gemm_output_zero_allocator=gemm_output_zero_allocator,
-                prev_topk_indices=prev_topk_indices,
-                next_full_attention_layer_id=next_full_attention_layer_id,
-            )
-
         quant_format = (
             "mxfp4"
             if (
@@ -1651,4 +1563,8 @@ class ModelNextForCausalLM(nn.Module):
             self.post_load_weights(is_nextn=False)
 
 
-EntryClass = [ModelNextForCausalLM]
+class Glm5NextForCausalLM(ModelNextForCausalLM):
+    pass
+
+
+EntryClass = [Glm5NextForCausalLM]

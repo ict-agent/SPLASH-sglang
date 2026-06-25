@@ -354,19 +354,6 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
-        if self.nsa_kv_cache_store_fp8:
-            quant_block_size = 128
-            expected_kv_cache_dim = (
-                self.kv_lora_rank
-                + self.kv_lora_rank
-                // quant_block_size
-                * torch.float32.itemsize
-                + self.qk_rope_head_dim * torch.bfloat16.itemsize
-            )
-            assert self.kv_cache_dim == expected_kv_cache_dim, (
-                f"Invalid packed NSA KV cache width: expected "
-                f"{expected_kv_cache_dim}, got {self.kv_cache_dim}"
-            )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1393,6 +1380,9 @@ class NativeSparseAttnBackend(
             else self.nsa_prefill_impl
         )
 
+        if q_rope is not None and q_rope.shape[-1] == 0:
+            q_rope = None
+
         if nsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
                 q,
@@ -1443,7 +1433,6 @@ class NativeSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        assert q_rope is not None
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
@@ -1451,10 +1440,15 @@ class NativeSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
+            q_all = None
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
-            q_rope = q_all[:, :, layer.v_head_dim :]
+            q_rope = (
+                None
+                if layer.head_dim == layer.v_head_dim
+                else q_all[:, :, layer.v_head_dim :]
+            )
 
         # Align topk_indices with q dimensions
         # This handles cases where q is padded (TP + partial DP attention)
@@ -1594,6 +1588,9 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
+        if q_rope is not None and q_rope.shape[-1] == 0:
+            q_rope = None
+
         if self.nsa_decode_impl == "trtllm":
             return self._forward_trtllm(
                 q,
@@ -1642,7 +1639,11 @@ class NativeSparseAttnBackend(
             # otherwise redundant concat_mla_absorb_q_general call.
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
-            q_rope = q_all[:, :, layer.v_head_dim :]
+            q_rope = (
+                None
+                if layer.head_dim == layer.v_head_dim
+                else q_all[:, :, layer.v_head_dim :]
+            )
 
         # Align topk_indices with q dimensions
         if topk_indices is not None:
@@ -1805,6 +1806,23 @@ class NativeSparseAttnBackend(
             q_input = q_padded
         else:
             q_input = q_all
+
+        if _is_dcu and self.qk_rope_head_dim == 0:
+            if q_input.shape[-1] == v_head_dim:
+                q_padded = q_input.new_zeros(
+                    *q_input.shape[:-1],
+                    q_input.shape[-1] + 64,
+                )
+                q_padded[..., : q_input.shape[-1]] = q_input
+                q_input = q_padded
+            if kv_cache.shape[-1] == v_head_dim:
+                kv_padded = kv_cache.new_zeros(
+                    *kv_cache.shape[:-1],
+                    kv_cache.shape[-1] + 64,
+                )
+                kv_padded[..., : kv_cache.shape[-1]] = kv_cache
+                kv_cache = kv_padded
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -1842,6 +1860,13 @@ class NativeSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        if _is_dcu and self.qk_rope_head_dim == 0:
+            q_padded = q_all.new_zeros(
+                *q_all.shape[:-1],
+                q_all.shape[-1] + 64,
+            )
+            q_padded[..., : q_all.shape[-1]] = q_all
+            q_all = q_padded
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -2309,7 +2334,12 @@ class NativeSparseAttnBackend(
             # disable for MTP
             self.nsa_kv_cache_store_fp8
             and self.nsa_prefill_impl == "flashmla_sparse"
-            and forward_mode == ForwardMode.EXTEND
+            and forward_mode
+            in (
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.SPLIT_PREFILL,
+            )
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:

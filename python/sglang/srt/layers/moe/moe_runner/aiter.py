@@ -238,8 +238,8 @@ def _get_aiter_w8a8_original_dims(
     w1_shape = quant_info.original_w13_shape
     w2_shape = quant_info.original_w2_shape
     E, N1, K1 = w1_shape
-    E2, N2, _ = w2_shape
-    if E != E2 or K != K1 or K != N2:
+    E2, K2, N2 = w2_shape
+    if E != E2 or K != K1 or K != K2:
         raise RuntimeError(
             "AITER W8A8 MoE shape mismatch: "
             f"hidden_states={tuple(hidden_states.shape)}, "

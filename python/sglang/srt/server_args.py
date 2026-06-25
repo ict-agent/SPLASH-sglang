@@ -1798,7 +1798,7 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
-            "ModelNextForCausalLM",
+            "Glm5NextForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -1899,7 +1899,7 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    if model_arch == "ModelNextForCausalLM" and is_dcu():
+                    if model_arch == "Glm5NextForCausalLM" and is_dcu():
                         if self.kv_cache_dtype == "auto":
                             self.kv_cache_dtype = "fp8_e4m3"
                         if self.nsa_prefill_backend is None:
