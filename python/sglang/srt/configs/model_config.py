@@ -112,6 +112,7 @@ def is_deepseek_nsa(config) -> bool:
             "Glm5NextForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
+        and not bool(_hf_attr(config, "disable_nsa"))
     )
 
 

@@ -1768,6 +1768,29 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        if model_arch == "Glm5NextForCausalLM" and not self.disable_radix_cache:
+            if getattr(hf_config, "disable_nsa", False):
+                if (
+                    self.attention_backend == "dcu_mla"
+                    or self.prefill_attention_backend == "dcu_mla"
+                    or self.decode_attention_backend == "dcu_mla"
+                ):
+                    self.page_size = 64
+                if self.mamba_scheduler_strategy != "extra_buffer":
+                    self.mamba_scheduler_strategy = "extra_buffer"
+                    logger.warning(
+                        "Use mamba extra_buffer for Glm5NextForCausalLM KDA+MLA radix cache "
+                        "so page_size can stay compatible with the MLA backend."
+                    )
+            else:
+                self.disable_radix_cache = True
+                if self.mamba_scheduler_strategy == "extra_buffer":
+                    self.mamba_scheduler_strategy = "no_buffer"
+                logger.warning(
+                    "Disabling Radix Cache for Glm5NextForCausalLM with NSA enabled. "
+                    "Only KDA+MLA radix cache is enabled in this path for now."
+                )
+
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None:
             self._handle_mamba_radix_cache(
@@ -1800,6 +1823,15 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
             "Glm5NextForCausalLM",
         ]:
+            if (
+                getattr(hf_config, "disable_nsa", False)
+                and self.enable_nsa_prefill_context_parallel
+            ):
+                raise ValueError(
+                    "--enable-nsa-prefill-context-parallel cannot be used when "
+                    "NSA is disabled. Dense MLA context parallel is not supported."
+                )
+
             # Set attention backend for DeepSeek
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():

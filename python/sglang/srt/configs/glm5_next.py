@@ -110,6 +110,7 @@ class Glm5NextConfig(PretrainedConfig):
         index_topk=2048,
         index_n_heads=32,
         index_dsa_use_layernorm=True,
+        disable_nsa=False,
         initializer_range=0.02,
         use_cache=True,
         pad_token_id=154820,
@@ -199,6 +200,7 @@ class Glm5NextConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_dsa_use_layernorm = index_dsa_use_layernorm
+        self.disable_nsa = disable_nsa
 
         self.initializer_range = initializer_range
         self.use_cache = use_cache
@@ -278,8 +280,8 @@ register_linear_attn_model(
         backend_class_name="sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend",
         arch_names=["Glm5NextForCausalLM"],
         uses_mamba_radix_cache=True,
-        support_mamba_cache=False,
-        support_mamba_cache_extra_buffer=False,
+        support_mamba_cache=True,
+        support_mamba_cache_extra_buffer=True,
     )
 )
 

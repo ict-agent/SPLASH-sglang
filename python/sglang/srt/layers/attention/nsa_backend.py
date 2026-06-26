@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -16,7 +17,6 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -37,6 +37,9 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, is_dcu
+from sglang.srt.utils.common import log_info_on_rank0
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -354,6 +357,12 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self._is_glm5_next = (
+            getattr(model_runner.model_config.hf_config, "model_type", None)
+            == "glm5_next"
+        )
+        self._logged_flashmla_sparse_shapes = False
+        self._logged_flashmla_kv_shapes = False
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1784,6 +1793,9 @@ class NativeSparseAttnBackend(
         else:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
 
+        original_q_shape = tuple(q_all.shape)
+        original_kv_shape = tuple(kv_cache.shape)
+
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
@@ -1807,7 +1819,7 @@ class NativeSparseAttnBackend(
         else:
             q_input = q_all
 
-        if _is_dcu and self.qk_rope_head_dim == 0:
+        if _is_dcu and self.nsa_kv_cache_store_fp8 and self.qk_rope_head_dim == 0:
             if q_input.shape[-1] == v_head_dim:
                 q_padded = q_input.new_zeros(
                     *q_input.shape[:-1],
@@ -1822,6 +1834,19 @@ class NativeSparseAttnBackend(
                 )
                 kv_padded[..., : kv_cache.shape[-1]] = kv_cache
                 kv_cache = kv_padded
+
+        if self._is_glm5_next and not self._logged_flashmla_sparse_shapes:
+            log_info_on_rank0(
+                logger,
+                "GLM5-Next FlashMLA sparse prefill shapes: "
+                f"kv_lora_rank={self.kv_lora_rank}, "
+                f"qk_nope_head_dim={self.qk_nope_head_dim}, "
+                f"qk_rope_head_dim={self.qk_rope_head_dim}, "
+                f"v_head_dim={v_head_dim}, "
+                f"q={original_q_shape}->{tuple(q_input.shape)} {q_input.dtype}, "
+                f"kv={original_kv_shape}->{tuple(kv_cache.shape)} {kv_cache.dtype}.",
+            )
+            self._logged_flashmla_sparse_shapes = True
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
@@ -1858,9 +1883,12 @@ class NativeSparseAttnBackend(
         cache_seqlens = metadata.nsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
+        original_q_shape = tuple(q_all.shape)
+        original_kv_shape = tuple(kv_cache.shape)
+
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        if _is_dcu and self.qk_rope_head_dim == 0:
+        if _is_dcu and self.nsa_kv_cache_store_fp8 and self.qk_rope_head_dim == 0:
             q_padded = q_all.new_zeros(
                 *q_all.shape[:-1],
                 q_all.shape[-1] + 64,
@@ -1881,10 +1909,19 @@ class NativeSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
-            # Current flash_mla sparse-kvcache path requires FP8 cache when
-            # indices are provided, so BF16 KV must still be quantized here.
-            kv_cache = quantize_k_cache(kv_cache)
+        if self._is_glm5_next and not self._logged_flashmla_kv_shapes:
+            log_info_on_rank0(
+                logger,
+                "GLM5-Next FlashMLA sparse decode shapes: "
+                f"kv_lora_rank={self.kv_lora_rank}, "
+                f"qk_nope_head_dim={self.qk_nope_head_dim}, "
+                f"qk_rope_head_dim={self.qk_rope_head_dim}, "
+                f"v_head_dim={v_head_dim}, "
+                f"q={original_q_shape}->{tuple(q_input.shape)} {q_input.dtype}, "
+                f"kv_cache={original_kv_shape}->{tuple(kv_cache.shape)} "
+                f"{kv_cache.dtype}, bytes_per_token={kv_cache.shape[-1]}.",
+            )
+            self._logged_flashmla_kv_shapes = True
 
         indices = page_table_1.unsqueeze(1)
         assert (
@@ -1904,7 +1941,7 @@ class NativeSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
         )
 
         if target_q_heads != num_q_heads:
@@ -2377,7 +2414,7 @@ class NativeSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
             topk=self.nsa_index_topk,
         )
         return NSAFlashMLAMetadata(

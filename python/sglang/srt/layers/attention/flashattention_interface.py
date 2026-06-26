@@ -173,6 +173,7 @@ def flash_attn_varlen_func(
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
+    out=None,
     sinks=None,
     ver=3,
 
@@ -188,7 +189,7 @@ def flash_attn_varlen_func(
 
     if is_nmz_fp8(k.dtype) and not IS_SLIMQUANT_W4A8 and not IS_KVCACHE_FP8_E4M3:
         q_descale = torch.ones_like(k_descale)
-        return flash_attn_varlen_func_interface(
+        result = flash_attn_varlen_func_interface(
                 q=q,
                 k=k,
                 v=v,
@@ -204,8 +205,16 @@ def flash_attn_varlen_func(
                 return_attn_probs=return_softmax_lse,
                 softcap=softcap,
             )
+        if out is not None:
+            if return_softmax_lse:
+                result_out, *rest = result
+                out.copy_(result_out)
+                return (out, *rest)
+            out.copy_(result)
+            return out
+        return result
 
-    return flash_attn_varlen_func_interface(
+    result = flash_attn_varlen_func_interface(
         q=q,
         k=k,
         v=v,
@@ -218,6 +227,14 @@ def flash_attn_varlen_func(
         return_attn_probs=return_softmax_lse,
         softcap=softcap,
     )
+    if out is not None:
+        if return_softmax_lse:
+            result_out, *rest = result
+            out.copy_(result_out)
+            return (out, *rest)
+        out.copy_(result)
+        return out
+    return result
 
 def vllm_flash_attn_varlen_func(
     q,

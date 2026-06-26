@@ -21,6 +21,10 @@ import logging
 logger = logging.getLogger(__name__)
 from sglang.srt.utils import is_dcu
 _is_dcu = is_dcu()
+try:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+except Exception:
+    FlashMLASchedMeta = None
 is_fp8 = False
 try:
     
@@ -81,6 +85,29 @@ def is_bmz_fp8(kv_cache: torch.Tensor) -> bool:
     except Exception:
         pass
     return False
+
+
+def _pad_last_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
+    if x.shape[-1] >= target_dim:
+        return x
+    out = x.new_zeros(*x.shape[:-1], target_dim)
+    out[..., : x.shape[-1]] = x
+    return out
+
+
+def _dense_flashmla_sched_meta(
+    flashmla_metadata,
+    num_splits,
+):
+    if FlashMLASchedMeta is None:
+        return flashmla_metadata, num_splits
+    if isinstance(flashmla_metadata, FlashMLASchedMeta):
+        return flashmla_metadata, None
+
+    # BF16 dense FlashMLA computes scheduler metadata internally. The DCU
+    # precomputed metadata here is for the fp8 path and can have a different
+    # num_sm_parts shape.
+    return FlashMLASchedMeta(), None
 
 
 if TYPE_CHECKING:
@@ -636,14 +663,21 @@ class DCUMLABackend(AttentionBackend):
             )
         else:
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+            if _is_dcu and self.qk_rope_head_dim == 0 and reshape_q.shape[-1] == 512:
+                reshape_q = _pad_last_dim(reshape_q, 576)
+                k_cache_reshaped = _pad_last_dim(k_cache_reshaped, 576)
+            flashmla_metadata, num_splits = _dense_flashmla_sched_meta(
+                self.forward_metadata.flashmla_metadata,
+                self.forward_metadata.num_splits,
+            )
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache_reshaped,
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,
-                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-                num_splits=self.forward_metadata.num_splits,
+                tile_scheduler_metadata=flashmla_metadata,
+                num_splits=num_splits,
                 softmax_scale=scaling,
                 causal=True,
             )

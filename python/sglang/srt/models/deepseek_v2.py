@@ -466,8 +466,22 @@ class DeepseekV2MLP(nn.Module):
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         if self.swiglu_limit is not None:
             M, N = gate_up.shape
-            x = gate_up.new_empty((M, N // 2))
-            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            out_dim = N // 2
+            vec_size = 16 // gate_up.element_size()
+            jit_kernel_supported = out_dim // vec_size <= 1024
+            if (
+                envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
+                and jit_kernel_supported
+            ):
+                x = gate_up.new_empty((M, out_dim))
+                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+            else:
+                gate = gate_up[..., :out_dim].clamp(max=self.swiglu_limit)
+                up = gate_up[..., out_dim:].clamp(
+                    min=-self.swiglu_limit,
+                    max=self.swiglu_limit,
+                )
+                x = F.silu(gate) * up
         else:
             x = self.act_fn(gate_up)
         x, _ = self.down_proj(
