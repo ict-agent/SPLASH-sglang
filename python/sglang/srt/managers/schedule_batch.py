@@ -1860,7 +1860,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        server_args = get_global_server_args()
+        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        prefix_len = len(req.prefix_indices)
         mask = req.extend_input_len >= mamba_cache_chunk_size
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(
@@ -1875,12 +1877,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # otherwise retrieved from h (i.e. unaligned).
             # We need to pass the non-aligned seqlen to the calculation. Even though
             # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+            mamba_track_seqlen = prefix_len + req.extend_input_len
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
+                prefix_len
                 + (req.extend_input_len // mamba_cache_chunk_size)
                 * mamba_cache_chunk_size
             )
@@ -1890,7 +1892,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
             mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
+                prefix_len
                 + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
@@ -1903,14 +1905,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.mamba_next_track_idx
                 )
             )
-            if req.mamba_branching_seqlen is not None:
+            if (
+                req.mamba_branching_seqlen is not None
+                and server_args.mamba_state_save_priority == "branch_first"
+            ):
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
+                    req.mamba_branching_seqlen - prefix_len
                 ) % mamba_cache_chunk_size == 0
                 if (
-                    req.mamba_branching_seqlen > len(req.prefix_indices)
+                    req.mamba_branching_seqlen > prefix_len
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):

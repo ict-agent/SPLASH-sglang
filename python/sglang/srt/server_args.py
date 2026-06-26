@@ -227,6 +227,8 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
+MAMBA_STATE_SAVE_PRIORITY_CHOICES = ["branch_first", "prefill_first"]
+
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "flash_kda"]
 
@@ -551,6 +553,9 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
+    mamba_state_save_priority: Literal["branch_first", "prefill_first"] = (
+        "branch_first"
+    )
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
@@ -5157,6 +5162,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mamba_track_interval,
             help="The interval to track the mamba state during decode.",
+        )
+        parser.add_argument(
+            "--mamba-state-save-priority",
+            type=str,
+            choices=MAMBA_STATE_SAVE_PRIORITY_CHOICES,
+            default=ServerArgs.mamba_state_save_priority,
+            help="Which mamba state to prioritize during prefill. "
+            "'branch_first' keeps the historical branch-boundary override. "
+            "'prefill_first' saves the aligned prefill-end state first.",
         )
         parser.add_argument(
             "--mamba-backend",
