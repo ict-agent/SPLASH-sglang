@@ -16,7 +16,6 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from functools import cached_property
 from pathlib import Path
@@ -97,74 +96,8 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
 
 
 def get_nsa_index_kpool(config: PretrainedConfig) -> int:
+    """Effective NSA pool_size; ``> 1`` means kpool enabled."""
     return getattr(config, "index_kpool", 1)
-
-
-def get_nsa_index_kpool_always_select_tail(config: PretrainedConfig) -> bool:
-    return getattr(config, "index_kpool_always_select_tail", False)
-
-
-def get_nsa_index_kpool_compress(config: PretrainedConfig) -> bool:
-    return getattr(config, "index_kpool_compress", False)
-
-
-@dataclass(frozen=True)
-class NsaKpoolConfig:
-    """Snapshot of the NSA kpool knobs on a model's hf_config.
-
-    Groups the three ``index_kpool*`` flags into one immutable record so
-    consumers (the KV pool, the cell-size estimator, the indexer) only
-    depend on this small surface rather than the full ``ModelConfig``.
-
-    ``pool_size == 1`` means kpool is off (anchor layout); compress and
-    always_select_tail are then ignored. Use ``enabled`` / ``is_compress``
-    for the standard branch tests.
-    """
-
-    pool_size: int
-    compress: bool
-    always_select_tail: bool
-
-    @property
-    def enabled(self) -> bool:
-        return self.pool_size > 1
-
-    @property
-    def is_compress(self) -> bool:
-        return self.enabled and self.compress
-
-    def assert_indexer_compatible(self, index_topk: int) -> None:
-        """Pre-flight check for the dense IndexerKPool path.
-
-        Bundles the kpool-config invariants that path requires so they
-        live next to the config they validate. Backend-specific
-        constraints (e.g. DeepGEMM's 64-token page) belong with the
-        caller, not here.
-
-        * ``pool_size > 1`` (kpool actually on)
-        * ``compress`` and ``always_select_tail`` both set
-        * ``index_topk`` evenly divisible by ``pool_size``
-
-        Call this exactly where the IndexerKPool path is selected, not
-        from generic constructors -- anchor / hisparse paths legitimately
-        violate the first two conditions.
-        """
-        assert self.is_compress and self.always_select_tail, (
-            "IndexerKPool requires pool_size > 1, compress=True, "
-            "and always_select_tail=True."
-        )
-        assert index_topk % self.pool_size == 0, (
-            f"index_topk ({index_topk}) must be divisible by "
-            f"pool_size ({self.pool_size})"
-        )
-
-    @classmethod
-    def from_hf_config(cls, hf_config: PretrainedConfig) -> "NsaKpoolConfig":
-        return cls(
-            pool_size=get_nsa_index_kpool(hf_config),
-            compress=get_nsa_index_kpool_compress(hf_config),
-            always_select_tail=get_nsa_index_kpool_always_select_tail(hf_config),
-        )
 
 
 class ModelConfig:
@@ -680,14 +613,9 @@ class ModelConfig:
         return max(1, total_num_attention_heads // tensor_parallel_size)
 
     @cached_property
-    def nsa_kpool(self) -> NsaKpoolConfig:
-        """NSA kpool flags from this model's hf_config.
-
-        Single source of truth for the ``index_kpool*`` knobs. Both the
-        KV pool (buffer layout) and the profile-time cell-size estimator
-        read from this property so they stay in sync.
-        """
-        return NsaKpoolConfig.from_hf_config(self.hf_config)
+    def nsa_index_kpool(self) -> int:
+        """Effective NSA pool_size; ``> 1`` means kpool enabled."""
+        return get_nsa_index_kpool(self.hf_config)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:

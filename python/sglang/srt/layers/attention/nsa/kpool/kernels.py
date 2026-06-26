@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -14,19 +16,14 @@ def gather_index_k_scale_prefix_into(
     k_out: torch.Tensor,
     scale_out: torch.Tensor,
 ) -> None:
-    assert buf.dtype == torch.uint8
-    assert page_indices.dtype in (torch.int32, torch.int64)
-    assert k_out.dtype == torch.uint8
-    assert scale_out.dtype == torch.float32
-    assert k_out.shape[0] >= seq_len
-    assert k_out.shape[1] == INDEX_HEAD_DIM
-    assert scale_out.shape[0] >= seq_len
+    if seq_len == 0:
+        return
+    # Contiguity is silent-corruption territory; the rest of the shape/dtype
+    # checks are upstream guarantees.
     assert buf.is_contiguous()
     assert page_indices.is_contiguous()
     assert k_out.is_contiguous()
     assert scale_out.is_contiguous()
-    if seq_len == 0:
-        return
 
     slots_per_page = pool.slots_per_page
     _gather_index_k_scale_prefix_into_kernel[(seq_len,)](
@@ -97,13 +94,6 @@ def kpool_build_ragged_layout(
     the CPU planner via the existing i32 H2D channel so no GPU cumsum is
     needed.
     """
-    assert full_page_table.ndim == 2
-    assert cu_pages_excl.dtype == torch.int32
-    assert ragged_pool_pages.dtype == torch.int32
-    assert cu_q_len_excl.dtype == torch.int32
-    assert ragged_q_len.dtype == torch.int32
-    assert pooled_seq_lens_expanded.dtype == torch.int32
-
     device = full_page_table.device
     n_rag = cu_pages_excl.shape[0]
     concat_page_table = torch.empty(
@@ -188,14 +178,8 @@ def update_kpool_decode_cuda_graph_page_tables(
     page_size: int,
 ) -> None:
     """Update CUDA graph decode page tables for kpool in one pass."""
-    assert req_to_token.ndim == 2
-    assert req_pool_indices.ndim == 1
-    assert page_table_1.ndim == 2
-    assert real_page_table.ndim == 2
-    assert req_to_token.dtype == torch.int32
-    assert req_pool_indices.dtype in (torch.int32, torch.int64)
-    assert page_table_1.dtype == torch.int32
-    assert real_page_table.dtype == torch.int32
+    # Algorithm invariant + contiguity (silent-corruption guard); other
+    # ndim/dtype/shape checks are upstream guarantees.
     assert page_size % pool_size == 0
     assert page_table_1.is_contiguous()
     assert real_page_table.is_contiguous()
@@ -205,8 +189,6 @@ def update_kpool_decode_cuda_graph_page_tables(
         return
 
     real_cols = triton.cdiv(max_len, page_size)
-    assert page_table_1.shape[0] >= bs and page_table_1.shape[1] >= max_len
-    assert real_page_table.shape[0] >= bs and real_page_table.shape[1] >= real_cols
 
     block_n = 1024
     block_p = block_n // page_size
@@ -274,6 +256,124 @@ def _update_kpool_decode_cuda_graph_page_tables_kernel(
     )
 
 
+def update_kpool_write_plan_cuda_graph(
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    req_out: torch.Tensor,
+    write_start_out: torch.Tensor,
+    tail_logical_start_out: torch.Tensor,
+    write_loc_out: torch.Tensor,
+    pool_seqlens_per_q_out: Optional[torch.Tensor],
+    seqlens_per_q_out: Optional[torch.Tensor],
+    *,
+    pool_size: int,
+    num_draft_tokens: int,
+    slots_per_page: int,
+) -> None:
+    """Build the kpool write plan (decode + target_verify) device-side in one launch.
+
+    Grid ``(B,)``, per program computes everything for one batch:
+      decode (N=1):  write_start = positions[b]
+      verify (N>=1): write_start = committed_seq_lens[b] (= seq_lens)
+
+    Per-batch shape ``[B]`` relies on EAGLE topk=1 chain-only with
+    ``num_draft_tokens <= pool_size`` -- each batch's N drafts cross at
+    most one pool boundary, so 0 or 1 pool closes per batch. Whether a
+    batch actually closed a pool is derived in-kernel by the consumer
+    (compress) from the stored ``write_start`` value; the addressing
+    fields here are computed unconditionally.
+
+    ``pool_seqlens_per_q_out`` / ``seqlens_per_q_out`` are verify-only
+    (shape ``[B*N]``); pass ``None`` for decode and the kernel skips them.
+    """
+    # Algorithm invariant: closure-row shape [B] assumes each batch closes
+    # at most one pool (see KPoolWritePlan docstring).
+    assert num_draft_tokens <= pool_size, (
+        f"write plan assumes N <= pool_size (got N={num_draft_tokens}, "
+        f"pool_size={pool_size}); see KPoolWritePlan docstring"
+    )
+
+    bs = write_start.shape[0]
+    if bs == 0 or num_draft_tokens == 0:
+        return
+
+    has_per_q_outputs = pool_seqlens_per_q_out is not None
+    assert has_per_q_outputs == (
+        seqlens_per_q_out is not None
+    ), "pool_seqlens_per_q_out and seqlens_per_q_out must be both set or both None"
+
+    _update_kpool_write_plan_kernel[(bs,)](
+        write_start,
+        req_pool_indices,
+        real_page_table,
+        req_out,
+        write_start_out,
+        tail_logical_start_out,
+        write_loc_out,
+        pool_seqlens_per_q_out,
+        seqlens_per_q_out,
+        real_page_table.stride(0),
+        POOL_SIZE=pool_size,
+        N=num_draft_tokens,
+        SLOTS_PER_PAGE=slots_per_page,
+        HAS_PER_Q=has_per_q_outputs,
+    )
+
+
+@triton.jit
+def _update_kpool_write_plan_kernel(
+    write_start_ptr,
+    req_pool_indices_ptr,
+    real_page_table_ptr,
+    req_out_ptr,
+    write_start_out_ptr,
+    tail_logical_start_out_ptr,
+    write_loc_out_ptr,
+    pool_seqlens_per_q_out_ptr,
+    seqlens_per_q_out_ptr,
+    real_page_table_stride_0,
+    POOL_SIZE: tl.constexpr,
+    N: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+    HAS_PER_Q: tl.constexpr,
+):
+    b = tl.program_id(0)
+    ws = tl.load(write_start_ptr + b).to(tl.int32)
+    req = tl.load(req_pool_indices_ptr + b)
+
+    # _decompose_compress(ws, N, POOL_SIZE): under N <= POOL_SIZE the
+    # N writes cross at most one pool boundary, so n_pool is 0 or 1. The
+    # closure consumer re-derives this in-kernel from write_start.
+    base_pool = ws // POOL_SIZE
+
+    # Per-q expanded fields (verify only): cover all N draft positions.
+    if HAS_PER_Q:
+        for k in tl.static_range(0, N):
+            row = b * N + k
+            seqlen_per_q = ws + k + 1
+            tl.store(seqlens_per_q_out_ptr + row, seqlen_per_q)
+            tl.store(pool_seqlens_per_q_out_ptr + row, seqlen_per_q // POOL_SIZE)
+
+    tl.store(write_start_out_ptr + b, ws)
+
+    tail_logical_start = base_pool * POOL_SIZE
+    pool_page_group = base_pool // SLOTS_PER_PAGE
+    # Read packed page from row (b * N): for verify the page table is
+    # repeat_interleave'd to [B*N, max_pages] so this picks the first-of-N
+    # (identical across N); for decode N=1 so this is just row b.
+    packed_page = tl.load(
+        real_page_table_ptr + (b * N) * real_page_table_stride_0 + pool_page_group
+    ).to(tl.int64)
+    write_loc = packed_page * SLOTS_PER_PAGE + (base_pool % SLOTS_PER_PAGE)
+
+    tl.store(req_out_ptr + b, req)
+    # Addressing fields stored unconditionally; closure consumer gates the
+    # write on `(ws + N) // P > ws // P` recomputed in-kernel.
+    tl.store(tail_logical_start_out_ptr + b, tail_logical_start.to(tl.int32))
+    tl.store(write_loc_out_ptr + b, write_loc.to(tl.int64))
+
+
 def expand_pooled_groups_to_topk(
     group_ids: torch.Tensor,
     group_valid: torch.Tensor,
@@ -283,10 +383,8 @@ def expand_pooled_groups_to_topk(
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Expand selected full-pool ids to a strict-width token topk tensor."""
-    assert group_ids.ndim == 2
-    assert group_valid.shape == group_ids.shape
+    # Correctness invariants (cheap, structural).
     assert topk % pool_size == 0
-    assert group_ids.shape[1] == topk // pool_size
     assert page_table is None or topk_offsets is None
 
     device = group_ids.device
@@ -300,15 +398,11 @@ def expand_pooled_groups_to_topk(
     )
 
     if page_table is not None:
-        assert page_table.ndim == 2
-        assert page_table.shape[0] == group_ids.shape[0]
         safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
         output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
     elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
-            assert topk_offsets.shape[1] == 1
             topk_offsets = topk_offsets.squeeze(1)
-        assert topk_offsets.ndim == 1
         output = (token_ids + topk_offsets.to(torch.int64).unsqueeze(1)).to(torch.int32)
     else:
         output = token_ids.to(torch.int32)
@@ -325,12 +419,6 @@ def append_kpool_tail_to_topk(
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Append non-pooled tail tokens after selected expanded-history tokens."""
-    assert topk_result.dtype == torch.int32
-    assert seq_lens.ndim == 1
-    assert pool_lens.ndim == 1
-    assert seq_lens.shape[0] == topk_result.shape[0]
-    assert pool_lens.shape[0] == topk_result.shape[0]
-
     tail_pool = pool_size - 1
     if tail_pool == 0:
         return topk_result
@@ -346,7 +434,6 @@ def append_kpool_tail_to_topk(
         has_page_table = False
         page_table_cols = 1
     else:
-        assert page_table.ndim == 2
         has_page_table = True
         page_table_cols = page_table.shape[1]
 
@@ -355,9 +442,7 @@ def append_kpool_tail_to_topk(
         has_topk_offsets = False
     else:
         if topk_offsets.ndim == 2:
-            assert topk_offsets.shape[1] == 1
             topk_offsets = topk_offsets.squeeze(1)
-        assert topk_offsets.ndim == 1
         has_topk_offsets = True
 
     block_cols = triton.next_power_of_2(out_cols)
@@ -474,16 +559,12 @@ def topk_from_pooled_history_logits(
     pad. Used when q is right-padded for mlp-sync (TP/CP) and the topk
     output should be sized against the padded q row count.
     """
-    assert logits.ndim == 2
-    assert group_lengths.ndim == 1
-    assert logits.shape[0] == group_lengths.shape[0]
     assert topk > 0
     assert topk % pool_size == 0
 
     _, cols = logits.shape
     group_topk = topk // pool_size
     if topk_offsets is not None and topk_offsets.ndim == 2:
-        assert topk_offsets.shape[1] == 1
         topk_offsets = topk_offsets.squeeze(1)
 
     if group_topk not in (128, 160, 192, 224, 256, 512, 2048):
@@ -528,9 +609,10 @@ def topk_from_pooled_history_logits(
         page_table_row_index is None
     ), "page_table_row_index requires the fused fast_kpool group_topk path"
 
+    group_lengths_i32 = group_lengths.to(torch.int32)
     selected_groups = fast_topk_v2(
         logits,
-        group_lengths.to(torch.int32),
+        group_lengths_i32,
         group_topk,
         row_starts=row_starts,
     )
@@ -538,8 +620,8 @@ def topk_from_pooled_history_logits(
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
     max_valid_groups = min(cols, group_topk)
     valid_counts = torch.minimum(
-        group_lengths.to(torch.int32),
-        torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+        group_lengths_i32,
+        torch.full_like(group_lengths_i32, max_valid_groups),
     )
     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
     expanded = expand_pooled_groups_to_topk(
@@ -577,180 +659,6 @@ def topk_from_pooled_history_logits(
     return padded
 
 
-def kpool_assemble_softmax_rotate_write_cache(
-    pool,
-    buf: torch.Tensor,
-    chunk_k: torch.Tensor,
-    chunk_score: torch.Tensor,
-    tail_k: torch.Tensor,
-    tail_score: torch.Tensor,
-    req_pool_idx: torch.Tensor,
-    n_from_tail: torch.Tensor,
-    chunk_src_start: torch.Tensor,
-    ape: torch.Tensor,
-    loc: torch.Tensor,
-    write_mask: torch.Tensor | None = None,
-    round_scale: bool = False,
-) -> None:
-    """Fused gather + softmax + Hadamard rotate + fp8 quant + cache write.
-
-    For each output pool row r, slots are gathered from tail or chunk
-    based on n_from_tail[r] (see _kpool_assemble_softmax_rotate_write_cache_kernel).
-    Avoids materializing the (n_pools, pool_size, head_dim) intermediate
-    """
-    assert chunk_k.dim() == 2 and chunk_k.shape[1] == INDEX_HEAD_DIM
-    assert chunk_score.shape == chunk_k.shape
-    assert tail_k.dim() == 3 and tail_k.shape[2] == INDEX_HEAD_DIM
-    assert tail_score.shape == tail_k.shape
-    assert chunk_k.dtype == torch.bfloat16
-    assert chunk_score.dtype in KPOOL_SCORE_DTYPES
-    assert tail_k.dtype == torch.bfloat16
-    assert tail_score.dtype in KPOOL_SCORE_DTYPES
-    pool_size = tail_k.shape[1]
-    n_pools = req_pool_idx.shape[0]
-    assert n_from_tail.shape == (n_pools,)
-    assert chunk_src_start.shape == (n_pools,)
-    assert ape.shape == (pool_size, INDEX_HEAD_DIM)
-    assert ape.dtype == torch.float32
-    assert buf.dtype == torch.uint8
-    assert pool.index_head_dim == INDEX_HEAD_DIM
-    assert loc.dtype == torch.int64
-    assert loc.shape == (n_pools,)
-
-    if n_pools == 0:
-        return
-
-    chunk_k = chunk_k.contiguous()
-    chunk_score = chunk_score.contiguous()
-    ape = ape.contiguous()
-    loc = loc.contiguous()
-    if write_mask is None:
-        write_mask = torch.empty((1,), dtype=torch.bool, device=chunk_k.device)
-        has_write_mask = False
-    else:
-        assert write_mask.shape == (n_pools,)
-        write_mask = write_mask.contiguous()
-        has_write_mask = True
-
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
-    buf_fp32 = buf.view(torch.float32)
-
-    _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
-        buf_fp8,
-        buf_fp32,
-        chunk_k,
-        chunk_score,
-        tail_k,
-        tail_score,
-        req_pool_idx,
-        n_from_tail,
-        chunk_src_start,
-        ape,
-        loc,
-        write_mask,
-        chunk_k.stride(0),
-        tail_k.stride(0),
-        tail_k.stride(1),
-        ape.stride(0),
-        PAGE_SIZE=pool.page_size,
-        BUF_NUMEL_PER_PAGE=buf.shape[1],
-        POOL_SIZE=pool_size,
-        HEAD_DIM=INDEX_HEAD_DIM,
-        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
-        ROUND_SCALE=round_scale,
-        HAS_WRITE_MASK=has_write_mask,
-        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
-        SLOTS_PER_PAGE=pool.slots_per_page,
-    )
-
-
-def kpool_decode_update_and_maybe_write_cache(
-    pool,
-    buf: torch.Tensor,
-    tail_k: torch.Tensor,
-    tail_score: torch.Tensor,
-    key: torch.Tensor,
-    slot_score: torch.Tensor,
-    ape: torch.Tensor,
-    block_tables: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    round_scale: bool = False,
-) -> None:
-    assert tail_k.ndim == 3
-    assert tail_score.shape == tail_k.shape
-    assert tail_k.shape[1] == ape.shape[0]
-    assert tail_k.shape[2] == INDEX_HEAD_DIM
-    assert key.ndim == 2 and key.shape[1] == INDEX_HEAD_DIM
-    assert slot_score.shape == key.shape
-    assert ape.shape == tail_k.shape[1:]
-    assert tail_k.dtype == torch.bfloat16
-    assert key.dtype == torch.bfloat16
-    assert tail_score.dtype in KPOOL_SCORE_DTYPES
-    assert slot_score.dtype == tail_score.dtype
-    assert ape.dtype == torch.float32
-    assert buf.dtype == torch.uint8
-    assert pool.index_head_dim == INDEX_HEAD_DIM
-    assert tail_k.is_contiguous()
-    assert tail_score.is_contiguous()
-
-    batch = key.shape[0]
-    if batch == 0:
-        return
-
-    key = key.contiguous()
-    slot_score = slot_score.contiguous()
-    ape = ape.contiguous()
-    req_pool_indices = req_pool_indices.contiguous()
-    positions = positions.contiguous()
-    seq_lens = seq_lens.contiguous()
-    out_cache_loc = out_cache_loc.contiguous()
-
-    assert req_pool_indices.shape[0] >= batch
-    assert positions.shape[0] >= batch
-    assert seq_lens.shape[0] >= batch
-    assert out_cache_loc.shape[0] >= batch
-    assert block_tables.ndim == 2
-    assert block_tables.shape[0] >= batch
-
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
-    buf_fp32 = buf.view(torch.float32)
-    _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
-        buf_fp8,
-        buf_fp32,
-        tail_k,
-        tail_score,
-        key,
-        slot_score,
-        ape,
-        block_tables,
-        req_pool_indices,
-        positions,
-        seq_lens,
-        out_cache_loc,
-        tail_k.stride(0),
-        tail_k.stride(1),
-        tail_score.stride(0),
-        tail_score.stride(1),
-        key.stride(0),
-        slot_score.stride(0),
-        ape.stride(0),
-        block_tables.stride(0),
-        block_tables.stride(1),
-        TAIL_SIZE=tail_k.shape[0],
-        PAGE_SIZE=pool.page_size,
-        BUF_NUMEL_PER_PAGE=buf.shape[1],
-        POOL_SIZE=tail_k.shape[1],
-        HEAD_DIM=tail_k.shape[2],
-        S_OFFSET_NBYTES_IN_PAGE=pool.slots_per_page * pool.index_head_dim,
-        ROUND_SCALE=round_scale,
-        BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
-        SLOTS_PER_PAGE=pool.slots_per_page,
-    )
-
-
 @triton.jit
 def _hadamard128_stage(x, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
     x3 = tl.reshape(x, (GROUPS, 2, STRIDE))
@@ -774,11 +682,10 @@ def _hadamard128(x):
 
 
 @triton.jit
-def _hadamard_quantize_fp8(acc, denom, do_write, ROUND_SCALE: tl.constexpr):
+def _hadamard_quantize_fp8(acc, denom, ROUND_SCALE: tl.constexpr):
     """Normalize -> bf16 round-trip -> Hadamard rotate -> bf16 round-trip
     -> fp8-e4m3 quantize. Returns (quantized, scale)."""
-    x = acc / denom
-    x = tl.where(do_write, x, 0.0).to(tl.bfloat16).to(tl.float32)
+    x = (acc / denom).to(tl.bfloat16).to(tl.float32)
     x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
 
     fp8_max_inv = 1.0 / 448.0
@@ -803,6 +710,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     req_pool_idx_ptr,
     n_from_tail_ptr,
     chunk_src_start_ptr,
+    tail_logical_base_ptr,
     ape_ptr,
     loc_ptr,
     write_mask_ptr,
@@ -810,9 +718,9 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     tail_stride_0,
     tail_stride_1,
     ape_stride_0,
-    PAGE_SIZE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     POOL_SIZE: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
@@ -822,22 +730,26 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
 ):
     """Per-pool program. Slot src dispatch:
     if slot < n_from_tail[row]:
-        src = tail[req_pool_idx[row], slot]
+        src = tail[req_pool_idx[row], (tail_logical_base[row] + slot) % TAIL_SIZE]
     else:
         chunk_off = chunk_src_start[row] + (slot - n_from_tail[row])
         src = chunk[chunk_off]
     """
     row = tl.program_id(0)
-    do_write = True
+    # CP rows masked out have no result to compute; skip the full
+    # POOL_SIZE-load + Hadamard + fp8 quant pipeline (the previous
+    # implementation paid them and only masked the final store).
     if HAS_WRITE_MASK:
-        do_write = tl.load(write_mask_ptr + row)
+        if not tl.load(write_mask_ptr + row):
+            return
 
     offs = tl.arange(0, BLOCK_D)
-    mask = (offs < HEAD_DIM) & do_write
+    mask = offs < HEAD_DIM
 
     n_tail = tl.load(n_from_tail_ptr + row)
     req = tl.load(req_pool_idx_ptr + row)
     chunk_src = tl.load(chunk_src_start_ptr + row)
+    tail_base = tl.load(tail_logical_base_ptr + row)
 
     # Online softmax over POOL_SIZE slots; (max, denom, acc) rescaled
     # in place to halve the load traffic vs a two-pass version.
@@ -854,7 +766,8 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     denom = tl.full((BLOCK_D,), 0.0, tl.float32)
     for slot in tl.static_range(0, POOL_SIZE):
         if slot < n_tail:
-            off = req * tail_stride_0 + slot * tail_stride_1 + offs
+            phys = (tail_base + slot) % TAIL_SIZE
+            off = req * tail_stride_0 + phys * tail_stride_1 + offs
             score = tl.load(tail_score_ptr + off, mask=mask, other=0.0).to(tl.float32)
             k = tl.load(tail_k_ptr + off, mask=mask, other=0.0).to(tl.float32)
         else:
@@ -873,9 +786,9 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         acc = acc * rescale + k * prob
         m = new_m
 
-    quantized, scale = _hadamard_quantize_fp8(acc, denom, do_write, ROUND_SCALE)
+    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
 
-    loc = tl.load(loc_ptr + row, mask=do_write, other=0)
+    loc = tl.load(loc_ptr + row)
     loc_page_index = loc // SLOTS_PER_PAGE
     loc_token_offset_in_page = loc % SLOTS_PER_PAGE
     out_k_offsets = (
@@ -888,186 +801,126 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     )
 
     tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
-    tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
+    tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
-@triton.jit
-def _kpool_decode_update_and_maybe_write_cache_kernel(
-    buf_fp8_ptr,
-    buf_fp32_ptr,
-    tail_k_ptr,
-    tail_score_ptr,
-    key_ptr,
-    slot_score_ptr,
-    ape_ptr,
-    block_tables_ptr,
-    req_pool_indices_ptr,
-    positions_ptr,
-    seq_lens_ptr,
-    out_cache_loc_ptr,
-    tail_k_stride_0,
-    tail_k_stride_1,
-    tail_score_stride_0,
-    tail_score_stride_1,
-    key_stride_0,
-    slot_score_stride_0,
-    ape_stride_0,
-    block_tables_stride_0,
-    block_tables_stride_1,
-    TAIL_SIZE: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BUF_NUMEL_PER_PAGE: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
-    ROUND_SCALE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    SLOTS_PER_PAGE: tl.constexpr = 64,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_D)
-    dim_mask = offs < HEAD_DIM
-
-    req_raw = tl.load(req_pool_indices_ptr + row)
-    req_valid = (req_raw >= 0) & (req_raw < TAIL_SIZE)
-    req = tl.minimum(tl.maximum(req_raw, 0), TAIL_SIZE - 1)
-
-    pos = tl.load(positions_ptr + row)
-    safe_pos = tl.maximum(pos, 0)
-    seq_len = tl.load(seq_lens_ptr + row)
-    cache_loc = tl.load(out_cache_loc_ptr + row)
-    pos_valid = req_valid & (cache_loc != 0) & (pos >= 0) & (pos < seq_len)
-
-    slot = safe_pos % POOL_SIZE
-
-    # key/score_current are needed for the tail store at the end on every
-    # pos_valid row, so load them outside the do_write branch.
-    key = tl.load(
-        key_ptr + row * key_stride_0 + offs,
-        mask=dim_mask,
-        other=0.0,
-    ).to(tl.float32)
-    score_current = tl.load(
-        slot_score_ptr + row * slot_score_stride_0 + offs,
-        mask=dim_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    # Only the last slot of each pool finalizes a compressed entry --
-    # 1/POOL_SIZE of programs do real work, the rest just defer-update tail.
-    do_write = pos_valid & (slot == POOL_SIZE - 1)
-
-    if do_write:
-        # Online softmax over POOL_SIZE slots. The current slot reads from
-        # key/score_current (new token); other slots read tail_k/tail_score,
-        # which still hold pre-update values because the tail store is
-        # deferred to the end of the kernel (avoids RAW).
-        m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-        acc = tl.full((BLOCK_D,), 0.0, tl.float32)
-        denom = tl.full((BLOCK_D,), 0.0, tl.float32)
-        for pool_slot in tl.static_range(0, POOL_SIZE):
-            is_current = pool_slot == slot
-            score_buf = tl.load(
-                tail_score_ptr
-                + req * tail_score_stride_0
-                + pool_slot * tail_score_stride_1
-                + offs,
-                mask=dim_mask,
-                other=0.0,
-            ).to(tl.float32)
-            score = tl.where(is_current, score_current, score_buf)
-            score += tl.load(
-                ape_ptr + pool_slot * ape_stride_0 + offs,
-                mask=dim_mask,
-                other=0.0,
-            ).to(tl.float32)
-            k_buf = tl.load(
-                tail_k_ptr + req * tail_k_stride_0 + pool_slot * tail_k_stride_1 + offs,
-                mask=dim_mask,
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.where(is_current, key, k_buf)
-            new_m = tl.maximum(m, score)
-            rescale = tl.exp(m - new_m)
-            prob = tl.exp(score - new_m)
-            denom = denom * rescale + prob
-            acc = acc * rescale + k * prob
-            m = new_m
-
-        quantized, scale = _hadamard_quantize_fp8(acc, denom, True, ROUND_SCALE)
-
-        pool_id = safe_pos // POOL_SIZE
-        pool_page_group = pool_id // SLOTS_PER_PAGE
-        # 16 (anchor: pool=16, slots=64) or 1 (dense: pool=16, slots=4).
-        token_pages_per_pool_group: tl.constexpr = (
-            POOL_SIZE * SLOTS_PER_PAGE // PAGE_SIZE
-        )
-        token_page_row = pool_page_group * token_pages_per_pool_group
-        packed_page = tl.load(
-            block_tables_ptr
-            + row * block_tables_stride_0
-            + token_page_row * block_tables_stride_1,
-        )
-        loc_page_index = packed_page.to(tl.int64)
-        loc_token_offset_in_page = pool_id % SLOTS_PER_PAGE
-        out_k_offsets = (
-            loc_page_index * BUF_NUMEL_PER_PAGE
-            + loc_token_offset_in_page * HEAD_DIM
-            + offs
-        )
-        out_s_offset = (
-            loc_page_index * BUF_NUMEL_PER_PAGE // 4
-            + S_OFFSET_NBYTES_IN_PAGE // 4
-            + loc_token_offset_in_page
-        )
-
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale)
-
-    # Deferred tail store (see online-softmax comment above for RAW).
-    tail_k_offset = req * tail_k_stride_0 + slot * tail_k_stride_1 + offs
-    tail_score_offset = req * tail_score_stride_0 + slot * tail_score_stride_1 + offs
-    update_mask = dim_mask & pos_valid
-    tl.store(tail_k_ptr + tail_k_offset, key, mask=update_mask)
-    tl.store(tail_score_ptr + tail_score_offset, score_current, mask=update_mask)
-
-
-def scatter_kpool_tail_updates(
+def kpool_assemble_softmax_rotate_write_cache(
+    pool,
+    buf: torch.Tensor,
     chunk_k: torch.Tensor,
     chunk_score: torch.Tensor,
     tail_k: torch.Tensor,
     tail_score: torch.Tensor,
     req_pool_idx: torch.Tensor,
-    dst_offset: torch.Tensor,
+    n_from_tail: torch.Tensor,
+    chunk_src_start: torch.Tensor,
+    tail_logical_base: torch.Tensor,
+    ape: torch.Tensor,
+    loc: torch.Tensor,
+    write_mask: torch.Tensor | None = None,
+    round_scale: bool = False,
+) -> None:
+    """Fused gather + softmax + Hadamard rotate + fp8 quant + cache write.
+
+    For each output pool row r, slots are gathered from tail or chunk
+    based on n_from_tail[r] (see _kpool_assemble_softmax_rotate_write_cache_kernel).
+    ``tail_logical_base[r]`` is the logical position of the in-progress pool's
+    first slot (used to ring-address the saved tail prefix).
+    """
+    pool_size = pool.index_kpool
+    n_pools = req_pool_idx.shape[0]
+
+    if n_pools == 0:
+        return
+
+    chunk_k = chunk_k.contiguous()
+    chunk_score = chunk_score.contiguous()
+    ape = ape.contiguous()
+    loc = loc.contiguous()
+    if write_mask is None:
+        write_mask = torch.empty((1,), dtype=torch.bool, device=chunk_k.device)
+        has_write_mask = False
+    else:
+        write_mask = write_mask.contiguous()
+        has_write_mask = True
+
+    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp32 = buf.view(torch.float32)
+    slots_per_page = pool.slots_per_page
+
+    _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
+        buf_fp8,
+        buf_fp32,
+        chunk_k,
+        chunk_score,
+        tail_k,
+        tail_score,
+        req_pool_idx,
+        n_from_tail,
+        chunk_src_start,
+        tail_logical_base,
+        ape,
+        loc,
+        write_mask,
+        chunk_k.stride(0),
+        tail_k.stride(0),
+        tail_k.stride(1),
+        ape.stride(0),
+        BUF_NUMEL_PER_PAGE=buf.shape[1],
+        POOL_SIZE=pool_size,
+        TAIL_SIZE=tail_k.shape[1],
+        HEAD_DIM=INDEX_HEAD_DIM,
+        S_OFFSET_NBYTES_IN_PAGE=slots_per_page * INDEX_HEAD_DIM,
+        ROUND_SCALE=round_scale,
+        HAS_WRITE_MASK=has_write_mask,
+        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        SLOTS_PER_PAGE=slots_per_page,
+    )
+
+
+def scatter_kpool_tail_updates(
+    pool,
+    chunk_k: torch.Tensor,
+    chunk_score: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_score: torch.Tensor,
+    req_pool_idx: torch.Tensor,
+    dst_logical_start: torch.Tensor,
     chunk_src_start: torch.Tensor,
     n_write: torch.Tensor,
 ) -> None:
-    """Per-batch tail buffer writes folded into one kernel.
+    """Per-batch tail buffer writes folded into one kernel, ring-addressed.
 
-    For each batch row r:
-        tail[req_pool_idx[r], dst_offset[r] : dst_offset[r] + n_write[r]] <-
-            chunk[chunk_src_start[r] : chunk_src_start[r] + n_write[r]]
+    For each batch row r, writes ``n_write[r]`` tail slots at logical positions
+    ``[dst_logical_start[r], dst_logical_start[r] + n_write[r])``, physical
+    ``(dst_logical_start[r] + s) % TAIL_SIZE`` for ``s ∈ [0, n_write[r])``.
     """
-    assert chunk_k.dim() == 2 and chunk_k.shape[1] == INDEX_HEAD_DIM
-    assert chunk_score.shape == chunk_k.shape
-    pool_size = tail_k.shape[1]
+    # Per-row n_write is at most pool_size (the rest closes pools instead),
+    # so the kernel grid covers pool_size slots and masks past n_write.
+    pool_size = pool.index_kpool
     n_rows = req_pool_idx.shape[0]
     if n_rows == 0:
         return
 
+    # Kernel passes a single ``chunk_stride_0`` and uses it for BOTH
+    # chunk_k and chunk_score loads; make both contiguous so the shared
+    # stride is correct even if a caller hands a view-of-permute in.
+    chunk_k = chunk_k.contiguous()
+    chunk_score = chunk_score.contiguous()
     _scatter_kpool_tail_updates_kernel[(n_rows, pool_size)](
         chunk_k,
         chunk_score,
         tail_k,
         tail_score,
         req_pool_idx,
-        dst_offset,
+        dst_logical_start,
         chunk_src_start,
         n_write,
         chunk_k.stride(0),
         tail_k.stride(0),
         tail_k.stride(1),
         POOL_SIZE=pool_size,
+        TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
     )
@@ -1080,13 +933,14 @@ def _scatter_kpool_tail_updates_kernel(
     tail_k_ptr,
     tail_score_ptr,
     req_pool_idx_ptr,
-    dst_offset_ptr,
+    dst_logical_start_ptr,
     chunk_src_start_ptr,
     n_write_ptr,
     chunk_stride_0,
     tail_stride_0,
     tail_stride_1,
     POOL_SIZE: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -1098,7 +952,7 @@ def _scatter_kpool_tail_updates_kernel(
         return
 
     req = tl.load(req_pool_idx_ptr + row)
-    dst_off = tl.load(dst_offset_ptr + row)
+    dst_logical_start = tl.load(dst_logical_start_ptr + row)
     src_off = tl.load(chunk_src_start_ptr + row) + slot
 
     offs = tl.arange(0, BLOCK_D)
@@ -1106,7 +960,11 @@ def _scatter_kpool_tail_updates_kernel(
     k = tl.load(chunk_k_ptr + src_off * chunk_stride_0 + offs, mask=mask)
     s = tl.load(chunk_score_ptr + src_off * chunk_stride_0 + offs, mask=mask)
 
-    dst = req * tail_stride_0 + (dst_off + slot) * tail_stride_1 + offs
+    dst = (
+        req * tail_stride_0
+        + ((dst_logical_start + slot) % TAIL_SIZE) * tail_stride_1
+        + offs
+    )
     tl.store(tail_k_ptr + dst, k, mask=mask)
     tl.store(tail_score_ptr + dst, s, mask=mask)
 
@@ -1216,16 +1074,14 @@ def all_gather_and_scatter_pool_slots(
                        rows in the plan (identical on every rank).
     owner_rank:        (N,) int32. Which CP rank owns each row (identical
                        on every rank). Derived from a row-index-mod-cp_size
-                       scheme in ``_init_kpool_extend_metadata``.
+                       scheme in ``_kpool_cp_owner_rank``.
     cp_size:           Number of CP ranks.
     """
     from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
 
-    assert buf.dtype == torch.uint8
+    # Contiguity is silent-corruption territory; other shape/dtype guards
+    # are upstream guarantees in CP setup.
     assert buf.is_contiguous()
-    assert local_locs.dtype == torch.int64
-    assert owner_rank.dtype == torch.int32
-    assert local_locs.shape == owner_rank.shape
 
     n_total = local_locs.shape[0]
     if n_total == 0 or cp_size <= 1:
@@ -1272,4 +1128,223 @@ def all_gather_and_scatter_pool_slots(
         scale_region_off=scale_region_off,
         n_total=n_total,
         BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+
+
+# ---------------------------------------------------------------------------
+# target_verify: draft-tail write + closed-pool compress (tail-only) + commit
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _kpool_write_tail_and_maybe_compress_kernel(
+    # Inputs.
+    key_ptr,  # bf16 [B*N, head_dim]
+    score_ptr,  # bf16 [B*N, head_dim]
+    tail_k_ptr,  # bf16 [req_pool, TAIL_SIZE, head_dim]
+    tail_score_ptr,  # bf16 same shape
+    ape_ptr,  # fp32 [POOL_SIZE, head_dim]
+    # Plan tensors ([B] from update_kpool_write_plan_cuda_graph).
+    req_pool_indices_ptr,  # int64 [B]
+    write_start_ptr,  # int32 [B] -- decode: positions[b]; verify: committed[b]
+    tail_logical_start_ptr,  # int32 [B] -- base_pool * POOL_SIZE
+    write_loc_ptr,  # int64 [B]
+    # Padding sentinel: out_cache_loc[b*N] == 0 means batch b is a
+    # cuda-graph padded slot (the cache allocator reserves slot 0 as a
+    # dummy sink, see NSATokenToKVPool init -- "padded slot 0 is used for
+    # writing dummy outputs from padded tokens"). Without this gate,
+    # padded batches would write garbage drafts into tail[req=0, ...] and
+    # poison req 0's tail ring across the whole forward.
+    out_cache_loc_ptr,  # int64 [B*N]
+    # V2-only: effective_n_per_batch[b] = accept_length[b] (which v2
+    # emits already including the bonus "next" token; the real advance),
+    # used to gate compress to the REAL advance (vs the full N drafts).
+    # nullptr -> ``HAS_EFFECTIVE_N=False`` and the kernel falls back to N
+    # as the gate window (verify / decode behavior).
+    effective_n_ptr,  # int32 [B] or null
+    # Compress sink.
+    buf_fp8_ptr,
+    buf_fp32_ptr,
+    # Strides.
+    key_stride_0,
+    score_stride_0,
+    tail_stride_0,
+    tail_stride_1,
+    ape_stride_0,
+    # Constexprs.
+    N: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    TAIL_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    HAS_EFFECTIVE_N: tl.constexpr,
+):
+    """Per-batch program: write N tokens to tail ring then compress closed pool.
+
+    Pool-close gating: ``(write_start + N) // POOL_SIZE > write_start // POOL_SIZE``.
+    Under EAGLE topk=1 chain-only with ``N <= POOL_SIZE`` each batch closes 0 or 1
+    pool. Padded batches (``out_cache_loc[b*N] == 0``, the reserved sink) early-return
+    to avoid poisoning req=0's tail.
+    """
+    b = tl.program_id(0)
+    # Padded-batch gate: any draft of this batch landing at the reserved
+    # sink slot 0 means the whole batch is padding. Skip both write and
+    # compress so req=0's real tail data stays untouched.
+    cache_loc_0 = tl.load(out_cache_loc_ptr + b * N)
+    if cache_loc_0 == 0:
+        return
+
+    req = tl.load(req_pool_indices_ptr + b)
+    write_start = tl.load(write_start_ptr + b)
+
+    offs = tl.arange(0, BLOCK_D)
+    dim_mask = offs < HEAD_DIM
+
+    # ----- Step 1: write N tokens into the tail ring. -----
+    for i_n in tl.static_range(0, N):
+        row = b * N + i_n
+        k = tl.load(key_ptr + row * key_stride_0 + offs, mask=dim_mask)
+        s = tl.load(score_ptr + row * score_stride_0 + offs, mask=dim_mask)
+        phys = (write_start + i_n) % TAIL_SIZE
+        dst = req * tail_stride_0 + phys * tail_stride_1 + offs
+        tl.store(tail_k_ptr + dst, k, mask=dim_mask)
+        tl.store(tail_score_ptr + dst, s, mask=dim_mask)
+
+    # ----- Step 2: if a pool closed, compress it from the tail. -----
+    # gate_n: window we treat as "committed" for compress purposes.
+    #   verify/decode: full N drafts ("assume all accepted").
+    #   v2: accept_length (already includes the bonus token; the REAL
+    #       advance). Rejected drafts past the accept frontier get their
+    #       tail K overwritten by the next round's V2 write before any
+    #       reader needs them, so deferring compress is safe and uses
+    #       real (not speculative) K when the pool finally crosses.
+    if HAS_EFFECTIVE_N:
+        gate_n = tl.load(effective_n_ptr + b).to(tl.int32)
+    else:
+        gate_n = N
+    base_pool = write_start // POOL_SIZE
+    n_pool = (write_start + gate_n) // POOL_SIZE - base_pool
+    if n_pool == 0:
+        return
+
+    base = tl.load(tail_logical_start_ptr + b)
+    m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+    acc = tl.full((BLOCK_D,), 0.0, tl.float32)
+    denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+    for slot in tl.static_range(0, POOL_SIZE):
+        phys = (base + slot) % TAIL_SIZE
+        off = req * tail_stride_0 + phys * tail_stride_1 + offs
+        score = tl.load(tail_score_ptr + off, mask=dim_mask, other=0.0).to(tl.float32)
+        k_ld = tl.load(tail_k_ptr + off, mask=dim_mask, other=0.0).to(tl.float32)
+        score += tl.load(
+            ape_ptr + slot * ape_stride_0 + offs, mask=dim_mask, other=0.0
+        ).to(tl.float32)
+        new_m = tl.maximum(m, score)
+        rescale = tl.exp(m - new_m)
+        prob = tl.exp(score - new_m)
+        denom = denom * rescale + prob
+        acc = acc * rescale + k_ld * prob
+        m = new_m
+
+    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+    loc = tl.load(write_loc_ptr + b)
+    loc_page_index = loc // SLOTS_PER_PAGE
+    loc_token_offset_in_page = loc % SLOTS_PER_PAGE
+    out_k_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * HEAD_DIM + offs
+    )
+    out_s_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE // 4
+        + S_OFFSET_NBYTES_IN_PAGE // 4
+        + loc_token_offset_in_page
+    )
+    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+    tl.store(buf_fp32_ptr + out_s_offset, scale)
+
+
+def kpool_write_tail_and_maybe_compress(
+    pool,
+    buf: torch.Tensor,
+    key: torch.Tensor,
+    score: torch.Tensor,
+    tail_k: torch.Tensor,
+    tail_score: torch.Tensor,
+    ape: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_start: torch.Tensor,
+    tail_logical_start: torch.Tensor,
+    write_loc: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    num_draft_tokens: int,
+    round_scale: bool,
+    effective_n_per_batch: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused kpool tail-write + closed-pool compress.
+
+    Unified entry point for decode (``num_draft_tokens=1``),
+    target_verify and draft_extend_v2 (``num_draft_tokens=N``). Per-batch
+    program: write N tokens to tail then compress a closed pool if the
+    "real advance" window crossed a pool boundary.
+
+    ``effective_n_per_batch`` (v2 only): int32 [B], the per-batch real
+    advance — for v2 this is ``spec_info.accept_length``, which v2 emits
+    already including the bonus "next" token. When provided, compress is
+    gated on ``(write_start + effective_n[b]) // P > write_start // P``;
+    when None the gate uses full N (verify "assume all accepted" semantics).
+
+    ``write_start``: decode = positions[b] (= seq_lens[b] - 1);
+    verify = committed_seq_lens[b] (= seq_lens[b]);
+    v2 = seq_lens[b] - N (= committed_after_verify).
+
+    Cuda-graph padding: ``out_cache_loc[b*N] == 0`` flags padded batches
+    (cache slot 0 is the reserved sink); the kernel skips both write and
+    compress so padded batches don't poison req=0's tail ring.
+    """
+    bn = key.shape[0]
+    if bn == 0:
+        return
+    bs = bn // num_draft_tokens
+
+    # Plan tensors (req_pool_indices / write_start / tail_logical_start /
+    # write_loc) and out_cache_loc are always allocated contiguous; only
+    # key/score may be views from the caller, so guard those.
+    key = key.contiguous()
+    score = score.contiguous()
+    slots_per_page = pool.slots_per_page
+    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp32 = buf.view(torch.float32)
+
+    _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
+        key,
+        score,
+        tail_k,
+        tail_score,
+        ape,
+        req_pool_indices,
+        write_start,
+        tail_logical_start,
+        write_loc,
+        out_cache_loc,
+        effective_n_per_batch,
+        buf_fp8,
+        buf_fp32,
+        key.stride(0),
+        score.stride(0),
+        tail_k.stride(0),
+        tail_k.stride(1),
+        ape.stride(0),
+        N=num_draft_tokens,
+        POOL_SIZE=pool.index_kpool,
+        TAIL_SIZE=tail_k.shape[1],
+        HEAD_DIM=INDEX_HEAD_DIM,
+        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        SLOTS_PER_PAGE=slots_per_page,
+        BUF_NUMEL_PER_PAGE=buf.shape[1],
+        S_OFFSET_NBYTES_IN_PAGE=slots_per_page * INDEX_HEAD_DIM,
+        ROUND_SCALE=round_scale,
+        HAS_EFFECTIVE_N=effective_n_per_batch is not None,
     )

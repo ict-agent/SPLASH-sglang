@@ -1156,7 +1156,9 @@ def load_megatron_weights(
                                 [knorm_bias[64:], knorm_bias[:64]], dim=0
                             )
                             layer_sd["self_attn.indexer.k_norm.bias"] = knorm_bias
-                        if getattr(init_model.config, "index_kpool_compress", False):
+                        # ``index_kpool > 1`` -> kpool enabled (Glm5NextConfig
+                        # normalizes the degenerate combo to 1).
+                        if getattr(init_model.config, "index_kpool", 1) > 1:
                             ape = dict_access_multi(
                                 mgt_tp_0,
                                 get_keys("dsa_index_kpool_compress_ape", i=i),

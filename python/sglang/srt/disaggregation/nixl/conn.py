@@ -796,21 +796,50 @@ class NixlKVManager(CommonKVManager):
         src_state_data_ptrs: list[int],
         src_state_item_lens: list[int],
         dst_state_data_ptrs: list[int],
-        src_idx: int,
-        dst_idx: int,
+        src_indices: list[int],
+        dst_indices: list[int],
         dst_gpu_id: int,
         notif: str,
     ):
         """Transfer one state component via a single per-request slot index
-        (replicated; e.g. NSA kpool compress-tail)."""
+        (replicated; e.g. NSA kpool tail).
+
+        Indices encoding (mirrored on the receiver via
+        ``build_state_indices``):
+          ``[req_pool_idx, off1, n1, off2, n2, tail_size]`` -- copy up
+          to two ring-segments (n2=0 means no wrap). The empty case
+          ``[]`` is filtered out by the caller.
+        """
+        if not src_indices and not dst_indices:
+            return 0
+        if not src_indices or not dst_indices:
+            logger.error(
+                f"{label} slot index missing: " f"src={src_indices}, dst={dst_indices}"
+            )
+            return -1
+        assert len(src_indices) == 6 and len(dst_indices) == 6, (
+            f"NSA_TAIL indices must be a 6-tuple; got src={src_indices}, "
+            f"dst={dst_indices}. PD nodes must run matching versions."
+        )
+        src_idx = int(src_indices[0])
+        dst_idx = int(dst_indices[0])
+        tail_size = int(src_indices[5])
         src_addrs = []
         dst_addrs = []
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * src_idx
-            dst_addr = dst_state_ptr + length * dst_idx
-            src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-            dst_addrs.append((dst_addr, length, dst_gpu_id))
+            row_bytes = src_state_item_lens[i]
+            slot_bytes = row_bytes // tail_size
+            src_row_base = src_state_data_ptrs[i] + row_bytes * src_idx
+            dst_row_base = dst_state_ptr + row_bytes * dst_idx
+            for seg in (1, 2):
+                n = int(src_indices[seg * 2])
+                if n == 0:
+                    continue
+                src_off = int(src_indices[seg * 2 - 1]) * slot_bytes
+                dst_off = int(dst_indices[seg * 2 - 1]) * slot_bytes
+                length = n * slot_bytes
+                src_addrs.append((src_row_base + src_off, length, self.kv_args.gpu_id))
+                dst_addrs.append((dst_row_base + dst_off, length, dst_gpu_id))
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
@@ -842,7 +871,7 @@ class NixlKVManager(CommonKVManager):
         Mirrors the mooncake component-list model: each component carries its
         own buffer sublists and per-request index sublist (emitted in matching
         order by ``setup_state_kv_args`` / ``build_state_indices``), so MTP
-        target+draft NSA and kpool compress-tail components are all expressed
+        target+draft NSA and kpool tail components are all expressed
         as separate components. Mamba components support a TP head-shard slice
         when prefill/decode attn_tp sizes differ (mirrors mooncake).
         """
@@ -921,8 +950,8 @@ class NixlKVManager(CommonKVManager):
                     src_ptrs,
                     src_item_lens,
                     dst_ptrs,
-                    int(src_indices[0]),
-                    int(dst_indices[0]),
+                    src_indices,
+                    dst_indices,
                     dst_gpu_id,
                     comp_notif,
                 )

@@ -23,12 +23,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import (
+    ZMQ_SOCKET_SEND_TIMEOUT_MS,
     FastQueue,
     group_concurrent_contiguous,
     pack_int_lists,
     send_multipart_by_req_socket,
     unpack_int_lists,
-    ZMQ_SOCKET_SEND_TIMEOUT_MS,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -385,7 +385,7 @@ class MooncakeKVManager(CommonKVManager):
                 None,
                 req.endpoint,
                 req.dst_port,
-                multipart_data= [
+                multipart_data=[
                     b"CHUNK_READY",
                     str(req.room).encode("ascii"),
                     str(chunk_idx).encode("ascii"),
@@ -398,7 +398,9 @@ class MooncakeKVManager(CommonKVManager):
                 bootstrap_room=req.room,
             )
         except Exception as e:
-            logger.error(f"Error occurred while sending chunk ready message: {e} room={req.room} chunk_idx={chunk_idx} session_id={req.mooncake_session_id}")
+            logger.error(
+                f"Error occurred while sending chunk ready message: {e} room={req.room} chunk_idx={chunk_idx} session_id={req.mooncake_session_id}"
+            )
 
     def _do_staging_transfer(
         self,
@@ -1248,23 +1250,51 @@ class MooncakeKVManager(CommonKVManager):
         label: str,
     ):
         """Transfer one state component using a single per-request slot index
-        (replicated; e.g. NSA kpool compress-tail). Each buffer is copied whole
-        at the slot offset on both sides."""
+        (replicated; e.g. NSA kpool tail).
 
+        Indices encoding (built by ``build_state_indices`` on both sides):
+          * ``[]`` -- no real data this iter; caller skips the component.
+          * ``[req_pool_idx, off1, n1, off2, n2, tail_size]`` -- copy up
+            to two ring-segments of ``n1`` / ``n2`` slots starting at
+            ``off1`` / ``off2``. ``n2 == 0`` means no wrap. The ring
+            layout guarantees the unsent slots are never read on the
+            receiver.
+        """
+
+        if not src_indices and not dst_indices:
+            return 0
         if not src_indices or not dst_indices:
             logger.error(
                 f"{label} slot index missing: " f"src={src_indices}, dst={dst_indices}"
             )
             return -1
+        if len(src_indices) != 6 or len(dst_indices) != 6:
+            logger.error(
+                f"{label} slot indices must be a 6-tuple "
+                f"(got src={src_indices}, dst={dst_indices}); "
+                f"PD nodes must run matching versions."
+            )
+            return -1
 
         src_idx = int(src_indices[0])
         dst_idx = int(dst_indices[0])
+        tail_size = int(src_indices[5])
         transfer_blocks = []
         for j, dst_ptr in enumerate(dst_ptrs):
-            length = src_item_lens[j]
-            src_addr = src_ptrs[j] + length * src_idx
-            dst_addr = dst_ptr + length * dst_idx
-            transfer_blocks.append((src_addr, dst_addr, length))
+            row_bytes = src_item_lens[j]
+            slot_bytes = row_bytes // tail_size
+            src_row_base = src_ptrs[j] + row_bytes * src_idx
+            dst_row_base = dst_ptr + row_bytes * dst_idx
+            for seg in (1, 2):
+                n = int(src_indices[seg * 2])  # n1 at idx 2, n2 at idx 4
+                if n == 0:
+                    continue
+                src_off = int(src_indices[seg * 2 - 1]) * slot_bytes
+                dst_off = int(dst_indices[seg * 2 - 1]) * slot_bytes
+                length = n * slot_bytes
+                transfer_blocks.append(
+                    (src_row_base + src_off, dst_row_base + dst_off, length)
+                )
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1382,7 +1412,7 @@ class MooncakeKVManager(CommonKVManager):
             None,
             remote,
             dst_port,
-            multipart_data= [
+            multipart_data=[
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
@@ -1546,7 +1576,10 @@ class MooncakeKVManager(CommonKVManager):
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
                                 # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= envs.SGLANG_DISAGGREGATION_SESSION_MAX_FAILURE.get():
+                                if (
+                                    self.session_failures[req.mooncake_session_id]
+                                    >= envs.SGLANG_DISAGGREGATION_SESSION_MAX_FAILURE.get()
+                                ):
                                     self.failed_sessions.add(req.mooncake_session_id)
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
@@ -1642,20 +1675,24 @@ class MooncakeKVManager(CommonKVManager):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
 
-            self.server_socket.setsockopt(zmq.SNDTIMEO, ZMQ_SOCKET_SEND_TIMEOUT_MS) # avoid blocking on ACK
+            self.server_socket.setsockopt(
+                zmq.SNDTIMEO, ZMQ_SOCKET_SEND_TIMEOUT_MS
+            )  # avoid blocking on ACK
 
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 try:
                     waiting_req_bytes = self.server_socket.recv_multipart()
-                    self.server_socket.send(b"ACK")  # ACK is requried by REP socket to receive next message
+                    self.server_socket.send(
+                        b"ACK"
+                    )  # ACK is requried by REP socket to receive next message
                 except Exception as e:
                     logger.error(
                         "Received message from decode with exception, src=%s:%s err=%s msg=%s",
                         self.bootstrap_host,
                         self.bootstrap_port,
                         e,
-                        waiting_req_bytes if 'waiting_req_bytes' in locals() else None
+                        waiting_req_bytes if "waiting_req_bytes" in locals() else None,
                     )
                     continue
 
@@ -1750,7 +1787,7 @@ class MooncakeKVManager(CommonKVManager):
 
     def start_decode_thread(self):
         def decode_thread():
-            self.server_socket.setsockopt(zmq.SNDTIMEO, 50) # avoid blocking on ACK
+            self.server_socket.setsockopt(zmq.SNDTIMEO, 50)  # avoid blocking on ACK
             while True:
                 msg = ""
                 try:
@@ -1762,7 +1799,7 @@ class MooncakeKVManager(CommonKVManager):
                         self.bootstrap_host,
                         self.bootstrap_port,
                         e,
-                        msg if 'msg' in locals() else None
+                        msg if "msg" in locals() else None,
                     )
                     continue
 
@@ -2181,7 +2218,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     packed_staging_base_ptr,
                     staging_total_size_str,
                 ],
-                non_blocking=True, # invoking in decode main loop, should never block
+                non_blocking=True,  # invoking in decode main loop, should never block
                 max_retries=3,
                 retry_delay_ms=10,
                 desc="Send kvargs registration to prefill instance",

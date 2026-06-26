@@ -1609,7 +1609,63 @@ class ServerArgs:
                             "Setting page size to 1 for DeepSeek DSA on ROCm."
                         )
                     else:
-                        # For CUDA GPU
+                        # NSA kpool launch invariants: page_size == 64
+                        # (DeepGEMM), index_topk % pool_size == 0, and
+                        # EAGLE topk == 1 for chain-only verify.
+                        from sglang.srt.configs.model_config import (
+                            get_nsa_index_kpool,
+                            get_nsa_index_topk,
+                        )
+
+                        kpool_pool_size = get_nsa_index_kpool(hf_config)
+                        if kpool_pool_size > 1:
+                            index_topk = get_nsa_index_topk(hf_config)
+                            if index_topk % kpool_pool_size != 0:
+                                raise ValueError(
+                                    f"NSA kpool: index_topk ({index_topk}) "
+                                    f"must be divisible by pool_size "
+                                    f"({kpool_pool_size})."
+                                )
+                            if self.page_size is not None and self.page_size != 64:
+                                raise ValueError(
+                                    f"NSA kpool requires page_size == 64, "
+                                    f"got {self.page_size}. Drop --page-size "
+                                    f"or set index_kpool=1."
+                                )
+                            if (
+                                self.speculative_eagle_topk is not None
+                                and self.speculative_eagle_topk != 1
+                            ):
+                                raise ValueError(
+                                    f"NSA kpool verify requires "
+                                    f"speculative_eagle_topk == 1, got "
+                                    f"{self.speculative_eagle_topk}."
+                                )
+                            # If spec is on (algorithm set, num_steps > 0,
+                            # or eagle_topk set), num_draft_tokens N must
+                            # satisfy 0 < N < pool_size: the kpool tail's
+                            # draft scratch region needs N > 0, and the
+                            # verify plan (shape [B], one closed pool per
+                            # batch at most) needs N < pool_size so the
+                            # drafts cross at most one pool boundary.
+                            spec_on = (
+                                bool(self.speculative_algorithm)
+                                or (self.speculative_num_steps or 0) > 0
+                                or (self.speculative_eagle_topk or 0) > 0
+                            )
+                            if spec_on and not (
+                                self.speculative_num_draft_tokens
+                                and 0
+                                < self.speculative_num_draft_tokens
+                                < kpool_pool_size
+                            ):
+                                raise ValueError(
+                                    f"NSA kpool + speculative decoding "
+                                    f"requires 0 < "
+                                    f"--speculative-num-draft-tokens < "
+                                    f"pool_size ({kpool_pool_size}), got "
+                                    f"{self.speculative_num_draft_tokens}."
+                                )
                         self.page_size = 64
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
@@ -1751,7 +1807,7 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
-            
+
             if model_arch == "Glm5NextForCausalLM":
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
@@ -6029,9 +6085,8 @@ class ServerArgs:
         parser.add_argument(
             "--glm-patch-uvicorn-sigquit-handler",
             action="store_true",
-            help="Patch the uvicorn SIGQUIT handler to terminate the process when receiving SIGQUIT."
+            help="Patch the uvicorn SIGQUIT handler to terminate the process when receiving SIGQUIT.",
         )
-
 
         # For PD-Multiplexing
         parser.add_argument(

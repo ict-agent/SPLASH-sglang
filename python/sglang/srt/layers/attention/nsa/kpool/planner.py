@@ -1,16 +1,30 @@
-"""Kpool planner: build the layer-invariant kpool extend plan and the
-decode paged-MQA metadata once per forward batch.
+"""Kpool planner: build the layer-invariant kpool plans + decode paged-MQA
+metadata once per forward batch.
 
 The ``init_*`` builders return a new ``NSAMetadata`` (frozen) via
 ``dataclasses.replace``; the ``update_*`` variant mutates in place
 because cuda-graph replay requires the captured tensors to stay put.
+
+Class index (which dataclass lives where):
+    Row-fanout (one row per closed pool / tail-write):
+        PoolWriteRows      -- extend: per-closed-pool compress, mixes
+                              tail prefix + chunk K
+        TailWriteRows      -- extend: per-batch tail-buffer append
+    Top-level plans (stashed on NSAMetadata, layer-invariant):
+        KPoolExtendPlan    -- extend (incl. draft_extend v1/v2)
+        KPoolWritePlan     -- decode + target_verify (shared schema)
+        KPoolCpInfo        -- CP-ownership rider on KPoolExtendPlan
+    Build-side scratch:
+        _KPoolCpuPlan      -- extend CPU intermediate (one H2D before
+                              GPU plan)
+        _KPoolDecompose    -- shared splice/bulk/tail row count helper
 """
 
 from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -18,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
     INDEX_HEAD_DIM,
     kpool_build_ragged_layout,
+    update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -25,6 +40,39 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
 )
 from sglang.srt.utils import is_cuda
+
+# Forward-persistent ragged compress scratch (uint8 K + fp32 scale). Lazy-grown
+# to the largest seen ``total_k_rows`` and sliced per forward, so prefill no
+# longer pays two cudaMallocs per call.
+_RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
+_RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
+
+
+def _get_ragged_scratch(
+    total_k_rows: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``[total_k_rows, INDEX_HEAD_DIM]`` u8 + ``[total_k_rows]`` fp32
+    slices of a persistent scratch pair, growing it if needed.
+    """
+    global _RAGGED_SCRATCH_K_U8, _RAGGED_SCRATCH_K_SCALE
+    # Compare device.type / index explicitly: ``torch.device('cuda') !=
+    # torch.device('cuda:0')`` even when they alias the same GPU.
+    cur = _RAGGED_SCRATCH_K_U8
+    grow = (
+        cur is None
+        or cur.device.type != device.type
+        or (device.index is not None and cur.device.index != device.index)
+        or cur.shape[0] < total_k_rows
+    )
+    if grow:
+        _RAGGED_SCRATCH_K_U8 = torch.empty(
+            (total_k_rows, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
+        )
+        _RAGGED_SCRATCH_K_SCALE = torch.empty(
+            (total_k_rows,), dtype=torch.float32, device=device
+        )
+    return _RAGGED_SCRATCH_K_U8[:total_k_rows], _RAGGED_SCRATCH_K_SCALE[:total_k_rows]
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa_backend import NSAMetadata, TopkTransformMethod
@@ -36,13 +84,16 @@ class PoolWriteRows:
     """All pool slots to compress + write this forward, flattened across batches.
 
     ``n_from_tail`` is 0 for bulk pools and equals the splice prefix
-    length for splice pools.
+    length for splice pools. ``tail_logical_base`` is the logical position
+    of the in-progress pool's first slot, used by the kernel to ring-address
+    the saved tail prefix.
     """
 
     req: torch.Tensor  # int64 [N]
     pool_id: torch.Tensor  # int64 [N]
     n_from_tail: torch.Tensor  # int32 [N]
     chunk_src: torch.Tensor  # int64 [N]
+    tail_logical_base: torch.Tensor  # int32 [N]
     write_loc: torch.Tensor  # int64 [N]
 
     @property
@@ -52,10 +103,14 @@ class PoolWriteRows:
 
 @dataclass(frozen=True)
 class TailWriteRows:
-    """Per-request tail-buffer write; one row per batch with leftover chunk tokens."""
+    """Per-request tail-buffer write; one row per batch with leftover chunk tokens.
+
+    ``dst_logical_start`` is the logical position where the new tail tokens
+    begin; the kernel ring-addresses ``(dst_logical_start + slot) % TAIL_SIZE``.
+    """
 
     req: torch.Tensor  # int64 [B]
-    dst_offset: torch.Tensor  # int32 [B]
+    dst_logical_start: torch.Tensor  # int32 [B]
     chunk_src: torch.Tensor  # int64 [B]
     n_write: torch.Tensor  # int32 [B]
 
@@ -127,6 +182,43 @@ class KPoolExtendPlan:
     cp: Optional[KPoolCpInfo] = None
 
 
+@dataclass(frozen=True)
+class KPoolWritePlan:
+    """Layer-invariant plan for kpool tail-write + closed-pool compress.
+
+    Shared by decode (N=1) and target_verify (N=num_draft_tokens). Per-batch
+    shape ``[B]`` because under EAGLE topk=1 chain-only with ``N <= POOL_SIZE``
+    each batch closes at most one pool. Pool-close + cuda-graph-padding gating
+    are both derived in-kernel; see ``_kpool_write_tail_and_maybe_compress_kernel``.
+    """
+
+    req: torch.Tensor  # int64 [B]
+    write_start: torch.Tensor  # int32 [B] -- decode: positions; verify: committed
+    tail_logical_start: torch.Tensor  # int32 [B]
+    write_loc: torch.Tensor  # int64 [B]
+
+    num_draft_tokens: int
+
+    # Verify-only (decode leaves these None).
+    paged_page_table: Optional[torch.Tensor] = None  # int32 [B*N, max_seq_pages]
+    pool_seqlens_per_q: Optional[torch.Tensor] = None  # int32 [B*N]
+    seqlens_per_q: Optional[torch.Tensor] = None  # int32 [B*N]
+    pool_schedule_metadata: Optional[torch.Tensor] = None
+
+    # V2 draft_extend only: the just-finished verify's ``accept_length``
+    # (which v2 emits already incremented to include the bonus "next"
+    # token -- see eagle_info_v2.sample's trailing ``accept_length.add_(1)``),
+    # used to gate the close-pool compress to the REAL advance rather than
+    # the full N drafts. Skipping compress on the speculative tail
+    # (positions past committed+effective_n) is safe because those
+    # tail-ring slots will be overwritten by the next round's V2 write
+    # before any reader needs them; deferring the FP8 quantize to the
+    # round that actually commits past the pool boundary uses real (not
+    # speculative) K, improving cache quality. ``None`` for verify/decode
+    # -> kernel falls back to N as the gating window.
+    effective_n_per_batch: Optional[torch.Tensor] = None  # int32 [B]
+
+
 @dataclass
 class _KPoolCpuPlan:
     """Raw per-batch lists; converted to GPU tensors in ``_kpool_plan_to_gpu``."""
@@ -136,12 +228,15 @@ class _KPoolCpuPlan:
     pool_pool_id: List[int] = field(default_factory=list)
     pool_n_from_tail: List[int] = field(default_factory=list)
     pool_chunk_src: List[int] = field(default_factory=list)
+    # Logical position of the in-progress pool's first slot (per closed pool
+    # row). Used by the ring-addressed tail read in the assemble kernel.
+    pool_tail_logical_base: List[int] = field(default_factory=list)
 
     tail_req: List[int] = field(default_factory=list)
-    tail_dst_offset: List[int] = field(default_factory=list)
+    # Logical position where this batch's new tail tokens start.
+    tail_dst_logical_start: List[int] = field(default_factory=list)
     tail_chunk_src: List[int] = field(default_factory=list)
     tail_n_write: List[int] = field(default_factory=list)
-
     ragged_q_len: List[int] = field(default_factory=list)
     ragged_pool_pages: List[int] = field(default_factory=list)
     # Exclusive prefix sums (per batch start offsets). Built on CPU and
@@ -155,6 +250,53 @@ class _KPoolCpuPlan:
     # n_rag = len(ragged_q_len) = batch_size (every batch contributes a row).
     # ragged_batch_idx is therefore arange(batch_size); recomputed in
     # _kpool_plan_to_gpu instead of being H2D'd as a redundant list.
+
+
+class _KPoolDecompose(NamedTuple):
+    """Splice/bulk/tail decomposition of one req's compress write.
+
+    For ``length`` new tokens appended at ``start`` into a pool layout of
+    ``pool_size``:
+      * ``first_slot``: in-progress tail offset at ``start`` (0..pool_size-1)
+      * ``base_pool``: pool index containing ``start``
+      * ``n_pool``: number of *closed* pools produced by these new tokens.
+        Row 0 splices ``first_slot`` saved-tail tokens with
+        ``pool_size - first_slot`` chunk tokens; rows 1..n_pool-1 are bulk
+        pools (``n_from_tail == 0``).
+      * ``tail_n_write``: residual tokens left in the in-progress pool
+        after the closed rows. Zero when fully consumed.
+    """
+
+    first_slot: int
+    base_pool: int
+    n_pool: int
+    tail_n_write: int
+
+
+def _is_kpool_layout_enabled(pool_size: int, real_page_size: int) -> bool:
+    """The 3 hardware/layout preconditions every kpool init/update gate on.
+
+    Single source of truth: pool actually on (``pool_size > 1``), the
+    DeepGEMM-required 64-token page, and pool slots evenly packed into
+    one page (``page_size % pool_size == 0``). Mode-specific predicates
+    (decode / extend / target_verify / cuda availability) stay at the
+    call site.
+    """
+    return pool_size > 1 and real_page_size == 64 and real_page_size % pool_size == 0
+
+
+def _decompose_compress(start: int, length: int, pool_size: int) -> _KPoolDecompose:
+    first_slot = start % pool_size
+    base_pool = start // pool_size
+    n_pool = (start + length) // pool_size - base_pool
+    consumed = max(0, n_pool * pool_size - first_slot)
+    tail_n = length - consumed
+    return _KPoolDecompose(
+        first_slot=first_slot,
+        base_pool=base_pool,
+        n_pool=n_pool,
+        tail_n_write=tail_n,
+    )
 
 
 def _append_compress_rows(
@@ -184,32 +326,35 @@ def _append_compress_rows(
 
         seq_len = seq_lens_cpu[i]
         req = req_pool_indices_cpu[i]
-        first_pos = seq_len - q_len
-        first_slot = first_pos % pool_size
-        base_pool = first_pos // pool_size
-        pool_seq_len = seq_len // pool_size
-        n_pool = pool_seq_len - base_pool
+        d = _decompose_compress(seq_len - q_len, q_len, pool_size)
 
-        if n_pool > 0:
-            plan.pool_batch_idx.extend([i] * n_pool)
-            plan.pool_req.extend([req] * n_pool)
-            plan.pool_pool_id.extend(range(base_pool, base_pool + n_pool))
-            plan.pool_n_from_tail.append(first_slot)
-            plan.pool_n_from_tail.extend([0] * (n_pool - 1))
-            bulk_start = q_offset + pool_size - first_slot
+        if d.n_pool > 0:
+            plan.pool_batch_idx.extend([i] * d.n_pool)
+            plan.pool_req.extend([req] * d.n_pool)
+            plan.pool_pool_id.extend(range(d.base_pool, d.base_pool + d.n_pool))
+            plan.pool_n_from_tail.append(d.first_slot)
+            plan.pool_n_from_tail.extend([0] * (d.n_pool - 1))
+            bulk_start = q_offset + pool_size - d.first_slot
             plan.pool_chunk_src.append(q_offset)
             plan.pool_chunk_src.extend(
-                range(bulk_start, bulk_start + (n_pool - 1) * pool_size, pool_size)
+                range(bulk_start, bulk_start + (d.n_pool - 1) * pool_size, pool_size)
+            )
+            # Logical base for each closed pool (= pool_id * pool_size).
+            plan.pool_tail_logical_base.extend(
+                range(
+                    d.base_pool * pool_size,
+                    (d.base_pool + d.n_pool) * pool_size,
+                    pool_size,
+                )
             )
 
-        consumed = max(0, n_pool * pool_size - first_slot)
-        n_remain = q_len - consumed
-        if n_remain > 0:
-            dst_offset = first_slot if n_pool == 0 else 0
+        if d.tail_n_write > 0:
+            consumed = q_len - d.tail_n_write
             plan.tail_req.append(req)
-            plan.tail_dst_offset.append(dst_offset)
+            # New in-progress tail tokens start at this logical position.
+            plan.tail_dst_logical_start.append(seq_len - q_len + consumed)
             plan.tail_chunk_src.append(q_offset + consumed)
-            plan.tail_n_write.append(n_remain)
+            plan.tail_n_write.append(d.tail_n_write)
 
         q_offset += q_len
 
@@ -301,7 +446,6 @@ def _kpool_plan_to_gpu(
     local_real_page_table: torch.Tensor,
     local_seqlens_expanded: torch.Tensor,
     local_req_pool_indices: torch.Tensor,
-    local_max_seq_len: int,
     pool_size: int,
     page_size: int,
     topk_transform_method: "TopkTransformMethod",
@@ -365,14 +509,16 @@ def _kpool_plan_to_gpu(
         pool_req_t = pool_pool_id_t = pool_chunk_src_t = pool_batch_idx_t = empty_i64
         tail_req_t = tail_chunk_src_t = empty_i64
 
-    # int32 H2D: pool_n_from_tail | tail_dst_offset | tail_n_write
+    # int32 H2D: pool_n_from_tail | pool_tail_logical_base
+    #          | tail_dst_logical_start | tail_n_write
     #          | ragged_pool_pages | ragged_q_len
     #          | cu_pages_excl | cu_q_len_excl
-    i32_total = n_pool + 2 * n_tail + 4 * n_rag
+    i32_total = 2 * n_pool + 2 * n_tail + 4 * n_rag
     if i32_total > 0:
         i32_cpu = torch.tensor(
             cpu.pool_n_from_tail
-            + cpu.tail_dst_offset
+            + cpu.pool_tail_logical_base
+            + cpu.tail_dst_logical_start
             + cpu.tail_n_write
             + cpu.ragged_pool_pages
             + cpu.ragged_q_len
@@ -385,7 +531,9 @@ def _kpool_plan_to_gpu(
         c = 0
         pool_n_from_tail_t = i32_gpu[c : c + n_pool]
         c += n_pool
-        tail_dst_offset_t = i32_gpu[c : c + n_tail]
+        pool_tail_logical_base_t = i32_gpu[c : c + n_pool]
+        c += n_pool
+        tail_dst_logical_start_t = i32_gpu[c : c + n_tail]
         c += n_tail
         tail_n_write_t = i32_gpu[c : c + n_tail]
         c += n_tail
@@ -398,8 +546,8 @@ def _kpool_plan_to_gpu(
         cu_q_len_excl_t = i32_gpu[c : c + n_rag]
     else:
         empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
-        pool_n_from_tail_t = empty_i32
-        tail_dst_offset_t = tail_n_write_t = empty_i32
+        pool_n_from_tail_t = pool_tail_logical_base_t = empty_i32
+        tail_dst_logical_start_t = tail_n_write_t = empty_i32
         ragged_pool_pages_t = ragged_q_len_t = empty_i32
         cu_pages_excl_t = cu_q_len_excl_t = empty_i32
 
@@ -466,14 +614,10 @@ def _kpool_plan_to_gpu(
         )
         ragged_paged_page_table = req_to_token
 
-    # Layer-shared scratch (all NSA layers share these (total_k_rows, head_dim) buffers).
+    # Layer-shared scratch backed by a forward-persistent lazy-grow buffer
+    # (avoids two allocations per forward; sliced to actual size below).
     if ragged_total_k_rows > 0:
-        ragged_k_u8 = torch.empty(
-            (ragged_total_k_rows, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
-        )
-        ragged_k_scale = torch.empty(
-            (ragged_total_k_rows,), dtype=torch.float32, device=device
-        )
+        ragged_k_u8, ragged_k_scale = _get_ragged_scratch(ragged_total_k_rows, device)
     else:
         ragged_k_u8 = None
         ragged_k_scale = None
@@ -484,11 +628,12 @@ def _kpool_plan_to_gpu(
             pool_id=pool_pool_id_t,
             n_from_tail=pool_n_from_tail_t,
             chunk_src=pool_chunk_src_t,
+            tail_logical_base=pool_tail_logical_base_t,
             write_loc=pool_write_locs,
         ),
         tails=TailWriteRows(
             req=tail_req_t,
-            dst_offset=tail_dst_offset_t,
+            dst_logical_start=tail_dst_logical_start_t,
             chunk_src=tail_chunk_src_t,
             n_write=tail_n_write_t,
         ),
@@ -550,7 +695,6 @@ def init_kpool_extend_metadata(
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
     local_req_pool_indices: Optional[torch.Tensor] = None,
-    local_max_seq_len: Optional[int] = None,
 ) -> "NSAMetadata":
     """Build the layer-invariant kpool extend plan once per forward.
 
@@ -562,16 +706,19 @@ def init_kpool_extend_metadata(
         the caller passes the rank-local ``local_*`` tensors and per-batch
         counts so topk runs on this rank's q slice without a q all_gather.
 
-    Returns input unchanged when the gating fails (pool_size > 1,
-    extend_without_speculative, page_size == 64, and 64 % pool_size == 0).
+    Returns input unchanged when the gate fails: extend-like mode
+    (extend / draft_extend v1/v2), valid seq lens, and the shared
+    kpool layout (see ``_is_kpool_layout_enabled``).
     """
+    mode = forward_batch.forward_mode
+    is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend(
+        include_v2=True
+    )
     if (
-        pool_size <= 1
-        or not forward_batch.forward_mode.is_extend_without_speculative()
+        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        or not is_extend_like
         or forward_batch.extend_seq_lens_cpu is None
         or forward_batch.seq_lens_cpu is None
-        or real_page_size != 64
-        or real_page_size % pool_size != 0
     ):
         return metadata
 
@@ -581,8 +728,6 @@ def init_kpool_extend_metadata(
         local_seqlens_expanded = full_seqlens_expanded
     if local_req_pool_indices is None:
         local_req_pool_indices = forward_batch.req_pool_indices
-    if local_max_seq_len is None:
-        local_max_seq_len = int(forward_batch.seq_lens_cpu.max().item())
 
     cpu = _kpool_cpu_plan(
         forward_batch,
@@ -598,7 +743,6 @@ def init_kpool_extend_metadata(
         local_real_page_table,
         local_seqlens_expanded,
         local_req_pool_indices,
-        local_max_seq_len,
         pool_size,
         real_page_size,
         topk_transform_method,
@@ -616,14 +760,14 @@ def init_pooled_paged_mqa_metadata(
 ) -> "NSAMetadata":
     """Build decode-side pooled cache seqlens + deep_gemm schedule.
 
-    Returns the (possibly updated) metadata.
+    Returns the (possibly updated) metadata. No-op when gate fails:
+    CUDA + decode/idle mode + the shared kpool layout
+    (see ``_is_kpool_layout_enabled``).
     """
     if (
-        pool_size <= 1
+        not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
-        or real_page_size != 64
-        or real_page_size % pool_size != 0
     ):
         return metadata
 
@@ -668,11 +812,9 @@ def update_pooled_paged_mqa_metadata(
     reset fields here.
     """
     if (
-        pool_size <= 1
+        not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
-        or real_page_size != 64
-        or real_page_size % pool_size != 0
     ):
         return
 
@@ -691,6 +833,270 @@ def update_pooled_paged_mqa_metadata(
         )
         metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
     except (ImportError, ModuleNotFoundError):
-        # deep_gemm availability at replay must match capture; if it was
-        # absent at capture the schedule buffer is None and nothing to do.
+        # capture saw deep_gemm absent -> schedule buffer is None already
         pass
+
+
+# ---------------------------------------------------------------------------
+# Unified write plan (decode + target_verify): per-batch tail write + closed-
+# pool compress addressing. Decode is the N=1 special case of verify.
+# Dataclass ``KPoolWritePlan`` lives at the top of the file alongside the
+# extend Plan classes.
+# ---------------------------------------------------------------------------
+
+
+def _alloc_kpool_write_plan_buffers(
+    *,
+    max_bs: int,
+    num_draft_tokens: int,
+    device: torch.device,
+    is_verify: bool,
+    is_v2: bool = False,
+) -> KPoolWritePlan:
+    """Allocate worst-case ``[max_bs]`` write-plan buffers; values filled by
+    ``update_kpool_write_plan_cuda_graph``. Eager uses ``max_bs = bs``;
+    capture uses the cuda-graph max batch.
+    """
+    n_rows = max_bs * num_draft_tokens
+    verify_extras = {}
+    if is_verify:
+        verify_extras = dict(
+            pool_seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
+            seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
+        )
+    if is_v2:
+        verify_extras["effective_n_per_batch"] = torch.zeros(
+            max_bs, dtype=torch.int32, device=device
+        )
+    return KPoolWritePlan(
+        req=torch.zeros(max_bs, dtype=torch.int64, device=device),
+        write_start=torch.zeros(max_bs, dtype=torch.int32, device=device),
+        tail_logical_start=torch.zeros(max_bs, dtype=torch.int32, device=device),
+        write_loc=torch.zeros(max_bs, dtype=torch.int64, device=device),
+        num_draft_tokens=num_draft_tokens,
+        **verify_extras,
+    )
+
+
+def _compute_pool_schedule_metadata(
+    pool_seqlens_per_q: torch.Tensor,
+    *,
+    slots_per_page: int,
+) -> Optional[torch.Tensor]:
+    """Per-pool DeepGEMM schedule metadata; None if deep_gemm absent."""
+    if not is_cuda():
+        return None
+    try:
+        import deep_gemm
+
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            pool_seqlens_per_q.unsqueeze(-1),
+            slots_per_page,
+            deep_gemm.get_num_sms(),
+        )
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+
+def init_kpool_write_plan_capture(
+    metadata: "NSAMetadata",
+    *,
+    max_bs: int,
+    pool_size: int,
+    real_page_size: int,
+    real_page_table: torch.Tensor,
+    num_draft_tokens: int,
+    device: torch.device,
+    is_verify: bool,
+    is_v2: bool = False,
+) -> "NSAMetadata":
+    """Pre-allocate the kpool write plan at the worst-case ``[max_bs]`` shape.
+
+    Shared by decode (``num_draft_tokens=1``, ``is_verify=False``),
+    target_verify (``num_draft_tokens=N``, ``is_verify=True``) and
+    draft_extend_v2 (``num_draft_tokens=N``, ``is_verify=True``,
+    ``is_v2=True``). For verify/v2, ``real_page_table`` is the
+    ``repeat_interleave(N)``-shaped ``[max_bs*N, max_pages]`` table; for
+    decode it's the plain ``[max_bs, max_pages]``.
+
+    Verify-only fields (``pool_seqlens_per_q`` / ``seqlens_per_q`` /
+    ``pool_schedule_metadata`` / ``paged_page_table``) are allocated and
+    wired only when ``is_verify`` is True; for decode they stay None.
+    ``effective_n_per_batch`` is v2-only.
+    """
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or num_draft_tokens == 0:
+        return metadata
+
+    plan = _alloc_kpool_write_plan_buffers(
+        max_bs=max_bs,
+        num_draft_tokens=num_draft_tokens,
+        device=device,
+        is_verify=is_verify,
+        is_v2=is_v2,
+    )
+    if is_verify:
+        slots_per_page = real_page_size // pool_size
+        schedule = _compute_pool_schedule_metadata(
+            plan.pool_seqlens_per_q,
+            slots_per_page=slots_per_page,
+        )
+        plan = dataclasses.replace(
+            plan,
+            paged_page_table=real_page_table,
+            pool_schedule_metadata=schedule,
+        )
+    return dataclasses.replace(metadata, kpool_write_plan=plan)
+
+
+def update_kpool_write_plan(
+    metadata: "NSAMetadata",
+    *,
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    pool_size: int,
+    real_page_size: int,
+    num_draft_tokens: int,
+    forward_mode: "ForwardMode",
+    accept_length: Optional[torch.Tensor] = None,
+) -> None:
+    """Rebuild the kpool write plan device-side, in-place.
+
+    Capture (or eager) must have already allocated ``metadata.kpool_write_plan``
+    via ``init_kpool_write_plan_capture``. This call fires the GPU
+    plan-build kernel and (for verify / v2 only) refreshes
+    ``pool_schedule_metadata``.
+
+    Gate: shared kpool layout + cuda + ring-write mode
+    (decode / target_verify / draft_extend_v2).
+
+    ``write_start`` carries the per-batch logical write position:
+      decode: forward_batch.positions[:bs] (= seq_lens - 1)
+      verify: forward_batch.seq_lens[:bs]  (= committed)
+      v2:     forward_batch.seq_lens - N   (= extend_prefix_lens)
+
+    ``accept_length`` (v2 only): int32 [B] of the just-finished verify's
+    accept_length, already incremented in eagle_info_v2.sample to include
+    the bonus "next" token (so it IS the real advance, not raw accepted
+    drafts). Stored on the plan as ``effective_n_per_batch = accept_length``
+    so the write kernel can gate compress on the real advance rather than
+    the full N drafts (safe because rejected draft K in the tail ring gets
+    overwritten by the next round's V2 write before any reader needs it).
+    """
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
+        return
+    is_verify = forward_mode.is_target_verify()
+    is_decode = forward_mode.is_decode_or_idle()
+    is_v2 = forward_mode.is_draft_extend_v2()
+    if not (is_verify or is_decode or is_v2):
+        return
+    plan = metadata.kpool_write_plan
+    assert plan is not None, (
+        "kpool_write_plan must be pre-allocated before update; "
+        "see init_kpool_write_plan_capture"
+    )
+    slots_per_page = real_page_size // pool_size
+    update_kpool_write_plan_cuda_graph(
+        write_start=write_start,
+        req_pool_indices=req_pool_indices,
+        real_page_table=real_page_table,
+        req_out=plan.req,
+        write_start_out=plan.write_start,
+        tail_logical_start_out=plan.tail_logical_start,
+        write_loc_out=plan.write_loc,
+        pool_seqlens_per_q_out=plan.pool_seqlens_per_q,
+        seqlens_per_q_out=plan.seqlens_per_q,
+        pool_size=pool_size,
+        num_draft_tokens=num_draft_tokens,
+        slots_per_page=slots_per_page,
+    )
+    if is_v2 and accept_length is not None and plan.effective_n_per_batch is not None:
+        # effective_n = accept_length directly. v2's accept_length already
+        # includes the bonus "next" token (eagle_info_v2.sample applies an
+        # in-place ``accept_length.add_(1)`` before return), so it IS the
+        # real advance; adding +1 here would over-count by one slot and
+        # spuriously fire compress on rounds that didn't truly cross.
+        plan.effective_n_per_batch.copy_(accept_length.to(torch.int32))
+    if plan.pool_schedule_metadata is not None:
+        new_schedule = _compute_pool_schedule_metadata(
+            plan.pool_seqlens_per_q,
+            slots_per_page=slots_per_page,
+        )
+        if new_schedule is not None:
+            plan.pool_schedule_metadata.copy_(new_schedule)
+
+
+def init_kpool_write_plan(
+    metadata: "NSAMetadata",
+    forward_batch: "ForwardBatch",
+    *,
+    pool_size: int,
+    real_page_size: int,
+    real_page_table: torch.Tensor,
+    num_draft_tokens: int,
+    write_start: torch.Tensor,
+    accept_length: Optional[torch.Tensor] = None,
+) -> "NSAMetadata":
+    """Build the layer-invariant kpool write plan (eager path).
+
+    Allocates worst-case buffers at ``batch_size`` and fills them via
+    the shared GPU plan-build kernel -- same code path as the cuda-graph
+    replay update. Returns input unchanged when the gate fails.
+
+    Inputs:
+      real_page_table: int32 ``[B, max_pages]`` (decode) or
+        ``[B*N, max_pages]`` (verify / v2 draft_extend, repeat-interleave'd).
+      write_start: int32 ``[B]`` -- per-batch logical write position
+        (decode: positions; verify: committed_seq_lens = seq_lens;
+        v2 draft_extend: seq_lens - N = extend_prefix_lens).
+      accept_length: int32 ``[B]`` -- v2 only, just-finished verify's
+        accept_length (already includes the bonus token from
+        eagle_info_v2.sample); lets the write kernel gate compress on
+        this real-advance window instead of the full N drafts.
+    """
+    forward_mode = forward_batch.forward_mode
+    # "ring write" modes share the [B] write-plan: decode (N=1), target_verify
+    # and draft_extend_v2 (N=num_draft_tokens, fixed per batch). v1 draft_extend
+    # has variable q_len and still goes through the extend planner.
+    is_verify = forward_mode.is_target_verify()
+    is_v2 = forward_mode.is_draft_extend_v2()
+    is_ring_write = forward_mode.is_decode_or_idle() or is_verify or is_v2
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_ring_write:
+        return metadata
+
+    if is_verify or is_v2:
+        pool = forward_batch.token_to_kv_pool
+        assert pool.tail_extra_slots == num_draft_tokens, (
+            f"tail_extra_slots mismatch: pool={pool.tail_extra_slots}, "
+            f"forward={num_draft_tokens}"
+        )
+    assert (
+        real_page_table.dtype == torch.int32
+    ), f"real_page_table must be int32, got {real_page_table.dtype}"
+
+    batch_size = forward_batch.seq_lens.shape[0]
+    device = forward_batch.seq_lens.device
+
+    metadata = init_kpool_write_plan_capture(
+        metadata,
+        max_bs=batch_size,
+        pool_size=pool_size,
+        real_page_size=real_page_size,
+        real_page_table=real_page_table,
+        num_draft_tokens=num_draft_tokens,
+        device=device,
+        is_verify=is_verify or is_v2,
+        is_v2=is_v2,
+    )
+    update_kpool_write_plan(
+        metadata,
+        write_start=write_start,
+        req_pool_indices=forward_batch.req_pool_indices,
+        real_page_table=real_page_table,
+        pool_size=pool_size,
+        real_page_size=real_page_size,
+        num_draft_tokens=num_draft_tokens,
+        forward_mode=forward_mode,
+        accept_length=accept_length,
+    )
+    return metadata

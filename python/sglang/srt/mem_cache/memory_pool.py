@@ -66,7 +66,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import NsaKpoolConfig
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
@@ -1442,10 +1441,11 @@ class HybridLinearKVPool(KVCache):
         index_head_dim: Optional[int] = None,
         kv_cache_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
-        nsa_kpool: Optional["NsaKpoolConfig"] = None,
+        nsa_index_kpool: int = 1,
         max_running_requests: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
+        tail_extra_slots: int = 0,
     ):
         self.size = size
         self.dtype = dtype
@@ -1463,6 +1463,10 @@ class HybridLinearKVPool(KVCache):
         self.use_nsa = use_nsa
         if use_mla:
             if use_nsa:
+                # One NSA pool class handles both anchor (index_kpool == 1)
+                # and dense kpool (index_kpool > 1) layouts. The kpool-only
+                # knobs (tail_extra_slots, max_running_requests) are
+                # ignored under anchor; ``__init__`` asserts the contract.
                 self.full_kv_pool = NSATokenToKVPool(
                     size=size,
                     page_size=self.page_size,
@@ -1475,7 +1479,8 @@ class HybridLinearKVPool(KVCache):
                     start_layer=self.start_layer,
                     index_head_dim=index_head_dim,
                     kv_cache_dim=kv_cache_dim,
-                    nsa_kpool=nsa_kpool,
+                    nsa_index_kpool=nsa_index_kpool,
+                    tail_extra_slots=tail_extra_slots,
                     max_running_requests=max_running_requests,
                     layer_shard_rank=layer_shard_rank,
                     layer_shard_size=layer_shard_size,
@@ -1553,13 +1558,14 @@ class HybridLinearKVPool(KVCache):
             mamba_data_lens.extend(nsa_page_lens)
             mamba_item_lens.extend(nsa_page_item_lens)
 
-            if self.full_kv_pool.kpool_use_compress:
-                tail_ptrs, tail_lens, tail_item_lens = (
-                    self.full_kv_pool.get_compress_tail_buf_infos()
-                )
-                mamba_data_ptrs.extend(tail_ptrs)
-                mamba_data_lens.extend(tail_lens)
-                mamba_item_lens.extend(tail_item_lens)
+            # Kpool tail buffers; anchor returns empty lists, so the
+            # extend below no-ops without needing a type check.
+            tail_ptrs, tail_lens, tail_item_lens = (
+                self.full_kv_pool.get_tail_buf_infos()
+            )
+            mamba_data_ptrs.extend(tail_ptrs)
+            mamba_data_lens.extend(tail_lens)
+            mamba_item_lens.extend(tail_item_lens)
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
 
     def get_mamba_state_count(self) -> int:
@@ -1579,9 +1585,9 @@ class HybridLinearKVPool(KVCache):
             nsa_page_ptrs, _, _ = self.full_kv_pool.get_state_buf_infos()
             dims.extend([0] * len(nsa_page_ptrs))
 
-            if self.full_kv_pool.kpool_use_compress:
-                tail_ptrs, _, _ = self.full_kv_pool.get_compress_tail_buf_infos()
-                dims.extend([0] * len(tail_ptrs))
+            # Kpool tail buffers; anchor returns empty.
+            tail_ptrs, _, _ = self.full_kv_pool.get_tail_buf_infos()
+            dims.extend([0] * len(tail_ptrs))
         return dims
 
     def get_state_dim_components_per_tensor(self):
@@ -1591,9 +1597,9 @@ class HybridLinearKVPool(KVCache):
             nsa_page_ptrs, _, _ = self.full_kv_pool.get_state_buf_infos()
             comps.extend([[] for _ in nsa_page_ptrs])
 
-            if self.full_kv_pool.kpool_use_compress:
-                tail_ptrs, _, _ = self.full_kv_pool.get_compress_tail_buf_infos()
-                comps.extend([[] for _ in tail_ptrs])
+            # Kpool tail buffers; anchor returns empty.
+            tail_ptrs, _, _ = self.full_kv_pool.get_tail_buf_infos()
+            comps.extend([[] for _ in tail_ptrs])
         return comps
 
     def maybe_get_custom_mem_pool(self):
@@ -1728,26 +1734,21 @@ class HybridLinearKVPool(KVCache):
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
+    # Forwarders to the inner pool; defaults cover non-NSA inner pools.
     @property
     def nsa_kv_cache_store_fp8(self) -> bool:
-        # Forward to the inner NSA pool. Only meaningful when use_nsa is True
-        # (i.e. self.full_kv_pool is NSATokenToKVPool); for non-NSA inner
-        # pools this returns False.
         return getattr(self.full_kv_pool, "nsa_kv_cache_store_fp8", False)
 
     @property
-    def kpool_use_compress(self) -> bool:
-        # Forward to the inner NSA pool; False for non-NSA inner pools.
-        return getattr(self.full_kv_pool, "kpool_use_compress", False)
+    def index_kpool(self) -> int:
+        return getattr(self.full_kv_pool, "index_kpool", 1)
 
     @property
     def kv_cache_dim(self) -> Optional[int]:
-        # Forward to the inner pool; NSATokenToKVPool always defines this.
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
     @property
     def index_head_dim(self) -> Optional[int]:
-        # Forward to the inner pool; NSATokenToKVPool always defines this.
         return getattr(self.full_kv_pool, "index_head_dim", None)
 
     def set_mla_kv_buffer(
@@ -1806,12 +1807,16 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
 
-    def get_compress_tail_buffers(
-        self, layer_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert self.use_nsa, "get_compress_tail_buffers called when use_nsa is False"
+    def get_tail_buffers(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.use_nsa, "get_tail_buffers called when use_nsa is False"
         layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool.get_compress_tail_buffers(layer_id)
+        return self.full_kv_pool.get_tail_buffers(layer_id)
+
+    # Forwarder so kpool-agnostic callers can read tail_extra_slots
+    # uniformly through the hybrid wrapper. Default 0 = no scratch.
+    @property
+    def tail_extra_slots(self) -> int:
+        return getattr(self.full_kv_pool, "tail_extra_slots", 0)
 
     def get_index_k_continuous(
         self,
@@ -2391,6 +2396,18 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 
 class NSATokenToKVPool(MLATokenToKVPool):
+    """NSA KV cache pool. One class, two layouts gated by ``nsa_index_kpool``:
+
+    * **anchor** (``== 1``): one index slot per token; no per-req tail.
+    * **dense kpool** (``> 1``): pack ``page_size // index_kpool`` pool
+      entries per index_k page; per-req bf16 ring tail of width
+      ``index_kpool + tail_extra_slots`` rooted at logical pos %
+      ``TAIL_SIZE``. ``tail_extra_slots`` is scratch for EAGLE
+      target_verify drafts; rejected drafts get naturally overwritten by
+      the next decode/extend at the same logical positions. See
+      ``nsa/kpool/`` for the ring invariants the kernels rely on.
+    """
+
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
@@ -2410,16 +2427,16 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
-        nsa_kpool: Optional["NsaKpoolConfig"] = None,
+        # Kpool knobs; anchor when nsa_index_kpool == 1.
+        nsa_index_kpool: int = 1,
+        tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
     ):
-
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
-
         super().__init__(
             size,
             page_size,
@@ -2436,115 +2453,27 @@ class NSATokenToKVPool(MLATokenToKVPool):
             layer_shard_rank=layer_shard_rank,
             layer_shard_size=layer_shard_size,
         )
-        # self.index_k_dtype = torch.float8_e4m3fn
-        # self.index_k_scale_dtype = torch.float32
-        self.index_head_dim = index_head_dim
-        if index_buf_size is None:
-            index_buf_size = size
-        # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
+        assert self.page_size == (1 if _is_hip else 64)
+        assert (
+            nsa_index_kpool > 1 or tail_extra_slots == 0
+        ), f"tail_extra_slots is kpool-only; got {tail_extra_slots} with anchor."
+        self.index_head_dim = index_head_dim
+        self.index_kpool = nsa_index_kpool
+        self.tail_extra_slots = tail_extra_slots
+        # Anchor (==1) collapses to slots_per_page = page_size.
+        self.slots_per_page = self.page_size // nsa_index_kpool
 
-        if _is_hip:
-            assert self.page_size == 1
-        else:
-            assert self.page_size == 64
-
-        # Two NSA index-cache modes share this pool; the only structural
-        # difference is the per-page slot count, so the layout math is
-        # threaded through `slots_per_page` and the mode-specific
-        # tail buffers live behind `_init_kpool_compress_tail_buffers`.
-        # `nsa_kpool` drives mode selection so the buffer math here and
-        # the profile-time cell-size estimator stay in sync via the same
-        # NsaKpoolConfig snapshot.
-        self._kpool_use_compress = nsa_kpool is not None and nsa_kpool.is_compress
-        if self._kpool_use_compress:
-            self._init_kpool_compress_mode(
-                index_buf_size=index_buf_size,
-                index_kpool=nsa_kpool.pool_size,
-                index_head_dim=index_head_dim,
-                layer_num=layer_num,
-                device=device,
-                max_running_requests=max_running_requests,
-            )
-        else:
-            self._init_anchor_mode(
-                index_buf_size=index_buf_size,
-                index_head_dim=index_head_dim,
-                layer_num=layer_num,
-                device=device,
-            )
-
-        self._finalize_allocation_log(size)
-
-    def _init_anchor_mode(
-        self,
-        *,
-        index_buf_size: int,
-        index_head_dim: int,
-        layer_num: int,
-        device: str,
-    ) -> None:
-        """Anchor layout: one slot per token, ``slots_per_page == page_size``."""
-        self.slots_per_page = self.page_size
-        self._alloc_index_k_with_scale_buffer(
-            index_buf_size=index_buf_size,
-            index_head_dim=index_head_dim,
-            layer_num=layer_num,
-            device=device,
-        )
-        # Anchor mode has no kpool tail state.
-        self.index_kpool = 1
-        self.index_kpool_compress = False
-        self._compress_tail_k = None
-        self._compress_tail_score = None
-
-    def _init_kpool_compress_mode(
-        self,
-        *,
-        index_buf_size: int,
-        index_kpool: int,
-        index_head_dim: int,
-        layer_num: int,
-        device: str,
-        max_running_requests: Optional[int],
-    ) -> None:
-        """Dense kpool-compress: pack ``page_size // index_kpool`` pool slots
-        per page; the addressing math (inlined in nsa/kpool/planner.py)
-        keys off ``slots_per_page``.
-        """
-        self.slots_per_page = self.page_size // index_kpool
-        self._alloc_index_k_with_scale_buffer(
-            index_buf_size=index_buf_size,
-            index_head_dim=index_head_dim,
-            layer_num=layer_num,
-            device=device,
-        )
-        self._init_kpool_compress_tail_buffers(
-            index_kpool=index_kpool,
-            index_head_dim=index_head_dim,
-            layer_num=layer_num,
-            device=device,
-            max_running_requests=max_running_requests,
-        )
-
-    def _alloc_index_k_with_scale_buffer(
-        self,
-        *,
-        index_buf_size: int,
-        index_head_dim: int,
-        layer_num: int,
-        device: str,
-    ) -> None:
-        """Allocate the per-layer (num_pages, slots_per_page * row_bytes)
-        index_k+scale buffer. Row layout is documented in
-        ``test_attention.py :: kv_cache_cast_to_fp8``:
-            anchor: slots_per_page=64 -> row = 64*132 = 8448 B
-            dense : slots_per_page=4  -> row = 4*132  = 528 B
-        """
+        # Per-layer index_k+scale buffer (anchor row = 64*132 = 8448 B;
+        # dense row = 4*132 = 528 B), plus per-req bf16 tail ring (kpool
+        # only). _tail_k/_score == None on anchor short-circuits getters.
+        index_buf_size = size if index_buf_size is None else index_buf_size
         num_pages = (index_buf_size + self.page_size + 1) // self.page_size
         row_bytes = self.slots_per_page * (
             index_head_dim + index_head_dim // self.quant_block_size * 4
         )
+        self._tail_k: Optional[List[torch.Tensor]] = None
+        self._tail_score: Optional[List[torch.Tensor]] = None
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -2573,82 +2502,47 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     device=device,
                 )
                 self.remote_index_layer_id: Optional[int] = None
-
-    def _init_kpool_compress_tail_buffers(
-        self,
-        index_kpool: int,
-        index_head_dim: int,
-        layer_num: int,
-        device: str,
-        max_running_requests: Optional[int],
-    ) -> None:
-        """Allocate per-layer kpool-compress tail buffers.
-
-        These hold the raw bf16 key / score of the in-progress pool that
-        hasn't been compressed + flushed to the fp8 index cache yet.
-        Conceptually part of the index cache state, so they live on the
-        KV pool rather than on the per-layer Indexer module.
-
-        Only called from the kpool-compress mode branch; the caller has
-        already established ``self._kpool_use_compress = True``.
-        """
-        self.index_kpool = index_kpool
-        self.index_kpool_compress = True
-
-        assert (
-            max_running_requests is not None
-        ), "NSATokenToKVPool with kpool compress requires max_running_requests"
-        # +1 mirrors req_to_token_pool.size + 1 used by the indexer to
-        # provide an extra slot for invalid / sentinel req indices.
-        req_pool_size = max_running_requests + 1
-        tail_dtype = torch.bfloat16
-        with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
-        ):
-            self._compress_tail_k: List[torch.Tensor] = [
-                torch.zeros(
-                    req_pool_size,
-                    index_kpool,
+            if nsa_index_kpool > 1:
+                assert (
+                    max_running_requests is not None
+                ), "kpool layout requires max_running_requests for the per-req tail."
+                # +1 mirrors req_to_token_pool.size + 1 (sentinel slot).
+                shape = (
+                    max_running_requests + 1,
+                    nsa_index_kpool + tail_extra_slots,
                     index_head_dim,
-                    dtype=tail_dtype,
-                    device=device,
                 )
-                for _ in range(layer_num)
-            ]
-            self._compress_tail_score: List[torch.Tensor] = [
-                torch.zeros(
-                    req_pool_size,
-                    index_kpool,
-                    index_head_dim,
-                    dtype=tail_dtype,
-                    device=device,
-                )
-                for _ in range(layer_num)
-            ]
+                self._tail_k = [
+                    torch.zeros(shape, dtype=torch.bfloat16, device=device)
+                    for _ in range(layer_num)
+                ]
+                self._tail_score = [
+                    torch.zeros(shape, dtype=torch.bfloat16, device=device)
+                    for _ in range(layer_num)
+                ]
 
-    @property
-    def kpool_use_compress(self) -> bool:
-        """True when this pool maintains kpool compress-tail buffers."""
-        return self._kpool_use_compress
+        self._finalize_allocation_log(size)
 
-    def get_compress_tail_buffers(
-        self, layer_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (tail_k, tail_score) for a single NSA layer.
-
-        Used by the kpool indexer to feed its compress/scatter kernels;
-        also useful for read-only sanity checks. Pool owns the storage --
-        callers must not free or replace the returned tensors.
-        """
+    def get_tail_buffers(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(tail_k, tail_score)`` for one NSA layer. Kpool only; anchor
+        callers must gate on ``index_kpool > 1`` (assert is a backstop)."""
         assert (
-            self._kpool_use_compress
-        ), "get_compress_tail_buffers called when kpool compress is disabled"
+            self._tail_k is not None and self._tail_score is not None
+        ), "get_tail_buffers on anchor layout; gate with `index_kpool > 1`."
         idx = layer_id - self.start_layer
+        return self._tail_k[idx], self._tail_score[idx]
+
+    def get_tail_buf_infos(self):
+        """``(data_ptrs, data_lens, item_lens)`` over ``2 * layer_num``
+        tail tensors (all _tail_k then all _tail_score). Anchor returns
+        empty lists so disagg/hybrid registration is layout-agnostic."""
+        if self._tail_k is None:
+            return [], [], []
+        bufs = self._tail_k + self._tail_score
         return (
-            self._compress_tail_k[idx],
-            self._compress_tail_score[idx],
+            [b.data_ptr() for b in bufs],
+            [b.nbytes for b in bufs],
+            [b[0].nbytes for b in bufs],
         )
 
     def _clear_buffers(self):
@@ -2656,6 +2550,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         del self.index_k_with_scale_buffer
         if hasattr(self, "remote_index_k_with_scale_buffer"):
             del self.remote_index_k_with_scale_buffer
+        if self._tail_k is not None:
+            del self._tail_k
+            del self._tail_score
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -2786,37 +2683,17 @@ class NSATokenToKVPool(MLATokenToKVPool):
         ]
         return data_ptrs, data_lens, item_lens
 
-    def get_compress_tail_buf_infos(self):
-        """Buffer infos for the per-request kpool compress-tail buffers.
-
-        Returns (data_ptrs, data_lens, item_lens) covering the ``2 * layer_num``
-        tail tensors -- all ``_compress_tail_k`` layers first, then all
-        ``_compress_tail_score`` layers. Each buffer is indexed by
-        ``req_pool_idx`` (one slot per request), so ``item_lens[i]`` is the byte
-        size of a single request slot.
-
-        Returns empty lists when kpool compress is disabled, since the tail
-        buffers do not exist in that case.
-        """
-        if not self._kpool_use_compress:
-            return [], [], []
-        tail_buffers = self._compress_tail_k + self._compress_tail_score
-        data_ptrs = [buf.data_ptr() for buf in tail_buffers]
-        data_lens = [buf.nbytes for buf in tail_buffers]
-        item_lens = [buf[0].nbytes for buf in tail_buffers]
-        return data_ptrs, data_lens, item_lens
-
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        # First, save the kv_buffer (inherited from MLATokenToKVPool)
+        # super() trailing-syncs after its own D2Hs, so the queue is empty
+        # here; we issue our copies non_blocking and sync once at the end.
         kv_cache_cpu = super().get_cpu_copy(indices)
 
-        # Additionally, save the index_k_with_scale_buffer (page-indexed)
+        # Page-indexed D2H of the index_k_with_scale_buffer.
         page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
-        index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
-        # Convert chunk_size from token-level to page-level
+        # token-level -> page-level chunk size.
         page_chunk_size = max(1, chunk_size // self.page_size)
+        index_k_cpu: List[List[torch.Tensor]] = []
         for layer_id in range(self.layer_num):
             index_k_cpu.append([])
             if self.index_k_with_scale_buffer[layer_id].shape[0] == 0:
@@ -2827,43 +2704,36 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     chunk_page_indices
                 ].to("cpu", non_blocking=True)
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
 
         result = {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-        # kpool compress-tail is a per-request (req_pool_idx-indexed) recurrent buffer.
-        if self._kpool_use_compress and req_pool_index is not None:
-            torch.cuda.synchronize()
-            tail_k_cpu = [
-                self._compress_tail_k[layer_id][req_pool_index].to(
-                    "cpu", non_blocking=True
-                )
-                for layer_id in range(self.layer_num)
+        # Kpool-only per-req tail buffer; anchor pools skip this entirely.
+        if self._tail_k is not None and req_pool_index is not None:
+            result["tail_k"] = [
+                self._tail_k[i][req_pool_index].to("cpu", non_blocking=True)
+                for i in range(self.layer_num)
             ]
-            tail_score_cpu = [
-                self._compress_tail_score[layer_id][req_pool_index].to(
-                    "cpu", non_blocking=True
-                )
-                for layer_id in range(self.layer_num)
+            result["tail_score"] = [
+                self._tail_score[i][req_pool_index].to("cpu", non_blocking=True)
+                for i in range(self.layer_num)
             ]
-            torch.cuda.synchronize()
-            result["tail_k"] = tail_k_cpu
-            result["tail_score"] = tail_score_cpu
 
+        torch.cuda.synchronize()  # drains all non_blocking D2H above.
         return result
 
     def load_cpu_copy(
         self, kv_cache_cpu_dict, indices, mamba_indices=None, req_pool_index=None
     ):
-        # Restore the kv_buffer (inherited from MLATokenToKVPool)
+        # super() trailing-syncs after its own H2Ds; we follow the same
+        # non_blocking-issue + single-sync pattern.
         super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
 
-        # Restore the index_k_with_scale_buffer (page-indexed)
+        # Page-indexed H2D of the index_k_with_scale_buffer.
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
-        torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
+        idx_dev = self.index_k_with_scale_buffer[0].device
         for layer_id in range(self.layer_num):
             if self.index_k_with_scale_buffer[layer_id].shape[0] == 0:
                 continue
@@ -2871,29 +2741,27 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(
-                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = (
+                    idx_cpu.to(idx_dev, non_blocking=True)
                 )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
 
-        # Restore the kpool compress-tail into the (possibly newly allocated) req_pool_idx slot.
+        # Restore tail into the (possibly newly allocated) req_pool_idx slot.
         if (
-            self._kpool_use_compress
+            self._tail_k is not None
             and req_pool_index is not None
             and "tail_k" in kv_cache_cpu_dict
         ):
             tail_k_cpu = kv_cache_cpu_dict["tail_k"]
             tail_score_cpu = kv_cache_cpu_dict["tail_score"]
-            torch.cuda.synchronize()
-            for layer_id in range(self.layer_num):
-                self._compress_tail_k[layer_id][req_pool_index] = tail_k_cpu[
-                    layer_id
-                ].to(self._compress_tail_k[layer_id].device, non_blocking=True)
-                self._compress_tail_score[layer_id][req_pool_index] = tail_score_cpu[
-                    layer_id
-                ].to(self._compress_tail_score[layer_id].device, non_blocking=True)
-            torch.cuda.synchronize()
+            for i in range(self.layer_num):
+                self._tail_k[i][req_pool_index] = tail_k_cpu[i].to(
+                    self._tail_k[i].device, non_blocking=True
+                )
+                self._tail_score[i][req_pool_index] = tail_score_cpu[i].to(
+                    self._tail_score[i].device, non_blocking=True
+                )
+
+        torch.cuda.synchronize()  # drains all non_blocking H2D above.
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()

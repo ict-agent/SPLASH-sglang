@@ -49,6 +49,12 @@ class PrecomputedMetadata:
     # FlashMLA (optional)
     flashmla_metadata: Optional[torch.Tensor] = None
 
+    # Needed by the per-backend kpool write-plan rebuild on the fast
+    # (precomputed) replay path. The plan is per-backend buffer state, so
+    # we can't share it -- but we share the inputs. ``None`` is fine when
+    # kpool layout is disabled (the rebuild is a no-op then).
+    req_pool_indices: Optional[torch.Tensor] = None  # int64, [bs]
+
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     """Compute cumulative sequence lengths with padding."""
@@ -167,6 +173,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=max_len,
             max_seqlen_k=max_len,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )
 
     def _precompute_target_verify_mode(
@@ -250,6 +257,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )
 
     def _precompute_draft_extend_mode(
@@ -331,4 +339,5 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=max_seqlen_k,
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )

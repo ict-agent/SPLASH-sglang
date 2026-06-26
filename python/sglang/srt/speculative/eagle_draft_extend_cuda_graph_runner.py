@@ -88,9 +88,25 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
 
+        # kpool v1 draft_extend has variable q_len = accept_length+1 and
+        # still uses the extend planner, which builds dynamically-sized
+        # plan tensors that cuda-graph capture cannot pre-allocate -> force
+        # eager. v2 has fixed q_len = num_draft_tokens and shares the
+        # target_verify write-plan path, so v2 captures normally.
+        kpool_on = (
+            getattr(self.eagle_worker.draft_extend_attn_backend, "nsa_index_kpool", 1)
+            > 1
+        )
+        self._kpool_force_eager = kpool_on and self.forward_mode == ForwardMode.DRAFT_EXTEND
+        if self._kpool_force_eager:
+            self.capture_bs = []
+            self.compile_bs = []
+
         # Attention backend
         self.num_tokens_per_bs = self.speculative_num_steps + 1
-        self.max_bs = max(self.capture_bs)
+        # max_bs sizes the static buffers below; needs a valid floor even when
+        # capture is disabled (allocators still run; can_run gates the replay).
+        self.max_bs = max(self.capture_bs) if self.capture_bs else 1
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
@@ -222,6 +238,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self._kpool_force_eager:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs

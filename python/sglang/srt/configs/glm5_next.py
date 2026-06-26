@@ -1,6 +1,10 @@
+import logging
+
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+
+logger = logging.getLogger(__name__)
 
 
 class Glm5NextConfig(PretrainedConfig):
@@ -130,6 +134,14 @@ class Glm5NextConfig(PretrainedConfig):
         self.index_topk = index_topk
         self.index_n_heads = index_n_heads
         self.index_dsa_use_layernorm = index_dsa_use_layernorm
+        # Downstream uses ``index_kpool > 1`` as the single
+        # "kpool enabled" condition; collapse the degenerate combo here.
+        if index_kpool > 1 and not index_kpool_compress:
+            logger.warning(
+                "index_kpool=%d with compress=False -> disable kpool.",
+                index_kpool,
+            )
+            index_kpool = 1
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.index_kpool_always_select_tail = index_kpool_always_select_tail

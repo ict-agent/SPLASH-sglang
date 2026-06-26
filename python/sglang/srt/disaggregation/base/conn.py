@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import enum
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
@@ -18,7 +17,7 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
-    NSA_TAIL = "nsa_tail"  # NSA kpool compress-tail: one per-request slot index.
+    NSA_TAIL = "nsa_tail"  # NSA kpool tail: one per-request slot index.
 
 
 class KVArgs:

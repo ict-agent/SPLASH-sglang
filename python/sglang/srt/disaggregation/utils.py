@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import random
-import dataclasses
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -562,9 +561,9 @@ def setup_state_kv_args(kv_args: KVArgs, token_to_kv_pool, draft_token_to_kv_poo
 
     def _append_nsa(pool):
         append_state_component(kv_args, StateType.NSA, *pool.get_state_buf_infos())
-        if pool.kpool_use_compress:
+        if pool.index_kpool > 1:
             append_state_component(
-                kv_args, StateType.NSA_TAIL, *pool.get_compress_tail_buf_infos()
+                kv_args, StateType.NSA_TAIL, *pool.get_tail_buf_infos()
             )
 
     def _append_draft_nsa():
@@ -639,8 +638,28 @@ def build_state_indices(
 
     def _append_nsa(pool):
         components.append(_nsa_pages(pool))
-        if pool.kpool_use_compress:
-            components.append([req_pool_idx])
+        if pool.index_kpool > 1:
+            # kpool tail is a ring of size (index_kpool + tail_extra_slots).
+            # After prefill, only the open pool's accumulated prefix slots
+            # hold real data: n_valid = seq_len % pool_size slots starting
+            # at physical (seq_len - n_valid) % tail_size. With
+            # tail_extra_slots > 0 the live range can wrap (tail_size is
+            # not a multiple of pool_size), so we emit up to two
+            # contiguous segments. Empty when seq_len is pool-aligned.
+            pool_size = pool.index_kpool
+            tail_size = pool_size + getattr(pool, "tail_extra_slots", 0)
+            n_valid = seq_len % pool_size
+            if n_valid:
+                start_phys = (seq_len - n_valid) % tail_size
+                first_n = min(n_valid, tail_size - start_phys)
+                second_n = n_valid - first_n
+                # [req_pool_idx, off1, n1, off2, n2, tail_size];
+                # second segment is 0/0 when no wrap.
+                components.append(
+                    [req_pool_idx, start_phys, first_n, 0, second_n, tail_size]
+                )
+            else:
+                components.append([])
 
     def _append_draft_nsa():
         draft_nsa_pool = getattr(

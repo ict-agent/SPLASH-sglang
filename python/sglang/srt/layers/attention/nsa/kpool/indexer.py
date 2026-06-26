@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import NsaKpoolConfig
+from sglang.srt.configs.model_config import get_nsa_index_kpool
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.nsa.kpool.kernels import (
     all_gather_and_scatter_pool_slots,
     gather_index_k_scale_prefix_into,
     kpool_assemble_softmax_rotate_write_cache,
-    kpool_decode_update_and_maybe_write_cache,
+    kpool_write_tail_and_maybe_compress,
     scatter_kpool_tail_updates,
     topk_from_pooled_history_logits,
 )
@@ -97,19 +97,14 @@ class IndexerKPool(Indexer):
         )
 
         assert config is not None, "IndexerKPool requires the model config"
-        self.nsa_kpool = NsaKpoolConfig.from_hf_config(config)
-        self.nsa_kpool.assert_indexer_compatible(self.index_topk)
-        # block_kv = page_size // pool_size = slots_per_page; on SM90 DeepGEMM
-        # accepts {4,8,16,32,64} so any pool_size dividing 64 works. SGLang's
-        # KV-cache page_size is fixed at 64 (FlashMLA decode requirement), so
-        # the divisibility check below is what actually gates pool_size.
+        # Launch-time invariants (page_size, index_topk %, EAGLE topk)
+        # are enforced in server_args; only the kernel-level DeepGEMM
+        # divisibility check belongs here.
+        self.index_kpool = get_nsa_index_kpool(config)
+        assert self.index_kpool > 1, "IndexerKPool requires kpool enabled."
         assert (
-            64 % self.nsa_kpool.pool_size == 0
-        ), f"pool_size ({self.nsa_kpool.pool_size}) must divide DeepGEMM page_size (64)"
-        # Hot path reads `self.index_kpool` directly (compute_pooled_*,
-        # block_kv math, pool-seqlens, etc); keep the alias rather than
-        # touching every call site for now.
-        self.index_kpool = self.nsa_kpool.pool_size
+            64 % self.index_kpool == 0
+        ), f"index_kpool ({self.index_kpool}) must divide DeepGEMM page_size (64)"
 
         # Kpool-specific learned params: absolute positional embedding inside
         # each pool, and the gate projection for the per-token slot score.
@@ -131,11 +126,11 @@ class IndexerKPool(Indexer):
         # Reuse the parent's bf16 weights_proj path; only difference is the
         # GLM head broadcast below.
         weights = self._weights_proj_bf16_in_fp32_out(x)
-        # GLM models may use fewer than 32 heads; broadcast to 32 to match
-        # downstream kernels that hard-code that count.
-        if (num_heads := weights.size(1)) < 32:
-            assert 32 % num_heads == 0
-            weights = weights.repeat_interleave(32 // num_heads, dim=1)
+        # deep_gemm.fp8_paged_mqa_logits requires num_heads in
+        # {8, 16, 32, 64}; broadcast small head counts up to 8.
+        if (num_heads := weights.size(1)) < 8:
+            assert 8 % num_heads == 0
+            weights = weights.repeat_interleave(8 // num_heads, dim=1)
         weights = weights * self.n_heads**-0.5
         return weights
 
@@ -344,20 +339,31 @@ class IndexerKPool(Indexer):
         ), "kpool decode under nsa_enable_prefill_cp is not supported"
         batch = key.shape[0]
         pool = forward_batch.token_to_kv_pool
-        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
-        kpool_decode_update_and_maybe_write_cache(
+        tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
+        # Unified decode + verify entry point. Decode passes N=1 and the
+        # plan's per-batch addressing (req / write_start / tail_logical_start
+        # / write_loc) precomputed in init/update_kpool_write_plan; the
+        # kernel writes 1 token per batch into the tail ring and, if that
+        # write closed a pool, compresses it into the persistent FP8 cache.
+        plan = metadata.attn_metadata.kpool_write_plan
+        assert plan is not None, (
+            "kpool_write_plan must be built before _compress_write_decode; "
+            "see _build_kpool_metadata / init_kpool_write_plan_capture"
+        )
+        kpool_write_tail_and_maybe_compress(
             pool=pool,
             buf=pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            key=key,
+            score=gate_score,
             tail_k=tail_k_buf,
             tail_score=tail_score_buf,
-            key=key,
-            slot_score=gate_score,
             ape=self.index_kpool_compress_ape,
-            block_tables=metadata.get_page_table_64(),
-            req_pool_indices=forward_batch.req_pool_indices[:batch],
-            positions=positions[:batch],
-            seq_lens=metadata.get_seqlens_int32()[:batch],
+            req_pool_indices=plan.req[:batch],
+            write_start=plan.write_start[:batch],
+            tail_logical_start=plan.tail_logical_start[:batch],
+            write_loc=plan.write_loc[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
+            num_draft_tokens=1,
             round_scale=self.scale_fmt is not None,
         )
 
@@ -397,7 +403,7 @@ class IndexerKPool(Indexer):
         if writes.is_empty and tails.is_empty:
             return
 
-        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+        tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
 
         # --- assemble + compress (owned pools under CP, all otherwise) ---
         if not writes.is_empty:
@@ -413,6 +419,7 @@ class IndexerKPool(Indexer):
                 req_pool_idx=writes.req,
                 n_from_tail=writes.n_from_tail,
                 chunk_src_start=writes.chunk_src,
+                tail_logical_base=writes.tail_logical_base,
                 ape=self.index_kpool_compress_ape,
                 loc=writes.write_loc,
                 # CP: write only this rank's owned pools.
@@ -434,12 +441,13 @@ class IndexerKPool(Indexer):
         # --- scatter tail updates --------------------------------------------
         if not tails.is_empty:
             scatter_kpool_tail_updates(
+                pool=pool,
                 chunk_k=key,
                 chunk_score=gate_score,
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 req_pool_idx=tails.req,
-                dst_offset=tails.dst_offset,
+                dst_logical_start=tails.dst_logical_start,
                 chunk_src_start=tails.chunk_src,
                 n_write=tails.n_write,
             )
@@ -571,11 +579,14 @@ class IndexerKPool(Indexer):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        seqlens_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Override: pooled-history paged top-k via the kpool fused kernel.
 
-        Caller (``forward_cuda``) only dispatches here for decode (speculative
-        modes raise NotImplementedError upstream), so we assume decode.
+        Called for decode (1 row per req) and draft_extend (sum_q rows
+        per batch with page_table already repeat_interleave'd). For
+        draft_extend, callers pass ``seqlens_override = seqlens_expanded``
+        so per-q ke is correct.
         """
         page_size = forward_batch.token_to_kv_pool.page_size
 
@@ -584,7 +595,11 @@ class IndexerKPool(Indexer):
             layer_id=layer_id
         )
 
-        seqlens_32 = metadata.get_seqlens_int32()
+        seqlens_32 = (
+            seqlens_override
+            if seqlens_override is not None
+            else metadata.get_seqlens_int32()
+        )
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)
         assert len(kv_cache_fp8.shape) == 2
@@ -900,6 +915,156 @@ class IndexerKPool(Indexer):
             return cp_split_and_rebuild_data(forward_batch, topk_full)
         return topk_full
 
+    # ------------------------------------------------------------------
+    # target_verify (chain-only, EAGLE topk=1)
+    # ------------------------------------------------------------------
+
+    def _forward_cuda_target_verify(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Verify forward: draft K/score ring-written into the tail at logical
+        positions ``[committed, committed+N)``, closed pools compressed
+        directly into persistent FP8, paged top-k via the persistent
+        page_table_64.
+
+        Verify is essentially "extend assuming all drafts accepted": closed
+        pools written here become correct iff the corresponding drafts
+        accept; for any rejected draft past the accept frontier the next
+        decode/extend will rewrite the pool from authoritative K. The tail
+        ring layout means the post-sample commit is a no-op (just advance
+        ``committed_seq_len`` upstream).
+
+        CUDA-only: target_verify with kpool only runs on CUDA today.
+        """
+        assert is_cuda(), "kpool ring-write path is CUDA-only"
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+        plan = metadata.attn_metadata.kpool_write_plan
+        assert plan is not None, (
+            "kpool target_verify plan is required; see "
+            "init_kpool_write_plan in nsa_backend.py"
+        )
+
+        # (1) Q/K bf16 projection (Hadamard already applied in _get_q_k_bf16).
+        # CP / dual-stream are not active in target_verify.
+        query, key, gate_score_maybe = self._get_q_k_bf16(
+            q_lora,
+            x,
+            positions,
+            enable_dual_stream=False,
+            forward_batch=forward_batch,
+            precompute_compress_gate=False,
+        )
+        gate_score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+        if (num_heads := query.size(1)) < 8:
+            assert 8 % num_heads == 0
+            query = query.repeat_interleave(8 // num_heads, dim=1)
+
+        # (2) Fused: write N draft K/score into the tail ring, then compress
+        # any closed pool from tail into the persistent FP8 cache. One kernel
+        # launch (grid=(B,)) handles both steps per batch; the compress
+        # half is gated in-kernel on ``(committed + N) // P > committed // P``.
+        pool = forward_batch.token_to_kv_pool
+        tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
+        buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        kpool_write_tail_and_maybe_compress(
+            pool=pool,
+            buf=buf,
+            key=key,
+            score=gate_score,
+            tail_k=tail_k_buf,
+            tail_score=tail_score_buf,
+            ape=self.index_kpool_compress_ape,
+            req_pool_indices=plan.req,
+            write_start=plan.write_start,
+            tail_logical_start=plan.tail_logical_start,
+            write_loc=plan.write_loc,
+            out_cache_loc=forward_batch.out_cache_loc,
+            num_draft_tokens=plan.num_draft_tokens,
+            round_scale=self.scale_fmt is not None,
+            # v2 only (None for target_verify): defer compress to the round
+            # whose real advance crosses a pool boundary.
+            effective_n_per_batch=plan.effective_n_per_batch,
+        )
+
+        # (3) Q quant + weights.
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        weights = self._get_logits_head_gate(x, q_scale)
+
+        # (4) Top-k via persistent paged page_table (no stitched reserve).
+        topk_indices = (
+            self._get_topk_paged_verify(
+                forward_batch, layer_id, q_fp8, weights, plan, metadata
+            )
+            if return_indices
+            else None
+        )
+
+        return topk_indices
+
+    def _get_topk_paged_verify(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        plan,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Paged top-k over committed pool history + the just-written drafts.
+
+        ``plan.paged_page_table`` is the persistent page_table_64 (no
+        reserve stitching). Closed-pool FP8 was just written to those
+        very pages above, so DeepGEMM reads correct draft-assuming data.
+        """
+        page_size = forward_batch.token_to_kv_pool.page_size
+        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
+        block_kv = page_size // self.index_kpool
+        head_dim_with_sf = self.head_dim + 4
+        kv_cache_fp8 = kv_cache_fp8.view(
+            kv_cache_fp8.shape[0], block_kv, 1, head_dim_with_sf
+        )
+
+        assert q_fp8.dim() == 3
+        q_fp8 = q_fp8.unsqueeze(1)
+        assert weights.dim() == 3
+        weights = weights.squeeze(2)
+
+        pool_max_seq_len = plan.paged_page_table.shape[1] * block_kv
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            plan.pool_seqlens_per_q.unsqueeze(-1),
+            plan.paged_page_table,
+            plan.pool_schedule_metadata,
+            pool_max_seq_len,
+            clean_logits=False,
+        )
+
+        # Fused top-k method dispatch. ``_kpool_fused_topk_mapping`` resolves
+        # to page_table_1 (token-granularity, B*N rows after repeat_interleave),
+        # which the topk transform expects. plan.paged_page_table is the
+        # page_table_64 used by DeepGEMM above and must NOT leak to topk.
+        page_table_for_topk, _, _ = self._kpool_fused_topk_mapping(metadata)
+
+        return self._topk_from_kpool_logits(
+            logits=logits,
+            pool_lens=plan.pool_seqlens_per_q,
+            seq_lens=plan.seqlens_per_q,
+            page_table=page_table_for_topk,
+            topk_offsets=None,
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -936,13 +1101,24 @@ class IndexerKPool(Indexer):
         mode = forward_batch.forward_mode
         is_extend_prefill = mode.is_extend_without_speculative()
         is_decode = mode.is_decode_or_idle()
-        is_speculative = mode.is_target_verify() or mode.is_draft_extend(
-            include_v2=True
-        )
-        if is_speculative:
-            raise NotImplementedError(
-                "index_kpool > 1 with pooled FP8 index cache does not "
-                "support target_verify/draft_extend yet."
+        is_target_verify = mode.is_target_verify()
+        is_v2 = mode.is_draft_extend_v2()
+        is_draft_extend_v1 = mode.is_draft_extend() and not is_v2
+
+        # target_verify and draft_extend_v2 share the same KPoolWritePlan
+        # path: fixed q_len = N per batch, identical tail-ring + close-pool
+        # write semantics, identical paged topk shape ``[B*N, ...]``.
+        # v1 draft_extend still has variable q_len = accept_length+1 and
+        # falls through to the extend planner below.
+        if is_target_verify or is_v2:
+            return self._forward_cuda_target_verify(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
+                return_indices=return_indices,
             )
 
         enable_dual_stream = (
@@ -962,8 +1138,8 @@ class IndexerKPool(Indexer):
                 )
 
         # Q/K projection (plus optional compress-gate matmul on a third
-        # stream for dual-stream decode). index_kpool > 1 and
-        # index_kpool_compress are class invariants (see __init__).
+        # stream for dual-stream decode). ``index_kpool > 1`` is a class
+        # invariant (see __init__).
         precompute_compress_gate = (
             enable_dual_stream and is_decode and self.compress_gate_stream is not None
         )
@@ -975,9 +1151,9 @@ class IndexerKPool(Indexer):
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
         )
-        if (num_heads := query.size(1)) < 32:
-            assert 32 % num_heads == 0
-            query = query.repeat_interleave(32 // num_heads, dim=1)
+        if (num_heads := query.size(1)) < 8:
+            assert 8 % num_heads == 0
+            query = query.repeat_interleave(8 // num_heads, dim=1)
 
         # Three scheduling paths:
         #   (a) dual-stream decode: compress runs on alt stream while q
@@ -995,7 +1171,9 @@ class IndexerKPool(Indexer):
 
         if is_decode:
             compress_fn = self._compress_write_decode
-        elif is_extend_prefill:
+        elif is_extend_prefill or is_draft_extend_v1:
+            # v1 draft_extend: variable q_len = accept_length+1; goes through
+            # the extend planner like a short prefill.
             compress_fn = self._compress_write_extend
         else:
             raise NotImplementedError(
@@ -1039,11 +1217,17 @@ class IndexerKPool(Indexer):
 
         # K-only fast path (extend only): caller wants the cache
         # populated but not the topk indices.
-        if is_extend_prefill and not return_indices:
+        if (is_extend_prefill or is_draft_extend_v1) and not return_indices:
             return None
 
         # Topk dispatch:
         #   decode               -> paged kernel
+        #   draft_extend v1      -> paged kernel; per-q seqlens from
+        #                           nsa_seqlens_expanded (the backend
+        #                           already produced the right per-q lengths
+        #                           and the matching repeat_interleave'd
+        #                           page_table_64). v2 already returned above
+        #                           via the verify path.
         #   prefill (in-seq-split CP) -> ragged_with_cp on prev/next halves
         #   prefill (otherwise)  -> ragged kernel; CP round-robin-split runs
         #                           rank-local because the planner already
@@ -1051,6 +1235,16 @@ class IndexerKPool(Indexer):
         if is_decode:
             return self._get_topk_paged(
                 forward_batch, layer_id, q_fp8, weights, metadata
+            )
+
+        if is_draft_extend_v1:
+            return self._get_topk_paged(
+                forward_batch,
+                layer_id,
+                q_fp8,
+                weights,
+                metadata,
+                seqlens_override=metadata.get_seqlens_expanded(),
             )
 
         if (

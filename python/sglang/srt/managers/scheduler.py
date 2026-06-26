@@ -1465,11 +1465,14 @@ class Scheduler(
         return disable_overlap_for_batch or need_grammar_sync
 
     def _has_retract_sensitive_recurrent_state(self) -> bool:
+        # NSA kpool's per-req tail ring would be corrupted by retract;
+        # mamba pool likewise. Both pools expose ``index_kpool`` /
+        # ``mamba_pool`` so no isinstance walk is needed.
         req_to_token_pool = self.tree_cache.req_to_token_pool
         token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-
-        return getattr(req_to_token_pool, "mamba_pool", None) is not None or getattr(
-            token_to_kv_pool, "kpool_use_compress", False
+        return (
+            getattr(req_to_token_pool, "mamba_pool", None) is not None
+            or getattr(token_to_kv_pool, "index_kpool", 1) > 1
         )
 
     def _drain_pending_overlap_result_for_retract(self) -> bool:

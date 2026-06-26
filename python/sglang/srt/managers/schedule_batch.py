@@ -1244,7 +1244,7 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        # Copies over the kv cache, mamba state, and NSA kpool compress-tail
+        # Copies over the kv cache, mamba state, and NSA kpool tail
         # (a per-request, req_pool_idx-indexed buffer) if available.
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices,

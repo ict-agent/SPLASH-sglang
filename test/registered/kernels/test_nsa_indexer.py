@@ -585,6 +585,9 @@ class TestNSAIndexer(CustomTestCase):
             page_size = 64
             index_head_dim = 128
             slots_per_page = 64
+            # Anchor-mode mock: tail width == pool_size, no spec scratch.
+            index_kpool = 16
+            tail_extra_slots = 0
 
         pool = _Pool()
 
@@ -599,6 +602,12 @@ class TestNSAIndexer(CustomTestCase):
             buf_fused = torch.zeros(
                 (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
             )
+            # tail_logical_base = 0 for every row: the saved tail prefix
+            # lives at physical slots [0, n_from_tail[r]) of tail[req],
+            # which matches the pre-ring per-pool layout. The ring kernel
+            # computes phys = (base + slot) % TAIL_SIZE, so base=0 is the
+            # non-wrap path.
+            tail_logical_base = torch.zeros(n_pools, dtype=torch.int32, device="cuda")
             kpool_assemble_softmax_rotate_write_cache(
                 pool=pool,
                 buf=buf_fused,
@@ -609,6 +618,7 @@ class TestNSAIndexer(CustomTestCase):
                 req_pool_idx=req_pool_idx,
                 n_from_tail=n_from_tail,
                 chunk_src_start=chunk_src_start,
+                tail_logical_base=tail_logical_base,
                 ape=ape,
                 loc=write_loc,
                 write_mask=write_mask,
@@ -640,146 +650,6 @@ class TestNSAIndexer(CustomTestCase):
             scale_fused = buf_fused[:, scale_offset:].view(torch.float32)
             scale_ref = buf_ref[:, scale_offset:].view(torch.float32)
             torch.testing.assert_close(scale_fused, scale_ref, atol=1e-4, rtol=1e-3)
-
-    def test_kpool_decode_update_matches_reference(self):
-        """kpool_decode_update_and_maybe_write_cache matches a PyTorch
-        reference: tail buffer updated for every valid row; compressed
-        cache entry written only when slot == POOL_SIZE - 1."""
-        from sglang.srt.layers.attention.nsa.kpool.kernels import (
-            kpool_decode_update_and_maybe_write_cache,
-        )
-
-        torch.manual_seed(1)
-        head_dim, pool_size, page_size = 128, 16, 64
-        slots_per_page = 64
-        page_nbytes = page_size * head_dim + page_size * 4
-        num_pages = 8
-        max_req = 4
-        batch = 4
-
-        h = torch.tensor([[1.0]], device="cuda")
-        for _ in range(7):
-            h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
-        H = (h / (head_dim**0.5)).to(torch.float32)
-
-        tail_k = torch.randn(
-            max_req, pool_size, head_dim, dtype=torch.bfloat16, device="cuda"
-        )
-        tail_score = torch.randn(
-            max_req, pool_size, head_dim, dtype=torch.bfloat16, device="cuda"
-        )
-        ape = torch.randn(pool_size, head_dim, dtype=torch.float32, device="cuda")
-        key = torch.randn(batch, head_dim, dtype=torch.bfloat16, device="cuda")
-        slot_score = torch.randn(batch, head_dim, dtype=torch.bfloat16, device="cuda")
-        # Mix of last-slot rows (do_write=True) and mid-slot rows (defer-only).
-        positions = torch.tensor(
-            [pool_size - 1, 5, 2 * pool_size - 1, 3],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        seq_lens = torch.tensor(
-            [pool_size + 1, 10, 2 * pool_size + 1, 5],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        # Distinct req per row: the deferred tail store races against other
-        # rows' softmax reads if (req, slot) pairs collide. Production decode
-        # satisfies this (1 token / req / step).
-        req_pool_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="cuda")
-        out_cache_loc = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
-        n_block_cols = 4
-        block_tables = torch.randint(
-            1, num_pages, (batch, n_block_cols), dtype=torch.int32, device="cuda"
-        )
-
-        class _Pool:
-            page_size = 64
-            index_head_dim = 128
-            slots_per_page = 64
-
-        pool = _Pool()
-        buf_kernel = torch.zeros(
-            (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
-        )
-        tail_k_kernel = tail_k.clone()
-        tail_score_kernel = tail_score.clone()
-        kpool_decode_update_and_maybe_write_cache(
-            pool=pool,
-            buf=buf_kernel,
-            tail_k=tail_k_kernel,
-            tail_score=tail_score_kernel,
-            key=key,
-            slot_score=slot_score,
-            ape=ape,
-            block_tables=block_tables,
-            req_pool_indices=req_pool_indices,
-            positions=positions,
-            seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            round_scale=False,
-        )
-
-        # PyTorch reference.
-        buf_ref = torch.zeros_like(buf_kernel)
-        tail_k_ref = tail_k.clone()
-        tail_score_ref = tail_score.clone()
-        buf_fp8 = buf_ref.view(torch.float8_e4m3fn)
-        buf_fp32 = buf_ref.view(torch.float32)
-        for r in range(batch):
-            req = int(req_pool_indices[r])
-            pos = int(positions[r])
-            slot = pos % pool_size
-            pos_valid = (
-                0 <= req < max_req
-                and out_cache_loc[r] != 0
-                and 0 <= pos < int(seq_lens[r])
-            )
-            if not pos_valid:
-                continue
-            do_write = slot == pool_size - 1
-            if do_write:
-                slot_k = tail_k[req].clone().to(torch.float32)
-                slot_s = tail_score[req].clone().to(torch.float32)
-                slot_k[slot] = key[r].to(torch.float32)
-                slot_s[slot] = slot_score[r].to(torch.float32)
-                score = slot_s + ape
-                w = torch.softmax(score, dim=0)
-                x = (w * slot_k).sum(dim=0)
-                x = x.to(torch.bfloat16).to(torch.float32)
-                x = (H @ x).to(torch.bfloat16).to(torch.float32)
-                absmax = torch.clamp(x.abs().max(), min=1e-4)
-                scale = absmax / 448.0
-                quantized = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-                pool_id = pos // pool_size
-                pool_page_group = pool_id // slots_per_page
-                token_pages_per_pool_group = pool_size * slots_per_page // page_size
-                token_page_row = pool_page_group * token_pages_per_pool_group
-                packed_page = int(block_tables[r, token_page_row])
-                slot_in_page = pool_id % slots_per_page
-                buf_fp8[
-                    packed_page, slot_in_page * head_dim : (slot_in_page + 1) * head_dim
-                ] = quantized
-                buf_fp32[
-                    packed_page,
-                    (slots_per_page * head_dim) // 4 + slot_in_page,
-                ] = scale
-            tail_k_ref[req, slot] = key[r]
-            tail_score_ref[req, slot] = slot_score[r]
-
-        # Tail buffers exact for the slots written; full tensor compare ok
-        # because untouched slots are bf16-identical clones.
-        torch.testing.assert_close(tail_k_kernel, tail_k_ref, atol=0, rtol=0)
-        torch.testing.assert_close(tail_score_kernel, tail_score_ref, atol=0, rtol=0)
-        # FP8 region: 1-ulp tolerance.
-        scale_offset = slots_per_page * head_dim
-        fp8_kernel = (
-            buf_kernel[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
-        )
-        fp8_ref = buf_ref[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
-        torch.testing.assert_close(fp8_kernel, fp8_ref, atol=64.0, rtol=0.05)
-        scale_kernel = buf_kernel[:, scale_offset:].view(torch.float32)
-        scale_ref_v = buf_ref[:, scale_offset:].view(torch.float32)
-        torch.testing.assert_close(scale_kernel, scale_ref_v, atol=1e-4, rtol=1e-3)
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):
@@ -1043,6 +913,234 @@ class TestNSAIndexer(CustomTestCase):
                 expected_blocks = (seq_len + 63) // 64
                 self.assertEqual(page_table.shape[0], batch_size)
                 self.assertGreaterEqual(page_table.shape[1], expected_blocks)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKpoolVerifyRingKernels(CustomTestCase):
+    """Coverage for the target_verify-side kpool ring kernel:
+
+    * ``kpool_write_tail_and_maybe_compress`` (fused draft-write +
+      closed-pool compress)
+    * ring-wrap correctness of the closed-pool compress vs the bulk-mode
+      ``kpool_assemble_softmax_rotate_write_cache`` reference.
+    """
+
+    HEAD_DIM = 128
+    POOL_SIZE = 16
+    PAGE_SIZE = 64
+    SLOTS_PER_PAGE = 4  # = page_size // pool_size (dense kpool)
+
+    def _pool(self, tail_extra_slots: int):
+        class _Pool:
+            pass
+
+        p = _Pool()
+        p.page_size = self.PAGE_SIZE
+        p.index_head_dim = self.HEAD_DIM
+        p.slots_per_page = self.SLOTS_PER_PAGE
+        p.index_kpool = self.POOL_SIZE
+        p.tail_extra_slots = tail_extra_slots
+        p.quant_block_size = 128
+        return p
+
+    def test_write_draft_tail_ring_wrap(self):
+        """Drafts at logical positions [committed, committed+N) must land at
+        physical slot (logical % TAIL_SIZE). Tested via the fused kernel
+        with committed values chosen so no pool closes (compress half
+        short-circuits in-kernel)."""
+        from sglang.srt.layers.attention.nsa.kpool.kernels import (
+            kpool_write_tail_and_maybe_compress,
+        )
+
+        N = 4
+        TAIL_SIZE = self.POOL_SIZE + N  # 20
+        max_req = 3
+        num_pages = 1
+        page_nbytes = self.PAGE_SIZE * self.HEAD_DIM + self.PAGE_SIZE * 4
+        # Committed near the ring boundary: writes wrap around but no pool
+        # closes (none of these committed + N crosses a pool=16 boundary).
+        # req 0: committed=18 -> phys: 18, 19, 0, 1  | (18+4)//16 - 18//16 = 0
+        # req 1: committed=0  -> phys: 0, 1, 2, 3    | (0+4)//16 - 0//16 = 0
+        # req 2: committed=19 -> phys: 19, 0, 1, 2   | (19+4)//16 - 19//16 = 0
+        committed_vals = [TAIL_SIZE - 2, 0, TAIL_SIZE - 1]
+        req_indices = [0, 1, 2]
+        B = len(committed_vals)
+        bn = B * N
+
+        torch.manual_seed(42)
+        key = torch.randn(bn, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        score = torch.randn(bn, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        tail_k = torch.zeros(
+            max_req, TAIL_SIZE, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        tail_score = torch.zeros_like(tail_k)
+        ape = torch.zeros(
+            self.POOL_SIZE, self.HEAD_DIM, dtype=torch.float32, device="cuda"
+        )
+        buf = torch.zeros((num_pages, page_nbytes), dtype=torch.uint8, device="cuda")
+
+        write_start = torch.tensor(committed_vals, dtype=torch.int32, device="cuda")
+        req = torch.tensor(req_indices, dtype=torch.int64, device="cuda")
+        # No closure for any batch: tail_logical_start / write_loc unused
+        # (kernel derives "did pool close?" from committed + N and skips).
+        zero_i32 = torch.zeros(B, dtype=torch.int32, device="cuda")
+        zero_i64 = torch.zeros(B, dtype=torch.int64, device="cuda")
+        # No padded batches in this test: all out_cache_loc non-zero.
+        out_cache_loc = torch.arange(1, B * N + 1, dtype=torch.int64, device="cuda")
+
+        kpool_write_tail_and_maybe_compress(
+            pool=self._pool(tail_extra_slots=N),
+            buf=buf,
+            key=key,
+            score=score,
+            tail_k=tail_k,
+            tail_score=tail_score,
+            ape=ape,
+            req_pool_indices=req,
+            write_start=write_start,
+            tail_logical_start=zero_i32,
+            write_loc=zero_i64,
+            out_cache_loc=out_cache_loc,
+            num_draft_tokens=N,
+            round_scale=False,
+        )
+
+        for i_b, (c, r) in enumerate(zip(committed_vals, req_indices)):
+            for i_n in range(N):
+                row = i_b * N + i_n
+                phys = (c + i_n) % TAIL_SIZE
+                torch.testing.assert_close(tail_k[r, phys], key[row], atol=0, rtol=0)
+                torch.testing.assert_close(
+                    tail_score[r, phys], score[row], atol=0, rtol=0
+                )
+
+    def test_compress_from_tail_matches_assemble_full_tail(self):
+        """Closed-pool compress (tail-only) is equivalent to
+        ``kpool_assemble_softmax_rotate_write_cache`` with
+        ``n_from_tail == POOL_SIZE`` when both use the same ring base.
+
+        Driven via ``kpool_write_tail_and_maybe_compress`` with
+        N=1 and committed picked so each batch's draft closes a pool
+        (committed % POOL_SIZE == POOL_SIZE - 1); the draft writes are
+        no-ops (key set to current tail value), so the compress side
+        sees the same tail content the reference assemble does.
+        """
+        from sglang.srt.layers.attention.nsa.kpool.kernels import (
+            kpool_assemble_softmax_rotate_write_cache,
+            kpool_write_tail_and_maybe_compress,
+        )
+
+        torch.manual_seed(7)
+        max_req = 4
+        TAIL_SIZE = self.POOL_SIZE + 4  # spec-style extra slots
+        n_pools = 5
+        N = 4
+        num_pages = 4
+        page_nbytes = self.PAGE_SIZE * self.HEAD_DIM + self.PAGE_SIZE * 4
+
+        tail_k_ref = torch.randn(
+            max_req,
+            TAIL_SIZE,
+            self.HEAD_DIM,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        tail_score_ref = torch.randn_like(tail_k_ref)
+        ape = torch.randn(
+            self.POOL_SIZE, self.HEAD_DIM, dtype=torch.float32, device="cuda"
+        )
+        # Heterogeneous ring bases across pools: 0 (no wrap), 1, 3, 5, 17
+        # (wraps because 17 + 16 > 20).
+        tail_logical_base = torch.tensor(
+            [0, 1, 3, 5, 17], dtype=torch.int32, device="cuda"
+        )
+        req_pool_idx = torch.tensor([0, 1, 2, 0, 3], dtype=torch.int64, device="cuda")
+        write_loc = torch.tensor([0, 1, 2, 4, 5], dtype=torch.int64, device="cuda")
+
+        pool = self._pool(tail_extra_slots=4)
+
+        # --- Reference: assemble with all slots from tail -----------------
+        buf_ref = torch.zeros(
+            (num_pages, page_nbytes), dtype=torch.uint8, device="cuda"
+        )
+        chunk_k = torch.zeros(1, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        chunk_score = torch.zeros_like(chunk_k)
+        n_from_tail = torch.full(
+            (n_pools,), self.POOL_SIZE, dtype=torch.int32, device="cuda"
+        )
+        chunk_src_start = torch.zeros(n_pools, dtype=torch.int64, device="cuda")
+        kpool_assemble_softmax_rotate_write_cache(
+            pool=pool,
+            buf=buf_ref,
+            chunk_k=chunk_k,
+            chunk_score=chunk_score,
+            tail_k=tail_k_ref,
+            tail_score=tail_score_ref,
+            req_pool_idx=req_pool_idx,
+            n_from_tail=n_from_tail,
+            chunk_src_start=chunk_src_start,
+            tail_logical_base=tail_logical_base,
+            ape=ape,
+            loc=write_loc,
+            round_scale=False,
+        )
+
+        # --- Merged kernel ------------------------------------------------
+        # Drive the compress half by picking committed so (committed+N)//P >
+        # committed//P. For N=1, P=16: committed % 16 == 15 closes a pool.
+        # Draft writes (1 per program) land at phys = (committed+0)%TAIL_SIZE
+        # = 15, which collides with the compress read window for every
+        # tail_logical_base here. So set key = tail value at that slot
+        # (a bit-exact no-op write).
+        buf_new = torch.zeros_like(buf_ref)
+        tail_k_new = tail_k_ref.clone()
+        tail_score_new = tail_score_ref.clone()
+        N = 1  # Single-draft scenario for this equivalence test.
+        write_start_vals = torch.tensor(
+            [15] * n_pools, dtype=torch.int32, device="cuda"
+        )
+        key = torch.empty(
+            n_pools * N, self.HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        score_in = torch.empty_like(key)
+        for b in range(n_pools):
+            r = int(req_pool_idx[b].item())
+            for i_n in range(N):
+                phys = (int(write_start_vals[b].item()) + i_n) % TAIL_SIZE
+                key[b * N + i_n] = tail_k_new[r, phys]
+                score_in[b * N + i_n] = tail_score_new[r, phys]
+
+        # No padded batches; all out_cache_loc non-zero.
+        out_cache_loc = torch.arange(
+            1, n_pools * N + 1, dtype=torch.int64, device="cuda"
+        )
+
+        kpool_write_tail_and_maybe_compress(
+            pool=pool,
+            buf=buf_new,
+            key=key,
+            score=score_in,
+            tail_k=tail_k_new,
+            tail_score=tail_score_new,
+            ape=ape,
+            req_pool_indices=req_pool_idx,
+            write_start=write_start_vals,
+            tail_logical_start=tail_logical_base,
+            write_loc=write_loc,
+            out_cache_loc=out_cache_loc,
+            num_draft_tokens=N,
+            round_scale=False,
+        )
+
+        # FP8 region: exact (same kernel math), 1-ulp slack just in case.
+        scale_offset = self.SLOTS_PER_PAGE * self.HEAD_DIM
+        fp8_ref = buf_ref[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+        fp8_new = buf_new[:, :scale_offset].view(torch.float8_e4m3fn).to(torch.float32)
+        torch.testing.assert_close(fp8_new, fp8_ref, atol=0.0, rtol=0.0)
+        # Scale region: int-cast view, exact.
+        scale_ref_v = buf_ref[:, scale_offset:].view(torch.float32)
+        scale_new_v = buf_new[:, scale_offset:].view(torch.float32)
+        torch.testing.assert_close(scale_new_v, scale_ref_v, atol=0.0, rtol=0.0)
 
 
 if __name__ == "__main__":

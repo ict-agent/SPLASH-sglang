@@ -136,9 +136,9 @@ class ModelRunnerKVCacheMixin:
                 # Anchor layout stores one slot per token (slots_per_page = page_size);
                 # dense kpool-compress packs page_size // pool_size pool slots per page,
                 # i.e. the per-token indexer overhead shrinks by 1/pool_size.
-                # Mirrors the buffer math in NSATokenToKVPool._alloc_index_k_with_scale_buffer.
-                nsa_kpool = self.model_config.nsa_kpool
-                slot_scale = 1.0 / nsa_kpool.pool_size if nsa_kpool.is_compress else 1.0
+                # Mirrors the index_k+scale buffer math in NSATokenToKVPool.__init__.
+                pool_size = self.model_config.nsa_index_kpool
+                slot_scale = 1.0 / pool_size if pool_size > 1 else 1.0
                 indexer_size_per_token = (
                     index_head_dim
                     + index_head_dim // NSATokenToKVPool.quant_block_size * 4
@@ -669,12 +669,22 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
-                nsa_pool_kwargs["nsa_kpool"] = self.model_config.nsa_kpool
-                # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
-                # must cover the *full* request-pool capacity, not just max_running_requests.
-                nsa_pool_kwargs["max_running_requests"] = (
-                    self.req_to_token_pool.req_to_token.shape[0]
-                )
+                # Single NSA pool class for both anchor (index_kpool == 1)
+                # and dense kpool layouts. Kpool-only kwargs are passed
+                # unconditionally; ``__init__`` asserts the contract.
+                nsa_pool_kwargs["nsa_index_kpool"] = self.model_config.nsa_index_kpool
+                if self.model_config.nsa_index_kpool > 1:
+                    # Tail buffers are indexed by req_pool_idx, so they cover
+                    # the full request-pool capacity, not just max_running_requests.
+                    nsa_pool_kwargs["max_running_requests"] = (
+                        self.req_to_token_pool.req_to_token.shape[0]
+                    )
+                    # Spec-decoding (EAGLE target_verify) needs N extra bf16
+                    # tail slots per request to stage draft K/score before
+                    # commit. 0 when spec-decode is off.
+                    nsa_pool_kwargs["tail_extra_slots"] = (
+                        self.server_args.speculative_num_draft_tokens or 0
+                    )
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -759,14 +769,17 @@ class ModelRunnerKVCacheMixin:
                     extra_args["index_head_dim"] = get_nsa_index_head_dim(
                         self.model_config.hf_config
                     )
-                    extra_args["nsa_kpool"] = self.model_config.nsa_kpool
-                    # NSA kpool compress-tail buffers are indexed by req_pool_idx, so they
+                    extra_args["nsa_index_kpool"] = self.model_config.nsa_index_kpool
+                    # NSA kpool tail buffers are indexed by req_pool_idx, so they
                     # must cover the *full* request-pool capacity, not just max_running_requests.
                     extra_args["max_running_requests"] = (
                         self.req_to_token_pool.req_to_token.shape[0]
                     )
                     extra_args["layer_shard_rank"] = nsa_cp_layer_shard_rank
                     extra_args["layer_shard_size"] = nsa_cp_layer_shard_size
+                    extra_args["tail_extra_slots"] = (
+                        self.server_args.speculative_num_draft_tokens or 0
+                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,

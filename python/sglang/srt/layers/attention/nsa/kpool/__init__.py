@@ -8,18 +8,20 @@ Layered architecture:
 
 Public API:
     IndexerKPool
-    KPoolExtendPlan, PoolWriteRows, TailWriteRows, KPoolCpInfo
-    init_kpool_extend_metadata, init_pooled_paged_mqa_metadata,
-    update_pooled_paged_mqa_metadata
+    KPoolExtendPlan, KPoolWritePlan, PoolWriteRows, TailWriteRows, KPoolCpInfo
+    init_kpool_extend_metadata, init_kpool_write_plan,
+    init_pooled_paged_mqa_metadata, update_pooled_paged_mqa_metadata
 """
 
 from sglang.srt.layers.attention.nsa.kpool.indexer import IndexerKPool
 from sglang.srt.layers.attention.nsa.kpool.planner import (
     KPoolCpInfo,
     KPoolExtendPlan,
+    KPoolWritePlan,
     PoolWriteRows,
     TailWriteRows,
     init_kpool_extend_metadata,
+    init_kpool_write_plan,
     init_pooled_paged_mqa_metadata,
     update_pooled_paged_mqa_metadata,
 )
@@ -28,9 +30,11 @@ __all__ = [
     "IndexerKPool",
     "KPoolCpInfo",
     "KPoolExtendPlan",
+    "KPoolWritePlan",
     "PoolWriteRows",
     "TailWriteRows",
     "init_kpool_extend_metadata",
+    "init_kpool_write_plan",
     "init_pooled_paged_mqa_metadata",
     "update_pooled_paged_mqa_metadata",
 ]
