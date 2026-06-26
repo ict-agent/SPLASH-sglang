@@ -41,6 +41,11 @@ class SchedulerRuntimeCheckerMixin:
             return self.tree_cache.session_held_req_count()
         return 0
 
+    def _session_held_mamba_slots(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_mamba_slots()
+        return 0
+
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -143,9 +148,11 @@ class SchedulerRuntimeCheckerMixin:
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
         session_held = self._session_held_tokens()
+        session_held_mamba = self._session_held_mamba_slots()
         memory_leak = (
             full_num_used != self.tree_cache.full_protected_size() + session_held
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+            or mamba_num_used
+            != self.tree_cache.mamba_protected_size() + session_held_mamba
         )
         if memory_leak:
             free_full_pages = set(
@@ -171,12 +178,12 @@ class SchedulerRuntimeCheckerMixin:
             )
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
+                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, {session_held_mamba=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
             )
         else:
             token_msg = (
                 f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
+                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, {session_held_mamba=}\n"
             )
         return memory_leak, token_msg
 

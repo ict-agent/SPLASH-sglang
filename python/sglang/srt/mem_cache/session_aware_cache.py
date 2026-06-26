@@ -81,8 +81,14 @@ class SessionSlot:
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
+        # Ownership has moved to the session slot. Clear all req-side
+        # mamba refs so later alloc/free paths cannot observe stale slots.
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_seqlen = None
+        req.mamba_branching_seqlen = None
         req.mamba_cow_src_index = None
         req.mamba_needs_clear = False
 
@@ -202,9 +208,49 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
+
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            # Current branch can keep session on pre-rejected abort reqs.
+            # If no pool state was allocated, do not release an existing slot.
+            if (
+                req.req_pool_idx is None
+                and req.mamba_pool_idx is None
+                and req.mamba_ping_pong_track_buffer is None
+            ):
+                return
+
+            if slot is None:
+                slot = SessionSlot(
+                    req_pool_idx=req.req_pool_idx,
+                    kv_allocated_len=req.kv_allocated_len,
+                    last_node=req.last_node,
+                    cache_protected_len=req.cache_protected_len,
+                    swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    mamba_pool_idx=req.mamba_pool_idx,
+                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
+                )
+                self.slots[session_id] = slot
+            else:
+                slot.kv_allocated_len = max(
+                    slot.kv_allocated_len, req.kv_allocated_len
+                )
+
+            self.release_session(session_id)
+            req.req_pool_idx = None
+            req.mamba_pool_idx = None
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
+            req.mamba_last_track_seqlen = None
+            req.mamba_branching_seqlen = None
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
+            return
+
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
@@ -269,6 +315,22 @@ class SessionAwareCache(BasePrefixCache):
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+        self._free_slot_mamba(slot)
+
+    def _free_slot_mamba(self, slot: SessionSlot) -> None:
+        """Return mamba state owned by a session slot to the mamba pool."""
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        if slot.mamba_pool_idx is not None:
+            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            slot.mamba_pool_idx = None
+        if slot.mamba_ping_pong_track_buffer is not None:
+            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            slot.mamba_ping_pong_track_buffer = None
+        slot.mamba_next_track_idx = None
+        slot.mamba_last_track_seqlen = None
+        slot.mamba_branching_seqlen = None
 
     def session_held_tokens(self) -> int:
         """Total KV tokens held by session slots, not tracked by the tree."""
@@ -297,6 +359,16 @@ class SessionAwareCache(BasePrefixCache):
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
         return sum(s.is_holding_kv for s in self.slots.values())
+
+    def session_held_mamba_slots(self) -> int:
+        """Total mamba pool slots held by streaming session slots."""
+        total = 0
+        for slot in self.slots.values():
+            if slot.mamba_pool_idx is not None:
+                total += slot.mamba_pool_idx.numel()
+            if slot.mamba_ping_pong_track_buffer is not None:
+                total += slot.mamba_ping_pong_track_buffer.numel()
+        return total
 
     # -- Pass-through methods --
 
