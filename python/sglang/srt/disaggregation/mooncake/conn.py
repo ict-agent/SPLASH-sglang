@@ -1433,6 +1433,15 @@ class MooncakeKVManager(CommonKVManager):
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Failed
+                ):
+                    logger.debug(
+                        f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
+                    )
+                    continue
+
+                if (
                     self.enable_staging
                     and staging_strategy is None
                     and staging_buffer is not None
@@ -2145,6 +2154,7 @@ class MooncakeKVSender(CommonKVSender):
             "Aborted by AbortReq.",
         )
         # Explicitly set the status to failure since this request has been aborted
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
 
