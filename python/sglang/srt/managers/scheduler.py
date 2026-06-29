@@ -1067,7 +1067,11 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                mtp_topk_indices_dim=get_mtp_index_share_topk(model_config.hf_config),
+                mtp_topk_indices_dim=(
+                    get_mtp_index_share_topk(model_config.hf_config)
+                    if self.draft_worker is not None and not self.spec_algorithm.is_ngram()
+                    else 0
+                ),
             )
 
             # The decode requests polling kv cache
@@ -1123,7 +1127,11 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-                mtp_topk_indices_dim=get_mtp_index_share_topk(model_config.hf_config),
+                mtp_topk_indices_dim=(
+                    get_mtp_index_share_topk(model_config.hf_config)
+                    if self.draft_worker is not None and not self.spec_algorithm.is_ngram()
+                    else 0
+                ),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
