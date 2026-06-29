@@ -1769,26 +1769,17 @@ class ServerArgs:
         model_arch = hf_config.architectures[0]
 
         if model_arch == "Glm5NextForCausalLM" and not self.disable_radix_cache:
-            if getattr(hf_config, "disable_nsa", False):
-                if (
-                    self.attention_backend == "dcu_mla"
-                    or self.prefill_attention_backend == "dcu_mla"
-                    or self.decode_attention_backend == "dcu_mla"
-                ):
-                    self.page_size = 64
-                if self.mamba_scheduler_strategy != "extra_buffer":
-                    self.mamba_scheduler_strategy = "extra_buffer"
-                    logger.warning(
-                        "Use mamba extra_buffer for Glm5NextForCausalLM KDA+MLA radix cache "
-                        "so page_size can stay compatible with the MLA backend."
-                    )
-            else:
-                self.disable_radix_cache = True
-                if self.mamba_scheduler_strategy == "extra_buffer":
-                    self.mamba_scheduler_strategy = "no_buffer"
+            if (
+                self.attention_backend == "dcu_mla"
+                or self.prefill_attention_backend == "dcu_mla"
+                or self.decode_attention_backend == "dcu_mla"
+            ):
+                self.page_size = 64
+            if self.mamba_scheduler_strategy != "extra_buffer":
+                self.mamba_scheduler_strategy = "extra_buffer"
                 logger.warning(
-                    "Disabling Radix Cache for Glm5NextForCausalLM with NSA enabled. "
-                    "Only KDA+MLA radix cache is enabled in this path for now."
+                    "Use mamba extra_buffer for Glm5NextForCausalLM KDA hybrid radix cache "
+                    "so page_size can stay compatible with MLA/NSA backends."
                 )
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)

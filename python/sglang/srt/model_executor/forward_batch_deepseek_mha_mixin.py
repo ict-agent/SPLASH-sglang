@@ -108,11 +108,15 @@ class ForwardBatchDeepSeekMHAMixin:
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
 
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+
+        token_to_kv_pool = self.token_to_kv_pool
+        if isinstance(token_to_kv_pool, HybridLinearKVPool):
+            token_to_kv_pool = token_to_kv_pool.full_kv_pool
 
         assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
-        ), "Currently chunked prefix cache can only be used by Deepseek models"
+            token_to_kv_pool, MLATokenToKVPool
+        ), "Currently chunked prefix cache can only be used by MLA models"
 
         if not any(self.extend_prefix_lens_cpu):
             self.num_prefix_chunks = 0

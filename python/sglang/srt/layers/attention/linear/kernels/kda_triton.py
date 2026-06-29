@@ -65,6 +65,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        return_intermediate_state: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         return chunk_kda(
@@ -80,4 +81,5 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            return_intermediate_state=return_intermediate_state,
         )

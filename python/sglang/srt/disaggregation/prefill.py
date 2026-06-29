@@ -822,7 +822,10 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+                device_page_size = self.token_to_kv_pool.page_size
+                return kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), device_page_size
+                )
 
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
