@@ -425,13 +425,8 @@ class ModelNextLinearAttention(nn.Module):
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
-        # Split views keep the row stride of the larger fused projection. KDA
-        # kernels expect compact packed qkv/beta/gate inputs.
-        qkv = qkv.contiguous()
-        beta = beta.contiguous()
-        fg_a_states = fg_a_states.contiguous()
         forget_gate, g_proj_states = self.fused_fg_b_proj(
-            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1).contiguous()
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         )
         return qkv, beta, forget_gate, g_proj_states
 
