@@ -791,6 +791,10 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        # GLM NOTE: NSA index_share_for_mtp_iteration: indices captured on prefill side
+        # for the draft model to reuse on decode side. Optional; may be None
+        # when the feature is disabled or capture failed.
+        self.mtp_topk_indices_tensor = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
@@ -1411,6 +1415,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_num_seqs: Optional[List[int]] = None
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False

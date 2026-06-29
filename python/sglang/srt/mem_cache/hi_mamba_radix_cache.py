@@ -35,7 +35,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     TreeNode,
     get_last_access_time,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool, KVCache
 from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     MambaPoolHost,
@@ -311,6 +311,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
+        if self.cache_controller.mem_pool_host_draft is not None:
+            self.cache_controller.mem_pool_host_draft.clear()
         self.mamba_host_lru_list = HostLRUList()
         logger.info(
             "HiMambaRadixCache reset completed: host_kv_available=%s host_mamba_available=%s",
@@ -1413,6 +1415,44 @@ class HiMambaRadixCache(MambaRadixCache):
         return DecLockRefResult(delta=delta)
 
     # ---- L3 Support ----
+
+    def register_hicache_draft_pool(
+        self,
+        draft_kv_pool: Optional[KVCache],
+        server_args: "ServerArgs",
+    ) -> None:
+        """Register an MTP draft KV pool for L2 piggyback on target transfers."""
+        if draft_kv_pool is None:
+            return
+
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            NSATokenToKVPool,
+        )
+
+        # The draft worker is flagged mambaish for GLM5Next, so its KV pool is a
+        # HybridLinearKVPool whose full_kv_pool is the single-layer NSA (DSA)
+        # block. Unwrap to the NSA pool that actually holds latent + index_k.
+        if isinstance(draft_kv_pool, HybridLinearKVPool):
+            draft_kv_pool = draft_kv_pool.full_kv_pool
+        if not isinstance(draft_kv_pool, NSATokenToKVPool):
+            logger.warning(
+                "Skipping draft hicache: expected NSATokenToKVPool for GLM5Next "
+                "MTP, got %s.",
+                type(draft_kv_pool).__name__,
+            )
+            return
+
+        draft_host_to_device_ratio = self.full_kv_pool_host.size / self.kvcache.size
+        draft_host = NSATokenToKVPoolHost(
+            draft_kv_pool,
+            draft_host_to_device_ratio,
+            0,
+            self.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        self.cache_controller.set_draft_kv_pool(draft_kv_pool, draft_host)
 
     def shutdown(self):
         try:

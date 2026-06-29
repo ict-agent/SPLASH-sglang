@@ -162,6 +162,21 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
+            # GLM NOTE: NSA index_share_for_mtp_iteration: rebuild per-request seed
+            # indices from prefill. We require ALL reqs in the batch to have
+            # a captured tensor (or NONE do) — otherwise we can't stack to a
+            # uniform shape. If any req is missing, drop the whole field and
+            # let the draft fallback path recompute from scratch.
+            mtp_topk_indices = None
+            mtp_indices_list = [
+                getattr(req, "mtp_topk_indices_tensor", None)
+                for req in self.reqs
+            ]
+            if mtp_indices_list and all(t is not None for t in mtp_indices_list):
+                mtp_topk_indices = torch.stack(mtp_indices_list, dim=0).to(
+                    self.device
+                )
+
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -169,6 +184,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
+                mtp_topk_indices=mtp_topk_indices,
                 verified_id=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )

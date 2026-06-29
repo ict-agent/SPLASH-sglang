@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -79,6 +80,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.enable_mtp_index_share = is_mtp_index_share_enabled(
+            model_runner.model_config.hf_config
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -383,6 +387,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
         )
+        if self.enable_mtp_index_share:
+            forward_batch.capture_mtp_topk_indices = True
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -408,6 +414,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            topk_indices_backup = forward_batch.topk_indices
 
             ret = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -416,9 +423,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             probs = torch.softmax(ret.next_token_logits, dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+            ret.mtp_topk_indices = forward_batch.topk_indices
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.topk_indices = topk_indices_backup
             return ret
 
         self._capture_init(run_once)
@@ -543,6 +552,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
+                mtp_topk_indices=out_copy.mtp_topk_indices,
             )
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]

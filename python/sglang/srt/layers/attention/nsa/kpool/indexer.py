@@ -601,6 +601,11 @@ class IndexerKPool(Indexer):
             else metadata.get_seqlens_int32()
         )
         assert len(q_fp8.shape) == 3
+        num_q_padded = q_fp8.shape[0]
+        n_real = seqlens_32.shape[0]
+        if n_real < num_q_padded:
+            q_fp8 = q_fp8[:n_real]
+            weights = weights[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)
         assert len(kv_cache_fp8.shape) == 2
         # Anchor: index_kpool=1  -> block_kv=64, row=8448 B/page
@@ -638,6 +643,10 @@ class IndexerKPool(Indexer):
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
+            # ``out_rows`` makes the topk kernel pad its output back to the
+            # padded q row count (caller upstream expects topk_indices.shape[0]
+            # == hidden_states.shape[0]); padding rows are filled with -1.
+            out_rows=num_q_padded if num_q_padded != n_real else None,
         )
 
     def _get_topk_ragged(

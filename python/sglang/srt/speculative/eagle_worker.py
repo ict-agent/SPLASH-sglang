@@ -4,6 +4,11 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import (
+    get_mtp_index_share_topk,
+    get_nsa_index_topk,
+    is_mtp_index_share_enabled,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -560,6 +565,19 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+        if is_mtp_index_share_enabled(self.model_config.hf_config) and not batch.forward_mode.is_idle():
+            if spec_info.mtp_topk_indices is not None:
+                logger.debug(
+                    "Draft MTP index share enabled: reusing draft_extend "
+                    f"topk_indices (cuda_graph={bool(can_cuda_graph)}, "
+                    f"shape={tuple(spec_info.mtp_topk_indices.shape)})",
+                )
+            else:
+                logger.debug(
+                    "Draft MTP index share enabled but draft_extend "
+                    f"topk_indices are unavailable; falling back to local "
+                    f"compute (cuda_graph={bool(can_cuda_graph)})",
+                )
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -649,6 +667,12 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
+        # Reuse NSA/DSA topk_indices from the first draft forward step for
+        # subsequent steps, analogous to skip_topk in deepseek_v2.py layers.
+        index_share_for_mtp_iteration = is_mtp_index_share_enabled(self.model_config.hf_config)
+        if index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            forward_batch.topk_indices = spec_info.mtp_topk_indices
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -693,6 +717,9 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
+        if index_share_for_mtp_iteration:
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
@@ -775,9 +802,7 @@ class EAGLEWorker(TpModelWorker):
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
+            self.target_worker.model_runner.mambaish_config is not None
         ):
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
@@ -909,13 +934,32 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
+        # Draft extend reuses the target batch, whose global_num_tokens_for_logprob
+        # was computed for return_logprob=True (= per-rank Σ(logprob_len)). But draft
+        # extend runs return_logprob=False and only gathers the last token per sequence
+        # (pruned_states has batch_size rows). Reset the DP logprob-gather counts to the
+        # per-rank seq counts so the gather mask matches the real rows; otherwise the
+        # inflated counts overflow the gather buffer (illegal memory access).
+        if (
+            batch.global_num_seqs is not None
+            and forward_batch.global_num_tokens_for_logprob_cpu is not None
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            forward_batch.global_num_tokens_for_logprob_cpu = batch.global_num_seqs
+            forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                batch.global_num_seqs, dtype=torch.int64
+            ).to(self.draft_model_runner.device, non_blocking=True)
+        if is_mtp_index_share_enabled(self.model_config.hf_config):
+            forward_batch.capture_mtp_topk_indices = True
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(
+            logits_output, forward_batch.spec_info, forward_batch=forward_batch
+        )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -982,8 +1026,16 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_index,
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            self.maybe_store_draft_seed_mtp_topk_indices(
+                forward_batch.spec_info,
+                forward_batch,
+                mtp_topk_indices=logits_output.mtp_topk_indices,
+                cuda_graph=True,
+            )
         else:
             forward_batch.can_run_dp_cuda_graph = False
+            if is_mtp_index_share_enabled(self.model_config.hf_config):
+                forward_batch.capture_mtp_topk_indices = True
             if not forward_batch.forward_mode.is_idle():
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
@@ -991,7 +1043,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            self.capture_for_decode(
+                logits_output, forward_batch.spec_info, forward_batch=forward_batch
+            )
 
         maybe_detect_nan(
             logits_output.next_token_logits,
@@ -1010,11 +1064,71 @@ class EAGLEWorker(TpModelWorker):
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self,
+        logits_output: LogitsProcessorOutput,
+        draft_input: EagleDraftInput,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+        self.maybe_store_draft_seed_mtp_topk_indices(
+            draft_input, forward_batch, cuda_graph=False
+        )
+
+
+    def extract_draft_seed_mtp_topk_indices(
+        self,
+        forward_batch: ForwardBatch,
+        mtp_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not is_mtp_index_share_enabled(self.model_config.hf_config):
+            return None
+
+        mtp_topk_indices = (
+            forward_batch.topk_indices
+            if mtp_topk_indices is None
+            else mtp_topk_indices
+        )
+        if mtp_topk_indices is None or forward_batch.extend_seq_lens is None:
+            return None
+
+        last_token_indices = torch.cumsum(
+            forward_batch.extend_seq_lens.to(torch.int64), dim=0
+        ) - 1
+        return mtp_topk_indices.index_select(0, last_token_indices)
+
+    def maybe_store_draft_seed_mtp_topk_indices(
+        self,
+        draft_input: EagleDraftInput,
+        forward_batch: Optional[ForwardBatch],
+        mtp_topk_indices: Optional[torch.Tensor] = None,
+        cuda_graph: bool = False,
+    ) -> None:
+        if not is_mtp_index_share_enabled(self.model_config.hf_config):
+            return
+
+        draft_input.mtp_topk_indices = None
+        if forward_batch is None:
+            return
+
+        draft_seed_mtp_topk_indices = self.extract_draft_seed_mtp_topk_indices(
+            forward_batch, mtp_topk_indices=mtp_topk_indices
+        )
+        if draft_seed_mtp_topk_indices is None:
+            if not forward_batch.forward_mode.is_idle():
+                logger.debug(
+                    "Draft MTP index share enabled but draft_extend produced no "
+                    f"reusable topk_indices (cuda_graph={cuda_graph})",
+                )
+            return
+
+        draft_input.mtp_topk_indices = draft_seed_mtp_topk_indices.clone()
+        logger.debug(
+            "Captured draft_extend topk_indices for draft reuse "
+            f"(cuda_graph={cuda_graph}, "
+            f"shape={tuple(draft_input.mtp_topk_indices.shape)})",
+        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

@@ -649,6 +649,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
+    # shape: (b, nsa_index_topk)
+    mtp_topk_indices: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
@@ -802,12 +804,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
+            if self.mtp_topk_indices is not None:
+                self.mtp_topk_indices = self.mtp_topk_indices[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
+            if self.mtp_topk_indices is not None:
+                self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
@@ -825,6 +831,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.mtp_topk_indices = spec_info.mtp_topk_indices
             return
         if spec_info.hidden_states is None:
             return
@@ -834,6 +841,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.mtp_topk_indices is None:
+            self.mtp_topk_indices = spec_info.mtp_topk_indices
+        elif spec_info.mtp_topk_indices is not None:
+            self.mtp_topk_indices = torch.cat(
+                [self.mtp_topk_indices, spec_info.mtp_topk_indices]
+            )
 
 
 @dataclass

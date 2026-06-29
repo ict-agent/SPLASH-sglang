@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -89,9 +90,14 @@ class KDAKernelDispatcher:
                 "KDA supports 'triton' or 'flash_kda' for prefill."
             )
 
+        # KDA verify kernel is only implemented in TritonKDAKernel
+        # (FlashKDA/CuteDSL will raise NotImplementedError). Hard-bind 
+        # so verify works even when extend_backend is flash_kda.
+        self.verify_kernel = triton_kernel
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__}"
+            f"extend={self.extend_kernel.__class__.__name__},"
+            f"verify={self.verify_kernel.__class__.__name__} "
         )
 
     @property
@@ -149,6 +155,45 @@ class KDAKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            **kwargs,
+        )
+    
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+        safe_gate_lower_bound: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_steps,
+            retrieve_parent_token=retrieve_parent_token,
+            safe_gate_lower_bound=safe_gate_lower_bound,
             **kwargs,
         )
 
@@ -274,112 +319,160 @@ class KDAAttnBackend(MambaAttnBackendBase):
             a = a[:, :n_valid]
             b = b[:, :n_valid]
 
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
+        retrieve_next_token = forward_metadata.retrieve_next_token
+        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
 
         ssm_states = mamba_cache_params.temporal
 
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
         splits = [layer.q_dim, layer.k_dim, layer.v_dim]
-        mixed_qkv = mixed_qkv.transpose(0, 1)
-        if forward_metadata.has_mamba_track_mask:
-            mixed_qkv_to_track = mixed_qkv[
-                :, forward_metadata.track_conv_indices
-            ].transpose(0, 1)
-            conv_states[forward_metadata.conv_states_mask_indices] = (
-                mixed_qkv_to_track.to(conv_states.dtype, copy=False)
+        if is_target_verify:
+            assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            seq_len = mixed_qkv.shape[0]
+            batch_size = seq_len // draft_token_num
+            intermediate_state_indices = torch.arange(
+                batch_size, dtype=torch.int32, device=cache_indices.device
             )
-
-        q, k, v = mixed_qkv.split(splits, dim=0)
-        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
-            splits, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
-        if layer.bias is not None:
-            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            mixed_qkv = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2)
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=mamba_cache_params.intermediate_conv_window[0],
+                intermediate_state_indices=intermediate_state_indices[:batch_size],
+                retrieve_next_token=retrieve_next_token,
+                retrieve_next_sibling=retrieve_next_sibling,
+                retrieve_parent_token=retrieve_parent_token,
+            ).transpose(1, 2).reshape(seq_len, -1)
+            q, k, v = mixed_qkv.split(splits, dim=-1)
         else:
-            q_bias, k_bias, v_bias = None, None, None
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+            mixed_qkv = mixed_qkv.transpose(0, 1)
+            if forward_metadata.has_mamba_track_mask:
+                mixed_qkv_to_track = mixed_qkv[
+                    :, forward_metadata.track_conv_indices
+                ].transpose(0, 1)
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track.to(conv_states.dtype, copy=False)
+                )
 
-        q = causal_conv1d_fn(
-            q,
-            q_conv_weight,
-            q_bias,
-            activation="silu",
-            conv_states=q_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k,
-            k_conv_weight,
-            k_bias,
-            activation="silu",
-            conv_states=k_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v,
-            v_conv_weight,
-            v_bias,
-            activation="silu",
-            conv_states=v_conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            q, k, v = mixed_qkv.split(splits, dim=0)
+            q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+                splits, dim=0
+            )
+            q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+            if layer.bias is not None:
+                q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+            else:
+                q_bias, k_bias, v_bias = None, None, None
+
+            q = causal_conv1d_fn(
+                q,
+                q_conv_weight,
+                q_bias,
+                activation="silu",
+                conv_states=q_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k,
+                k_conv_weight,
+                k_bias,
+                activation="silu",
+                conv_states=k_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v,
+                v_conv_weight,
+                v_bias,
+                activation="silu",
+                conv_states=v_conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
-        # Apply KDA gate activation here unless the extend kernel does it
-        # internally (e.g. FlashKDA). Model always passes raw g (a) and raw
-        # beta logits (b); backend decides based on the dispatched kernel.
-        if not self.kernel_dispatcher.extend_applies_gate_internally:
-            from sglang.srt.layers.attention.fla.kda import fused_kda_gate
-
-            a, b = fused_kda_gate(
-                a,
-                layer.A_log,
-                layer.head_k_dim,
-                g_bias=layer.dt_bias,
-                safe_gate=getattr(layer, "safe_gate", False),
-                lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
-                beta=b,
+        if is_target_verify:
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=mamba_cache_params.intermediate_ssm,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
                 beta_scale=getattr(layer, "beta_scale", 1.0),
+                safe_gate=getattr(layer, "safe_gate", False),
+                safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
+            )
+        else:
+            # Apply KDA gate activation here unless the extend kernel does it
+            # internally (e.g. FlashKDA). Model always passes raw g (a) and raw
+            # beta logits (b); backend decides based on the dispatched kernel.
+            if not self.kernel_dispatcher.extend_applies_gate_internally:
+                from sglang.srt.layers.attention.fla.kda import fused_kda_gate
+
+                a, b = fused_kda_gate(
+                    a,
+                    layer.A_log,
+                    layer.head_k_dim,
+                    g_bias=layer.dt_bias,
+                    safe_gate=getattr(layer, "safe_gate", False),
+                    lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
+                    beta=b,
+                    beta_scale=getattr(layer, "beta_scale", 1.0),
+                )
+
+            core_attn_out, h = self.kernel_dispatcher.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=a,
+                beta=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
             )
 
-        core_attn_out, h = self.kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
-        )
-
-        if h is not None:
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
+            if h is not None:
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
 
         if needs_repad:
             # core_attn_out comes back from chunk_kda as [1, n_valid, h, d]

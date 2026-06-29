@@ -424,6 +424,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+    capture_mtp_topk_indices: bool = False
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -1009,6 +1014,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if spec_info.topk_index is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
+                )
+            if getattr(spec_info, "mtp_topk_indices", None) is not None:
+                spec_info.mtp_topk_indices = self._pad_tensor_to_size(
+                    spec_info.mtp_topk_indices, bs
                 )
             if spec_info.accept_length is not None:
                 spec_info.accept_length = self._pad_tensor_to_size(

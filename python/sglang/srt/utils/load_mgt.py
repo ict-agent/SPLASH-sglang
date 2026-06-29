@@ -499,72 +499,35 @@ def load_megatron_weights(
         }
 
     if ifmtp:
+        # Reuse every base mcore mapping by rewriting the per-layer prefix
+        # "decoder.layers.{i}." to the MTP subgraph prefix
+        # "mtp.layers.{i}.transformer_layer.". This keeps MLA / DSA / kpool /
+        # KDA dispatch identical to the base loader; only the path prefix
+        # changes. Heads that live one level above the transformer layer
+        # (eh_proj, enorm, hnorm, final_layernorm) and the global embedding
+        # / output_layer are handled by the explicit overrides below.
+        BASE_PREFIX = "decoder.layers.{i}."
+        MTP_PREFIX = "mtp.layers.{i}.transformer_layer."
+        for _name, _spec in list(key_map.items()):
+            paths = _spec.get("mcore")
+            if not paths:
+                continue
+            rewritten = [
+                (MTP_PREFIX + p[len(BASE_PREFIX):]) if p.startswith(BASE_PREFIX) else p
+                for p in paths
+            ]
+            key_map[_name] = {**_spec, "mcore": rewritten}
+
         key_map.update(
             {
                 "word_embeddings": {
                     "mcore": ["embedding.word_embeddings.weight"],
                 },
                 "eh_proj": {"mcore": ["mtp.layers.{i}.eh_proj.weight"]},
-                "moe.shared_experts.dense_h_to_4h": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.mlp.shared_experts.linear_fc1.{attr}"
-                    ]
-                },
-                "moe.shared_experts.dense_4h_to_h": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.mlp.shared_experts.linear_fc2.{attr}"
-                    ]
-                },
-                "query_key_value": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.self_attention.linear_qkv.{attr}"
-                    ],
-                },
-                "dense": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.self_attention.linear_proj.{attr}"
-                    ],
-                },
-                "moe.router": {
-                    "mcore": ["mtp.layers.{i}.transformer_layer.mlp.router.weight"]
-                },
                 "enorm": {"mcore": ["mtp.layers.{i}.enorm.weight"]},
+                "hnorm": {"mcore": ["mtp.layers.{i}.hnorm.weight"]},
                 "final_layernorm": {
                     "mcore": ["mtp.layers.{i}.final_layernorm.weight"],
-                },
-                "hnorm": {"mcore": ["mtp.layers.{i}.hnorm.weight"]},
-                "post_attention_layernorm": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.pre_mlp_layernorm.{attr}"
-                    ]
-                },
-                "input_layernorm": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.self_attention.linear_qkv.layer_norm_{attr}"
-                    ]
-                },
-                "moe.router_bias": {
-                    "mcore": ["mtp.layers.{i}.transformer_layer.mlp.router.expert_bias"]
-                },
-                "q_layernorm": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.self_attention.q_layernorm.{attr}"
-                    ],
-                },
-                "k_layernorm": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.self_attention.k_layernorm.{attr}"
-                    ],
-                },
-                "moe.dense_h_to_4h": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.mlp.experts.linear_fc1.weight{j}"
-                    ],
-                },
-                "moe.dense_4h_to_h": {
-                    "mcore": [
-                        "mtp.layers.{i}.transformer_layer.mlp.experts.linear_fc2.weight{j}"
-                    ],
                 },
                 "output_layer": {
                     "mcore": ["output_layer.weight"],
@@ -1659,14 +1622,20 @@ def load_megatron_weights(
         embedding_keys = get_keys("output_layer", attr="weight")
     else:
         embedding_keys = get_keys("word_embeddings")
+    
+    lm_head_tp_size = getattr(init_model.lm_head, "tp_size", target_tp)
+    if lm_head_tp_size == 1:
+        lm_target_tp, lm_current_tp = 1, 0
+    else:
+        lm_target_tp, lm_current_tp = target_tp, tp
     init_model.lm_head.weight.copy_(
         merge_tensors(
             tp_sd=mgt_sd[-1],
             model_key=last_model_in_pp,
             keys=embedding_keys,
             original_tp=original_tp,
-            target_tp=target_tp,
-            current_tp=tp,
+            target_tp=lm_target_tp,
+            current_tp=lm_current_tp,
             slice_dim=0,
         ).to(device)
     )

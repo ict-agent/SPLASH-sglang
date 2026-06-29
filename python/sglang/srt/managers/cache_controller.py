@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -281,6 +281,16 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
+
+        # Draft KV pool support (best-effort piggyback on target L2/L3 ops,
+        # matches upstream PR #21125). At most one draft pool may be
+        # registered via ``set_draft_kv_pool``; the L2/L3 piggyback issues a
+        # single backup/load call against it in lockstep with the main
+        # target's transfer. The draft pool owns its own host slot range
+        # (independent from main); device slots are shared (token-keyed).
+        self.has_draft = False
+        self.mem_pool_device_draft: Optional[Any] = None
+        self.mem_pool_host_draft: Optional["HostKVCache"] = None
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -688,6 +698,17 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            if self.has_draft:
+                # Piggyback the registered draft pool on the same indices
+                # (upstream PR #21125 semantics: draft is a passive sibling
+                # of the main host pool, slot N in both refers to the same
+                # token).
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -761,6 +782,21 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
+                # Piggyback the registered draft pool on the same indices
+                # (upstream PR #21125 semantics). Guard `i < layer_num`
+                # because the draft pool typically has fewer layers than
+                # the target.
+                if (
+                    self.has_draft
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -788,7 +824,26 @@ class HiCacheController:
             raise ValueError("Other eviction policies are not supported yet.")
 
         self.mem_pool_host.free(host_indices)
+        # Draft pool is a passive sibling sharing main's indices (upstream
+        # PR #21125): no separate alloc state to release.
         return len(host_indices)
+
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        """Register a draft KV pool for piggyback L2/L3 ops on target transfers.
+
+        Matches upstream PR #21125's signature. Only one draft pool may
+        be registered per controller; calling this a second time raises
+        AssertionError.
+        """
+        assert not self.has_draft, "Draft KV pool already registered"
+        self.has_draft = True
+        self.mem_pool_device_draft = draft_device_pool
+        self.mem_pool_host_draft = draft_host_pool
+        logger.info(
+            "HiCache draft KV registered: %s, host %d slots",
+            type(draft_device_pool).__name__,
+            draft_host_pool.size,
+        )
 
     def prefetch(
         self,
@@ -865,6 +920,14 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Best-effort draft L3 read BEFORE the target page_get_func, so
+            # draft KV lands on host before consumers observe target
+            # completion (otherwise wait_complete races and decode reads
+            # stale draft). Matches upstream PR #21125 ordering.
+            if self.has_draft:
+                self._draft_page_get(batch_hashes, batch_host_indices)
+
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1013,6 +1076,64 @@ class HiCacheController:
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
+    def _draft_page_set(self, hash_values, host_indices) -> None:
+        """Best-effort write the registered draft pool's pages to L3.
+
+        Keys are namespaced ``f"d:{hash}"`` (matches upstream PR #21125).
+        Failures are logged at debug level and do not fail the target write.
+
+        ``host_indices`` is the main pool's host indices for this batch.
+        L3 piggyback currently reuses them to index the draft pool too,
+        which is correct in the homogeneous-alloc case our production uses;
+        revisit when L3 lands on heterogeneous drafts.
+        """
+        if not self.has_draft:
+            return
+        try:
+            draft_keys = [f"d:{h}" for h in hash_values]
+            draft_data = [
+                self.mem_pool_host_draft.get_data_page(
+                    host_indices[i * self.page_size]
+                )
+                for i in range(len(draft_keys))
+            ]
+            self.storage_backend.batch_set(draft_keys, draft_data)
+        except Exception:
+            logger.debug(
+                "Draft L3 write failed (best-effort), skipping.",
+                exc_info=True,
+            )
+
+    def _draft_page_get(self, hash_values, host_indices) -> None:
+        """Best-effort read the registered draft pool's pages from L3.
+
+        Symmetric to ``_draft_page_set``. Must be called before the target
+        ``page_get_func`` so that draft KV lands on host before consumers
+        observe target completion (otherwise wait_complete races and the
+        decode side reads stale draft).
+        """
+        if not self.has_draft:
+            return
+        try:
+            draft_keys = [f"d:{h}" for h in hash_values]
+            draft_dummy = [
+                self.mem_pool_host_draft.get_dummy_flat_data_page()
+                for _ in draft_keys
+            ]
+            draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+            if draft_pages is None:
+                return
+            for i, page in enumerate(draft_pages):
+                if page is not None:
+                    self.mem_pool_host_draft.set_from_flat_data_page(
+                        host_indices[i * self.page_size], page
+                    )
+        except Exception:
+            logger.debug(
+                "Draft L3 read failed (best-effort), skipping.",
+                exc_info=True,
+            )
+
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
@@ -1036,6 +1157,10 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            # Best-effort draft L3 write alongside target (upstream PR #21125).
+            if self.has_draft:
+                self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

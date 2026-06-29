@@ -38,7 +38,11 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    get_mtp_index_share_topk,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -817,9 +821,9 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             and self.draft_worker is not None
-            and envs.GLM_USE_HICACHE_MTP_FIX.get()
+            and envs.SGLANG_HICACHE_DRAFT.get()
         ):
-            self._register_mtp_hicache_pools()
+            self._maybe_register_hicache_draft()
 
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
@@ -846,10 +850,10 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _register_mtp_hicache_pools(self):
-        """Register MTP draft KV pools with HiRadixCache so hicache offload/load
-        moves the MTP KV in lockstep with the main KV. No-op if `tree_cache`
-        isn't a `HiRadixCache` or no NSA MTP pool is found.
+    def _maybe_register_hicache_draft(self):
+        """Register draft KV pools with HiRadixCache so hicache offload/load
+        moves the draft KV in lockstep with the main KV. No-op if `tree_cache`
+        isn't a `HiRadixCache` or no draft pool is found.
 
         Walks both spec-worker layouts:
           * V2 (`BaseSpecWorker`): inner draft worker at `draft_worker`
@@ -858,10 +862,9 @@ class Scheduler(
             / `StandaloneWorker`): the spec worker is itself the draft
             `TpModelWorker`, exposing `model_runner` / `model_runner_list`.
         """
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import KVCache
 
-        if not isinstance(self.tree_cache, HiRadixCache):
+        if not hasattr(self.tree_cache, "register_hicache_draft_pool"):
             return
 
         runners = []
@@ -879,14 +882,14 @@ class Scheduler(
                 else []
             )
 
-        seen, mtp_pools = set(), []
+        draft_pool = None
         for runner in runners:
             pool = getattr(runner, "token_to_kv_pool", None)
-            if isinstance(pool, NSATokenToKVPool) and id(pool) not in seen:
-                mtp_pools.append(pool)
-                seen.add(id(pool))
+            if isinstance(pool, KVCache):
+                draft_pool = pool
+                break
 
-        self.tree_cache.register_mtp_hicache_pools(mtp_pools, self.server_args)
+        self.tree_cache.register_hicache_draft_pool(draft_pool, self.server_args)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1064,6 +1067,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                mtp_topk_indices_dim=get_mtp_index_share_topk(model_config.hf_config),
             )
 
             # The decode requests polling kv cache
@@ -1119,6 +1123,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                mtp_topk_indices_dim=get_mtp_index_share_topk(model_config.hf_config),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

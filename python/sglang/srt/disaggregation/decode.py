@@ -997,6 +997,7 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_mtp_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1054,6 +1055,14 @@ class DecodeTransferQueue:
             decode_req.req.output_topk_p = output_topk_p.clone()
             decode_req.req.output_topk_index = output_topk_index.clone()
             decode_req.req.hidden_states_tensor = output_hidden_states.clone()
+            # GLM NOTE: Same buffer-aliasing caveat applies here; clone to detach.
+            # When the feature is disabled (output_mtp_topk_indices is None),
+            # leave the field as its default None so downstream code falls
+            # back to its no-seed path.
+            if output_mtp_topk_indices is not None:
+                decode_req.req.mtp_topk_indices_tensor = (
+                    output_mtp_topk_indices.clone()
+                )
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(

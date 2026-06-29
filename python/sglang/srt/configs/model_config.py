@@ -100,6 +100,16 @@ def get_nsa_index_kpool(config: PretrainedConfig) -> int:
     return getattr(config, "index_kpool", 1)
 
 
+def is_mtp_index_share_enabled(hf_config) -> bool:
+    return getattr(hf_config, "index_share_for_mtp_iteration", False)
+
+
+def get_mtp_index_share_topk(hf_config) -> int:
+    if not is_mtp_index_share_enabled(hf_config):
+        return 0
+    return get_nsa_index_topk(hf_config)
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -316,6 +326,11 @@ class ModelConfig:
             "GlmOcrForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] == "Glm5NextForCausalLM":
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+            self.hf_config.linear_attn_config = None
 
         if (
             is_draft_model

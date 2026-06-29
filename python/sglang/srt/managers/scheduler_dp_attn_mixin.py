@@ -33,11 +33,13 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    num_seqs: int
 
     # some gathered elements
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_num_seqs: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -51,6 +53,7 @@ class MLPSyncBatchInfo:
                 int(self.is_extend_in_batch),
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
+                self.num_seqs,
             ],
             device=device,
             dtype=dtype,
@@ -65,6 +68,7 @@ class MLPSyncBatchInfo:
                 0,  # is_extend_in_batch
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
+                0,  # num_seqs
             ],
             device=device,
             dtype=dtype,
@@ -73,7 +77,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.dp_size, self.tp_size * self.cp_size, 7),
             dtype=torch.int64,
             device=device,
         )
@@ -89,7 +93,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -98,6 +102,7 @@ class MLPSyncBatchInfo:
         cpu_data = tp0_info[:, :2].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.global_num_seqs = tp0_info[:, 6].cpu().tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
@@ -114,11 +119,13 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_num_seqs = [mlp_sync_info.num_seqs]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.global_num_seqs = mlp_sync_info.global_num_seqs
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -144,9 +151,11 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
         num_tokens_for_logprob = 0
+        num_seqs = 0
     elif local_batch.forward_mode.is_decode():
         num_tokens = local_batch.batch_size()
         num_tokens_for_logprob = num_tokens
+        num_seqs = local_batch.batch_size()
     else:
         num_tokens = local_batch.extend_num_tokens
         num_tokens_for_logprob = sum(
@@ -161,6 +170,7 @@ def prepare_mlp_sync_batch_raw(
             local_batch.return_logprob
             or num_tokens_for_logprob == local_batch.batch_size()
         )
+        num_seqs = local_batch.batch_size()
 
     skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_cuda_graph = (
@@ -196,6 +206,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        num_seqs=num_seqs,
     )
 
     if not skip_all_gather:

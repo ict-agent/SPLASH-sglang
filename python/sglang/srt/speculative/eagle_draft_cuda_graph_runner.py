@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import (
+    get_mtp_index_share_topk,
+    is_mtp_index_share_enabled,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -49,6 +53,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
+    mtp_topk_indices: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -74,6 +79,12 @@ class EAGLEDraftCudaGraphRunner:
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.enable_mtp_index_share = is_mtp_index_share_enabled(
+            model_runner.model_config.hf_config
+        )
+        self.mtp_index_share_topk = get_mtp_index_share_topk(
+            model_runner.model_config.hf_config
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -122,6 +133,11 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
+            mtp_topk_indices = (
+                torch.zeros((self.max_bs, self.mtp_index_share_topk), dtype=torch.int32)
+                if self.enable_mtp_index_share
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -153,6 +169,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            mtp_topk_indices=mtp_topk_indices,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -232,6 +249,11 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = buffers.hidden_states[:num_seqs]
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
+        mtp_topk_indices = (
+            buffers.mtp_topk_indices[:num_seqs]
+            if buffers.mtp_topk_indices is not None
+            else None
+        )
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -278,6 +300,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            mtp_topk_indices=mtp_topk_indices,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
@@ -377,6 +400,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            if buffers.mtp_topk_indices is not None:
+                buffers.mtp_topk_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -389,6 +414,12 @@ class EAGLEDraftCudaGraphRunner:
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if buffers.mtp_topk_indices is not None:
+            if forward_batch.spec_info.mtp_topk_indices is None:
+                # GLM Note: This is for idle batch when dp attention enabled
+                buffers.mtp_topk_indices[:raw_bs].zero_()
+            else:
+                buffers.mtp_topk_indices[:raw_bs].copy_(forward_batch.spec_info.mtp_topk_indices)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded

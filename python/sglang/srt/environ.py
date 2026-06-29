@@ -557,6 +557,9 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
 
+    # HiCache draft (MTP / EAGLE / Medusa) KV piggyback on hicache offload/load.
+    SGLANG_HICACHE_DRAFT = EnvBool(True)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
@@ -588,6 +591,7 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
     )
+    _print_deprecated_env("SGLANG_HICACHE_DRAFT", "GLM_USE_HICACHE_MTP_FIX")
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
         "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",

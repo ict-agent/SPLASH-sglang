@@ -514,8 +514,21 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                    # GLM NOTE: NSA index_share_for_mtp_iteration: forward_draft_extend
+                    # captured per-request indices (already collapsed to
+                    # [batch, K] by extract_draft_seed_mtp_topk_indices).
+                    # Snapshot to CPU so the buffer-aliasing aware set_buf
+                    # can ship it over RDMA to the decode side.
+                    mtp_indices = getattr(
+                        batch.spec_info, "mtp_topk_indices", None
+                    )
+                    if mtp_indices is not None:
+                        req.mtp_topk_indices_tensor = mtp_indices[i].cpu().clone()
+                    else:
+                        req.mtp_topk_indices_tensor = None
                 else:
                     req.hidden_states_tensor = None
+                    req.mtp_topk_indices_tensor = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None

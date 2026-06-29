@@ -857,9 +857,7 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                seqlens_32_2d = _to_2d_context_lens(
-                    seqlens_32, forward_batch.batch_size
-                )
+                seqlens_32_2d = seqlens_32.view(-1, 1)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1171,7 +1169,7 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+                seqlens_32_2d = seqlens_32.view(-1, 1)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1205,6 +1203,9 @@ class NativeSparseAttnBackend(
         # init_forward_metadata_replay_cuda_graph) and fills the buffers
         # in-place from write_start + req_pool_indices + real_page_table.
         # write_start: decode=positions; verify=committed; v2=committed (= seq_lens - N).
+        # Capture warmup also executes the target-verify forward, so the plan
+        # must be filled with a legal dummy layout before that forward reaches
+        # kpool topk/FA3. Replay will overwrite these buffers with real values.
         is_ring_write = (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
@@ -1212,6 +1213,7 @@ class NativeSparseAttnBackend(
         )
         if self.nsa_index_kpool > 1 and is_ring_write:
             is_decode = forward_mode.is_decode_or_idle()
+            is_v2 = forward_mode.is_draft_extend_v2()
             num_draft_tokens = 1 if is_decode else self.speculative_num_draft_tokens
             metadata = _init_kpool_write_plan_capture_impl(
                 metadata,
@@ -1222,7 +1224,23 @@ class NativeSparseAttnBackend(
                 num_draft_tokens=num_draft_tokens,
                 device=self.device,
                 is_verify=not is_decode,
-                is_v2=forward_mode.is_draft_extend_v2(),
+                is_v2=is_v2,
+            )
+            write_start = seq_lens.to(torch.int32)
+            if is_decode:
+                write_start = write_start - 1
+            elif is_v2:
+                write_start = write_start - self.speculative_num_draft_tokens
+            _update_kpool_write_plan_impl(
+                metadata,
+                write_start=write_start,
+                req_pool_indices=req_pool_indices,
+                real_page_table=metadata.real_page_table,
+                pool_size=self.nsa_index_kpool,
+                real_page_size=self.real_page_size,
+                num_draft_tokens=num_draft_tokens,
+                forward_mode=forward_mode,
+                accept_length=None,
             )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
@@ -1388,7 +1406,7 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+                seqlens_32_2d = seqlens_32.view(-1, 1)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1579,6 +1597,19 @@ class NativeSparseAttnBackend(
                 print(
                     f"Warning: Fused metadata copy kernel failed with error: {e}, falling back to individual copies."
                 )
+
+            # The fused kernel only refreshes the dense metadata fields.
+            # Kpool buffers (pooled_paged_mqa_schedule_metadata,
+            # pooled_cache_seqlens_int32) are captured at graph-record
+            # time with the seq_len fill value (= 1); without this
+            # refresh, replay would run with a stale schedule sized for
+            # seqlens=1 and overflow at real seqlens. Mirror the
+            # fallback branch below.
+            self._update_pooled_paged_mqa_metadata(
+                metadata=metadata,
+                seqlens_32=metadata.cache_seqlens_int32,
+                forward_mode=forward_mode,
+            )
 
         # Fallback to individual copy operations if fused kernel disabled or failed
         if not fused_kernel_succeeded:
@@ -2825,6 +2856,32 @@ class NativeSparseAttnMultiStepBackend:
                             precomputed=precomputed,
                             forward_mode=ForwardMode.DECODE,
                         )
+
+                    # The multi-backend fused kernel above only refreshes
+                    # dense metadata fields on backends 0/1/2. Kpool buffers
+                    # (pooled_paged_mqa_schedule_metadata,
+                    # pooled_cache_seqlens_int32) are captured with the
+                    # seq_len fill value (= 1) and would replay stale
+                    # without this refresh. Backends with index >= 3 already
+                    # got refreshed via the loop above (it calls the single
+                    # backend fused path, which itself updates kpool).
+                    n_first = min(3, self.speculative_num_steps - 1)
+                    if n_first > 0:
+                        backend0 = self.attn_backends[0]
+                        meta0 = backend0.decode_cuda_graph_metadata[bs]
+                        backend0._update_pooled_paged_mqa_metadata(
+                            metadata=meta0,
+                            seqlens_32=meta0.cache_seqlens_int32,
+                            forward_mode=ForwardMode.DECODE,
+                        )
+                        for i in range(1, n_first):
+                            meta_i = self.attn_backends[i].decode_cuda_graph_metadata[bs]
+                            if meta_i.pooled_cache_seqlens_int32 is not None:
+                                meta_i.pooled_cache_seqlens_int32.copy_(meta0.pooled_cache_seqlens_int32)
+                            if meta_i.pooled_paged_mqa_schedule_metadata is not None:
+                                meta_i.pooled_paged_mqa_schedule_metadata.copy_(
+                                    meta0.pooled_paged_mqa_schedule_metadata
+                                )
                 except (ImportError, Exception) as e:
                     # Fallback to loop if multi-backend kernel not available or fails
                     if isinstance(e, ImportError):

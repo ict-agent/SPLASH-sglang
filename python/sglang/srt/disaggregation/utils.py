@@ -139,8 +139,10 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        mtp_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.mtp_topk_indices_dim = mtp_topk_indices_dim
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -188,6 +190,17 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            # Per-request mtp topk indices captured on prefill (last token's row)
+            # and consumed on decode as the seed for the first draft step.
+            # Only allocate when index_share_for_mtp_iteration is enabled.
+            if self.mtp_topk_indices_dim > 0:
+                self.output_mtp_topk_indices = torch.zeros(
+                    (size, self.mtp_topk_indices_dim),
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.output_mtp_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -230,6 +243,10 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if self.output_mtp_topk_indices is not None:
+            ptrs.insert(-1, self.output_mtp_topk_indices.data_ptr())
+            data_lens.insert(-1, self.output_mtp_topk_indices.nbytes)
+            item_lens.insert(-1, self.output_mtp_topk_indices[0].nbytes)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
@@ -243,6 +260,11 @@ class MetadataBuffers:
             self.output_topk_p[idx],
             self.output_topk_index[idx],
             self.output_hidden_states[idx],
+            (
+                self.output_mtp_topk_indices[idx]
+                if self.output_mtp_topk_indices is not None
+                else None
+            ),
             self.bootstrap_room[idx],
         )
 
@@ -289,6 +311,17 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            # GLM NOTE: NSA index_share: copy captured indices if both the buffer is
+            # provisioned (feature enabled at startup) AND prefill captured a
+            # valid tensor for this req. Zero out when capture failed (e.g.
+            # idle batch) so decode sees a deterministic "no seed" state.
+            if self.output_mtp_topk_indices is not None:
+                if req.mtp_topk_indices_tensor is not None:
+                    self.output_mtp_topk_indices[req.metadata_buffer_index].copy_(
+                        req.mtp_topk_indices_tensor
+                    )
+                else:
+                    self.output_mtp_topk_indices[req.metadata_buffer_index].zero_()
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0

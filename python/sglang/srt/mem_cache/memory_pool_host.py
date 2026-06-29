@@ -444,7 +444,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend,
-        pool_transfers=None,
     ):
         if not self._is_device_layer_owned(device_pool, layer_id):
             return
@@ -2178,10 +2177,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    # `pool_transfers` is forwarded by `HybridCacheController` to keep the call
-    # signature uniform with `HostPoolGroup`, which dispatches per-pool
-    # transfers (e.g. for MTP siblings). This pool only handles its own KV /
-    # indexer, so the kwarg is accepted-but-ignored here.
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -2189,7 +2184,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices,
         layer_id,
         io_backend,
-        pool_transfers=None,
     ):
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend
@@ -2199,7 +2193,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend, pool_transfers=None
+        self, device_pool, host_indices, device_indices, io_backend,
     ):
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
@@ -2454,8 +2448,6 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         # 返回 kv_buffer 以满足 HostKVCache 的接口约定
         return self.kv_buffer
 
-    # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
-    # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -2824,8 +2816,6 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
         return self.kv_buffer
 
-    # `pool_transfers` see NSATokenToKVPoolHost: forwarded by HybridCacheController
-    # for HostPoolGroup compatibility; ignored here as this pool only owns its KV.
     def load_to_device_per_layer(
         self,
         device_pool,

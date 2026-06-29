@@ -180,10 +180,15 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
-        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        use_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+        if use_cp:
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
+        should_update_mtp_topk_indices = (
+            forward_batch.reuse_mtp_topk_indices
+            or forward_batch.capture_mtp_topk_indices
+        )
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -191,6 +196,7 @@ class DeepseekModelNextN(nn.Module):
                 forward_batch,
                 residual,
                 zero_allocator,
+                prev_topk_indices=forward_batch.topk_indices if forward_batch.reuse_mtp_topk_indices else None,
             )
 
         if not forward_batch.forward_mode.is_idle():
@@ -199,7 +205,7 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
 
-            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            if use_cp:
                 # allgather + rerrange
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
@@ -207,6 +213,23 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+                # GLM NOTE: topk_indices is sliced along dim 0 (per-token) inside the
+                # NSA decoder when CP is active. Gather it back to the global
+                # token layout so that downstream consumers (e.g. EAGLE draft
+                # reuse via extend_seq_lens cumsum) see a shape consistent
+                # with the un-split sequence.
+                if should_update_mtp_topk_indices and topk_indices is not None:
+                    topk_indices = cp_all_gather_rerange_output(
+                        topk_indices,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+
+        # GLM NOTE: Write back AFTER the optional CP all-gather so forward_batch.topk_indices
+        # is always in the global token coordinate (matching extend_seq_lens).
+        if should_update_mtp_topk_indices and topk_indices is not None:
+            forward_batch.topk_indices = topk_indices
 
         if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
@@ -283,5 +306,27 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 
+    def load_from_megatron(self, model_config):
+        import gc
+
+        from sglang.srt.utils.load_mgt import load_megatron_weights
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        load_megatron_weights(
+            self, model_config.model_path, params_dict, ifmtp=True
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        if getattr(self.model, "consumed_train_tokens", None) is not None:
+            self.consumed_train_tokens = self.model.consumed_train_tokens
+        if getattr(self.model, "consumed_train_samples", None) is not None:
+            self.consumed_train_samples = self.model.consumed_train_samples
+        if getattr(model_config, "hf_config", False) and getattr(
+            getattr(model_config, "hf_config"), "mla", False
+        ):
+            self.post_load_weights(is_nextn=True)
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

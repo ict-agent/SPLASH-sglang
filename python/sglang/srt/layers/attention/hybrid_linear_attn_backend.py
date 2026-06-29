@@ -766,6 +766,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Proxy to the wrapped full attention backend so dispatchers that key
         # off `use_mha` (e.g. NSA's MHA_ONE_SHOT path) see the right value.
         return getattr(self.full_attn_backend, "use_mha", False)
+    
+    @property
+    def nsa_index_kpool(self) -> int:
+        return getattr(self.full_attn_backend, "nsa_index_kpool", 1)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
