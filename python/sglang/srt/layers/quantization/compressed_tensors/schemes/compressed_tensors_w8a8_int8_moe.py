@@ -18,6 +18,9 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.dcu_deepgemm_w8a8_utils import (
+    prepare_w8a8_int8_deepgemm_weights,
+)
 from sglang.srt.utils import get_bool_env_var, is_dcu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -37,6 +40,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_dcu = is_dcu()
 _use_aiter_moe = get_bool_env_var("SGLANG_ROCM_USE_AITER_MOE", default="true")
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
@@ -261,12 +265,17 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_dcu and _use_deepgemm_moe:
+            prepare_w8a8_int8_deepgemm_weights(layer)
+            return
+
         layer.w13_weight_scale = torch.nn.Parameter(
             layer.w13_weight_scale.data, requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+
         if not _use_aiter_moe:
             return
         shuffled_w13 = self._shuffle_w8a8_gemm1(layer.w13_weight)

@@ -23,11 +23,15 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from sglang.srt.layers.quantization.dcu_deepgemm_w8a8_utils import (
+    prepare_w8a8_int8_deepgemm_weights,
+)
 # from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_dcu,
@@ -46,6 +50,7 @@ _is_dcu = is_dcu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -322,6 +327,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_dcu and _use_deepgemm_moe:
+            prepare_w8a8_int8_deepgemm_weights(layer)
+            return
+
         if _is_dcu and self.runner.runner_backend.is_lightop():
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,

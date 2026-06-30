@@ -36,7 +36,6 @@ from sglang.srt.utils import (
 )
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 from lmslim.layers.gemm.fp8_utils import per_token_quant_fp8
-from sglang.srt.server_args import get_global_server_args
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
@@ -65,6 +64,7 @@ import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 
 use_groupgemm = get_bool_env_var(
@@ -500,7 +500,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 previous_event=previous_event,
                 async_finish=self.async_finish,
                 allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-                expert_alignment=256 if (get_global_server_args().quantization == "slimquant_marlin" or _use_fp8_w8a8_moe or _use_marlin_w16a16_moe) else 1,
+                expert_alignment=256 if (
+                    _use_deepgemm_moe
+                    or _use_fp8_w8a8_moe
+                    or _use_marlin_w16a16_moe
+                ) else 1,
                 config=DeepEPConfig.get_instance().normal_dispatch_config,
             )
         else:
