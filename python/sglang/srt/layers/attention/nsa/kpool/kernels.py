@@ -532,6 +532,94 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def _torch_topk_pooled_history(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None = None,
+    topk_offsets: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+    out_rows: int | None = None,
+    page_table_row_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Deterministic torch.topk-based fallback for the kpool history topk.
+
+    Mirrors ``topk_from_pooled_history_logits`` semantics for use under
+    ``enable_deterministic_inference``: the topk *selection* runs through
+    ``torch.topk`` (deterministic on CUDA for fp32 input), while the
+    downstream expand / page-table gather / tail-append helpers are reused
+    verbatim (already deterministic).
+    """
+    rows, cols = logits.shape
+    group_topk = topk // pool_size
+    device = logits.device
+
+    col_idx = torch.arange(cols, device=device, dtype=torch.int32)
+    if row_starts is None:
+        valid_lo = torch.zeros(rows, device=device, dtype=torch.int32)
+    else:
+        valid_lo = row_starts.to(torch.int32)
+    valid_hi = valid_lo + group_lengths.to(torch.int32)
+    valid_mask = (col_idx.unsqueeze(0) >= valid_lo.unsqueeze(1)) & (
+        col_idx.unsqueeze(0) < valid_hi.unsqueeze(1)
+    )
+
+    masked = torch.where(valid_mask, logits, torch.full_like(logits, float("-inf")))
+    k = min(group_topk, cols)
+    _, group_ids = torch.topk(masked, k=k, dim=1)
+    if k < group_topk:
+        pad = torch.zeros((rows, group_topk - k), device=device, dtype=group_ids.dtype)
+        group_ids = torch.cat([group_ids, pad], dim=1)
+    group_ids = group_ids.to(torch.int32)
+
+    if row_starts is not None:
+        group_ids = group_ids - valid_lo.unsqueeze(1)
+
+    if page_table is not None and page_table_row_index is not None:
+        page_table = page_table.index_select(0, page_table_row_index.to(torch.int64))
+
+    max_valid_groups = min(cols, group_topk)
+    rank = torch.arange(group_topk, device=device, dtype=torch.int32)
+    valid_counts = group_lengths.to(torch.int32).clamp(max=max_valid_groups)
+    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+
+    expanded = expand_pooled_groups_to_topk(
+        group_ids.contiguous(),
+        group_valid,
+        topk=topk,
+        pool_size=pool_size,
+        page_table=page_table,
+        topk_offsets=topk_offsets,
+    )
+    if seq_lens is None:
+        result = expanded
+    else:
+        result = append_kpool_tail_to_topk(
+            expanded,
+            seq_lens=seq_lens,
+            pool_lens=group_lengths,
+            pool_size=pool_size,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+        )
+
+    if out_rows is None or out_rows == result.shape[0]:
+        return result
+    assert (
+        out_rows >= result.shape[0]
+    ), f"out_rows ({out_rows}) must be >= topk rows ({result.shape[0]})"
+    padded = torch.full(
+        (out_rows, result.shape[1]),
+        -1,
+        dtype=result.dtype,
+        device=result.device,
+    )
+    padded[: result.shape[0]] = result
+    return padded
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,

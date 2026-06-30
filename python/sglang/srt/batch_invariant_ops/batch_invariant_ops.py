@@ -294,7 +294,13 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        try:
+            return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        except RuntimeError:
+            # DeepGEMM TMA descriptor builds fail on some odd-N shapes
+            # (e.g. N=1093 on bf16); fall back to triton, which is also
+            # batch-invariant.
+            return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
     if _ENABLE_MM_FALLBACK_VARIANT:
         out = torch.einsum("ik,kj->ij", a, b)

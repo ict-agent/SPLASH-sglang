@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
     INDEX_HEAD_DIM,
+    _torch_topk_pooled_history,
     all_gather_and_scatter_pool_slots,
     gather_index_k_scale_prefix_into,
     kpool_assemble_softmax_rotate_write_cache,
@@ -27,8 +28,8 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.nsa.utils import (
-    cp_all_gather_rerange_output,
     cp_all_gather_rerange_fused,
+    cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     is_nsa_prefill_cp_in_seq_split,
     nsa_use_prefill_cp,
@@ -37,6 +38,7 @@ from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if is_cuda():
@@ -485,6 +487,20 @@ class IndexerKPool(Indexer):
         letting the caller share a compact page table across q-tokens.
         """
 
+        if get_global_server_args().enable_deterministic_inference:
+            return _torch_topk_pooled_history(
+                logits=logits,
+                group_lengths=pool_lens,
+                pool_size=self.index_kpool,
+                topk=self.index_topk,
+                page_table=page_table,
+                topk_offsets=topk_offsets,
+                seq_lens=seq_lens,
+                row_starts=row_starts,
+                out_rows=out_rows,
+                page_table_row_index=page_table_row_index,
+            )
+
         return topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
@@ -514,9 +530,16 @@ class IndexerKPool(Indexer):
         (ragged path) indirects the per-row page-table lookup so a compact
         page table (the full ``req_to_token``) can be shared across q-tokens
         instead of densely replicated per q-token.
+
+        ``force_unfused_topk`` (hisparse decode) requires the topk kernel to
+        emit *logical* positions so the downstream hisparse coordinator can
+        do its own page-table swap; mirrors the community Indexer guard in
+        ``NSAIndexerMetadata.topk_transform``.
         """
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        if not envs.SGLANG_NSA_FUSE_TOPK.get() or getattr(
+            metadata, "force_unfused_topk", False
+        ):
             return None, None, None
 
         method = metadata.topk_transform_method

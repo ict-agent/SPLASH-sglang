@@ -291,8 +291,20 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
+
+        dtype_map = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        router_dtype_cfg = getattr(config, "router_dtype", None)
+        self.router_dtype = dtype_map[router_dtype_cfg] if router_dtype_cfg else None
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=self.router_dtype,
+            )
         )
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = torch.float32
@@ -317,6 +329,11 @@ class MoEGate(nn.Module):
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
+    def _router_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.router_dtype is None:
+            return F.linear(hidden_states, self.weight, None)
+        return F.linear(hidden_states.to(self.router_dtype), self.weight, None)
+
     def forward(
         self,
         hidden_states,
@@ -332,10 +349,10 @@ class MoEGate(nn.Module):
             )
 
         if get_global_server_args().enable_deterministic_inference:
-            return F.linear(hidden_states, self.weight, None)
+            return self._router_gemm(hidden_states)
 
         if forward_batch is not None and nsa_use_prefill_cp(forward_batch):
-            logits = F.linear(hidden_states, self.weight, None)
+            logits = self._router_gemm(hidden_states)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
@@ -362,7 +379,7 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
-                logits = F.linear(hidden_states, self.weight, None)
+                logits = self._router_gemm(hidden_states)
 
         return logits
 

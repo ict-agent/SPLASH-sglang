@@ -1304,11 +1304,6 @@ def load_megatron_weights(
                     layer_sd[f"mlp.gate.weight"] = dict_access_multi(
                         mgt_tp_0, get_keys("moe.router", i=i)
                     )
-                    if (
-                        getattr(init_model.config, "moe_router_dtype", "float32")
-                        == "float32"
-                    ):
-                        layer_sd[f"mlp.gate.weight"].float()
                     if getattr(
                         init_model.config, "moe_router_enable_expert_bias", True
                     ):
