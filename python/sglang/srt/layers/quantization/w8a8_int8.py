@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
@@ -22,6 +23,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.quantization.compressed_tensors import (
+    quant_ops as compressed_quant_ops,
+)
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 # from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from lmslim.layers.gemm.int8_utils import per_token_quant_int8
@@ -166,6 +170,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
+        self.w8a8_strategy = int(os.getenv("W8A8_SUPPORT_METHODS", "1"))
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
@@ -176,6 +181,8 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             else:
                 assert False, "W8A8Int8LinearMethod on CPU only works on AMX or Arm64"
         else:
+            if _is_dcu and self.w8a8_strategy == 3:
+                layer.weight.data = layer.weight.data.T
             layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
@@ -229,16 +236,29 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
-        output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
-        output = quant_ops.triton_scaled_mm(
-            x_q_2d,
-            layer.weight,
-            x_scale_2d,
-            layer.weight_scale,
-            out_dtype=x.dtype,
-            bias=bias,
-        )
+        if _is_dcu and self.w8a8_strategy == 3:
+            output_shape = [*x_q.shape[:-1], layer.weight.shape[0]]
+            output = compressed_quant_ops.blaslt_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                scale_a=x_scale_2d,
+                scale_b=layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=None,
+            )
+            if bias is not None:
+                output = output + bias
+        else:
+            output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+            output = quant_ops.triton_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
 
         return output.view(output_shape)
 
