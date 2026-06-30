@@ -239,15 +239,6 @@ class DeepseekModelNextN(nn.Module):
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
-    # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
-    # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
-    # https://huggingface.co/amd/DeepSeek-R1-0528-MXFP4/blob/main/config.json
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.layers.61": "model.decoder",
-        },
-    )
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -269,6 +260,16 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         else:
             self.cp_rank = None
             self.cp_size = None
+
+        if quant_config is not None:
+            nextn_layer_prefix = self._initialize_nextn_conf(
+                is_nextn=True
+            ).nextn_layer_prefix
+            quant_config.apply_weight_name_mapper(
+                WeightsMapper(
+                    orig_to_new_substr={nextn_layer_prefix: "model.decoder"},
+                )
+            )
 
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
