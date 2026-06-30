@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_cp_all_gather_into_tensor,
@@ -19,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
+    get_triton_multimem_state,
     is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -347,6 +349,107 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     return outputs
 
 
+def _nsa_cp_segment_params(n_local, cp_size, forward_batch):
+    """Where each local token lands in the gathered output, as the segment
+    descriptors the fused kernel scatters by.
+
+    The destination row is piecewise-affine in (at most) two segments, so no
+    per-token index tensor is built:
+      token i < n_a:  dst = base_a + i        * stride_a
+      token i >= n_a: dst = base_b + (i - n_a) * stride_b
+
+    round-robin: rank r holds tokens r, r+cp, r+2cp, ... -> one segment
+      (n_a = n_local, base_a = cp_rank, stride_a = cp_size).
+    in-seq-split: rank r holds two zigzag segments [seg r | seg 2cp-1-r], each
+      mapping (stride 1) to its natural prefix-sum offset in split_list.
+
+    Returns (total_tokens, n_a, base_a, stride_a, base_b, stride_b).
+    """
+    cp_rank = get_attention_cp_rank()
+    if is_nsa_prefill_cp_round_robin_split():
+        return n_local * cp_size, n_local, cp_rank, cp_size, 0, 1
+    split_list = forward_batch.nsa_cp_metadata.split_list
+    seg_b = 2 * cp_size - 1 - cp_rank
+    return (
+        sum(split_list),
+        split_list[cp_rank],
+        sum(split_list[:cp_rank]),
+        1,
+        sum(split_list[:seg_b]),
+        1,
+    )
+
+
+def cp_all_gather_rerange_fused(sources, cp_size, forward_batch, safe=False):
+    """Fused all-gather + rerange + concat of 1-2 sources in one multimem
+    collective, the fast-path replacement for ``torch.cat`` +
+    ``cp_all_gather_rerange_output``.
+
+    The kernel multicast-stores each local token straight to its
+    natural-sequential row (folding in the host-side rerange permute) and reads
+    each source in place via its per-row stride, so all three host ops vanish:
+      - the rerange permute (split + cat),
+      - the input copy into the comm buffer, and
+      - the ``torch.cat`` across sources (concatenated per output token instead).
+    A strided slice view of a wider tensor is read directly -- no ``.contiguous()``.
+
+    Args:
+        sources: 1-2 same-N bf16 2-D tensors, each width a multiple of 8 (16B).
+        safe: if False (default) the result is a VIEW into the reused comm
+            buffer; if True it is cloned. See the contract below.
+
+    Returns:
+        The gathered [total, sum_width] tensor in natural sequential order
+        (bit-exact with the cat+NCCL path), or None to fall back to NCCL when the
+        fast-path is unavailable: feature off (SGLANG_ENABLE_TRITON_MULTIMEM /
+        NSA CP), >2 sources (kernel limit), a source not bf16/2-D/16B-aligned,
+        comm state uninitialized, or the gather exceeds the fixed comm buffer.
+
+    safe=False contract: the view aliases the single reused comm buffer and is
+    only valid until the NEXT fused gather overwrites it -- so it must be fully
+    consumed (fed to attention, split into views, or returned) before then.
+    Within a forward the gathers are sequential and every caller satisfies this;
+    a clone would just reintroduce the gather-sized DtoD copy this path removes.
+    Pass safe=True only to hold the result across another fused gather.
+
+    Uses the process-wide CP-group state from initialize_triton_multimem_comm().
+    """
+    from sglang.srt.distributed.device_communicators.triton_communicator import (
+        all_gather_rerange,
+        all_gather_rerange_supported,
+        fits_comm_buffer,
+    )
+
+    state = get_triton_multimem_state()
+    if (
+        state is None
+        or not is_nsa_enable_prefill_cp()
+        or not all_gather_rerange_supported(sources)
+    ):
+        return None
+    n_local = sources[0].shape[0]
+    width = sum(s.shape[1] for s in sources)
+
+    total, n_a, base_a, stride_a, base_b, stride_b = _nsa_cp_segment_params(
+        n_local, cp_size, forward_batch
+    )
+
+    if not fits_comm_buffer(state, total, width):
+        return None
+
+    return all_gather_rerange(
+        state,
+        sources,
+        total_num_tokens=total,
+        n_a=n_a,
+        base_a=base_a,
+        stride_a=stride_a,
+        base_b=base_b,
+        stride_b=stride_b,
+        safe=safe,
+    )
+
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -374,6 +477,12 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
+    # Fused fast-path: one multimem collective that folds in the split/cat
+    # rerange below.
+    output_tensor = cp_all_gather_rerange_fused([input_tensor], cp_size, forward_batch)
+    if output_tensor is not None:
+        return output_tensor.view(-1, input_tensor.shape[-1])
+
     if is_nsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()

@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
 )
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
+    cp_all_gather_rerange_fused,
     cp_split_and_rebuild_data,
     is_nsa_prefill_cp_in_seq_split,
     nsa_use_prefill_cp,
@@ -170,13 +171,20 @@ class IndexerKPool(Indexer):
             flat = t.reshape(n_local, -1).contiguous()
             feature_sizes.append(flat.shape[1])
             flats.append(flat)
-        combined = flats[0] if len(flats) == 1 else torch.cat(flats, dim=1)
-        gathered = cp_all_gather_rerange_output(
-            combined,
-            cp_size,
-            forward_batch,
-            torch.cuda.current_stream(),
-        )
+
+        # Fused fast-path: gather + rerange + concat in one multimem collective,
+        # reading each source in place. Only 1-2 sources are supported by the kernel.
+        gathered = None
+        if len(flats) <= 2:
+            gathered = cp_all_gather_rerange_fused(flats, cp_size, forward_batch)
+        if gathered is None:
+            combined = flats[0] if len(flats) == 1 else torch.cat(flats, dim=1)
+            gathered = cp_all_gather_rerange_output(
+                combined,
+                cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         n_full = gathered.shape[0]
         if len(flats) == 1:
             return [gathered.reshape(n_full, *tails[0])]

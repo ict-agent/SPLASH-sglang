@@ -560,6 +560,10 @@ class Envs:
     # HiCache draft (MTP / EAGLE / Medusa) KV piggyback on hicache offload/load.
     SGLANG_HICACHE_DRAFT = EnvBool(True)
 
+    # Triton multimem communicator
+    SGLANG_ENABLE_TRITON_MULTIMEM = EnvBool(False)
+    SGLANG_TRITON_MULTIMEM_BUFFER_MB = EnvInt(128)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

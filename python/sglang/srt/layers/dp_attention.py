@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -42,6 +43,8 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+
+_TRITON_MULTIMEM_STATE = None
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
@@ -232,6 +235,58 @@ def is_dp_max_padding() -> bool:
     return _DpGatheredBufferWrapper.is_dp_max_padding()
 
 
+def initialize_triton_multimem_comm():
+    global _TRITON_MULTIMEM_STATE
+    assert _TRITON_MULTIMEM_STATE is None, "Triton multimem comm already initialized"
+
+    if not envs.SGLANG_ENABLE_TRITON_MULTIMEM.get():
+        return
+
+    from sglang.srt.distributed.device_communicators.triton_communicator import (
+        create_state,
+    )
+
+    # Rendezvous on the group the multimem collectives actually run over: the
+    # attention CP group when CP is active (>1), else the attention TP group.
+    cp_group = get_attention_cp_group()
+    group = cp_group if cp_group.world_size > 1 else get_attention_tp_group()
+
+    # Multimem rides NVLink multicast, which only spans a single node.
+    from sglang.srt.server_args import get_global_server_args
+
+    server_args = get_global_server_args()
+    gpus_per_node = server_args.tp_size * server_args.pp_size // server_args.nnodes
+    if group.world_size > gpus_per_node:
+        logger.warning(
+            "Triton multimem comm is enabled but the comm group (world_size=%d) "
+            "spans more than one node (%d GPUs/node); multimem needs single-node "
+            "NVLink. Falling back to default collectives.",
+            group.world_size,
+            gpus_per_node,
+        )
+        return
+
+    try:
+        _TRITON_MULTIMEM_STATE = create_state(
+            group=group.cpu_group,  # create_state wants a real ProcessGroup
+            rank_in_group=group.rank_in_group,
+            buffer_bytes=envs.SGLANG_TRITON_MULTIMEM_BUFFER_MB.get() * 1024 * 1024,
+        )
+    except Exception as e:
+        logger.warning(
+            "Triton multimem comm is enabled but initialization failed; "
+            "falling back to default collectives: %s",
+            e,
+        )
+
+
+def get_triton_multimem_state():
+    """Return the process-wide Triton multimem comm state, or ``None`` when the
+    feature is disabled or failed to initialize (callers fall back to the
+    default collectives)."""
+    return _TRITON_MULTIMEM_STATE
+
+
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
@@ -304,6 +359,8 @@ def initialize_dp_attention(
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
+
+    initialize_triton_multimem_comm()
 
 
 def is_dp_attention_enabled() -> bool:
