@@ -79,7 +79,28 @@ def cp_plain_split(input_: torch.Tensor, cp_size: Optional[int] = None):
     return input_.tensor_split(cp_size, dim=0)[cp_rank].contiguous()
 
 
-def cp_plain_all_gather(input_: torch.Tensor, cp_size: Optional[int] = None):
+def _metadata_total_len(forward_batch) -> Optional[int]:
+    if forward_batch is None or forward_batch.attn_cp_metadata is None:
+        return None
+    total_len = forward_batch.attn_cp_metadata.total_seq_lens
+    if total_len is None:
+        return None
+    if isinstance(total_len, torch.Tensor):
+        return int(total_len.item())
+    return int(total_len)
+
+
+def _plain_cp_chunk_sizes(total_len: int, cp_size: int) -> List[int]:
+    base = total_len // cp_size
+    remainder = total_len % cp_size
+    return [base + int(rank < remainder) for rank in range(cp_size)]
+
+
+def cp_plain_all_gather(
+    input_: torch.Tensor,
+    cp_size: Optional[int] = None,
+    forward_batch=None,
+):
     """Gather rank-contiguous CP chunks back into natural sequence order."""
     cp_size = _cp_size(cp_size)
     if cp_size == 1:
@@ -87,6 +108,30 @@ def cp_plain_all_gather(input_: torch.Tensor, cp_size: Optional[int] = None):
 
     group = get_attention_cp_group()
     local_len = int(input_.shape[0])
+    total_len = _metadata_total_len(forward_batch)
+    if total_len is not None:
+        sizes = _plain_cp_chunk_sizes(total_len, cp_size)
+        max_len = max(sizes)
+        if total_len % cp_size == 0:
+            with use_symmetric_memory(
+                get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            ):
+                gathered = input_.new_empty(max_len * cp_size, *input_.shape[1:])
+            attn_cp_all_gather_into_tensor(gathered, input_)
+        else:
+            pad_shape = (max_len - local_len, *input_.shape[1:])
+            padding = input_.new_zeros(pad_shape)
+            gather_input = torch.cat([input_, padding], dim=0)
+            with use_symmetric_memory(
+                get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            ):
+                gathered = gather_input.new_empty(
+                    max_len * cp_size, *gather_input.shape[1:]
+                )
+            attn_cp_all_gather_into_tensor(gathered, gather_input)
+        chunks = gathered.tensor_split(cp_size, dim=0)
+        return torch.cat([chunk[:size] for chunk, size in zip(chunks, sizes)], dim=0)
+
     sizes = group.all_gather_object(local_len)
     if all(size == sizes[0] for size in sizes):
         return group.all_gather(input_, dim=0)
@@ -113,6 +158,55 @@ def cp_plain_reduce_scatter(input_: torch.Tensor, cp_size: Optional[int] = None)
     return cp_plain_split(reduced, cp_size)
 
 
+def _cp_round_robin_all_gather_rerange(
+    input_: torch.Tensor,
+    forward_batch,
+    cp_size: Optional[int] = None,
+):
+    """Gather round-robin CP shards and restore natural token order."""
+    cp_size = _cp_size(cp_size)
+    if cp_size == 1:
+        return input_
+
+    local_len = int(input_.shape[0])
+    cp_meta = forward_batch.attn_cp_metadata
+    sizes = cp_meta.per_rank_actual_token
+    max_len = cp_meta.max_rank_len[0]
+    total_len = int(cp_meta.total_seq_lens)
+
+    if total_len % cp_size == 0:
+        with use_symmetric_memory(
+            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        ):
+            gathered = input_.new_empty(max_len * cp_size, *input_.shape[1:])
+        attn_cp_all_gather_into_tensor(gathered, input_)
+        out_shape = gathered.shape
+        return (
+            gathered.view(cp_size, max_len, *out_shape[1:])
+            .transpose(0, 1)
+            .reshape(out_shape)
+        )[:total_len]
+
+    if local_len < max_len:
+        pad_shape = (max_len - local_len, *input_.shape[1:])
+        padding = input_.new_zeros(pad_shape)
+        gather_input = torch.cat([input_, padding], dim=0)
+    else:
+        gather_input = input_
+
+    with use_symmetric_memory(
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+    ):
+        gathered = gather_input.new_empty(max_len * cp_size, *gather_input.shape[1:])
+    attn_cp_all_gather_into_tensor(gathered, gather_input)
+    token_idx = torch.arange(max_len, device=input_.device).unsqueeze(1)
+    ranks = torch.arange(cp_size, device=input_.device).unsqueeze(0)
+    sizes_tensor = torch.tensor(sizes, device=input_.device)
+    valid = token_idx < sizes_tensor.unsqueeze(0)
+    gather_idx = (ranks * max_len + token_idx).masked_select(valid)
+    return gathered.index_select(0, gather_idx)
+
+
 def cp_plain_to_scattered(
     input_: torch.Tensor, forward_batch, cp_size: Optional[int] = None
 ):
@@ -120,7 +214,7 @@ def cp_plain_to_scattered(
     cp_size = _cp_size(cp_size)
     if cp_size == 1:
         return input_
-    gathered = cp_plain_all_gather(input_, cp_size)
+    gathered = cp_plain_all_gather(input_, cp_size, forward_batch)
     return cp_split_and_rebuild_data(forward_batch, gathered)
 
 
@@ -144,10 +238,6 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
         return nsa_cp_round_robin_split_data(input_)
 
     input_list = list(
@@ -166,11 +256,6 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
         return nsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
@@ -315,23 +400,9 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        with use_symmetric_memory(
-            get_attention_cp_group(), disabled=not is_allocation_symmetric()
-        ):
-            output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
-            )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
+        return _cp_round_robin_all_gather_rerange(
+            input_tensor, forward_batch, cp_size
         )
-        out_shape = output_tensor.shape
-        output_tensor = (
-            output_tensor.view(cp_size, -1, *out_shape[1:])
-            .transpose(0, 1)
-            .reshape(out_shape)
-        )
-        return output_tensor
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
@@ -373,6 +444,13 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
     |   +-------------------------+
     """
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    if is_nsa_prefill_cp_round_robin_split():
+        return _cp_round_robin_all_gather_rerange(input_tensor, forward_batch, cp_size)
+
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
         forward_batch.attn_cp_metadata.total_seq_lens,
@@ -472,7 +550,17 @@ def prepare_context_parallel_metadata(
     )
 
     if is_nsa_prefill_cp_round_robin_split():
-        return ContextParallelMetadata()
+        total_len = int(kv_len)
+        max_rank_len = (total_len + cp_size - 1) // cp_size
+        per_rank_actual_token = [
+            total_len // cp_size + int(total_len % cp_size > rank)
+            for rank in range(cp_size)
+        ]
+        return ContextParallelMetadata(
+            max_rank_len=[max_rank_len] * cp_size,
+            per_rank_actual_token=per_rank_actual_token,
+            total_seq_lens=total_len,
+        )
 
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):

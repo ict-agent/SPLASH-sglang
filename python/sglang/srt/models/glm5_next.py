@@ -390,7 +390,7 @@ class ModelNextLinearAttention(nn.Module):
         else:
             if cp_prefill:
                 hidden_states = cp_plain_all_gather(
-                    hidden_states, get_attention_cp_size()
+                    hidden_states, get_attention_cp_size(), forward_batch
                 )
             qkv = self.qkv_proj(hidden_states)[0]
             beta = self.b_proj(hidden_states)[0]
@@ -420,7 +420,7 @@ class ModelNextLinearAttention(nn.Module):
         else:
             if cp_prefill:
                 hidden_states = cp_plain_all_gather(
-                    hidden_states, get_attention_cp_size()
+                    hidden_states, get_attention_cp_size(), forward_batch
                 )
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
@@ -1133,7 +1133,9 @@ class ModelNextModel(nn.Module):
         ):
             # Plain contract: rank-major all_gather output is already in
             # natural sequential order, no rerange needed.
-            hidden_states = cp_plain_all_gather(hidden_states, self.cp_size)
+            hidden_states = cp_plain_all_gather(
+                hidden_states, self.cp_size, forward_batch
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states

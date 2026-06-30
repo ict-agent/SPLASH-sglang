@@ -168,10 +168,7 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
 
 def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
-        cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        cur_cp_seq_len = ceil_div(seq_len, cp_size)
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
