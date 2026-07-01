@@ -173,8 +173,10 @@ class SchedulerOutputProcessorMixin:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.finished() or req.is_retracted:
-                    # decode req in mixed batch or retracted req
+                if (req.finished() and req.is_chunked <= 0) or req.is_retracted:
+                    # Decode req in a mixed batch, or a retracted req. Keep an
+                    # aborted middle chunk in the chunked branch long enough to
+                    # drain its accounting without streaming it.
                     continue
 
                 if req.is_chunked <= 0:

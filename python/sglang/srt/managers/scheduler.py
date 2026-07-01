@@ -927,6 +927,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2229,6 +2230,38 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
+    def process_pending_chunked_abort(self) -> None:
+        """Abort an in-flight chunked-prefill request at a scheduler boundary."""
+        req = getattr(self, "_pending_chunked_abort_req", None)
+        if req is None:
+            return
+        if self.chunked_req is not req:
+            # Already past chunked prefill; the running-batch abort path handles it.
+            if req.finished() or req.req_pool_idx is None:
+                self._pending_chunked_abort_req = None
+            return
+
+        prepare_abort(req, "Aborted")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        req.to_finish = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if hasattr(req.disagg_kv_sender, "abort"):
+                req.disagg_kv_sender.abort()
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if (
+            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+        ) and not req.kv_committed_freed:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        self.chunked_req = None
+        self._pending_chunked_abort_req = None
+        self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2269,6 +2302,8 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -3070,6 +3105,7 @@ class Scheduler(
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
@@ -3297,6 +3333,10 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if (chunked_req := getattr(self, "chunked_req", None)) is not None:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []

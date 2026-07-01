@@ -365,14 +365,60 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
+        """Abort waiting prefill requests if their decode peer died."""
+        candidates = [req for req in self.waiting_queue if not req.finished()]
+        if not candidates:
+            return
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in candidates],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        failed = []
+        for req, poll in zip(candidates, polls):
+            if poll != KVPoll.Failed:
+                continue
+
+            error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.error(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            self.stream_output([req], req.return_logprob)
+            failed.append(req)
+            if self.enable_metrics:
+                self.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+
+        if failed:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in failed
+            ]
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         self.running_batch.batch_is_full = False
 
         self.process_prefill_chunk()
+
+        self.resolve_waiting_queue_bootstrap()
 
         batch = self.get_new_batch_prefill()
         batch = self.maybe_prepare_mlp_sync_batch(batch)
@@ -565,6 +611,17 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
+
+                # A chunked request may have been aborted after this chunk was
+                # launched. Drain accounting, but do not send KV to decode.
+                if req.finished():
+                    if req.return_logprob:
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+                        if extend_logprob_start_len < extend_input_len:
+                            logprob_pt += extend_input_len - extend_logprob_start_len
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
