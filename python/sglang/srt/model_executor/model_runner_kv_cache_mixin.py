@@ -770,16 +770,17 @@ class ModelRunnerKVCacheMixin:
                         self.model_config.hf_config
                     )
                     extra_args["nsa_index_kpool"] = self.model_config.nsa_index_kpool
-                    # NSA kpool tail buffers are indexed by req_pool_idx, so they
-                    # must cover the *full* request-pool capacity, not just max_running_requests.
-                    extra_args["max_running_requests"] = (
-                        self.req_to_token_pool.req_to_token.shape[0]
-                    )
+                    if self.model_config.nsa_index_kpool > 1:
+                        # NSA kpool tail buffers are indexed by req_pool_idx, so they
+                        # must cover the *full* request-pool capacity, not just max_running_requests.
+                        extra_args["max_running_requests"] = (
+                            self.req_to_token_pool.req_to_token.shape[0]
+                        )
+                        extra_args["tail_extra_slots"] = (
+                            self.server_args.speculative_num_draft_tokens or 0
+                        )
                     extra_args["layer_shard_rank"] = nsa_cp_layer_shard_rank
                     extra_args["layer_shard_size"] = nsa_cp_layer_shard_size
-                    extra_args["tail_extra_slots"] = (
-                        self.server_args.speculative_num_draft_tokens or 0
-                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
