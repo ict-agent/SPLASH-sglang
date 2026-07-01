@@ -593,6 +593,25 @@ class HiMambaRadixCache(MambaRadixCache):
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
+    def _drain_write_through_acks_blocking(
+        self, target_id: Optional[int] = None
+    ) -> bool:
+        """Drain write-through backups, optionally stopping after target commits."""
+        while len(self.ongoing_write_through) > 0:
+            if target_id is not None and target_id not in self.ongoing_write_through:
+                return True
+            if not self.cache_controller.ack_write_queue:
+                return target_id is None
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                backuped_node = self.ongoing_write_through.pop(ack_id)
+                self._commit_pending_backup(backuped_node)
+                self.dec_lock_ref(backuped_node)
+                if self.enable_storage:
+                    self.write_backup_storage(backuped_node)
+        return True
+
     def loading_check(self):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
@@ -1256,6 +1275,11 @@ class HiMambaRadixCache(MambaRadixCache):
         if child.evicted:
             return self._split_evicted_node(key, child, split_len)
 
+        if (
+            child.id in self.pending_write_backups
+            or child.id in self.ongoing_write_through
+        ):
+            self._drain_write_through_acks_blocking(target_id=child.id)
         self.evictable_full_device_leaves.discard(child)
 
         new_node = super()._split_node(key, child, split_len)
