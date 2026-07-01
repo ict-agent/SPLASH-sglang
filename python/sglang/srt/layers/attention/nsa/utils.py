@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
+    get_attention_tp_size,
     get_triton_multimem_state,
     is_allocation_symmetric,
 )
@@ -107,11 +108,21 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
+    from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
+    # Must match the two-stage padding in ForwardBatch.prepare_mlp_sync_batch:
+    # first align to attn_tp_size (reduce-scatter across attn_tp), then to the
+    # CP align size. Missing the attn_tp_size step under-pads nsa_cache_seqlens
+    # relative to the padded q / page_table and breaks draft-extend (FA3
+    # "batch_size must be equal to batch_size_k").
+    cp_align_size = get_cp_padding_align_size()
     attn_cp_size = get_attention_cp_size()
+    attn_tp_size = get_attention_tp_size()
     for i in range(sync_group_size):
-        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
         forward_batch.is_extend_in_batch, global_num_tokens
     )

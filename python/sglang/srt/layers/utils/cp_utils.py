@@ -5,7 +5,7 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import get_attention_cp_group
+from sglang.srt.layers.dp_attention import get_attention_cp_group, get_attention_cp_size
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -40,6 +40,20 @@ def is_prefill_cp_in_seq_split():
         is_prefill_context_parallel_enabled()
         and get_global_server_args().prefill_cp_mode == "in-seq-split"
     )
+
+def get_cp_padding_align_size() -> int:
+    """Token-count alignment for CP padding of global_num_tokens: 2 * cp_size
+    for zigzag (in-seq-split) CP, otherwise cp_size (1 when CP is off, so the
+    padding is a no-op; extra padding breaks EAGLE/MTP draft prefill, see
+    #23269). Keep prepare_mlp_sync_batch and cal_padded_tokens consistent
+    through this helper.
+    """
+    from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+
+    attn_cp_size = get_attention_cp_size()
+    if is_prefill_cp_in_seq_split() or is_nsa_prefill_cp_in_seq_split():
+        return attn_cp_size * 2
+    return attn_cp_size
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):

@@ -341,6 +341,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -445,9 +446,7 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            logits_output = self.draft_runner.forward(forward_batch).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -588,9 +587,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
         else:
-            draft_logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            draft_logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,
@@ -789,11 +786,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
+        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
+        # prepare_for_v2_verify marked the batch in exactly that case; the
+        # non-cuda-graph path stays unmarked and gets forward_extend's init
+        # (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 

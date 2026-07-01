@@ -590,6 +590,7 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -702,7 +703,7 @@ class EAGLEWorker(TpModelWorker):
 
             # Run forward
             logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -1040,8 +1041,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch
                 )
+                forward_batch.mark_forward_metadata_ready()
             logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch
             ).logits_output
             self.capture_for_decode(
                 logits_output, forward_batch.spec_info, forward_batch=forward_batch

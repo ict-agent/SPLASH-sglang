@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -45,7 +46,6 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -74,6 +74,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+
+_skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 
@@ -440,6 +442,94 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    # Attention planning state. True iff attention metadata for this batch has
+    # already been planned outside ModelRunner.forward (multi-step draft
+    # pre-plan, plan-stream load_batch, hand-built spec batches), so the
+    # forward path must not plan again. Only such pre-planners may set this —
+    # ModelRunner / graph runners never mark after their own planning. The
+    # marker is only valid for the planning regime (backend set) it was set
+    # under; a fresh batch from init_new always starts unplanned.
+    forward_metadata_ready: bool = False
+    # Shapes the batch had when it was marked (plan record). Lets the
+    # judgment predicate detect staleness when DP padding
+    # (prepare_mlp_sync_batch) reshapes the batch after pre-planning.
+    # Deliberately plain ints — no planner object ref on ForwardBatch
+    # (runtime refs were removed from this dataclass on purpose).
+    forward_metadata_planned_bs: Optional[int] = None
+    forward_metadata_planned_num_tokens: Optional[int] = None
+    # Whether the forward path may re-plan this batch when its shapes no
+    # longer match the plan record. Only mark sites where the forward
+    # path's own init_forward_metadata is equivalent to the pre-plan
+    # (same backend object, no special context) may opt in; multi-step
+    # wrapper plans and view-context plans must keep this False — a
+    # forward-path re-plan would clobber their metadata.
+    forward_metadata_replan_equivalent: bool = False
+
+    def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
+        """Record that attention metadata was pre-planned for this batch.
+
+        Call right next to the out-of-forward planning action
+        (e.g. ``draft_attn_backend.init_forward_metadata(fb)`` or
+        ``graph_runner.load_batch(fb)``). Records the batch shapes so
+        staleness is detectable; pass ``replan_equivalent=True`` only when
+        a forward-path re-plan is equivalent to the pre-plan (see field
+        docs).
+        """
+        self.forward_metadata_ready = True
+        self.forward_metadata_planned_bs = self.batch_size
+        self.forward_metadata_planned_num_tokens = (
+            self.input_ids.shape[0] if self.input_ids is not None else 0
+        )
+        self.forward_metadata_replan_equivalent = replan_equivalent
+
+    def needs_forward_metadata_init(self) -> bool:
+        """Single judgment point for whether the forward path must plan.
+
+        A marked batch is treated as stale — and re-planned — when its
+        shapes no longer match the plan record AND the mark site declared
+        the re-plan safe (replan_equivalent). This runs after
+        prepare_mlp_sync_batch in _forward_raw, so the re-plan sees the
+        padded (final) shapes. Sites that cannot opt in (multi-step
+        wrapper plans etc.) keep today's behavior: marked stays skipped,
+        backends' defensive checks remain the backstop.
+        """
+        if not self.forward_metadata_ready:
+            return True
+        if not self.forward_metadata_replan_equivalent:
+            return False
+        num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
+        return (
+            self.batch_size != self.forward_metadata_planned_bs
+            or num_tokens != self.forward_metadata_planned_num_tokens
+        )
+
+    def apply_deprecated_skip_attn_backend_init(
+        self, skip_attn_backend_init: Optional[bool]
+    ) -> None:
+        """Map the deprecated ``skip_attn_backend_init`` kwarg onto the marker.
+
+        Mapped, not ignored: callers passing True relied on planning being
+        skipped — ignoring the flag would silently re-plan and corrupt
+        pre-planned multi-step draft metadata. Warns once per process (a
+        module flag, not the warnings filter, so the hot decode loop never
+        pays warnings.warn per forward).
+        """
+        if skip_attn_backend_init is None:
+            return
+        global _skip_attn_backend_init_warned
+        if not _skip_attn_backend_init_warned:
+            _skip_attn_backend_init_warned = True
+            warnings.warn(
+                "skip_attn_backend_init is deprecated and will be removed; "
+                "pre-planners should call "
+                "ForwardBatch.mark_forward_metadata_ready() after planning "
+                "instead. The flag is mapped onto the marker for now.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        if skip_attn_backend_init:
+            self.mark_forward_metadata_ready()
 
     @property
     def extend_num_valid_tokens(self) -> Optional[int]:
@@ -857,6 +947,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
+        # Local import: a module-level cp_utils import here is circular (#27014).
+        from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -870,9 +963,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
         # make sure that each rank has the same number of tokens to do collective communication.
-        attn_cp_size = get_attention_cp_size()
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
+        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
+        # prefill with NaN draft logits, see #23269).
+        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
+        cp_align_size = get_cp_padding_align_size()
         for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
