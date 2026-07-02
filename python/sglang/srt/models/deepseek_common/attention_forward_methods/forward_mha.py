@@ -144,14 +144,33 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
+                # GLM NOTE: when NSA MTP index share is enabled, the nextn
+                # draft-extend pass must emit seed topk_indices even on this
+                # dense MHA fast path; otherwise requests prefilled here carry
+                # no seed while requests from the sparse MLA path do, and
+                # EagleDraftInput.merge_batch would produce mtp_topk_indices
+                # whose row count disagrees with the merged batch size
+                # (crash in EAGLEDraftCudaGraphRunner.replay). For sequences
+                # short enough to take this path the indexer returns the
+                # cheap select-all dummy topk, which is the exact correct
+                # seed (all kv positions fit in the topk window).
+                capture_seed_indices = (
+                    self.is_nextn and forward_batch.capture_mtp_topk_indices
+                )
+                topk_indices = self.indexer(
                     x=hidden_states,
                     q_lora=q_lora,
                     positions=positions,
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
-                    return_indices=False,
+                    return_indices=capture_seed_indices,
                 )
+                if capture_seed_indices and topk_indices is not None:
+                    # The MHA core path returns a plain tensor (no tuple), so
+                    # the decoder-level write-back in deepseek_nextn is
+                    # skipped; store directly. MHA one-shot is disabled under
+                    # prefill CP, so no CP re-gather is needed here.
+                    forward_batch.topk_indices = topk_indices
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
