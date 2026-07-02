@@ -1163,6 +1163,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.accept_length = self.spec_info.accept_length[:bs]
+                # MTP index-share seed extraction cumsums extend_seq_lens after
+                # this returns; keep it unpadded like accept_length or the
+                # padded zero-length rows duplicate the last request's seed.
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
