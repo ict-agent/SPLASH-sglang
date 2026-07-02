@@ -571,7 +571,16 @@ class IndexerKPool(Indexer):
             dtype=torch.float32,
             device=device,
         )
-        return metadata.topk_transform(full_select_logits, self.index_topk)
+        topk_full = metadata.topk_transform(full_select_logits, self.index_topk)
+        # Pad to kpool path width [qo_len, index_topk + kpool - 1] with -1 sentinels
+        # so consumers like the MTP index-share buffer see a consistent shape.
+        pad = torch.full(
+            (topk_full.shape[0], self.index_kpool - 1),
+            -1,
+            dtype=topk_full.dtype,
+            device=topk_full.device,
+        )
+        return torch.cat([topk_full, pad], dim=1)
 
     def _get_kpool_decode_metadata(
         self,
@@ -1130,7 +1139,7 @@ class IndexerKPool(Indexer):
         assert forward_batch.seq_lens_cpu is not None
         if len(forward_batch.seq_lens_cpu) == 0:
             return torch.full(
-                (x.shape[0], self.index_topk),
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
                 dtype=torch.int,
                 device=x.device,

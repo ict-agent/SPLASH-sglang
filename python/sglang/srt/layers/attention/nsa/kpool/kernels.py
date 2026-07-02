@@ -419,12 +419,8 @@ def append_kpool_tail_to_topk(
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Append non-pooled tail tokens after selected expanded-history tokens."""
-    tail_pool = pool_size - 1
-    if tail_pool == 0:
-        return topk_result
-
     rows, n_cols = topk_result.shape
-    out_cols = n_cols + tail_pool
+    out_cols = n_cols + pool_size - 1
     out = torch.empty(
         (rows, out_cols), dtype=topk_result.dtype, device=topk_result.device
     )

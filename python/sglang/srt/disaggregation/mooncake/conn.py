@@ -1019,15 +1019,19 @@ class MooncakeKVManager(CommonKVManager):
         src_state_indices = chunk.state_indices or []
         dst_state_indices = req.dst_state_indices or []
 
-        # The per-component lists (src indices, dst indices, dst buffer ptrs)
-        # must all line up with state_types: prefill/decode build their
-        # components symmetrically from the same config, and each component's
-        # indices are paired with its own buffers.
+        # Under NSA cache layer_shard, non-terminal ranks own no draft KV
+        # buffers, so setup_state_kv_args registers fewer components than the
+        # symmetric prefill/decode config would suggest. The remote (or the
+        # sender's own build_state_indices) still emits index sublists for the
+        # full component set. Iterate against the local state_types and treat
+        # the leading N sublists as the components this rank owns; extra
+        # trailing components (draft NSA/tail on non-terminal ranks) are
+        # dropped -- the terminal rank ships them.
         n = len(state_types)
         if not (
-            len(src_state_indices) == n
-            and len(dst_state_indices) == n
-            and len(info.dst_state_data_ptrs) == n
+            len(src_state_indices) >= n
+            and len(dst_state_indices) >= n
+            and len(info.dst_state_data_ptrs) >= n
         ):
             logger.error(
                 f"State component count mismatch for room {req.room}: "
