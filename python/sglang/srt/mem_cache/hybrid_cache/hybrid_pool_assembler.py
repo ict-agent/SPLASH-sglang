@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
+    NSATokenToKVPoolHost,
     PoolEntry,
 )
 
@@ -509,12 +510,31 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=kv_pool,
-        page_size=page_size,
-        server_args=server_args,
-        use_mla=use_mla,
-    )
+    # NSA/DSA (e.g. GLM5-Next) full-attention KV pools carry a separate indexer
+    # buffer in addition to the latent KV, and their device KV buffer is
+    # kv_cache_dim wide (kv_lora_rank + fp8 scale + FlashMLA rope padding on
+    # DCU). A plain MLATokenToKVPoolHost would size/transfer only the latent KV
+    # at kv_lora_rank + qk_rope_head_dim, causing a shape mismatch on transfer
+    # (e.g. 512 vs 656) and leaving the indexer unbacked. NSATokenToKVPoolHost
+    # sizes the host KV from the device kv_cache_dim and backs up/loads the
+    # indexer together with the latent KV. Non-NSA Mamba hybrids keep the plain
+    # MLA/MHA host pool.
+    if getattr(kv_pool, "use_nsa", False):
+        kv_host_pool = NSATokenToKVPoolHost(
+            kv_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    else:
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=kv_pool,
+            page_size=page_size,
+            server_args=server_args,
+            use_mla=use_mla,
+        )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,

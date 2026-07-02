@@ -2677,3 +2677,93 @@ class NSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+
+class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
+    """Host-side NSA/DSA KV pool: MLA latent KV **plus** the NSA indexer.
+
+    GLM5-Next (DSA + KDA) uses an NSA (MLA-family) full-attention KV pool whose
+    device buffer is ``kv_cache_dim`` wide (on DCU/fp8 this is
+    kv_lora_rank + fp8 scale + FlashMLA rope padding, e.g. 656) and additionally
+    carries a separate NSA indexer buffer per token. Its HiCache full-attention
+    host pool must therefore back up / load *both* the latent KV and the indexer
+    for every token; otherwise:
+      * a plain MLATokenToKVPoolHost sizes host slots at kv_lora_rank +
+        qk_rope_head_dim (e.g. 512) and the device<->host transfer op fails with
+        a shape mismatch ("size of tensor a (512) must match tensor b (656)"),
+      * and even if sizes matched, KV restored from host would be missing its
+        indexer, so NSA attention would read stale/zero indexer state.
+
+    We fold the indexer into a single host pool (mirroring NV's validated
+    GLM5-Next path) but reuse the already-validated DCU ``NSAIndexerPoolHost``
+    (which handles the DCU-specific fp8/bf16 index-K storage) as the indexer
+    engine via composition. The main latent KV is handled entirely by the
+    MLATokenToKVPoolHost base class, sized with override_kv_cache_dim taken
+    directly from the device pool so it always matches (incl. FlashMLA padding).
+    """
+
+    device_pool: NSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        # Main latent KV host buffer. device_pool.kv_cache_dim already accounts
+        # for DCU FlashMLA rope padding + fp8 scale, so forward it as override so
+        # the host buffer width always matches the device buffer width.
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+        )
+        # Indexer host buffer + transfer logic. The sidecar shares this pool's
+        # host slot layout (same size / page_num), so it consumes the same
+        # host_indices we allocate for the main KV.
+        self.indexer_host = NSAIndexerPoolHost(
+            device_pool,
+            self,
+            layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        self.indexer_host.load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        self.indexer_host.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def clear(self):
+        super().clear()
+        # indexer_host is created after super().__init__ (which calls clear()),
+        # so guard against the first call during base construction.
+        if getattr(self, "indexer_host", None) is not None:
+            self.indexer_host.clear()
