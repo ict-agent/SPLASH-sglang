@@ -899,22 +899,56 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_num_evicted = 0
 
         if full_num_tokens > 0:
-            leaves = list(self.evictable_full_device_leaves)
-            eviction_heap = [(n.last_access_time, n) for n in leaves]
-            heapq.heapify(eviction_heap)
+            eviction_heap = []
+            full_num_evicted_at_last_rebuild = -1
 
-            while full_num_evicted < full_num_tokens and eviction_heap:
+            while full_num_evicted < full_num_tokens:
+                if not eviction_heap:
+                    if not self.evictable_full_device_leaves:
+                        break
+                    if full_num_evicted_at_last_rebuild == full_num_evicted:
+                        logger.warning(
+                            "HiMamba full eviction made no progress after heap "
+                            "rebuild: requested=%s evicted=%s "
+                            "full_evictable_size=%s device_leaf_candidates=%s",
+                            full_num_tokens,
+                            full_num_evicted,
+                            self.full_evictable_size_,
+                            len(self.evictable_full_device_leaves),
+                        )
+                        break
+                    full_num_evicted_at_last_rebuild = full_num_evicted
+                    eviction_heap = [
+                        (n.last_access_time, n)
+                        for n in self.evictable_full_device_leaves
+                    ]
+                    heapq.heapify(eviction_heap)
+
                 _, x = heapq.heappop(eviction_heap)
                 if x not in self.evictable_full_device_leaves:
                     continue
 
+                parent = x.parent
                 evicted_full, evicted_mamba = self._evict_device_leaf(x)
                 full_num_evicted += evicted_full
                 mamba_num_evicted += evicted_mamba
 
-                parent = x.parent
                 if parent in self.evictable_full_device_leaves:
                     heapq.heappush(eviction_heap, (parent.last_access_time, parent))
+
+            if (
+                full_num_evicted < full_num_tokens
+                and self.full_evictable_size_ > 0
+                and len(self.evictable_full_device_leaves) > 0
+            ):
+                logger.warning(
+                    "HiMamba full eviction returned short: requested=%s evicted=%s "
+                    "full_evictable_size=%s device_leaf_candidates=%s",
+                    full_num_tokens,
+                    full_num_evicted,
+                    self.full_evictable_size_,
+                    len(self.evictable_full_device_leaves),
+                )
 
         if params.mamba_num > 0:
             mamba_num_evicted += self.evict_mamba(params.mamba_num)
@@ -926,11 +960,29 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def evict_host(self, num_tokens: int):
         """Evict host-resident leaf nodes: free host KV + mamba, delete from tree, cascade."""
-        heap = [(n.last_access_time, n) for n in self.evictable_full_host_leaves]
-        heapq.heapify(heap)
-
+        heap = []
         num_evicted = 0
-        while num_evicted < num_tokens and heap:
+        num_evicted_at_last_rebuild = -1
+
+        while num_evicted < num_tokens:
+            if not heap:
+                if not self.evictable_full_host_leaves:
+                    break
+                if num_evicted_at_last_rebuild == num_evicted:
+                    logger.warning(
+                        "HiMamba host eviction made no progress after heap "
+                        "rebuild: requested=%s evicted=%s host_leaf_candidates=%s",
+                        num_tokens,
+                        num_evicted,
+                        len(self.evictable_full_host_leaves),
+                    )
+                    break
+                num_evicted_at_last_rebuild = num_evicted
+                heap = [
+                    (n.last_access_time, n) for n in self.evictable_full_host_leaves
+                ]
+                heapq.heapify(heap)
+
             _, x = heapq.heappop(heap)
             if x not in self.evictable_full_host_leaves:
                 continue
@@ -939,6 +991,15 @@ class HiMambaRadixCache(MambaRadixCache):
 
             if x.parent in self.evictable_full_host_leaves:
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+
+        if num_evicted < num_tokens and len(self.evictable_full_host_leaves) > 0:
+            logger.warning(
+                "HiMamba host eviction returned short: requested=%s evicted=%s "
+                "host_leaf_candidates=%s",
+                num_tokens,
+                num_evicted,
+                len(self.evictable_full_host_leaves),
+            )
 
     def evict_mamba_host(self, num_mamba_hosts: int) -> int:
         """Evict host mamba states.
