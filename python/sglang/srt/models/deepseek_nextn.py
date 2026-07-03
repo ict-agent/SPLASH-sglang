@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
@@ -207,6 +208,7 @@ class DeepseekModelNextN(nn.Module):
 
             if use_cp:
                 # allgather + rerrange
+                local_num_tokens = hidden_states.shape[0]
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
                     self.cp_size,
@@ -219,6 +221,20 @@ class DeepseekModelNextN(nn.Module):
                 # reuse via extend_seq_lens cumsum) see a shape consistent
                 # with the un-split sequence.
                 if should_update_mtp_topk_indices and topk_indices is not None:
+                    if (
+                        is_nsa_prefill_cp_round_robin_split()
+                        and topk_indices.shape[0] < local_num_tokens
+                    ):
+                        pad_rows = local_num_tokens - topk_indices.shape[0]
+                        topk_indices = torch.cat(
+                            [
+                                topk_indices,
+                                topk_indices.new_full(
+                                    (pad_rows, topk_indices.shape[1]), -1
+                                ),
+                            ],
+                            dim=0,
+                        )
                     topk_indices = cp_all_gather_rerange_output(
                         topk_indices,
                         self.cp_size,
