@@ -130,6 +130,16 @@ class FutureMap:
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
+            # input_ids is produced on the schedule stream but the gather below
+            # runs on the forward stream. Without record_stream, the caching
+            # allocator may reclaim/reuse input_ids' memory before the forward
+            # stream finishes reading it, so the gather reads uninitialized
+            # memory (e.g. 0x55555556) as an index -> OOB gather -> VMFault.
+            # This is the same protection the spec path applies to `indices`
+            # below. Observed on DCU under HiCache memory pressure.
+            model_worker_batch.input_ids.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
