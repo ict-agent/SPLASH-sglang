@@ -1155,6 +1155,7 @@ class NixlKVSender(CommonKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last:

@@ -483,8 +483,21 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
     return (num_kv_indices + page_size - 1) // page_size
 
 
+def _get_cp_rank_page_bounds(
+    total_pages: int, cp_rank: int, cp_size: int
+) -> Tuple[int, int]:
+    base = total_pages // cp_size
+    rem = total_pages % cp_size
+    local_start = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    return local_start, local_start + n_pages
+
+
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
     """Partition kv_indices/index_slice across CP ranks for KV transfer.
 
@@ -494,24 +507,29 @@ def filter_kv_indices_for_cp_rank(
     ranks sending the same data, each rank sends a contiguous *positional*
     slice of the page list; together the slices tile the request exactly once.
     """
-    total_pages = len(kv_indices)
+    if total_pages is None:
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
-    if cp_size <= 1 or total_pages == 0:
+    if cp_size <= 1:
         return kv_indices, index_slice
 
-    base = total_pages // cp_size
-    rem = total_pages % cp_size
-    local_start = cp_rank * base + min(cp_rank, rem)
-    n_pages = base + (1 if cp_rank < rem else 0)
-    local_end = local_start + n_pages
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = index_slice.start if index_slice.start is not None else 0
+    chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
+    first_pos = max(rank_start, chunk_start) - chunk_start
+    last_pos = min(rank_end, chunk_end) - chunk_start
 
-    new_kv_indices = kv_indices[local_start:local_end]
-    new_index_slice = slice(
-        index_slice.start + local_start,
-        index_slice.start + local_end,
-    )
+    if last_pos <= first_pos:
+        new_kv_indices = kv_indices[:0]
+        new_index_slice = slice(chunk_start, chunk_start)
+    else:
+        new_kv_indices = kv_indices[first_pos:last_pos]
+        new_index_slice = slice(
+            chunk_start + first_pos,
+            chunk_start + last_pos,
+        )
     return new_kv_indices, new_index_slice
 
 

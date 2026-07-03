@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.utils import filter_kv_indices_for_cp_rank
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -88,6 +89,68 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestCPPageFiltering(unittest.TestCase):
+    @staticmethod
+    def _mgr(cp_rank, cp_size):
+        class Manager:
+            pass
+
+        mgr = Manager()
+        mgr.attn_cp_rank = cp_rank
+        mgr.attn_cp_size = cp_size
+        return mgr
+
+    @staticmethod
+    def _arr(values):
+        return np.array(values, dtype=np.int32)
+
+    def test_uses_request_positions_not_global_page_ids(self):
+        pages = self._arr([10, 2, 30, 4, 50, 6])
+
+        rank0_pages, rank0_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(0, 2), pages, slice(0, 6), total_pages=6
+        )
+        rank1_pages, rank1_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(1, 2), pages, slice(0, 6), total_pages=6
+        )
+
+        np.testing.assert_array_equal(rank0_pages, self._arr([10, 2, 30]))
+        self.assertEqual((rank0_slice.start, rank0_slice.stop), (0, 3))
+        np.testing.assert_array_equal(rank1_pages, self._arr([4, 50, 6]))
+        self.assertEqual((rank1_slice.start, rank1_slice.stop), (3, 6))
+
+    def test_intersects_cp_range_with_chunk_offset(self):
+        chunk = self._arr([30, 4, 50])
+
+        rank0_pages, rank0_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(0, 2), chunk, slice(2, 5), total_pages=6
+        )
+        rank1_pages, rank1_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(1, 2), chunk, slice(2, 5), total_pages=6
+        )
+
+        np.testing.assert_array_equal(rank0_pages, self._arr([30]))
+        self.assertEqual((rank0_slice.start, rank0_slice.stop), (2, 3))
+        np.testing.assert_array_equal(rank1_pages, self._arr([4, 50]))
+        self.assertEqual((rank1_slice.start, rank1_slice.stop), (3, 5))
+
+    def test_empty_intersection_preserves_chunk_start(self):
+        pages, index_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(1, 2), self._arr([10, 2]), slice(0, 2), total_pages=6
+        )
+
+        np.testing.assert_array_equal(pages, self._arr([]))
+        self.assertEqual((index_slice.start, index_slice.stop), (0, 0))
+
+    def test_total_pages_default_keeps_legacy_full_chunk_behavior(self):
+        pages, index_slice = filter_kv_indices_for_cp_rank(
+            self._mgr(1, 2), self._arr([10, 2, 30, 4]), slice(0, 4)
+        )
+
+        np.testing.assert_array_equal(pages, self._arr([30, 4]))
+        self.assertEqual((index_slice.start, index_slice.stop), (2, 4))
 
 
 if __name__ == "__main__":
