@@ -808,19 +808,22 @@ class DeepseekV2MoE(nn.Module):
         sbo_overlap_combine_flag = (
             sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
         )
+        # Defer the shared experts so they are enqueued on alt_stream *after*
+        # the main-stream routed experts (see below). Issuing the main branch
+        # first, with a single uniform wait_stream fork/join, lets CUDA-graph
+        # capture reuse one physical side stream across layers instead of
+        # minting a new layer-local side stream per fork.
+        defer_shared_experts = (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.alt_stream is not None
+        )
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag:
-                if self.alt_stream is not None:
-                    self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(self.alt_stream):
-                        shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
-                else:
-                    shared_output = self._forward_shared_experts(hidden_states)
+            if not sbo_enabled_flag and self.alt_stream is None:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -980,17 +983,21 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-        )
-
-        if (
-            hidden_states.shape[0] > 0
-            and not sbo_enabled_flag
-            and self.alt_stream is not None
-        ):
-            torch.cuda.current_stream().wait_event(shared_event)
+        if defer_shared_experts:
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                topk_output=topk_output,
+            )
 
         if shared_output is not None:
             x = shared_output

@@ -131,12 +131,6 @@ class IndexerKPool(Indexer):
             torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
         )
 
-        # Extra stream so the gate matmul can overlap with q/k projection
-        # when dual-stream is active during decode.
-        self.compress_gate_stream = None
-        if is_cuda() and self.alt_stream is not None:
-            self.compress_gate_stream = torch.cuda.Stream()
-
     @torch.compile(dynamic=True) if not is_hip() else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):
         # Reuse the parent's bf16 weights_proj path; only difference is the
@@ -280,9 +274,6 @@ class IndexerKPool(Indexer):
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if precompute_compress_gate:
-                assert self.compress_gate_stream is not None
-                self.compress_gate_stream.wait_stream(current_stream)
 
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.half_device_sm_count
@@ -290,9 +281,7 @@ class IndexerKPool(Indexer):
                 query, q_rope = self._project_q(q_lora)
             with torch.cuda.stream(self.alt_stream):
                 key, k_rope = self._project_k(x)
-
-            if precompute_compress_gate:
-                with torch.cuda.stream(self.compress_gate_stream):
+                if precompute_compress_gate:
                     gate_score = self._compute_gate_score(x)
 
             current_stream.wait_stream(self.alt_stream)
@@ -1194,12 +1183,9 @@ class IndexerKPool(Indexer):
                     x, positions, forward_batch, layer_id, metadata, return_indices
                 )
 
-        # Q/K projection (plus optional compress-gate matmul on a third
-        # stream for dual-stream decode). ``index_kpool > 1`` is a class
-        # invariant (see __init__).
-        precompute_compress_gate = (
-            enable_dual_stream and is_decode and self.compress_gate_stream is not None
-        )
+        # Q/K projection (plus optional compress-gate matmul on the shared
+        # alt stream for dual-stream decode).
+        precompute_compress_gate = enable_dual_stream and is_decode
         query, key, gate_score = self._get_q_k_bf16(
             q_lora,
             x,
@@ -1240,8 +1226,8 @@ class IndexerKPool(Indexer):
         if overlap_decode or overlap_prefill:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            if precompute_compress_gate:
-                self.alt_stream.wait_stream(self.compress_gate_stream)
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            weights = self._get_logits_head_gate(x, q_scale)
             with torch.cuda.stream(self.alt_stream):
                 # Resolve gate_score on alt_stream so the fallback
                 # F.linear overlaps with q quant on the current stream.
@@ -1253,8 +1239,6 @@ class IndexerKPool(Indexer):
                     layer_id=layer_id,
                     metadata=metadata,
                 )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            weights = self._get_logits_head_gate(x, q_scale)
             current_stream.wait_stream(self.alt_stream)
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
