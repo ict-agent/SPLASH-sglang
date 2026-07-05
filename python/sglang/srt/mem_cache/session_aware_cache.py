@@ -332,38 +332,61 @@ class SessionAwareCache(BasePrefixCache):
         slot.mamba_last_track_seqlen = None
         slot.mamba_branching_seqlen = None
 
-    def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Total KV tokens held by session slots, not tracked by the tree.
+
+        Excludes slots whose KV is currently owned by an owning request --
+        those tokens are counted via uncached_size in the busy mem check.
+        A slot's pool_idx being in active_pool_idxs indicates a req owns it.
+        """
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
 
-    def session_held_full_tokens(self) -> int:
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """An alias to align the naming style of SWA"""
-        return self.session_held_tokens()
+        return self.session_held_tokens(active_pool_idxs)
 
-    def session_held_swa_tokens(self) -> int:
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
                 )
         return total
 
-    def session_held_req_count(self) -> int:
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(s.is_holding_kv for s in self.slots.values())
 
-    def session_held_mamba_slots(self) -> int:
+        def _owned(s):
+            in_batch = (
+                active_pool_idxs is not None and s.req_pool_idx in active_pool_idxs
+            )
+            return s.is_holding_kv and not in_batch
+
+        return sum(_owned(s) for s in self.slots.values())
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total mamba pool slots held by streaming session slots."""
         total = 0
         for slot in self.slots.values():
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if in_batch:
+                continue
             if slot.mamba_pool_idx is not None:
                 total += slot.mamba_pool_idx.numel()
             if slot.mamba_ping_pong_track_buffer is not None:

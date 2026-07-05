@@ -21,19 +21,34 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _active_pool_idxs(self: Scheduler) -> set:
+        """Pool idxs currently owned by reqs in last_batch / running_batch.
+
+        Used to decide which session slots' KV is owned by batch reqs
+        (and thus counted via uncached_size, not session_held).
+        """
+        idxs = set()
+        for batch in [self.last_batch, self.running_batch]:
+            if batch is None or batch.is_empty():
+                continue
+            for req in batch.reqs:
+                if req.req_pool_idx is not None:
+                    idxs.add(req.req_pool_idx)
+        return idxs
+
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_tokens()
+            return self.tree_cache.session_held_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_full_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_full_tokens()
+            return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_swa_tokens()
+            return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_req_count(self: Scheduler) -> int:
@@ -43,7 +58,7 @@ class SchedulerRuntimeCheckerMixin:
 
     def _session_held_mamba_slots(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_mamba_slots()
+            return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
         return 0
 
     def _get_token_info(self: Scheduler):
@@ -368,6 +383,8 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        if not self.is_fully_idle():
+            return
         if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
             return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
