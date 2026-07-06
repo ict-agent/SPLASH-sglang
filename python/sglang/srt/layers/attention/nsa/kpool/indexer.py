@@ -250,19 +250,20 @@ class IndexerKPool(Indexer):
         Differences vs ``Indexer._get_q_k_bf16``:
           * Skips ``rotate_activation(key)`` -- the kpool path rotates inside
             the fused compress kernel instead.
-          * Optionally launches the compress-gate matmul on a third stream
-            when running under dual-stream decode.
+          * Optionally launches the compress-gate matmul on the alt stream
+            when running under dual-stream decode/verify.
           * Under nsa_enable_prefill_cp this rank's K and gate_score are
             all-gathered (then rerange'd into natural order) into the full
             sequence before returning. The query path stays rank-local.
             Rotary embedding is applied locally before all-gather; this is
             safe because rope is a per-token op that commutes with gather.
         """
+
         use_cp = (
             nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
             and forward_batch.forward_mode.is_extend_without_speculative()
         )
-        # precompute_compress_gate only fires in dual-stream decode; CP
+        # precompute_compress_gate only fires in dual-stream decode/verify; CP
         # only fires in prefill. They are mutually exclusive by mode --
         # the assert guards against a future caller that breaks this.
         assert not (use_cp and precompute_compress_gate), (
@@ -299,7 +300,7 @@ class IndexerKPool(Indexer):
         if use_cp:
             # Fused all-gather of K + gate_score (same N, both bf16). See
             # ``_cp_gather_concat`` for layout. gate_score is None here:
-            # precompute_compress_gate is decode-only, CP is prefill-only.
+            # precompute_compress_gate is decode/verify-only, CP is prefill-only.
             gate_score = self._compute_gate_score(x)
             key, gate_score = self._cp_gather_concat(
                 [key, gate_score], self.cp_size, forward_batch
@@ -975,6 +976,7 @@ class IndexerKPool(Indexer):
         forward_batch: ForwardBatch,
         layer_id: int,
         metadata: BaseIndexerMetadata,
+        enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         """Verify forward: draft K/score ring-written into the tail at logical
@@ -1001,59 +1003,70 @@ class IndexerKPool(Indexer):
         )
 
         # (1) Q/K bf16 projection (Hadamard already applied in _get_q_k_bf16).
-        # CP / dual-stream are not active in target_verify.
+        # Under cuda graph, Q projection stays on the current stream while K
+        # projection and the compress-gate matmul run on the alt stream.
         query, key, gate_score_maybe = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
-            enable_dual_stream=False,
+            enable_dual_stream=enable_dual_stream,
             forward_batch=forward_batch,
-            precompute_compress_gate=False,
+            precompute_compress_gate=enable_dual_stream,
         )
-        gate_score = self._compute_gate_score_if_missing(x, gate_score_maybe)
         query = _ensure_min_heads(query)
 
-        # (2) Fused: write N draft K/score into the tail ring, then compress
-        # any closed pool from tail into the persistent FP8 cache. One kernel
-        # launch (grid=(B,)) handles both steps per batch; the compress
-        # half is gated in-kernel on ``(committed + N) // P > committed // P``.
-        pool = forward_batch.token_to_kv_pool
-        tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
-        buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-        kpool_write_tail_and_maybe_compress(
-            pool=pool,
-            buf=buf,
-            key=key,
-            score=gate_score,
-            tail_k=tail_k_buf,
-            tail_score=tail_score_buf,
-            ape=self.index_kpool_compress_ape,
-            req_pool_indices=plan.req,
-            write_start=plan.write_start,
-            tail_logical_start=plan.tail_logical_start,
-            write_loc=plan.write_loc,
-            out_cache_loc=forward_batch.out_cache_loc,
-            num_draft_tokens=plan.num_draft_tokens,
-            round_scale=self.scale_fmt is not None,
-            # v2 only (None for target_verify): defer compress to the round
-            # whose real advance crosses a pool boundary.
-            effective_n_per_batch=plan.effective_n_per_batch,
-        )
-
-        # (3) Q quant + weights.
-        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-        weights = self._get_logits_head_gate(x, q_scale)
-
-        # (4) Top-k via persistent paged page_table (no stitched reserve).
-        topk_indices = (
-            self._get_topk_paged_verify(
-                forward_batch, layer_id, q_fp8, weights, plan, metadata
+        def _compress_write() -> None:
+            # Fused: write N draft K/score into the tail ring, then compress
+            # any closed pool from tail into the persistent FP8 cache. One
+            # kernel launch (grid=(B,)) handles both steps per batch; the
+            # compress half is gated in-kernel on pool-boundary crossing.
+            pool = forward_batch.token_to_kv_pool
+            tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            kpool_write_tail_and_maybe_compress(
+                pool=pool,
+                buf=buf,
+                key=key,
+                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                ape=self.index_kpool_compress_ape,
+                req_pool_indices=plan.req,
+                write_start=plan.write_start,
+                tail_logical_start=plan.tail_logical_start,
+                write_loc=plan.write_loc,
+                out_cache_loc=forward_batch.out_cache_loc,
+                num_draft_tokens=plan.num_draft_tokens,
+                round_scale=self.scale_fmt is not None,
+                # v2 only (None for target_verify): defer compress to the
+                # round whose real advance crosses a pool boundary.
+                effective_n_per_batch=plan.effective_n_per_batch,
             )
-            if return_indices
-            else None
-        )
 
-        return topk_indices
+        # (2) Run tail/compress on the alt stream while the current stream
+        # prepares q_fp8 and head-gate weights for paged top-k.
+        if enable_dual_stream:
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                weights = self._get_logits_head_gate(x, q_scale)
+            with torch.cuda.stream(self.alt_stream):
+                _compress_write()
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            _compress_write()
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                weights = self._get_logits_head_gate(x, q_scale)
+
+        if not return_indices:
+            return None
+
+        # (3) Top-k via persistent paged page_table (no stitched reserve).
+        return self._get_topk_paged_verify(
+            forward_batch, layer_id, q_fp8, weights, plan, metadata
+        )
 
     def _get_topk_paged_verify(
         self,
@@ -1151,6 +1164,13 @@ class IndexerKPool(Indexer):
         is_draft_extend_v2 = mode.is_draft_extend_v2()
         is_draft_extend_v1 = mode.is_draft_extend() and not is_draft_extend_v2
 
+        enable_dual_stream = (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and q_lora.shape[0] > 0
+            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+        )
+
         # target_verify and draft_extend_v2 share the same KPoolWritePlan
         # path: fixed q_len = N per batch, identical tail-ring + close-pool
         # write semantics, identical paged topk shape ``[B*N, ...]``.
@@ -1164,15 +1184,9 @@ class IndexerKPool(Indexer):
                 forward_batch=forward_batch,
                 layer_id=layer_id,
                 metadata=metadata,
+                enable_dual_stream=enable_dual_stream,
                 return_indices=return_indices,
             )
-
-        enable_dual_stream = (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-        )
 
         # Skip-logits fast path: when every request fits inside the topk
         # window, the indexer just stores K and returns a dummy topk
