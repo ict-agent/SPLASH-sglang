@@ -217,7 +217,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                quant_config=None,#quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
