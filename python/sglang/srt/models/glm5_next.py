@@ -191,16 +191,17 @@ class ModelNextLinearAttention(nn.Module):
 
         # Optional experimental fusion for the KDA projections.
         requested_fuse_qkvbfg = envs.SGLANG_Model_NEXT_FUSE_QKVBFG.get()
-        fuse_qkvbfg_supported = (
-            not self.nsa_enable_prefill_cp
-            and head_shard_size == get_tensor_model_parallel_world_size()
+        fuse_qkvbfg_supported = head_shard_size == (
+            get_attention_cp_size()
+            if self.nsa_enable_prefill_cp
+            else get_tensor_model_parallel_world_size()
         )
         self.do_fuse_qkvbfg = requested_fuse_qkvbfg and fuse_qkvbfg_supported
         if requested_fuse_qkvbfg and not fuse_qkvbfg_supported:
             log_info_on_rank0(
                 logger,
                 "SGLANG_Model_NEXT_FUSE_QKVBFG is disabled because ModelNext KDA "
-                "is not sharded by the tensor-parallel group in this run.",
+                "is not sharded by the active attention group in this run.",
             )
         if self.do_fuse_qkvbfg:
             # Fuse q/k/v/beta (column-parallel) + f_a/g_a (replicated) into one
@@ -219,6 +220,8 @@ class ModelNextLinearAttention(nn.Module):
                 self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,  # qkv
@@ -230,6 +233,8 @@ class ModelNextLinearAttention(nn.Module):
                 self.head_dim,
                 projection_size,
                 dtype=_get_config_dtype(config),
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
