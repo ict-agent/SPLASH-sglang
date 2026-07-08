@@ -37,9 +37,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_dcu, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -123,8 +124,18 @@ def alloc_with_host_register(
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
+        # On DCU/ROCm the "kernel" hicache io backend runs a GPU transfer kernel
+        # that dereferences the host buffer pointer directly. For the GPU to be
+        # able to access this host memory, it must be registered as *mapped*
+        # (cudaHostRegisterMapped == 2); the transfer kernel then obtains a
+        # GPU-accessible pointer via cudaHostGetDevicePointer (see
+        # get_rocm_kernel_accessible_ptr in sgl-kernel/csrc/kvcacheio/transfer.cu).
+        # With the default flag (0) the host pages are not mapped into the GPU
+        # address space and the transfer kernel faults (VMFault). On CUDA, UVA
+        # makes flag 0 sufficient, so keep the original behavior there.
+        flags = 2 if _is_dcu else 0
         torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            buffer.data_ptr(), buffer.numel() * buffer.element_size(), flags
         )
     return buffer
 
@@ -141,6 +152,63 @@ def alloc_with_pin_memory(
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
+
+
+def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
+    """Return a pointer to ``tensor``'s storage that a GPU transfer kernel can
+    dereference.
+
+    The "kernel" hicache io backend passes a table of per-layer base addresses
+    (``k_data_ptrs`` / ``v_data_ptrs``) to a GPU kernel that dereferences those
+    addresses directly (see ``get_global_offset_lf_tbl`` in
+    ``sgl-kernel/csrc/kvcacheio/transfer.cu``). For host buffers, the raw host
+    ``data_ptr()`` is only GPU-accessible on CUDA (thanks to UVA). On DCU/ROCm
+    the host pages must be registered as mapped (see ``alloc_with_host_register``)
+    and the GPU-side address obtained via ``hipHostGetDevicePointer``; otherwise
+    the kernel faults (VMFault) when it dereferences an unmapped host address.
+
+    Device tensors and non-DCU platforms return the plain ``data_ptr()``.
+    """
+    if not _is_dcu or tensor.is_cuda:
+        return tensor.data_ptr()
+    # DCU host tensor: translate the host pointer to a GPU-accessible one.
+    # torch's cudart python binding does not expose HostGetDevicePointer, so we
+    # call the HIP runtime directly via ctypes.
+    return _hip_host_get_device_pointer(tensor.data_ptr())
+
+
+_HIP_RT = None
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    import ctypes
+
+    global _HIP_RT
+    if _HIP_RT is None:
+        last_err = None
+        for lib in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+            try:
+                _HIP_RT = ctypes.CDLL(lib)
+                break
+            except OSError as e:  # noqa: PERF203
+                last_err = e
+        if _HIP_RT is None:
+            raise RuntimeError(
+                f"Failed to load the HIP runtime for hipHostGetDevicePointer: {last_err}"
+            )
+
+    dev_ptr = ctypes.c_void_p()
+    # hipError_t hipHostGetDevicePointer(void** devPtr, void* hstPtr, unsigned int flags)
+    err = _HIP_RT.hipHostGetDevicePointer(
+        ctypes.byref(dev_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer failed (hipError={err}) while building the "
+            f"kernel hicache device-pointer table; the host buffer must be "
+            f"registered with hipHostRegisterMapped (see alloc_with_host_register)."
+        )
+    return int(dev_ptr.value)
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(
@@ -328,12 +396,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
+            [kernel_accessible_host_ptr(x) for x in self.k_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
         self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
+            [kernel_accessible_host_ptr(x) for x in self.v_data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -823,7 +891,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
+            [kernel_accessible_host_ptr(x) for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -1454,7 +1522,7 @@ class MambaPoolHost(HostKVCache):
         if io_backend == "kernel":
             item_size = MambaPoolHost._item_size_per_index(src_layers[0])
             src_ptrs = torch.tensor(
-                [src_layers[i].data_ptr() for i in range(num_layers)],
+                [kernel_accessible_host_ptr(src_layers[i]) for i in range(num_layers)],
                 dtype=torch.uint64,
                 device=device,
             )
@@ -2410,7 +2478,7 @@ class NSAIndexerPoolHost(HostKVCache):
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
             ]
             self.index_k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.index_k_data_refs],
+                [kernel_accessible_host_ptr(x) for x in self.index_k_data_refs],
                 dtype=torch.uint64,
                 device=self.device_pool.device,
             )
@@ -2609,3 +2677,93 @@ class NSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+
+class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
+    """Host-side NSA/DSA KV pool: MLA latent KV **plus** the NSA indexer.
+
+    GLM5-Next (DSA + KDA) uses an NSA (MLA-family) full-attention KV pool whose
+    device buffer is ``kv_cache_dim`` wide (on DCU/fp8 this is
+    kv_lora_rank + fp8 scale + FlashMLA rope padding, e.g. 656) and additionally
+    carries a separate NSA indexer buffer per token. Its HiCache full-attention
+    host pool must therefore back up / load *both* the latent KV and the indexer
+    for every token; otherwise:
+      * a plain MLATokenToKVPoolHost sizes host slots at kv_lora_rank +
+        qk_rope_head_dim (e.g. 512) and the device<->host transfer op fails with
+        a shape mismatch ("size of tensor a (512) must match tensor b (656)"),
+      * and even if sizes matched, KV restored from host would be missing its
+        indexer, so NSA attention would read stale/zero indexer state.
+
+    We fold the indexer into a single host pool (mirroring NV's validated
+    GLM5-Next path) but reuse the already-validated DCU ``NSAIndexerPoolHost``
+    (which handles the DCU-specific fp8/bf16 index-K storage) as the indexer
+    engine via composition. The main latent KV is handled entirely by the
+    MLATokenToKVPoolHost base class, sized with override_kv_cache_dim taken
+    directly from the device pool so it always matches (incl. FlashMLA padding).
+    """
+
+    device_pool: NSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        # Main latent KV host buffer. device_pool.kv_cache_dim already accounts
+        # for DCU FlashMLA rope padding + fp8 scale, so forward it as override so
+        # the host buffer width always matches the device buffer width.
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+            override_kv_cache_dim=device_pool.kv_cache_dim,
+        )
+        # Indexer host buffer + transfer logic. The sidecar shares this pool's
+        # host slot layout (same size / page_num), so it consumes the same
+        # host_indices we allocate for the main KV.
+        self.indexer_host = NSAIndexerPoolHost(
+            device_pool,
+            self,
+            layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        self.indexer_host.load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        self.indexer_host.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def clear(self):
+        super().clear()
+        # indexer_host is created after super().__init__ (which calls clear()),
+        # so guard against the first call during base construction.
+        if getattr(self, "indexer_host", None) is not None:
+            self.indexer_host.clear()

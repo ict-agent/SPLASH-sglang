@@ -314,7 +314,8 @@ def _init_jit_cuda_arch_once():
 @contextmanager
 def _jit_compile_context():
     if is_hip_runtime():
-        yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
+        _patch_tvm_ffi_load_inline_for_hip()
+        yield
         return
     env_key = "TVM_FFI_CUDA_ARCH_LIST"
     old_value = os.environ.get(env_key, None)
