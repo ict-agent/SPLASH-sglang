@@ -8,7 +8,14 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.configs.glm5_next import Glm5NextConfig
+from sglang.srt.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextTextUnderscoreConfig,
+    Glm5NextVisionConfig,
+    Glm5VNextConfig,
+    Glm5VNextVisionConfig,
+)
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
@@ -71,6 +78,11 @@ __all__ = [
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
     "Glm5NextConfig",
+    "Glm5NextTextConfig",
+    "Glm5NextTextUnderscoreConfig",
+    "Glm5NextVisionConfig",
+    "Glm5VNextConfig",
+    "Glm5VNextVisionConfig",
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",

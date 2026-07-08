@@ -1,4 +1,5 @@
 from transformers import CONFIG_MAPPING, PretrainedConfig
+from transformers.models.glm4v.configuration_glm4v import Glm4vVisionConfig
 
 from sglang.srt.configs.linear_attn_model_registry import (
     LinearAttnModelSpec,
@@ -9,6 +10,14 @@ from sglang.srt.configs.mamba_utils import (
     KimiLinearStateShape,
     mamba2_state_dtype,
 )
+
+
+class Glm5NextVisionConfig(Glm4vVisionConfig):
+    model_type = "glm5next_vision"
+
+
+class Glm5VNextVisionConfig(Glm5NextVisionConfig):
+    model_type = "glm5v_next_vision"
 
 
 def _default_linear_attn_config():
@@ -60,7 +69,23 @@ def _default_linear_attn_config():
 
 class Glm5NextConfig(PretrainedConfig):
     model_type = "glm5_next"
+    sub_configs = {"vision_config": Glm5NextVisionConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
+
+    _NO_PROMOTE = frozenset(
+        {
+            "model_type",
+            "architectures",
+            "text_config",
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "image_start_token_id",
+            "image_end_token_id",
+            "video_start_token_id",
+            "video_end_token_id",
+        }
+    )
 
     def __init__(
         self,
@@ -118,8 +143,23 @@ class Glm5NextConfig(PretrainedConfig):
         eos_token_id=None,
         tie_word_embeddings=False,
         architectures=None,
+        text_config=None,
+        vision_config=None,
+        image_token_id=151363,
+        video_token_id=151364,
+        image_start_token_id=151339,
+        image_end_token_id=151340,
+        video_start_token_id=151341,
+        video_end_token_id=151342,
         **kwargs,
     ):
+        if architectures is not None:
+            arch_aliases = {
+                "Glm5vNextForCausalLM": "Glm5NextForCausalLM",
+                "Glm5vNextForConditionalGeneration": "Glm5NextForConditionalGeneration",
+            }
+            architectures = [arch_aliases.get(arch, arch) for arch in architectures]
+
         self.model_type = model_type
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -202,6 +242,36 @@ class Glm5NextConfig(PretrainedConfig):
         self.index_dsa_use_layernorm = index_dsa_use_layernorm
         self.disable_nsa = disable_nsa
 
+        is_vlm = text_config is not None or vision_config is not None
+        if is_vlm:
+            if text_config is not None:
+                text_conf_cls = self.sub_configs["text_config"]
+                if isinstance(text_config, text_conf_cls):
+                    self.text_config = text_config
+                elif isinstance(text_config, PretrainedConfig):
+                    self.text_config = text_conf_cls(**text_config.to_dict())
+                else:
+                    self.text_config = text_conf_cls(**text_config)
+
+                for key, value in self.text_config.__dict__.items():
+                    if key.startswith("_") or key in self._NO_PROMOTE:
+                        continue
+                    setattr(self, key, value)
+
+            if isinstance(vision_config, dict):
+                self.vision_config = self.sub_configs["vision_config"](
+                    **vision_config
+                )
+            else:
+                self.vision_config = vision_config
+
+            self.image_token_id = image_token_id
+            self.video_token_id = video_token_id
+            self.image_start_token_id = image_start_token_id
+            self.image_end_token_id = image_end_token_id
+            self.video_start_token_id = video_start_token_id
+            self.video_end_token_id = video_end_token_id
+
         self.initializer_range = initializer_range
         self.use_cache = use_cache
 
@@ -274,11 +344,33 @@ class Glm5NextConfig(PretrainedConfig):
         )
 
 
+class Glm5NextTextConfig(Glm5NextConfig):
+    model_type = "glm5next_text"
+
+
+Glm5NextConfig.sub_configs["text_config"] = Glm5NextTextConfig
+
+
+class Glm5NextTextUnderscoreConfig(Glm5NextTextConfig):
+    model_type = "glm5_next_text"
+
+
+class Glm5VNextConfig(Glm5NextConfig):
+    model_type = "glm5v_next"
+    sub_configs = {
+        "vision_config": Glm5VNextVisionConfig,
+        "text_config": Glm5NextTextUnderscoreConfig,
+    }
+
+    def __init__(self, model_type="glm5v_next", **kwargs):
+        super().__init__(model_type=model_type, **kwargs)
+
+
 register_linear_attn_model(
     LinearAttnModelSpec(
         config_class=Glm5NextConfig,
         backend_class_name="sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend",
-        arch_names=["Glm5NextForCausalLM"],
+        arch_names=["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
         support_mamba_cache_extra_buffer=True,
@@ -289,3 +381,15 @@ try:
     CONFIG_MAPPING.register("glm5_next", Glm5NextConfig)
 except Exception:
     CONFIG_MAPPING._extra_content["glm5_next"] = Glm5NextConfig
+
+for _model_type, _config_cls in (
+    ("glm5next_text", Glm5NextTextConfig),
+    ("glm5_next_text", Glm5NextTextUnderscoreConfig),
+    ("glm5next_vision", Glm5NextVisionConfig),
+    ("glm5v_next", Glm5VNextConfig),
+    ("glm5v_next_vision", Glm5VNextVisionConfig),
+):
+    try:
+        CONFIG_MAPPING.register(_model_type, _config_cls)
+    except Exception:
+        CONFIG_MAPPING._extra_content[_model_type] = _config_cls

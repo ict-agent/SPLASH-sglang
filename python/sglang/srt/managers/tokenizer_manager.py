@@ -455,6 +455,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                is_decode_role=(
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                ),
             )
 
     def init_metric_collector_watchdog(self):

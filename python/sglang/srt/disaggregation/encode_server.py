@@ -38,6 +38,11 @@ from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileRe
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.processors.glm4v import (
+    _split_video_items as glm_split_video_items,
+    glm_sample_and_decode_sync,
+    preprocess_video_frames_sync as glm_preprocess_video_frames_sync,
+)
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.server_args import (
     PortArgs,
@@ -453,7 +458,7 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, False)
+                img, _ = load_image(data, self.use_image_processor_gpu)
                 if (
                     discard_alpha_channel
                     and not isinstance(img, torch.Tensor)
@@ -463,7 +468,7 @@ class MMEncoder:
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(data, use_gpu=self.use_image_processor_gpu)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -514,6 +519,10 @@ class MMEncoder:
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
+        video_urls, video_configs = glm_split_video_items(mm_items)
+        if video_urls is not None:
+            mm_items = video_urls
+
         futures, _ = self.submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
         )
@@ -531,6 +540,44 @@ class MMEncoder:
             ]
             videos, video_metadata = map(list, zip(*video_processed))
             video_processor_kwargs["do_sample_frames"] = False
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            return videos, video_processor_kwargs
+        elif "glm" in self.model_type:
+            framed = any(isinstance(video, list) for video in video_items)
+            loop = asyncio.get_running_loop()
+            if framed:
+                tasks = [
+                    loop.run_in_executor(
+                        self.io_executor, glm_preprocess_video_frames_sync, video
+                    )
+                    for video in video_items
+                ]
+                video_processed = await asyncio.gather(*tasks)
+                videos, video_metadata = map(list, zip(*video_processed))
+                video_processor_kwargs["do_sample_frames"] = True
+                video_processor_kwargs["return_metadata"] = True
+                if video_metadata:
+                    video_processor_kwargs["video_metadata"] = video_metadata
+                return videos, video_processor_kwargs
+
+            num_decode_workers = int(
+                os.environ.get("SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS", "4")
+            )
+            tasks = [
+                loop.run_in_executor(
+                    self.io_executor,
+                    glm_sample_and_decode_sync,
+                    video,
+                    num_decode_workers,
+                    video_configs[idx] if idx < len(video_configs) else {},
+                )
+                for idx, video in enumerate(video_items)
+            ]
+            video_processed = await asyncio.gather(*tasks)
+            videos, video_metadata = map(list, zip(*video_processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            video_processor_kwargs["return_metadata"] = True
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
@@ -997,6 +1044,21 @@ class MMEncoder:
                     )
                     video_timestamps.append(timestamps)
                 processor_input["video_timestamps"] = video_timestamps
+            elif "glm" in self.model_type:
+                video_metadata = processor_input.get("video_metadata", None)
+                video_timestamps = []
+                if video_metadata is not None:
+                    for metadata in video_metadata:
+                        ts = getattr(metadata, "timestamps", None)
+                        if ts is None and isinstance(metadata, dict):
+                            ts = metadata.get("timestamps", None)
+                        if ts is None:
+                            raise InternalError(
+                                f"GLM-V video metadata missing timestamps: {metadata}"
+                            )
+                        video_timestamps.append(list(ts)[::2])
+                processor_input["video_timestamps"] = video_timestamps
+                processor_input.pop("video_metadata", None)
             elif (
                 self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
                 and processor_input.get("video_grid_thw", None) is not None
@@ -1112,8 +1174,9 @@ class MMEncoder:
         prefill_host=None,
         embedding_port=None,
         url=None,
+        meta_only=False,
     ):
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake" and not meta_only:
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
@@ -1130,7 +1193,10 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if meta_only:
+            serialized_data = pickle.dumps(mm_data.copy_without_embedding())
+            buffer = None
+        elif self.server_args.encoder_transfer_backend == "mooncake":
             serialized_data = pickle.dumps(mm_data)
             buffer = None
         else:
@@ -1200,7 +1266,13 @@ class MMEncoder:
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_port,
+        session_id=None,
+        buffer_address=None,
+        meta_only=False,
     ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
         await self._send(
@@ -1210,6 +1282,7 @@ class MMEncoder:
             buffer_address=buffer_address,
             prefill_host=prefill_host,
             embedding_port=embedding_port,
+            meta_only=meta_only,
         )
 
     # For zmq_to_scheduler
@@ -1502,6 +1575,15 @@ async def handle_encode_request(request: dict):
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
+            if request.get("role") == "decode":
+                await encoder.send(
+                    req_id=req_id,
+                    prefill_host=request["prefill_host"],
+                    embedding_port=request["embedding_port"],
+                    meta_only=True,
+                )
+                encoder.embedding_to_send.pop(req_id, None)
+                return ORJSONResponse(content=None)
             del request["mm_items"]
             request.update(
                 {

@@ -129,6 +129,10 @@ class Glm4vVisionBlock(nn.Module):
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
         use_data_parallel: bool = False,
+        proj_bias: bool = False,
+        qk_normalization: bool = False,
+        qk_normalization_by_head_size: bool = False,
+        mlp_linear_bias: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
@@ -139,8 +143,11 @@ class Glm4vVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=False,
+            proj_bias=proj_bias,
             qkv_bias=attn_qkv_bias,
+            qk_normalization=qk_normalization,
+            qk_normalization_by_head_size=qk_normalization_by_head_size,
+            layer_norm_eps=rms_norm_eps,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -150,6 +157,7 @@ class Glm4vVisionBlock(nn.Module):
         self.mlp = Glm4vVisionMLP(
             dim,
             intermediate_dim,
+            bias=mlp_linear_bias,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
             use_data_parallel=use_data_parallel,
@@ -234,6 +242,7 @@ class Glm4vPatchMerger(nn.Module):
         bias: bool = False,
         prefix: str = "",
         use_data_parallel: bool = False,
+        layer_norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
@@ -246,7 +255,7 @@ class Glm4vPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
-        self.post_projection_norm = LayerNorm(self.hidden_size)
+        self.post_projection_norm = LayerNorm(self.hidden_size, eps=layer_norm_eps)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,
@@ -375,6 +384,7 @@ class Glm4vVisionModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        text_config=None,
     ) -> None:
         super().__init__()
 
@@ -388,6 +398,7 @@ class Glm4vVisionModel(nn.Module):
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
+        self.intermediate_dim = vision_config.intermediate_size
         self.use_data_parallel = use_data_parallel
 
         self.patch_embed = Glm4vVisionPatchEmbed(
@@ -410,7 +421,7 @@ class Glm4vVisionModel(nn.Module):
             [
                 Glm4vVisionBlock(
                     dim=self.hidden_size,
-                    intermediate_dim=self.out_hidden_size,
+                    intermediate_dim=self.intermediate_dim,
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
@@ -418,25 +429,46 @@ class Glm4vVisionModel(nn.Module):
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
+                    proj_bias=getattr(vision_config, "proj_bias", False),
+                    qk_normalization=getattr(
+                        vision_config, "qk_normalization", False
+                    ),
+                    qk_normalization_by_head_size=getattr(
+                        vision_config, "qk_norm_by_head_size", False
+                    ),
+                    mlp_linear_bias=getattr(vision_config, "mlp_linear_bias", False),
                 )
                 for layer_idx in range(depth)
             ]
         )
 
+        merger_context_dim = getattr(vision_config, "projection_intermediate_size", None)
+        if merger_context_dim is None:
+            merger_context_dim = (
+                text_config.intermediate_size
+                if text_config is not None
+                else vision_config.intermediate_size
+            )
+
         self.merger = Glm4vPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=vision_config.intermediate_size,
+            context_dim=merger_context_dim,
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            layer_norm_eps=vision_config.rms_norm_eps,
         )
 
-        self.embeddings = Glm4vVisionEmbeddings(vision_config)
+        self.adapt_position = getattr(vision_config, "adapt_position", True)
+        if self.adapt_position:
+            self.embeddings = Glm4vVisionEmbeddings(vision_config)
 
-        self.post_conv_layernorm = Glm4vRMSNorm(
-            vision_config.hidden_size, eps=vision_config.rms_norm_eps
-        )
+        self.use_post_conv_ln = getattr(vision_config, "post_conv_ln", True)
+        if self.use_post_conv_ln:
+            self.post_conv_layernorm = Glm4vRMSNorm(
+                vision_config.hidden_size, eps=vision_config.rms_norm_eps
+            )
         self.downsample = nn.Conv2d(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
@@ -497,7 +529,8 @@ class Glm4vVisionModel(nn.Module):
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        x = self.post_conv_layernorm(x)
+        if self.use_post_conv_ln:
+            x = self.post_conv_layernorm(x)
 
         # compute position embedding
         rotary_pos_emb_cos, rotary_pos_emb_sin, image_type_ids = self.rot_pos_emb(
@@ -510,9 +543,10 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        x = self.embeddings(
-            x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
-        )
+        if self.adapt_position:
+            x = self.embeddings(
+                x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
+            )
 
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
@@ -555,32 +589,44 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
-        self.visual = Glm4vVisionModel(
-            config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
 
-        self.model = Glm4Model(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+        self.config.encoder_only = getattr(config, "encoder_only", False)
+        self.config.language_only = getattr(config, "language_only", False)
 
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+        if not self.config.language_only:
+            self.visual = Glm4vVisionModel(
+                config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+                text_config=getattr(config, "text_config", None),
+            )
         else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+            self.visual = None
+
+        if not self.config.encoder_only:
+            self.model = Glm4Model(
+                config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            self.model = None
+            self.lm_head = None
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -663,6 +709,9 @@ class Glm4vForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
+        if self.model is None:
+            raise RuntimeError("encoder_only GLM4V cannot run language forward")
+
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 

@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from transformers.models.glm4v.configuration_glm4v import Glm4vVisionConfig
 
 from sglang.srt.configs.glm5_next import Glm5NextConfig as ModelNextConfig
 from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -32,6 +33,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split as can_cp_split,
@@ -91,6 +93,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -110,6 +117,8 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as ModelNextMLAAttention
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as ModelNextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as ModelNextMoe
+from sglang.srt.models.glm4v import Glm4vVisionModel
+from sglang.srt.models.glm_visual import GlmVisualEncoderMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -1582,4 +1591,200 @@ class Glm5NextForCausalLM(ModelNextForCausalLM):
     pass
 
 
-EntryClass = [Glm5NextForCausalLM]
+class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausalLM):
+    fall_back_to_pt_during_load = False
+
+    def __init__(
+        self,
+        config: ModelNextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        config.encoder_only = getattr(config, "encoder_only", False)
+        config.language_only = getattr(config, "language_only", False)
+
+        if config.encoder_only:
+            nn.Module.__init__(self)
+            self.fuse_qkv_a_proj = config.q_lora_rank is not None
+            if self.fuse_qkv_a_proj:
+                self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
+                    "q_a_proj",
+                    "kv_a_proj_with_mqa",
+                ]
+            self.pp_group = get_pp_group()
+            self.config = config
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.quant_config = quant_config
+            self.num_fused_shared_experts = 0
+            self.use_nsa = is_deepseek_nsa(config)
+            self.model = None
+            self.lm_head = PPMissingLayer()
+            self.logits_processor = LogitsProcessor(config)
+            self._routed_experts_weights_of_layer = LazyValue(lambda: {})
+            self.capture_aux_hidden_states = False
+            self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+            if self.nsa_enable_prefill_cp:
+                self.cp_rank = get_attention_cp_rank()
+                self.cp_size = get_attention_cp_size()
+            else:
+                self.cp_rank = self.cp_size = None
+            get_attn_tp_context().init_context(
+                config.q_lora_rank, self.use_nsa, config.mhc
+            )
+        else:
+            super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+            self.config.encoder_only = config.encoder_only
+            self.config.language_only = config.language_only
+
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        vision_config = getattr(config, "vision_config", None)
+        if isinstance(vision_config, dict):
+            vision_config = Glm4vVisionConfig(**vision_config)
+            self.config.vision_config = vision_config
+
+        if (
+            not self.config.language_only
+            and vision_config is not None
+            and isinstance(vision_config, Glm4vVisionConfig)
+        ):
+            vision_utils.update_vit_attn_dummy_heads_config(self.config)
+            self.visual = Glm4vVisionModel(
+                vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+                text_config=getattr(config, "text_config", None),
+            )
+        else:
+            self.visual = None
+
+        self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
+
+    @property
+    def start_layer(self):
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self):
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None) or self.config
+        return int(getattr(cfg, "num_hidden_layers", 0))
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.model is None:
+            raise RuntimeError("encoder_only GLM5 Next VLM cannot run language forward")
+
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+        params_dict: Optional[Dict[str, torch.nn.Parameter]] = None,
+        is_eagle: bool = False,
+    ):
+        def iter_normalized_weights():
+            for name, loaded_weight in weights:
+                if "language_model." in name:
+                    name = name.replace("language_model.", "")
+                if "model.visual." in name:
+                    name = name.replace("model.visual.", "visual.")
+                if self.config.language_only and "visual" in name:
+                    continue
+                if "visual" in name:
+                    name = name.replace("attn.qkv.", "attn.qkv_proj.")
+                    if getattr(self.config, "vision_config", None) is not None:
+                        loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                            self.config, name, loaded_weight
+                        )
+                yield name, loaded_weight
+
+        if self.config.encoder_only:
+            return super().load_weights(
+                (
+                    (name, loaded_weight)
+                    for name, loaded_weight in iter_normalized_weights()
+                    if "visual" in name
+                ),
+                is_nextn=is_nextn,
+                params_dict=params_dict,
+                is_eagle=is_eagle,
+            )
+
+        return super().load_weights(
+            iter_normalized_weights(),
+            is_nextn=is_nextn,
+            params_dict=params_dict,
+            is_eagle=is_eagle,
+        )
+
+    def post_load_weights(self, is_nextn: bool = False, weight_names=None):
+        if self.model is None:
+            return
+        return super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def load_from_megatron(self, model_config):
+        if self.config.encoder_only:
+            import gc
+
+            from sglang.srt.utils.load_mgt import load_megatron_weights
+
+            params_dict = dict(self.named_parameters(remove_duplicate=False))
+            load_megatron_weights(
+                self, model_config.model_path, params_dict, ifmtp=False
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            return
+
+        return super().load_from_megatron(model_config)
+
+
+EntryClass = [Glm5NextForCausalLM, Glm5NextForConditionalGeneration]

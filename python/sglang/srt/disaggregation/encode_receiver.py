@@ -630,11 +630,14 @@ class MMReceiverBase(ABC):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)
+        self.is_decode_role = is_decode_role
+        self.meta_only = is_decode_role and self.encoder_transfer_backend == "mooncake"
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -729,7 +732,7 @@ class MMReceiverBase(ABC):
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=20,
+                timeout=envs.SGLANG_ENCODER_RECV_TIMEOUT.get(),
             )
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
@@ -802,7 +805,7 @@ class MMReceiverBase(ABC):
                 else:
                     recv_embedding_data.add(recv_obj)
 
-            if self.encoder_transfer_backend == "mooncake":
+            if self.encoder_transfer_backend == "mooncake" and not self.meta_only:
                 if req_id not in self.embeddings_buffer:
                     logger.error(
                         "mooncake: embeddings_buffer missing req_id=%s", req_id
@@ -1099,6 +1102,7 @@ class MMReceiverHTTP(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         super().__init__(
             server_args,
@@ -1108,6 +1112,7 @@ class MMReceiverHTTP(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            is_decode_role=is_decode_role,
         )
 
     # For zmq_to_scheduler
@@ -1171,6 +1176,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "modality": modality.name,  # convert enum to string for json serialization
                         "prefill_host": self.host,
                         "embedding_port": embedding_port,
+                        "role": "decode" if self.meta_only else "prefill",
                     }
                 )
                 cum_idx += 1
@@ -1206,6 +1212,9 @@ class MMReceiverHTTP(MMReceiverBase):
             response_json_list_unsort = [
                 await response.json() for response in responses
             ]
+
+            if self.meta_only:
+                return
 
             # zmq backend: return is None
             if None in response_json_list_unsort:
@@ -1258,6 +1267,7 @@ class MMReceiverGrpc(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         super().__init__(
             server_args,
@@ -1267,6 +1277,7 @@ class MMReceiverGrpc(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            is_decode_role=is_decode_role,
         )
 
     def build_and_send_encode_request(self, image_urls, rid):
@@ -1438,6 +1449,7 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
+    is_decode_role: bool = False,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
@@ -1457,4 +1469,5 @@ def create_mm_receiver(
         tp_rank=tp_rank,
         tp_group=tp_group,
         scheduler=scheduler,
+        is_decode_role=is_decode_role,
     )

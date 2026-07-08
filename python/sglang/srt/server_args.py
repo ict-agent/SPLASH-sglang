@@ -1779,7 +1779,11 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        if model_arch == "Glm5NextForCausalLM" and not self.disable_radix_cache:
+        if (
+            model_arch
+            in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
+            and not self.disable_radix_cache
+        ):
             if (
                 self.attention_backend == "dcu_mla"
                 or self.prefill_attention_backend == "dcu_mla"
@@ -1789,7 +1793,7 @@ class ServerArgs:
             if self.mamba_scheduler_strategy != "extra_buffer":
                 self.mamba_scheduler_strategy = "extra_buffer"
                 logger.warning(
-                    "Use mamba extra_buffer for Glm5NextForCausalLM KDA hybrid radix cache "
+                    "Use mamba extra_buffer for GLM5 Next KDA hybrid radix cache "
                     "so page_size can stay compatible with MLA/NSA backends."
                 )
 
@@ -1824,6 +1828,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             if (
                 getattr(hf_config, "disable_nsa", False)
@@ -1933,7 +1938,14 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    if model_arch == "Glm5NextForCausalLM" and is_dcu():
+                    if (
+                        model_arch
+                        in (
+                            "Glm5NextForCausalLM",
+                            "Glm5NextForConditionalGeneration",
+                        )
+                        and is_dcu()
+                    ):
                         if self.kv_cache_dtype == "auto":
                             self.kv_cache_dtype = "fp8_e4m3"
                         if self.nsa_prefill_backend is None:
@@ -4229,11 +4241,14 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "Glm4vForConditionalGeneration",
+            "Glm4vMoeForConditionalGeneration",
+            "Glm5NextForConditionalGeneration",
             "KimiVLForConditionalGeneration",
             "KimiK25ForConditionalGeneration",
         ]:
             raise ValueError(
-                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+                f"Model type {model_arch} is not supported for encoder disaggregation."
             )
 
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:
