@@ -388,6 +388,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
 
+        request._prompt_ids = processed_messages.prompt_ids
+
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -829,6 +831,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        output_ids_dict = {}
         routed_experts = {}
         cached_tokens_details = {}
 
@@ -843,6 +846,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+
+                # GLM NOTE: collect token IDs if return_token_ids. Chunks carry
+                # incremental deltas only with incremental_streaming_output;
+                # otherwise each chunk carries the cumulative list (as a live
+                # reference for intermediate chunks, hence the copy).
+                if request.return_token_ids:
+                    chunk_output_ids = content.get("output_ids", [])
+                    if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        output_ids_dict.setdefault(index, []).extend(chunk_output_ids)
+                    else:
+                        output_ids_dict[index] = list(chunk_output_ids)
 
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
@@ -1068,12 +1082,25 @@ class OpenAIServingChat(OpenAIServingBase):
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
+
+                # GLM NOTE: prepare metadata with token IDs if return_token_ids
+                metadata = None
+                if request.return_token_ids and output_ids_dict:
+                    prompt_ids = getattr(request, "_prompt_ids", None)
+                    metadata = {}
+                    if prompt_ids is not None and not isinstance(prompt_ids, str):
+                        metadata["input_ids"] = prompt_ids
+                    metadata["output_ids"] = [
+                        output_ids_dict.get(i, []) for i in range(request.n)
+                    ]
+
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    metadata=metadata,
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
@@ -1210,13 +1237,26 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+
+        # GLM NOTE: return token IDs if return_token_ids
+        if request.return_token_ids:
+            prompt_ids = getattr(request, "_prompt_ids", None)
+            if prompt_ids is not None and not isinstance(prompt_ids, str):
+                metadata["input_ids"] = prompt_ids
+            output_ids_list = []
+            for ret_item in ret:
+                output_ids = ret_item.get("output_ids", [])
+                output_ids_list.append(output_ids)
+            metadata["output_ids"] = output_ids_list
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
             sglext=response_sglext,
         )
 
