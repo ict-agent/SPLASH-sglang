@@ -15,12 +15,14 @@
 
 import logging
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 
@@ -128,12 +130,42 @@ class InvalidGrammarObject(BaseGrammarObject):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
+class _GrammarCache:
+    def __init__(self, max_entries: int):
+        self.max_entries = max_entries
+        self.entries: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
+
+    def get(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+        value = self.entries.get(key)
+        if value is not None:
+            self.entries.move_to_end(key)
+        return value
+
+    def __setitem__(self, key: Tuple[str, str], value: BaseGrammarObject) -> None:
+        if self.max_entries == 0:
+            return
+
+        self.entries.pop(key, None)
+        self.entries[key] = value
+        self._evict()
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    def _evict(self) -> None:
+        if self.max_entries <= 0:
+            return
+
+        while len(self.entries) > self.max_entries:
+            self.entries.popitem(last=False)
+
+
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        self.cache = _GrammarCache(envs.GLM_GRAMMAR_OBJECT_CACHE_MAX_COUNT.get())
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")

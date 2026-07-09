@@ -38,6 +38,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.torch_ops.bitmask_ops import (
     apply_token_bitmask_inplace_torch,
 )
+from sglang.srt.environ import envs
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 
@@ -217,7 +218,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        limit_mb = envs.GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB.get()
+        cache_limit_bytes = -1 if limit_mb < 0 else limit_mb * 1024 * 1024
+        self.grammar_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info,
+            cache_limit_bytes=cache_limit_bytes,
+        )
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace

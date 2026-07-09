@@ -688,6 +688,14 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # GLM
+    # Max number of grammar cache entries per scheduler/rank.
+    # < 0: unbounded caching (current default); 0: disables grammar caching.
+    GLM_GRAMMAR_OBJECT_CACHE_MAX_COUNT = EnvInt(-1)
+    # Max MiB for xgrammar backend's internal native cache.
+    # < 0: unbounded caching (current default); 0: disable internal cache.
+    GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB = EnvInt(-1)
+
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
