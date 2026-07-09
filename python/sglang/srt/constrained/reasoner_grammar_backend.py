@@ -137,6 +137,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self._is_thinking():
             if not self.enable_token_filter:
+                vocab_mask.fill_(-1)
                 return
             if self._can_think_more():
                 self._do_token_filter(
