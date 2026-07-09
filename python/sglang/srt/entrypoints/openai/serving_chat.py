@@ -1454,12 +1454,16 @@ class OpenAIServingChat(OpenAIServingBase):
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
 
         # Try model-specific parser when output is in native format.
-        # For required/named: only use parser when structural_tag was used
+        # For required/named: use parser when native structural_tag/EBNF was used
         # as constraint (mirrors the streaming path). For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(tools, self.tool_call_parser)
+            supports_native_constraint = (
+                parser.detector.supports_structural_tag()
+                or hasattr(parser.detector, "build_ebnf")
+            )
             should_try_parser = (
-                not is_required or parser.detector.supports_structural_tag()
+                not is_required or supports_native_constraint
             )
             if should_try_parser and parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
@@ -1695,9 +1699,8 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             # For required/named tool choice: use JsonArrayParser when the
             # constrained output is plain JSON (detector doesn't support
-            # structural_tag or no parser configured). Use FunctionCallParser
-            # only when the detector supports structural_tag and will produce
-            # native format output.
+            # native structural_tag/EBNF or no parser configured). Use
+            # FunctionCallParser when the detector will produce native output.
             if is_required:
                 use_native_parser = False
                 if self.tool_call_parser:
@@ -1705,7 +1708,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
                     )
-                    use_native_parser = probe.detector.supports_structural_tag()
+                    use_native_parser = (
+                        probe.detector.supports_structural_tag()
+                        or hasattr(probe.detector, "build_ebnf")
+                    )
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:
