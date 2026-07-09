@@ -555,7 +555,7 @@ class Envs:
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
-    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(15)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
