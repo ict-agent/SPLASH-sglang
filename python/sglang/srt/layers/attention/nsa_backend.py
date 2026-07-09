@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.configs.model_config import get_nsa_index_kpool, get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -20,6 +20,19 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
+)
+from sglang.srt.layers.attention.nsa.kpool.kernels import (
+    update_kpool_decode_cuda_graph_page_tables,
+)
+from sglang.srt.layers.attention.nsa.kpool.planner import (
+    KPoolExtendPlan,
+    KPoolWritePlan,
+    init_kpool_extend_metadata as _init_kpool_extend_metadata_impl,
+    init_kpool_write_plan as _init_kpool_write_plan_impl,
+    init_kpool_write_plan_capture as _init_kpool_write_plan_capture_impl,
+    init_pooled_paged_mqa_metadata as _init_pooled_paged_mqa_metadata_impl,
+    update_kpool_write_plan as _update_kpool_write_plan_impl,
+    update_pooled_paged_mqa_metadata as _update_pooled_paged_mqa_metadata_impl,
 )
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
@@ -74,7 +87,7 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         if seqlens_32.size(1) == 1:
             return seqlens_32
         # Fall through and re-flatten if the caller already gave us a (bs, next_n)
-        # view — we want (N_total, 1) regardless.
+        # view ?we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
 
@@ -164,6 +177,11 @@ class NSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
+    pooled_index_kpool: int = 1
+    kpool_extend_plan: Optional[KPoolExtendPlan] = None
+    kpool_write_plan: Optional[KPoolWritePlan] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -182,6 +200,14 @@ class NSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+
+@dataclass
+class _KPoolForwardInputs:
+    """Inputs that are only needed by the kpool metadata dispatcher."""
+
+    full_real_page_table: Optional[torch.Tensor] = None
+    full_seqlens_expanded: Optional[torch.Tensor] = None
+    cp_overrides: dict = field(default_factory=dict)
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -349,6 +375,7 @@ class NativeSparseAttnBackend(
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
+        self.nsa_index_kpool = model_runner.model_config.nsa_index_kpool
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -445,6 +472,98 @@ class NativeSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    # ---- Kpool metadata: delegated to nsa.kpool.planner ------------
+    def _init_pooled_paged_mqa_metadata(
+        self,
+        metadata: NSAMetadata,
+        seqlens_32: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> NSAMetadata:
+        return _init_pooled_paged_mqa_metadata_impl(
+            metadata,
+            seqlens_32,
+            forward_mode,
+            pool_size=self.nsa_index_kpool,
+            real_page_size=self.real_page_size,
+        )
+
+    def _update_pooled_paged_mqa_metadata(
+        self,
+        metadata: NSAMetadata,
+        seqlens_32: torch.Tensor,
+        forward_mode: ForwardMode,
+    ) -> None:
+        _update_pooled_paged_mqa_metadata_impl(
+            metadata,
+            seqlens_32,
+            forward_mode,
+            pool_size=self.nsa_index_kpool,
+            real_page_size=self.real_page_size,
+        )
+
+    def _build_kpool_metadata(
+        self,
+        metadata: NSAMetadata,
+        forward_batch: ForwardBatch,
+        topk_transform_method: TopkTransformMethod,
+        kpool_inputs: "_KPoolForwardInputs",
+        cache_seqlens_int32: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+    ) -> NSAMetadata:
+        mode = forward_batch.forward_mode
+        if (is_cuda() or is_dcu()) and mode.is_decode_or_idle():
+            metadata = self._init_pooled_paged_mqa_metadata(
+                metadata=metadata,
+                seqlens_32=cache_seqlens_int32,
+                forward_mode=mode,
+            )
+            metadata = _init_kpool_write_plan_impl(
+                metadata,
+                forward_batch,
+                pool_size=self.nsa_index_kpool,
+                real_page_size=self.real_page_size,
+                real_page_table=metadata.real_page_table,
+                num_draft_tokens=1,
+                write_start=(forward_batch.seq_lens - 1).to(torch.int32),
+            )
+            return metadata
+        if mode.is_extend_without_speculative() or mode.is_draft_extend():
+            return _init_kpool_extend_metadata_impl(
+                metadata,
+                forward_batch,
+                pool_size=self.nsa_index_kpool,
+                real_page_size=self.real_page_size,
+                topk_transform_method=topk_transform_method,
+                full_real_page_table=kpool_inputs.full_real_page_table,
+                full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
+                **kpool_inputs.cp_overrides,
+            )
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            if mode.is_target_verify():
+                write_start = forward_batch.seq_lens.to(torch.int32)
+                accept_length = None
+            else:
+                write_start = (
+                    forward_batch.seq_lens - self.speculative_num_draft_tokens
+                ).to(torch.int32)
+                spec_info = forward_batch.spec_info
+                accept_length = (
+                    spec_info.accept_length
+                    if spec_info is not None
+                    and getattr(spec_info, "accept_length", None) is not None
+                    else None
+                )
+            return _init_kpool_write_plan_impl(
+                metadata,
+                forward_batch,
+                pool_size=self.nsa_index_kpool,
+                real_page_size=self.real_page_size,
+                real_page_table=metadata.real_page_table,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                write_start=write_start,
+                accept_length=accept_length,
+            )
+        return metadata
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
@@ -482,6 +601,8 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        use_kpool = self.nsa_index_kpool > 1
+        kpool_inputs = _KPoolForwardInputs()
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -582,6 +703,10 @@ class NativeSparseAttnBackend(
                 ]
             )
 
+            if use_kpool:
+                kpool_inputs.full_real_page_table = self._transform_table_1_to_real(page_table)
+                kpool_inputs.full_seqlens_expanded = seqlens_expanded
+
             if can_nsa_prefill_cp_round_robin_split(forward_batch):
                 seqlens_expanded = nsa_cp_round_robin_split_data(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
@@ -599,6 +724,14 @@ class NativeSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
+                if use_kpool:
+                    kpool_inputs.cp_overrides.update(
+                        local_real_page_table=self._transform_table_1_to_real(page_table),
+                        local_seqlens_expanded=seqlens_expanded,
+                        local_extend_seq_lens_cpu=extend_seq_lens_cpu,
+                        local_seq_lens_cpu=indexer_seq_lens_cpu.tolist(),
+                        local_req_pool_indices=forward_batch.req_pool_indices[bs_idx],
+                    )
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
@@ -666,7 +799,22 @@ class NativeSparseAttnBackend(
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
             nsa_index_topk=self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
         )
+        if use_flashmla_kv and _is_dcu and self.nsa_index_kpool > 1:
+            # KPool adds a tail width of kpool-1. DCU FlashMLA sparse decode
+            # requires params.topk (derived from cache_seqlens/metadata) to be
+            # aligned to its TOPK_BLOCK_SIZE. The corresponding indices tensor
+            # is padded with -1 in _forward_flashmla_kv.
+            topk_block_size = 64
+            nsa_cache_seqlens_int32 = (
+                torch.div(
+                    nsa_cache_seqlens_int32 + topk_block_size - 1,
+                    topk_block_size,
+                    rounding_mode="floor",
+                )
+                * topk_block_size
+            ).to(torch.int32)
         nsa_cache_seqlens_int32 = pad_nsa_cache_seqlens(
             forward_batch, nsa_cache_seqlens_int32
         )
@@ -733,6 +881,16 @@ class NativeSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
+
+        if use_kpool:
+            metadata = self._build_kpool_metadata(
+                metadata,
+                forward_batch,
+                topk_transform_method,
+                kpool_inputs,
+                cache_seqlens_int32,
+                seqlens_expanded,
+            )
 
         self.forward_metadata = metadata
 
@@ -882,8 +1040,20 @@ class NativeSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
+                cache_seqlens_int32,
+                nsa_index_topk=self.nsa_index_topk,
+                index_kpool=self.nsa_index_kpool,
             )
+            if self.nsa_decode_impl == "flashmla_kv" and _is_dcu and self.nsa_index_kpool > 1:
+                topk_block_size = 64
+                nsa_cache_seqlens_int32 = (
+                    torch.div(
+                        nsa_cache_seqlens_int32 + topk_block_size - 1,
+                        topk_block_size,
+                        rounding_mode="floor",
+                    )
+                    * topk_block_size
+                ).to(torch.int32)
 
             seqlens_expanded = cache_seqlens_int32
             nsa_extend_seq_lens_list = [1] * num_tokens
@@ -942,8 +1112,20 @@ class NativeSparseAttnBackend(
                 ]
             )
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                seqlens_expanded, nsa_index_topk=self.nsa_index_topk
+                seqlens_expanded,
+                nsa_index_topk=self.nsa_index_topk,
+                index_kpool=self.nsa_index_kpool,
             )
+            if self.nsa_decode_impl == "flashmla_kv" and _is_dcu and self.nsa_index_kpool > 1:
+                topk_block_size = 64
+                nsa_cache_seqlens_int32 = (
+                    torch.div(
+                        nsa_cache_seqlens_int32 + topk_block_size - 1,
+                        topk_block_size,
+                        rounding_mode="floor",
+                    )
+                    * topk_block_size
+                ).to(torch.int32)
             nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
             if self.nsa_decode_impl == "flashmla_kv":
@@ -1005,6 +1187,40 @@ class NativeSparseAttnBackend(
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
+        if self.nsa_index_kpool > 1:
+            is_verify = forward_mode.is_target_verify()
+            is_v2 = forward_mode.is_draft_extend_v2()
+            is_ring_write = forward_mode.is_decode_or_idle() or is_verify or is_v2
+            if is_ring_write:
+                num_draft_tokens = (
+                    1 if forward_mode.is_decode_or_idle() else self.speculative_num_draft_tokens
+                )
+                metadata = _init_kpool_write_plan_capture_impl(
+                    metadata,
+                    max_bs=bs,
+                    pool_size=self.nsa_index_kpool,
+                    real_page_size=self.real_page_size,
+                    real_page_table=real_page_table,
+                    num_draft_tokens=num_draft_tokens,
+                    device=self.device,
+                    is_verify=is_verify or is_v2,
+                    is_v2=is_v2,
+                )
+                write_start = seq_lens.to(torch.int32)
+                if forward_mode.is_decode_or_idle():
+                    write_start = write_start - 1
+                elif is_v2:
+                    write_start = write_start - self.speculative_num_draft_tokens
+                _update_kpool_write_plan_impl(
+                    metadata,
+                    write_start=write_start,
+                    req_pool_indices=req_pool_indices,
+                    real_page_table=real_page_table,
+                    pool_size=self.nsa_index_kpool,
+                    real_page_size=self.real_page_size,
+                    num_draft_tokens=num_draft_tokens,
+                    forward_mode=forward_mode,
+                )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -1044,7 +1260,9 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
             nsa_cache_seqlens = compute_nsa_seqlens(
-                cache_seqlens, nsa_index_topk=self.nsa_index_topk
+                cache_seqlens,
+                nsa_index_topk=self.nsa_index_topk,
+                index_kpool=self.nsa_index_kpool,
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
@@ -1077,7 +1295,9 @@ class NativeSparseAttnBackend(
             )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
-                seqlens_expanded, self.nsa_index_topk
+                seqlens_expanded,
+                self.nsa_index_topk,
+                index_kpool=self.nsa_index_kpool,
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend(include_v2=True):
@@ -1109,7 +1329,9 @@ class NativeSparseAttnBackend(
                 seqlens_expanded
             )
             nsa_cache_seqlens = compute_nsa_seqlens(
-                seqlens_expanded, self.nsa_index_topk
+                seqlens_expanded,
+                self.nsa_index_topk,
+                index_kpool=self.nsa_index_kpool,
             )
             metadata.nsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
                 nsa_cache_seqlens
@@ -1144,6 +1366,38 @@ class NativeSparseAttnBackend(
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             except (ImportError, ModuleNotFoundError):
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+        # replay update kpool write plan
+        if self.nsa_index_kpool > 1:
+            is_verify = forward_mode.is_target_verify()
+            is_v2 = forward_mode.is_draft_extend_v2()
+            is_ring_write = forward_mode.is_decode_or_idle() or is_verify or is_v2
+            if is_ring_write:
+                real_page_table = self._transform_table_1_to_real(metadata.page_table_1)
+                object.__setattr__(metadata, "real_page_table", real_page_table)
+                num_draft_tokens = (
+                    1 if forward_mode.is_decode_or_idle() else self.speculative_num_draft_tokens
+                )
+                write_start = seq_lens.to(torch.int32)
+                if forward_mode.is_decode_or_idle():
+                    write_start = write_start - 1
+                elif is_v2:
+                    write_start = write_start - self.speculative_num_draft_tokens
+                accept_length = (
+                    spec_info.accept_length[:bs]
+                    if is_v2 and spec_info is not None and getattr(spec_info, "accept_length", None) is not None
+                    else None
+                )
+                _update_kpool_write_plan_impl(
+                    metadata,
+                    write_start=write_start,
+                    req_pool_indices=req_pool_indices,
+                    real_page_table=real_page_table,
+                    pool_size=self.nsa_index_kpool,
+                    real_page_size=self.real_page_size,
+                    num_draft_tokens=num_draft_tokens,
+                    forward_mode=forward_mode,
+                    accept_length=accept_length,
+                )
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1851,6 +2105,21 @@ class NativeSparseAttnBackend(
             )
             self._logged_flashmla_sparse_shapes = True
 
+        if _is_dcu and self.nsa_index_kpool > 1:
+            # DCU FlashMLA sparse prefill requires a stricter topk alignment than
+            # the logical KPool width (topk + kpool - 1), so pad invalid pages.
+            topk_block_size = 128
+            topk_width = page_table_1.shape[-1]
+            padded_topk_width = (
+                (topk_width + topk_block_size - 1) // topk_block_size
+            ) * topk_block_size
+            if padded_topk_width != topk_width:
+                page_table_1 = torch.nn.functional.pad(
+                    page_table_1,
+                    (0, padded_topk_width - topk_width),
+                    value=-1,
+                )
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -1927,10 +2196,34 @@ class NativeSparseAttnBackend(
             )
             self._logged_flashmla_kv_shapes = True
 
+        if _is_dcu and self.nsa_index_kpool > 1:
+            # KPool appends up to kpool-1 uncompressed tail tokens after the
+            # selected history tokens. DCU FlashMLA sparse decode additionally
+            # requires the indices width to be a TOPK_BLOCK_SIZE multiple; pad
+            # with -1 sentinels so the tail is preserved without adding work.
+            topk_block_size = 64
+            width = page_table_1.shape[-1]
+            padded_width = ((width + topk_block_size - 1) // topk_block_size) * topk_block_size
+            if padded_width != width:
+                page_table_1 = torch.nn.functional.pad(
+                    page_table_1, (0, padded_width - width), value=-1
+                )
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.nsa_index_topk
-        )  # requirement of FlashMLA decode kernel
+        expected_indices_width = self.nsa_index_topk
+        if self.nsa_index_kpool > 1:
+            expected_indices_width = self.nsa_index_topk + self.nsa_index_kpool - 1
+            if _is_dcu:
+                topk_block_size = 64
+                expected_indices_width = (
+                    (expected_indices_width + topk_block_size - 1)
+                    // topk_block_size
+                    * topk_block_size
+                )
+        assert indices.shape[-1] == expected_indices_width, (
+            "FlashMLA decode indices width mismatch: "
+            f"got {indices.shape[-1]}, expected {expected_indices_width} "
+            f"(topk={self.nsa_index_topk}, kpool={self.nsa_index_kpool})"
+        )
 
         # DP/CP padding may append zero-length target-verify rows.  The CUDA
         # FlashMLA implementation tolerates them, but the current DCU kernel
@@ -1944,7 +2237,6 @@ class NativeSparseAttnBackend(
             _is_dcu
             and n_valid is not None
             and 0 <= n_valid < n_total
-        )
         flashmla_metadata = metadata.flashmla_metadata
         if needs_repad:
             q_input = q_input[:n_valid]

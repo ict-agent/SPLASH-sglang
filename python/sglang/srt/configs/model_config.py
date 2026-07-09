@@ -133,11 +133,13 @@ def get_nsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_topk
 
-
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
 
+def get_nsa_index_kpool(config: PretrainedConfig) -> int:
+    """Effective NSA pool_size; ``> 1`` means kpool enabled."""
+    return getattr(config, "index_kpool", 1)
 
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
@@ -808,6 +810,11 @@ class ModelConfig:
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         total_num_attention_heads = self.num_attention_heads
         return max(1, total_num_attention_heads // tensor_parallel_size)
+
+    @property
+    def nsa_index_kpool(self) -> int:
+        """Effective NSA pool_size; ``> 1`` means kpool enabled."""
+        return get_nsa_index_kpool(self.hf_text_config)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:

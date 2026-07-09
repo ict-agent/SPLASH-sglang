@@ -138,7 +138,7 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    # Apple Silicon MLX backend â€” on-the-fly quantization of fp16 weights at load
+    # Apple Silicon MLX backend â€?on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
@@ -1158,7 +1158,7 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
-        # Native gRPC flags â€” env-only for now, not exposed as CLI args.
+        # Native gRPC flags â€?env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
         self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
@@ -1257,7 +1257,7 @@ class ServerArgs:
                 if os.path.exists(alt):
                     return alt
 
-            # Cache miss â€” download from ModelScope hub
+            # Cache miss â€?download from ModelScope hub
             return ms_snapshot_download(
                 path,
                 cache_dir=self.download_dir,
@@ -1853,7 +1853,10 @@ class ServerArgs:
                         )
                     else:
                         # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_nsa_index_topk
+                        from sglang.srt.configs.model_config import (
+                            get_nsa_index_kpool,
+                            get_nsa_index_topk,
+                        )
 
                         envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
                             get_nsa_index_topk(hf_config)
@@ -1932,6 +1935,50 @@ class ServerArgs:
                             "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
                         )
                     else:
+                        # NSA kpool launch invariants: page_size == 64, index_topk % pool_size == 0,
+                        # and EAGLE topk == 1 for chain-only verify.
+                        from sglang.srt.configs.model_config import (
+                            get_nsa_index_kpool,
+                            get_nsa_index_topk,
+                        )
+
+                        kpool_pool_size = get_nsa_index_kpool(hf_config)
+                        if kpool_pool_size > 1:
+                            index_topk = get_nsa_index_topk(hf_config)
+                            if index_topk % kpool_pool_size != 0:
+                                raise ValueError(
+                                    f"NSA kpool: index_topk ({index_topk}) must be divisible by "
+                                    f"pool_size ({kpool_pool_size})."
+                                )
+                            if self.page_size is not None and self.page_size != 64:
+                                raise ValueError(
+                                    f"NSA kpool requires page_size == 64, got {self.page_size}. "
+                                    f"Drop --page-size or set index_kpool=1."
+                                )
+                            if (
+                                self.speculative_eagle_topk is not None
+                                and self.speculative_eagle_topk != 1
+                            ):
+                                raise ValueError(
+                                    f"NSA kpool verify requires speculative_eagle_topk == 1, "
+                                    f"got {self.speculative_eagle_topk}."
+                                )
+                            spec_on = (
+                                bool(self.speculative_algorithm)
+                                or (self.speculative_num_steps or 0) > 0
+                                or (self.speculative_eagle_topk or 0) > 0
+                            )
+                            if spec_on and not (
+                                self.speculative_num_draft_tokens
+                                and 0
+                                < self.speculative_num_draft_tokens
+                                < kpool_pool_size
+                            ):
+                                raise ValueError(
+                                    f"NSA kpool + speculative decoding requires 0 < "
+                                    f"--speculative-num-draft-tokens < pool_size "
+                                    f"({kpool_pool_size}), got {self.speculative_num_draft_tokens}."
+                                )
                         self.page_size = 64
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")
 
@@ -7456,7 +7503,7 @@ class ServerArgs:
                 self.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
 
-            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x â€“ 2.8.x, leading to performance degradation.
+            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x â€?2.8.x, leading to performance degradation.
             import torch
 
             if torch_release >= (2, 7):

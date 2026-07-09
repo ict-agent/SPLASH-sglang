@@ -88,6 +88,41 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 _is_dcu = is_dcu()
 
+@triton.jit
+def copy_all_layer_kv_cache_tiled(
+    data_ptrs,
+    strides,
+    tgt_loc_ptr,
+    src_loc_ptr,
+    num_locs,
+    num_locs_upper: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """2D tiled kernel. Safe for in-place copy."""
+    bid = tl.program_id(0)
+    tid = tl.program_id(1)
+
+    stride = tl.load(strides + bid)
+    base_ptr = tl.load(data_ptrs + bid)
+    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < stride
+    tl.multiple_of(byte_off, 16)
+
+    loc_idx = tl.arange(0, num_locs_upper)
+    mask_loc = loc_idx < num_locs
+
+    src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
+    tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
+
+    src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
+    tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
+
+    mask = mask_loc[:, None] & mask_byte[None, :]
+    vals = tl.load(src_ptr, mask=mask)
+    tl.store(tgt_ptr, vals, mask=mask)
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -385,7 +420,7 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        # clear at alloc time �?expand a scalar GPU zero to the right shape, no CPU-GPU sync
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
@@ -1529,6 +1564,9 @@ class HybridLinearKVPool(KVCache):
         index_head_dim: int = None,
         kv_cache_dim: int = None,
         start_layer: Optional[int] = None,
+        nsa_index_kpool: int = 1,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1582,6 +1620,9 @@ class HybridLinearKVPool(KVCache):
                 index_head_dim=index_head_dim,
                 kv_cache_dim=kv_cache_dim,
                 enable_memory_saver=enable_memory_saver,
+                nsa_index_kpool=nsa_index_kpool,
+                tail_extra_slots=tail_extra_slots,
+                max_running_requests=max_running_requests,
             )
             self.use_fp8_index_k_cache = (
                 self.full_kv_pool.use_fp8_index_k_cache
@@ -1592,6 +1633,8 @@ class HybridLinearKVPool(KVCache):
                 self.full_kv_pool.nsa_kv_cache_store_fp8
             )
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
+            self.index_kpool = self.full_kv_pool.index_kpool
+            self.slots_per_page = self.full_kv_pool.slots_per_page
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1790,6 +1833,14 @@ class HybridLinearKVPool(KVCache):
         assert self.use_nsa, "NSA index cache called when use_nsa is False"
         self._wait_for_layer(layer_id)
         return self._transfer_full_attention_id(layer_id)
+
+    def get_tail_buffers(self, layer_id: int):
+        return self.full_kv_pool.get_tail_buffers(self._get_nsa_layer_id(layer_id))
+
+    def get_tail_buf_infos(self):
+        if not self.use_nsa:
+            return [], [], []
+        return self.full_kv_pool.get_tail_buf_infos()
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.full_kv_pool.get_index_k_with_scale_buffer(
@@ -2289,6 +2340,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        nsa_index_kpool: int = 1,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
     ):
 
         override_dim = (
@@ -2312,19 +2366,31 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        assert nsa_index_kpool > 1 or tail_extra_slots == 0
+        self.index_kpool = nsa_index_kpool
+        self.tail_extra_slots = tail_extra_slots
+        self.slots_per_page = self.page_size // nsa_index_kpool
+        self._tail_k = None
+        self._tail_score = None
         if index_buf_size is None:
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
         if _is_dcu:
-            self.use_fp8_index_k_cache = dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            ) and is_dcu_native_fp8_supported()
+            self.use_fp8_index_k_cache = nsa_index_kpool > 1 or (
+                dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                )
+                and is_dcu_native_fp8_supported()
+            )
         else:
             self.use_fp8_index_k_cache = True
         self.index_k_buffer_dtype = (
             torch.bfloat16 if _is_dcu and not self.use_fp8_index_k_cache else self.dtype
+        )
+        assert self.index_kpool <= 1 or self.use_fp8_index_k_cache, (
+            "kpool layout requires FP8 index K cache"
         )
 
         if _is_hip and not _is_dcu: #and  not _is_dcu:nhb
@@ -2349,7 +2415,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         #         * buf[i, page_size * head_dim:].view(float32) for scale
                         (
                             (index_buf_size + page_size + 1) // self.page_size,
-                            self.page_size
+                            self.slots_per_page
                             * (
                                 index_head_dim
                                 + index_head_dim // self.quant_block_size * 4
@@ -2374,11 +2440,46 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     )
                     for _ in range(layer_num)
                 ]
+            if self.index_kpool > 1:
+                assert max_running_requests is not None, (
+                    "kpool layout requires max_running_requests for the per-req tail"
+                )
+                tail_shape = (
+                    max_running_requests + 1,
+                    self.index_kpool + self.tail_extra_slots,
+                    self.index_head_dim,
+                )
+                self._tail_k = [
+                    torch.zeros(tail_shape, dtype=torch.bfloat16, device=device)
+                    for _ in range(layer_num)
+                ]
+                self._tail_score = [
+                    torch.zeros(tail_shape, dtype=torch.bfloat16, device=device)
+                    for _ in range(layer_num)
+                ]
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
         del self.kv_buffer
         del self.index_k_with_scale_buffer
+        if self._tail_k is not None:
+            del self._tail_k
+            del self._tail_score
+
+    def get_tail_buffers(self, layer_id: int):
+        assert self._tail_k is not None and self._tail_score is not None
+        idx = layer_id - self.start_layer
+        return self._tail_k[idx], self._tail_score[idx]
+
+    def get_tail_buf_infos(self):
+        if self._tail_k is None:
+            return [], [], []
+        bufs = self._tail_k + self._tail_score
+        return (
+            [b.data_ptr() for b in bufs],
+            [b.nbytes for b in bufs],
+            [b[0].nbytes for b in bufs],
+        )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
@@ -2575,38 +2676,3 @@ def move_kv_cache_native(
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
-
-@triton.jit
-def copy_all_layer_kv_cache_tiled(
-    data_ptrs,
-    strides,
-    tgt_loc_ptr,
-    src_loc_ptr,
-    num_locs,
-    num_locs_upper: tl.constexpr,
-    BYTES_PER_TILE: tl.constexpr,
-):
-    """2D tiled kernel. Safe for in-place copy."""
-    bid = tl.program_id(0)
-    tid = tl.program_id(1)
-
-    stride = tl.load(strides + bid)
-    base_ptr = tl.load(data_ptrs + bid)
-    base_ptr = tl.cast(base_ptr, tl.pointer_type(tl.uint8))
-
-    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
-    mask_byte = byte_off < stride
-    tl.multiple_of(byte_off, 16)
-
-    loc_idx = tl.arange(0, num_locs_upper)
-    mask_loc = loc_idx < num_locs
-
-    src = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
-    tgt = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
-
-    src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
-    tgt_ptr = base_ptr + tgt[:, None] * stride + byte_off[None, :]
-
-    mask = mask_loc[:, None] & mask_byte[None, :]
-    vals = tl.load(src_ptr, mask=mask)
-    tl.store(tgt_ptr, vals, mask=mask)

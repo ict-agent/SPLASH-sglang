@@ -41,6 +41,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     get_nsa_index_head_dim,
+    get_nsa_index_kpool,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
     is_deepseek_nsa,
@@ -64,6 +65,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.nsa.kpool.indexer import IndexerKPool
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
@@ -314,7 +316,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# 暂时先放这
+# 暂时先放�?
 def ds_bmm_wrapper(q: torch.Tensor, w: torch.Tensor, scale: float, dtype: torch.dtype):
     # # scale=1时去掉elementwise数乘
     if abs(scale - 1) < 1e-6:
@@ -615,7 +617,7 @@ class DeepseekV2MoE(nn.Module):
         _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
-        # mlp.shared_experts → mlp.experts.256 when > 0.
+        # mlp.shared_experts �?mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
 
         # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
@@ -1627,7 +1629,8 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
+            indexer_cls = IndexerKPool if get_nsa_index_kpool(config) > 1 else Indexer
+            indexer_kwargs = dict(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
                 index_head_dim=get_nsa_index_head_dim(config),
@@ -1645,6 +1648,9 @@ class DeepseekV2AttentionMLA(
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
+            if indexer_cls is IndexerKPool:
+                indexer_kwargs["config"] = config
+            self.indexer = indexer_cls(**indexer_kwargs)
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -2503,7 +2509,7 @@ class DeepseekV2AttentionMLA(
                 #     ).transpose(0, 1),
                 # )
         output, _ = self.o_proj(attn_bmm_output)
-        # 如果第一维是1才 squeeze
+        # 如果第一维是1�?squeeze
         if self.next_skip_topk is None:
             return output
         if not self.next_skip_topk:
@@ -3264,7 +3270,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
-        # 前三层dense，开融合时返回值为4个
+        # 前三层dense，开融合时返回值为4�?
         if _use_fused_rms_quant and residual is not None and self.post_attention_layernorm.weight.data is not None and isinstance(self.mlp, DeepseekV2MLP):
             hidden_states, _, _, _ = self.mlp(
                 hidden_states,
@@ -3275,7 +3281,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 rms_weight=self.post_attention_layernorm.weight.data,
                 residual=residual,
             )
-        else:  # 不管开不开融合，结果是一个就行
+        else:  # 不管开不开融合，结果是一个就�?
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,

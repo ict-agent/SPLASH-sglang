@@ -432,7 +432,7 @@ class ModelRunnerKVCacheMixin:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
-        # Out-of-tree platform plugin system â€” used by elif below
+        # Out-of-tree platform plugin system â€?used by elif below
         from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
@@ -610,11 +610,21 @@ class ModelRunnerKVCacheMixin:
             )
             pool_kwargs = {}
             if self.enable_hisparse:
+                if self.model_config.nsa_index_kpool > 1:
+                    raise NotImplementedError(
+                        "kpool is not supported with HiSparse NSA KV pool yet."
+                    )
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            else:
+                pool_kwargs.update(
+                    nsa_index_kpool=self.model_config.nsa_index_kpool,
+                    tail_extra_slots=self.server_args.speculative_num_draft_tokens or 0,
+                    max_running_requests=self.max_running_requests,
+                )
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -699,13 +709,16 @@ class ModelRunnerKVCacheMixin:
                     if is_nsa_model:
                         if self.enable_hisparse:
                             raise NotImplementedError(
-                                "HiSparse is not supported for hybrid NSA + linear attention models."
+                                "HiSparse is not supported for hybrid NSA + linear attention models; hybrid NSA + kpool uses the normal NSA pool."
                             )
                         extra_args.update(
                             use_nsa=True,
                             index_head_dim=get_nsa_index_head_dim(
                                 self.model_config.hf_config
                             ),
+                            nsa_index_kpool=self.model_config.nsa_index_kpool,
+                            tail_extra_slots=self.server_args.speculative_num_draft_tokens or 0,
+                            max_running_requests=self.max_running_requests,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
