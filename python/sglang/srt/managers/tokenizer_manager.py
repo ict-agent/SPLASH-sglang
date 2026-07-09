@@ -1401,10 +1401,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             incremental_stream = (
                 is_stream and self.server_args.incremental_streaming_output
             )
-            if incremental_stream and len(out_list) > 1:
+            glm_interleaved_stream = (
+                is_stream and self.server_args.glm_stream_speculated_tokens
+            )
+            if glm_interleaved_stream:
+                outs = out_list
+                out = outs[-1]
+            elif incremental_stream and len(out_list) > 1:
                 out = self._coalesce_streaming_chunks(out_list, obj.rid)
+                outs = [out]
             else:
                 out = out_list[-1]
+                outs = [out]
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
@@ -1444,17 +1452,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield abort_out
                         break
 
-                yield out
+                for stream_out in outs:
+                    yield stream_out
                 break
 
             if is_stream:
-                # Record response sent time right before we send response.
-                if not state.time_stats.response_sent_to_client_time:
-                    state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
-                yield out
+                for stream_out in outs:
+                    # Record response sent time right before we send response.
+                    if not state.time_stats.response_sent_to_client_time:
+                        state.time_stats.set_response_sent_to_client_time()
+                        stream_out["meta_info"][
+                            "response_sent_to_client_ts"
+                        ] = state.time_stats.get_response_sent_to_client_realtime()
+                    yield stream_out
             else:
                 if (
                     request is not None

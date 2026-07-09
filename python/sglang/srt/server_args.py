@@ -868,6 +868,9 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
+    # GLM speculative decoding
+    glm_stream_speculated_tokens: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -7243,6 +7246,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.msprobe_dump_config,
             help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
+        )
+        parser.add_argument(
+            "--glm-stream-speculated-tokens",
+            action="store_true",
+            default=ServerArgs.glm_stream_speculated_tokens,
+            help="When using speculative decoding, return accepted speculative "
+            "tokens as separate streaming events instead of merging them.",
         )
 
     @classmethod

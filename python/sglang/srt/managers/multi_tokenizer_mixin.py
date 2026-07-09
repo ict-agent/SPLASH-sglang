@@ -330,6 +330,15 @@ class MultiHttpWorkerDetokenizerMixin:
             # Fan out the output back to the originating tokenizer worker(s).
             # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
             # forward either batched or single requests, so handle both shapes.
+            if self.glm_stream_speculated_tokens and isinstance(output, list):
+                for o in output:
+                    for i, ipc_name in enumerate(o.http_worker_ipcs):
+                        new_output = _handle_output_by_index(o, i)
+                        self.socket_mapping.send_output(
+                            ipc_name, new_output, is_tokenizer=True
+                        )
+                continue
+
             if isinstance(recv_obj, BaseBatchReq):
                 for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
                     new_output = _handle_output_by_index(output, i)
