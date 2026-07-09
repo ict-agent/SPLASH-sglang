@@ -944,7 +944,7 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+                max_num_reqs, max(self.server_args.max_mamba_cache_size // ratio, 1)
             )
 
         return max_num_reqs
