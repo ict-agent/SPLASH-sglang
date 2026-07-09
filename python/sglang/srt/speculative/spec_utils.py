@@ -621,10 +621,40 @@ def traverse_tree(
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
+
+    Fast path: when the underlying xgrammar matcher exposes ``traverse_draft_tree``
+    (xgrammar >= 0.2.0), the entire DFS is executed inside C++ in a single call.
+    This eliminates per-node Python frame overhead, which under high concurrency
+    + long-running workloads (e.g. spec verify with 32 reqs × 6 draft tokens for
+    >30 min) drifts from ~900us to ~1.7ms per call due to CPython frame
+    allocation / GC pressure on the GrammarMatcher rollback stack.
+
+    Fallback: the original Python DFS, kept for older xgrammar versions.
     """
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
+
+    matcher = getattr(grammar, "matcher", None)
+    if matcher is not None and hasattr(matcher, "traverse_draft_tree"):
+        # xgrammar >= 0.2.0 requires int64 tensors for the C++ traversal.
+        rnt = (
+            retrieve_next_token
+            if retrieve_next_token.dtype == torch.int64
+            else retrieve_next_token.to(torch.int64)
+        )
+        rns = (
+            retrieve_next_sibling
+            if retrieve_next_sibling.dtype == torch.int64
+            else retrieve_next_sibling.to(torch.int64)
+        )
+        dts = (
+            draft_tokens
+            if draft_tokens.dtype == torch.int64
+            else draft_tokens.to(torch.int64)
+        )
+        matcher.traverse_draft_tree(rnt, rns, dts, allocate_token_bitmask)
+        return
 
     def dfs(
         curr: int,
