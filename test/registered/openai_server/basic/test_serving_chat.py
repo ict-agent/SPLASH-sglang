@@ -109,6 +109,103 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    @staticmethod
+    def _function_tool(name: str) -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+    @staticmethod
+    def _tool_reference_request(
+        reference_name: str = "mcp__os_knowledge_mcp__elink_reader",
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> ChatCompletionRequest:
+        request_kwargs = {
+            "model": "x",
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_123",
+                    "content": [
+                        {
+                            "type": "tool_reference",
+                            "name": reference_name,
+                        }
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+        if tools is not None:
+            request_kwargs["tools"] = tools
+        request_kwargs.update(kwargs)
+        return ChatCompletionRequest(**request_kwargs)
+
+    # ------------- validation tests -------------
+    def test_tool_reference_requires_tools(self):
+        req = self._tool_reference_request()
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "messages[0].content[0] is a tool_reference block, but tools is empty.",
+        )
+
+    def test_tool_reference_requires_referenced_tool_definition(self):
+        req = self._tool_reference_request(tools=[self._function_tool("other_tool")])
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "messages[0].content[0] references unknown tool "
+            "'mcp__os_knowledge_mcp__elink_reader'.",
+        )
+
+    def test_tool_reference_validates_tool_definitions_first(self):
+        bad_tool = self._function_tool("other_tool")
+        bad_tool["function"]["parameters"] = {"type": "not-a-json-schema-type"}
+        req = self._tool_reference_request(tools=[bad_tool])
+
+        self.assertIn(
+            "Tool 0 function has invalid 'parameters' schema",
+            self.chat._validate_request(req),
+        )
+
+    def test_tool_reference_rejects_tool_choice_none(self):
+        tool_name = "mcp__os_knowledge_mcp__elink_reader"
+        req = self._tool_reference_request(
+            tools=[self._function_tool(tool_name)],
+            tool_choice="none",
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "messages[0].content[0] is a tool_reference block, "
+            "but tool_choice is none.",
+        )
+
+    def test_tool_reference_respects_specific_tool_choice(self):
+        tool_name = "mcp__os_knowledge_mcp__elink_reader"
+        req = self._tool_reference_request(
+            tools=[self._function_tool(tool_name), self._function_tool("other_tool")],
+            tool_choice={"type": "function", "function": {"name": "other_tool"}},
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "messages[0].content[0] references unknown tool "
+            "'mcp__os_knowledge_mcp__elink_reader'.",
+        )
+
+    def test_tool_reference_accepts_matching_tool(self):
+        tool_name = "mcp__os_knowledge_mcp__elink_reader"
+        req = self._tool_reference_request(tools=[self._function_tool(tool_name)])
+
+        self.assertIsNone(self.chat._validate_request(req))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with patch(

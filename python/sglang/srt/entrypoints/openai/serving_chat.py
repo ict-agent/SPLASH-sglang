@@ -377,6 +377,53 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _validate_tool_references(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        tool_references = []
+        for msg_index, message in enumerate(request.messages):
+            content = getattr(message, "content", None)
+            if not isinstance(content, list):
+                continue
+
+            for part_index, part in enumerate(content):
+                if getattr(part, "type", None) == "tool_reference":
+                    tool_references.append((msg_index, part_index, part.name))
+
+        if not tool_references:
+            return None
+
+        if not request.tools:
+            msg_index, part_index, _ = tool_references[0]
+            return (
+                f"messages[{msg_index}].content[{part_index}] is a "
+                "tool_reference block, but tools is empty."
+            )
+
+        if request.tool_choice == "none":
+            msg_index, part_index, _ = tool_references[0]
+            return (
+                f"messages[{msg_index}].content[{part_index}] is a "
+                "tool_reference block, but tool_choice is none."
+            )
+
+        available_tool_names = {tool.function.name for tool in request.tools}
+        if isinstance(request.tool_choice, ToolChoice):
+            available_tool_names = {
+                name
+                for name in available_tool_names
+                if name == request.tool_choice.function.name
+            }
+
+        for msg_index, part_index, tool_name in tool_references:
+            if tool_name not in available_tool_names:
+                return (
+                    f"messages[{msg_index}].content[{part_index}] references "
+                    f"unknown tool '{tool_name}'."
+                )
+
+        return None
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
         if not request.messages:
@@ -405,6 +452,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 Draft202012Validator.check_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+
+        # Validate tool_references in messages
+        if tool_reference_error := self._validate_tool_references(request):
+            return tool_reference_error
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
