@@ -1173,6 +1173,8 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        data = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
     hash_bytes = hashlib.sha256(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
