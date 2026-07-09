@@ -435,6 +435,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
             heads[state_len - valid :].transpose(0, 1).to(local_conv_states.dtype)
         )
 
+    def _ensure_kda_cp_cpu_meta(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: KDAPrefillContextParallelMetadata,
+    ) -> None:
+        """Populate the per-forward CPU metadata cache on ``metadata`` the first
+        time any KDA layer needs it, so the same lists (and the track_mask /
+        track_seqlens D2H copies) are not rebuilt on every layer."""
+        if metadata.cpu_req_starts is None:
+            req_starts = [0]
+            for seq_len in forward_batch.extend_seq_lens_cpu[:-1]:
+                req_starts.append(req_starts[-1] + int(seq_len))
+            metadata.cpu_req_starts = req_starts
+        if metadata.cpu_track_mask is None and forward_batch.mamba_track_mask is not None:
+            metadata.cpu_track_mask = forward_batch.mamba_track_mask.cpu().tolist()
+            metadata.cpu_track_seqlens = (
+                forward_batch.mamba_track_seqlens.cpu().tolist()
+            )
+
     def _track_kda_cp_state_extend(
         self,
         layer: RadixLinearAttention,
@@ -482,12 +501,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
-        req_starts = [0]
-        for seq_len in forward_batch.extend_seq_lens_cpu[:-1]:
-            req_starts.append(req_starts[-1] + int(seq_len))
-
-        track_mask_cpu = forward_batch.mamba_track_mask.cpu().tolist()
-        track_seqlens_cpu = forward_batch.mamba_track_seqlens.cpu().tolist()
+        self._ensure_kda_cp_cpu_meta(forward_batch, metadata)
+        req_starts = metadata.cpu_req_starts
+        track_mask_cpu = metadata.cpu_track_mask
+        track_seqlens_cpu = metadata.cpu_track_seqlens
         track_indices = forward_batch.mamba_track_indices
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
@@ -501,6 +518,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         for L in metadata.local_seq_lens_cpu:
             seg_h_offsets.append(seg_h_offsets[-1] + (int(L) - 1) // chunk + 1)
 
+        dst_req_idx = []
+        owned = []
         for req_idx, should_track in enumerate(track_mask_cpu):
             if not should_track:
                 continue
@@ -522,10 +541,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 bc - 1, metadata.total_tokens, metadata.cp_size
             )
 
-            full_conv_state = runtime_conv_states.new_empty(
-                (conv_full_dim, conv_state_len)
-            )
-            full_ssm_state = runtime_ssm_states.new_empty(ssm_full_shape)
+            i = len(dst_req_idx)
+            dst_req_idx.append(req_idx)
 
             if cp_rank == owner_rank:
                 local_idx = None
@@ -545,7 +562,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # --- SSM state at bc ---
                 if local_pos == seg_len:
                     # Boundary is the segment end -> final recurrent state.
-                    full_ssm_state.copy_(runtime_ssm_states[local_idx])
+                    ssm_state = runtime_ssm_states[local_idx]
                 else:
                     # Nearest local FLA chunk boundary lb <= bc (h has its state).
                     lb_offset = (local_pos // chunk) * chunk
@@ -553,7 +570,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     state_lb = runtime_h[0, h_index]  # [HV, V, K] at seg_start+lb_offset
                     m = local_pos - lb_offset
                     if m == 0:
-                        full_ssm_state.copy_(state_lb)
+                        ssm_state = state_lb
                     else:
                         # Short recurrence: advance state_lb by the m (< 64) tokens
                         # [lb, bc) to reach the per-request chunk boundary bc that
@@ -584,7 +601,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                             use_qk_l2norm_in_kernel=True,
                             cu_seqlens=sub_cu,
                         )
-                        full_ssm_state.copy_(init[0])
+                        ssm_state = init[0]
 
                 # --- conv window at bc (last W-1 raw input tokens) ---
                 bc_local = bc - metadata.local_start
@@ -594,32 +611,142 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     win[conv_state_len - take :] = raw_mixed_qkv[
                         bc_local - take : bc_local
                     ]
-                full_conv_state.copy_(win.transpose(0, 1))
+                conv_win = win.transpose(0, 1)  # [conv_full_dim, W-1]
 
-            cp_group.broadcast(full_conv_state, src=owner_rank)
-            cp_group.broadcast(full_ssm_state, src=owner_rank)
+                owned.append((i, conv_win, ssm_state))
 
-            dst = track_indices[req_idx]
-            conv_shard = self._local_state_shard(
-                full_conv_state,
-                local_dim=persistent_conv_states.shape[1],
-                shard_dim=0,
-                cp_rank=cp_rank,
-                cp_size=cp_group.world_size,
+        dst_idx = track_indices[
+            torch.tensor(dst_req_idx, device=track_indices.device, dtype=torch.long)
+        ].to(device=persistent_conv_states.device, dtype=torch.long)
+        self._coalesced_cp_state_writeback(
+            dst_idx,
+            owned,
+            conv_full_dim,
+            conv_state_len,
+            ssm_full_shape,
+            persistent_conv_states,
+            persistent_ssm_states,
+        )
+
+    def _coalesced_cp_state_writeback(
+        self,
+        dst_idx: torch.Tensor,
+        owned: list,
+        conv_full_dim: int,
+        conv_state_len: int,
+        ssm_full_shape: tuple,
+        persistent_conv_states: torch.Tensor,
+        persistent_ssm_states: torch.Tensor,
+    ) -> None:
+        """Coalesce per-request conv+ssm state exchange into a single collective.
+
+        ``dst_idx`` (identical on every rank) is the ``[n]`` LongTensor of
+        persistent destination slots; ``owned`` holds ``(i, conv[D,W-1],
+        ssm[HV,V,K])`` for the items this rank owns (full head/channel dim, ``i``
+        indexing into ``dst_idx``). Every request has exactly one owner.
+
+        Fully vectorized to avoid per-item ops: the owned states are stacked and
+        cast once, scattered into the collective buffer with a single
+        ``index_copy_``, and written back with a single ``index_copy_`` on
+        ``dst_idx`` (no GPU-scalar indexing / D2H syncs).
+
+        Fast path (state head/channel-sharded across the CP group, the usual
+        case): one **reduce_scatter** delivers each rank exactly its shard of
+        every item (owner lays its full state out as ``cp_size`` contiguous
+        blocks by destination rank; others contribute zeros; SUM picks the
+        owner's block). Fallback (full storage or dims not divisible by cp_size):
+        one SUM **all-reduce** over the full-state buffer, then a batched narrow.
+        """
+        n = int(dst_idx.shape[0])
+        if n == 0:
+            return
+
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        cp_size = cp_group.world_size
+        device = persistent_conv_states.device
+
+        conv_local_dim = persistent_conv_states.shape[1]
+        ssm_local_dim = persistent_ssm_states.shape[1]
+        ssm_tail = tuple(ssm_full_shape[1:])  # (V, K)
+        ssm_tail_numel = 1
+        for s in ssm_tail:
+            ssm_tail_numel *= s
+        conv_numel = conv_full_dim * conv_state_len
+        ssm_numel = ssm_full_shape[0] * ssm_tail_numel
+
+        conv_sharded = conv_full_dim == conv_local_dim * cp_size
+        ssm_sharded = ssm_full_shape[0] == ssm_local_dim * cp_size
+
+        # Batch this rank's owned states once (this rank owns ~n / cp_size items).
+        num_owned = len(owned)
+        if num_owned:
+            owned_rows = torch.tensor(
+                [i for (i, _, _) in owned], device=device, dtype=torch.long
             )
-            ssm_shard = self._local_state_shard(
-                full_ssm_state,
-                local_dim=persistent_ssm_states.shape[1],
-                shard_dim=0,
-                cp_rank=cp_rank,
-                cp_size=cp_group.world_size,
+            conv_stack = torch.stack([c for (_, c, _) in owned]).to(torch.float32)
+            ssm_stack = torch.stack([s for (_, _, s) in owned]).to(torch.float32)
+
+        if cp_size > 1 and conv_sharded and ssm_sharded:
+            # --- reduce_scatter fast path ---
+            conv_shard_numel = conv_local_dim * conv_state_len
+            ssm_shard_numel = ssm_local_dim * ssm_tail_numel
+            chunk_numel = conv_shard_numel + ssm_shard_numel
+
+            inp = torch.zeros(cp_size, n, chunk_numel, dtype=torch.float32, device=device)
+            if num_owned:
+                # Per owned item, split its full state into cp_size contiguous
+                # blocks (block d -> rank d, matching _local_state_shard), then
+                # lay out by destination: src[d, j, :] = item j's block d.
+                conv_blocks = conv_stack.reshape(num_owned, cp_size, conv_shard_numel)
+                ssm_blocks = ssm_stack.reshape(num_owned, cp_size, ssm_shard_numel)
+                src = torch.cat(
+                    [conv_blocks.transpose(0, 1), ssm_blocks.transpose(0, 1)], dim=-1
+                ).contiguous()  # [cp_size, num_owned, chunk_numel]
+                inp.index_copy_(1, owned_rows, src)
+
+            out = torch.empty(n, chunk_numel, dtype=torch.float32, device=device)
+            torch.distributed.reduce_scatter_tensor(
+                out, inp, group=cp_group.device_group
             )
-            persistent_conv_states[dst].copy_(
-                conv_shard.to(persistent_conv_states.dtype, copy=False)
+
+            conv_out = out[:, :conv_shard_numel].reshape(
+                n, conv_local_dim, conv_state_len
             )
-            persistent_ssm_states[dst].copy_(
-                ssm_shard.to(persistent_ssm_states.dtype, copy=False)
+            ssm_out = out[:, conv_shard_numel:].reshape(n, ssm_local_dim, *ssm_tail)
+        else:
+            # --- all_reduce fallback (full storage, or non-divisible dims) ---
+            buf = torch.zeros(
+                n, conv_numel + ssm_numel, dtype=torch.float32, device=device
             )
+            if num_owned:
+                src = torch.cat(
+                    [conv_stack.reshape(num_owned, -1), ssm_stack.reshape(num_owned, -1)],
+                    dim=-1,
+                ).contiguous()
+                buf.index_copy_(0, owned_rows, src)
+
+            torch.distributed.all_reduce(buf, group=cp_group.device_group)
+
+            conv_full = buf[:, :conv_numel].reshape(n, conv_full_dim, conv_state_len)
+            ssm_full = buf[:, conv_numel:].reshape(n, ssm_full_shape[0], *ssm_tail)
+            conv_out = (
+                conv_full.narrow(1, cp_rank * conv_local_dim, conv_local_dim)
+                if conv_sharded
+                else conv_full
+            )
+            ssm_out = (
+                ssm_full.narrow(1, cp_rank * ssm_local_dim, ssm_local_dim)
+                if ssm_sharded
+                else ssm_full
+            )
+
+        persistent_conv_states.index_copy_(
+            0, dst_idx, conv_out.to(persistent_conv_states.dtype).contiguous()
+        )
+        persistent_ssm_states.index_copy_(
+            0, dst_idx, ssm_out.to(persistent_ssm_states.dtype).contiguous()
+        )
 
     def _writeback_kda_cp_final_states(
         self,
@@ -634,27 +761,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> None:
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
-        req_starts = [0]
-        for seq_len in forward_batch.extend_seq_lens_cpu[:-1]:
-            req_starts.append(req_starts[-1] + int(seq_len))
+        self._ensure_kda_cp_cpu_meta(forward_batch, metadata)
+        req_starts = metadata.cpu_req_starts
 
         conv_full_dim = layer.q_dim + layer.k_dim + layer.v_dim
         conv_state_len = persistent_conv_states.shape[-1]
         ssm_full_shape = (layer.num_q_heads, layer.head_v_dim, layer.head_k_dim)
 
+        dst_req_idx = []
+        owned = []
         for req_idx, req_start in enumerate(req_starts):
             req_end = req_start + int(forward_batch.extend_seq_lens_cpu[req_idx])
             if req_end <= req_start:
                 continue
 
+            i = len(dst_req_idx)
+            dst_req_idx.append(req_idx)
+
             owner_rank = kda_cp_owner_of_global_token(
                 req_end - 1, metadata.total_tokens, metadata.cp_size
             )
-            full_conv_state = runtime_conv_states.new_empty(
-                (conv_full_dim, conv_state_len)
-            )
-            full_ssm_state = runtime_ssm_states.new_empty(ssm_full_shape)
-
             if cp_rank == owner_rank:
                 local_idx = self._find_kda_cp_segment(
                     metadata, req_idx=req_idx, segment_end=req_end
@@ -664,33 +790,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         "KDA-CP final-state owner could not find its local "
                         f"segment for req_idx={req_idx}, req_end={req_end}."
                     )
-                full_conv_state.copy_(runtime_conv_states[local_idx])
-                full_ssm_state.copy_(runtime_ssm_states[local_idx])
+                owned.append(
+                    (
+                        i,
+                        runtime_conv_states[local_idx],
+                        runtime_ssm_states[local_idx],
+                    )
+                )
 
-            cp_group.broadcast(full_conv_state, src=owner_rank)
-            cp_group.broadcast(full_ssm_state, src=owner_rank)
-
-            dst = persistent_cache_indices[req_idx]
-            conv_shard = self._local_state_shard(
-                full_conv_state,
-                local_dim=persistent_conv_states.shape[1],
-                shard_dim=0,
-                cp_rank=cp_rank,
-                cp_size=cp_group.world_size,
+        dst_idx = persistent_cache_indices[
+            torch.tensor(
+                dst_req_idx, device=persistent_cache_indices.device, dtype=torch.long
             )
-            ssm_shard = self._local_state_shard(
-                full_ssm_state,
-                local_dim=persistent_ssm_states.shape[1],
-                shard_dim=0,
-                cp_rank=cp_rank,
-                cp_size=cp_group.world_size,
-            )
-            persistent_conv_states[dst].copy_(
-                conv_shard.to(persistent_conv_states.dtype, copy=False)
-            )
-            persistent_ssm_states[dst].copy_(
-                ssm_shard.to(persistent_ssm_states.dtype, copy=False)
-            )
+        ].to(device=persistent_conv_states.device, dtype=torch.long)
+        self._coalesced_cp_state_writeback(
+            dst_idx,
+            owned,
+            conv_full_dim,
+            conv_state_len,
+            ssm_full_shape,
+            persistent_conv_states,
+            persistent_ssm_states,
+        )
 
     def _scatter_kda_cp_runtime_states_to_persistent(
         self,

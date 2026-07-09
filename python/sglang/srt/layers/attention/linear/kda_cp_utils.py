@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -32,6 +32,14 @@ class KDAPrefillContextParallelMetadata:
     local_segment_global_starts_cpu: List[int]
     local_segment_global_ends_cpu: List[int]
     local_query_start_loc: torch.Tensor
+
+    # Lazily-cached per-forward CPU metadata (filled by the KDA backend). The
+    # metadata object is created once per forward and shared by every KDA layer,
+    # so caching these here avoids rebuilding / re-copying (D2H) the same lists
+    # on each layer's writeback/track.
+    cpu_req_starts: Optional[List[int]] = None
+    cpu_track_mask: Optional[List[int]] = None
+    cpu_track_seqlens: Optional[List[int]] = None
 
 
 def is_kda_prefill_cp_enabled() -> bool:
