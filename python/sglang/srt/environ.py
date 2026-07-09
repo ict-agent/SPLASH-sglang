@@ -562,6 +562,7 @@ class Envs:
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+    SGLANG_ENABLE_HEALTH_CHECK_IPC_DRAIN_ALL = EnvBool(False)
 
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)

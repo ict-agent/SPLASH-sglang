@@ -3206,7 +3206,17 @@ class Scheduler(
         self.update_device_timer()
 
     def maybe_send_health_check_signal(self):
-        if self.return_health_check_ipcs:
+        if not self.return_health_check_ipcs:
+            return
+
+        # GLM NOTE: Drain one health IPC by default; opt in to drain all for
+        # multi-tokenizer health checks.
+        drain_all = envs.SGLANG_ENABLE_HEALTH_CHECK_IPC_DRAIN_ALL.get()
+        if drain_all:
+            tic = time.perf_counter()
+            num_health_reqs = len(self.return_health_check_ipcs)
+
+        while self.return_health_check_ipcs:
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
@@ -3214,6 +3224,16 @@ class Scheduler(
                 HealthCheckOutput(
                     http_worker_ipc=self.return_health_check_ipcs.popleft()
                 )
+            )
+
+            if not drain_all:
+                break
+
+        if drain_all:
+            logger.info(
+                "Drain all health check IPCs. #health-req: %d, elapsed: %.3f ms",
+                num_health_reqs,
+                (time.perf_counter() - tic) * 1000,
             )
 
     def _check_pending_flush(self):
