@@ -237,6 +237,38 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or None.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
+        self.init_glm()
+
+    def init_glm(self):
+        # Decoding constraint module
+        self._glm_constraint_module = None
+        self._glm_special_token_config = None
+        self._ignore_decoding_constraint_exception = (
+            self.tokenizer_manager.server_args.glm_ignore_decoding_constraint_exception
+        )
+        # Map tool_call_parser to chat_template_version
+        _parser_to_version = {
+            "glm45": "glm45",
+            "glm45stream": "glm45",
+            "glm47": "glm47",
+            "glm5": "glm47",
+            "glm5stream": "glm47",
+        }
+        self._glm_chat_template_version = _parser_to_version.get(
+            self.tool_call_parser
+        )
+
+        constraint_module_path = (
+            self.tokenizer_manager.server_args.glm_decoding_constraint_module
+        )
+        if constraint_module_path:
+            if self.tool_call_parser and self._glm_chat_template_version is None:
+                raise ValueError(
+                    f"Unsupported tool_call_parser '{self.tool_call_parser}' for decoding constraint. "
+                    f"Supported parsers: {list(_parser_to_version.keys())}"
+                )
+            self._load_glm_constraint_module(constraint_module_path)
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -312,6 +344,35 @@ class OpenAIServingChat(OpenAIServingBase):
         if "DeepseekV3" in arch and not has_chat_template:
             return "dsv32"
         return None
+
+    def _load_glm_constraint_module(self, module_path: str):
+        """Load constraint module and initialize special token config."""
+        import importlib
+
+        module = importlib.import_module(module_path)
+
+        if not hasattr(module, "generation_constraint"):
+            raise AttributeError(
+                f"Module {module_path} missing 'generation_constraint'"
+            )
+        if not hasattr(module, "get_special_token_config"):
+            raise AttributeError(
+                f"Module {module_path} missing 'get_special_token_config'"
+            )
+
+        self._glm_constraint_module = module
+        self._glm_special_token_config = module.get_special_token_config(
+            self.tokenizer_manager.tokenizer
+        )
+        logger.info(f"Loaded decoding constraint module: {module_path}")
+
+    def _get_glm_enable_thinking(self, request: ChatCompletionRequest) -> bool:
+        """Get enable_thinking for constraint, default True."""
+        if request.chat_template_kwargs:
+            val = request.chat_template_kwargs.get("enable_thinking")
+            if val is not None:
+                return bool(val)
+        return True
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -389,6 +450,7 @@ class OpenAIServingChat(OpenAIServingBase):
         processed_messages = self._process_messages(request, is_multimodal)
 
         request._prompt_ids = processed_messages.prompt_ids
+        request._constraint_string = processed_messages.constraint_string
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -473,6 +535,37 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.server_args.reasoning_parser is not None
         )
         tool_call_constraint = None
+        constraint_string = None
+
+        # Check if decoding constraint module is enabled
+        if self._glm_constraint_module is not None and request.enable_constraint:
+            enable_thinking = self._get_glm_enable_thinking(request)
+
+            # Extract functions from tools (None if no tools)
+            functions = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                functions = [tool.function for tool in request.tools]
+
+            # Generate EBNF
+            try:
+                ebnf_grammar = self._glm_constraint_module.generation_constraint(
+                    enable_thinking=enable_thinking,
+                    functions=functions,
+                    special_tokens=self._glm_special_token_config,
+                    chat_template_version=self._glm_chat_template_version,
+                    root_name="root",
+                )
+                tool_call_constraint = ("ebnf", ebnf_grammar)
+                constraint_string = ebnf_grammar
+            except Exception:
+                if not self._ignore_decoding_constraint_exception:
+                    raise
+                import traceback
+                logger.error(
+                    "Failed to generate decoding constraint, proceeding without constraint.\n%s",
+                    traceback.format_exc(),
+                )
 
         # Apply chat template and its stop strings
         tools = None
@@ -486,7 +579,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser:
+            # Only use FunctionCallParser if decoding constraint module is not enabled
+            if self.tool_call_parser and self._glm_constraint_module is None:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
@@ -495,9 +589,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
-            if tool_call_constraint is None and (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if (
+                tool_call_constraint is None
+                and self._glm_constraint_module is None
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
+                # GLM NOTE: For glm toolcall parser, JsonArrayParser is not available
+                and (not self.tool_call_parser or "glm" not in self.tool_call_parser)
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools,
@@ -513,6 +613,7 @@ class OpenAIServingChat(OpenAIServingBase):
             result = self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
+        result.constraint_string = constraint_string
         return result
 
     def _apply_jinja_template(
@@ -1240,6 +1341,12 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+
+        # Return constraint EBNF if requested
+        if request.return_constraint:
+            constraint = getattr(request, "_constraint_string", None)
+            if constraint is not None:
+                metadata["constraint"] = constraint
 
         # GLM NOTE: return token IDs if return_token_ids
         if request.return_token_ids:

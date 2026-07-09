@@ -680,6 +680,11 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
 
+    # GLM NOTE (liumingdao): Whether to return decoding constraint EBNF string when --decoding-constraint-module is specified
+    return_constraint: bool = False
+    # GLM NOTE (liumingdao): Whether to enable decoding constraint when --decoding-constraint-module is specified
+    enable_constraint: bool = True
+
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
@@ -1523,6 +1528,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    constraint_string: Optional[str] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
