@@ -291,15 +291,23 @@ class TemplateManager:
                     f"Unknown separator style: {template['sep_style']}"
                 ) from None
 
+            system_template = template.get("system_template")
+            if system_template is None:
+                system_template = template["system"] + "\n{system_message}"
+
             register_conv_template(
                 Conversation(
                     name=template["name"],
-                    system_template=template["system"] + "\n{system_message}",
+                    system_template=system_template,
                     system_message=template.get("system_message", ""),
                     roles=(template["user"], template["assistant"]),
                     sep_style=sep_style,
                     sep=template.get("sep", "\n"),
                     stop_str=template["stop_str"],
+                    image_token=template.get("image_token", "<image>"),
+                    video_token=template.get("video_token", "<video>"),
+                    audio_token=template.get("audio_token", "<audio>"),
+                    image_token_at_prefix=template.get("image_token_at_prefix", False),
                 ),
                 override=True,
             )
