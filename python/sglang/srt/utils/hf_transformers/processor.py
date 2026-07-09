@@ -143,6 +143,7 @@ def get_processor(
     tokenizer_revision: Optional[str] = None,
     use_fast: Optional[bool] = True,
     tokenizer_backend: str = "huggingface",
+    glm_special_token_escape_seed: Optional[int] = None,
     **kwargs,
 ):
     if tokenizer_backend == "fastokens":
@@ -276,6 +277,7 @@ def get_processor(
             trust_remote_code=trust_remote_code,
             tokenizer_revision=revision,
             tokenizer_backend=tokenizer_backend,
+            glm_special_token_escape_seed=glm_special_token_escape_seed,
         )
         if isinstance(processor, PreTrainedTokenizerBase):
             processor = tokenizer
@@ -295,4 +297,8 @@ def get_processor(
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
+    if glm_special_token_escape_seed is not None:
+        from sglang.srt.utils.tokenizer_escape import escape_tokenizer_special_tokens
+
+        escape_tokenizer_special_tokens(tokenizer, glm_special_token_escape_seed)
     return processor

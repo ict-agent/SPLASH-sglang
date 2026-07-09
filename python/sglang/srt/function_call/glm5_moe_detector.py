@@ -190,14 +190,27 @@ class Glm5MoeDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<tool_call>"
-        self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
+        self.bot_token = sp.get("<tool_call>")
+        self.eot_token = sp.get("</tool_call>")
+        key_open = sp.get("<arg_key>")
+        key_close = sp.get("</arg_key>")
+        val_open = sp.get("<arg_value>")
+        val_close = sp.get("</arg_value>")
+        bot_re = re.escape(self.bot_token)
+        eot_re = re.escape(self.eot_token)
+        key_open_re = re.escape(key_open)
+        key_close_re = re.escape(key_close)
+        val_open_re = re.escape(val_open)
+        val_close_re = re.escape(val_close)
+        self.func_call_regex = rf"{bot_re}.*?{eot_re}"
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
+            rf"{bot_re}(.*?)({key_open_re}.*?)?{eot_re}", re.DOTALL
         )
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+            rf"{key_open_re}(.*?){key_close_re}(?:\\n|\s)*{val_open_re}(.*?){val_close_re}",
             re.DOTALL,
         )
 
@@ -297,6 +310,13 @@ class Glm5MoeDetector(BaseFormatDetector):
         raise NotImplementedError()
 
     def build_ebnf(self, tools: List[Tool]):
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
+        key_open = sp.get("<arg_key>")
+        key_close = sp.get("</arg_key>")
+        val_open = sp.get("<arg_value>")
+        val_close = sp.get("</arg_value>")
         seen_names, filtered_and_unique_tools = set(), []
         valid_name_pattern = re.compile(r'[^\"\s]+')
         for tool in tools:
@@ -312,7 +332,9 @@ class Glm5MoeDetector(BaseFormatDetector):
             tool_call_separator="\\n",
             function_format="xml",
             call_rule_fmt='"{name}" ( {arguments_rule} )',
-            key_value_rule_fmt='"<arg_key>{key}</arg_key><arg_value>" {valrule} "</arg_value>"',
+            key_value_rule_fmt=(
+                f'"{key_open}{{key}}{key_close}{val_open}" {{valrule}} "{val_close}"'
+            ),
             key_value_separator='',
         )
 
@@ -330,10 +352,13 @@ class Glm5MoeStreamDetector(Glm5MoeDetector):
 
     def __init__(self):
         super().__init__()
-        self.begin_of_arg_key_token = "<arg_key>"
-        self.end_of_arg_key_token = "</arg_key>"
-        self.begin_of_arg_value_token = "<arg_value>"
-        self.end_of_arg_value_token = "</arg_value>"
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
+        self.begin_of_arg_key_token = sp.get("<arg_key>")
+        self.end_of_arg_key_token = sp.get("</arg_key>")
+        self.begin_of_arg_value_token = sp.get("<arg_value>")
+        self.end_of_arg_value_token = sp.get("</arg_value>")
         self.tool_call_separator = "\n"
 
         self._state = Glm5MoeToolParsingState.WAITING_BOT

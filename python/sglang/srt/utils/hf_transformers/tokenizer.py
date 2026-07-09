@@ -413,7 +413,9 @@ def _fix_special_tokens_pattern(tokenizer):
         tokenizer.special_tokens_pattern = "none"
 
 
-def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
+def _apply_post_load_fixes(
+    tokenizer, tokenizer_name, revision, glm_special_token_escape_seed=None
+):
     """Apply all post-load patches and return the final tokenizer."""
     _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
@@ -427,7 +429,12 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
-    return patch_tokenizer(tokenizer)
+    tokenizer = patch_tokenizer(tokenizer)
+    if glm_special_token_escape_seed is not None:
+        from sglang.srt.utils.tokenizer_escape import escape_tokenizer_special_tokens
+
+        escape_tokenizer_special_tokens(tokenizer, glm_special_token_escape_seed)
+    return tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +470,7 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
+    glm_special_token_escape_seed: Optional[int] = None,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -511,7 +519,12 @@ def get_tokenizer(
                 tokenizer_name, *args, **common_kwargs
             )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(
+            tokenizer,
+            tokenizer_name,
+            tokenizer_revision,
+            glm_special_token_escape_seed,
+        )
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(

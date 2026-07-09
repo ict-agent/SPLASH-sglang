@@ -27,7 +27,20 @@ class SpecialTokenConfig:
 
 
 def get_special_token_config(tokenizer) -> SpecialTokenConfig:
-    return SpecialTokenConfig()
+    from .escape import get_global_escaped_special_tokens
+
+    sp = get_global_escaped_special_tokens()
+    return SpecialTokenConfig(
+        begin_of_thinking=sp.get("<think>"),
+        end_of_thinking=sp.get("</think>"),
+        begin_of_tool_call=sp.get("<tool_call>"),
+        end_of_tool_call=sp.get("</tool_call>"),
+        begin_of_key=sp.get("<arg_key>"),
+        end_of_key=sp.get("</arg_key>"),
+        begin_of_value=sp.get("<arg_value>"),
+        end_of_value=sp.get("</arg_value>"),
+        assistant_token=sp.get("<|assistant|>"),
+    )
 
 
 def generation_constraint(

@@ -235,14 +235,15 @@ class GLM5Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
-        # DeepSeek-R1 is assumed to be reasoning until `</think>` token
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
         super().__init__(
-            "<think>",
-            "</think>",
+            sp.get("<think>"),
+            sp.get("</think>"),
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
-        # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -268,15 +269,18 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
         think_excluded_tokens = [
-            "<tool_call>",
-            "</tool_call>",
-            "<|im_end|>",
-            "<|endoftext|>",
+            sp.get("<tool_call>"),
+            sp.get("</tool_call>"),
+            sp.get("<|im_end|>"),
+            sp.get("<|endoftext|>"),
         ]
         super().__init__(
-            "<think>",
-            "</think>",
+            sp.get("<think>"),
+            sp.get("</think>"),
             think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,

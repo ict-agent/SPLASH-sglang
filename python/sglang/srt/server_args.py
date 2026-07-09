@@ -841,6 +841,7 @@ class ServerArgs:
     glm_check_total_num_tokens: bool = False
     glm_decoding_constraint_module: Optional[str] = None
     glm_ignore_decoding_constraint_exception: bool = False
+    glm_special_token_escape_seed: Optional[int] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -7253,6 +7254,15 @@ class ServerArgs:
             default=ServerArgs.glm_stream_speculated_tokens,
             help="When using speculative decoding, return accepted speculative "
             "tokens as separate streaming events instead of merging them.",
+        )
+        parser.add_argument(
+            "--glm-special-token-escape-seed",
+            type=int,
+            default=ServerArgs.glm_special_token_escape_seed,
+            help="If set, randomize the string representation of every tokenizer "
+            "added-token by appending '<sha256(seed:token)[:8]>'. All processes "
+            "must be launched with the same seed value, otherwise their token-string "
+            "mappings will diverge.",
         )
 
     @classmethod

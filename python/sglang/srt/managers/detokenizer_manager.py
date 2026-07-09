@@ -116,6 +116,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
+                glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
             )
 
     def init_running_status(self, server_args: ServerArgs):

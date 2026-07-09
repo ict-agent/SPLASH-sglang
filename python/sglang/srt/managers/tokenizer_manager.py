@@ -326,6 +326,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
                 )
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
@@ -2864,6 +2865,7 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
             tokenizer_backend=server_args.tokenizer_backend,
+            glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2878,6 +2880,7 @@ def _get_processor_wrapper(server_args):
                 revision=server_args.revision,
                 use_fast=True,
                 tokenizer_backend=server_args.tokenizer_backend,
+                glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
             )
         else:
             raise e

@@ -592,6 +592,7 @@ class Scheduler(
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -601,6 +602,7 @@ class Scheduler(
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
                 )
 
         # Load multimodal processor for M-RoPE fallback computation.
@@ -626,9 +628,20 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            encoded = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            assert len(encoded) == 1, (
+                f"think_end_token {reasoning_parser.detector.think_end_token!r} did "
+                f"not encode as a single token: {encoded}. Did the tokenizer get "
+                f"escaped consistently across all processes "
+                f"(--glm-special-token-escape-seed)?"
+            )
+            self.tokenizer.think_end_id = encoded[0]
+            self.model_config.think_end_id = encoded[0]
+            self._think_end_id = self.tokenizer.think_end_id
+        else:
+            self._think_end_id = None
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
