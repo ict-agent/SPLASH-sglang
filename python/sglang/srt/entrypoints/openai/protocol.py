@@ -556,15 +556,13 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: str
     parameters: Optional[object] = None
-    strict: bool = False
+    strict: Optional[bool] = None
     defer_loading: Optional[bool] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        if self.defer_loading is None:
-            data.pop("defer_loading", None)
-        return data
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class Tool(BaseModel):

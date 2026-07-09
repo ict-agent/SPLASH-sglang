@@ -375,20 +375,25 @@ class TestModelSerialization(unittest.TestCase):
 class TestFunctionDeferLoading(unittest.TestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
-    def test_function_defaults_preserve_strict(self):
-        """strict must default to False and be present in dumps so downstream
-        code (function_call_parser, chat templates) sees the expected shape."""
+    def test_function_defaults_do_not_serialize_unset_flags(self):
+        """Unset strict/defer_loading should not be serialized."""
         f = Function(name="foo")
         data = f.model_dump()
         self.assertEqual(data["name"], "foo")
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
         self.assertNotIn("defer_loading", data)
+
+    def test_function_explicit_strict_false_serialized(self):
+        f = Function(name="foo", strict=False)
+        data = f.model_dump()
+        self.assertIn("strict", data)
+        self.assertFalse(data["strict"])
 
     def test_function_defer_loading_true_serialized(self):
         f = Function(name="foo", defer_loading=True)
         data = f.model_dump()
         self.assertTrue(data["defer_loading"])
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
 
     def test_function_defer_loading_false_serialized(self):
         """defer_loading=False is an explicit value and must be preserved."""
