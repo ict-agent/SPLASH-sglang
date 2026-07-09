@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, FINISH_ABORT
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -469,7 +469,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         logger.info(
                             f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                         )
-                        raise e
+                        error_message = (
+                            f"Grammar accept_token failed for req {req.rid} "
+                            f"with token {id}: {e}"
+                        )
+                        req.to_finish = FINISH_ABORT(error_message)
+                        req.check_finished()
+                        has_finished = True
+                        accept_index[i, j + 1 :] = -1
+                        break
                     req.check_finished()
                 if req.finished():
                     has_finished = True
