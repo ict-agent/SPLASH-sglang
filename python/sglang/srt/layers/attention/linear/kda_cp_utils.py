@@ -134,3 +134,65 @@ def kda_cp_plain_split_tensor(
     input_tensor: torch.Tensor, metadata: KDAPrefillContextParallelMetadata
 ) -> torch.Tensor:
     return input_tensor[metadata.local_start : metadata.local_end].contiguous()
+
+
+def kda_cp_continuation_segment_index(
+    metadata: KDAPrefillContextParallelMetadata,
+) -> int | None:
+    """Index of the local segment that continues a sequence started on a
+    previous rank (the only segment needing a cross-rank incoming state), or
+    ``None`` if this rank starts every sequence it holds."""
+    for local_idx, (seg_start, req_start) in enumerate(
+        zip(
+            metadata.local_segment_global_starts_cpu,
+            metadata.local_req_global_starts_cpu,
+        )
+    ):
+        if seg_start > req_start:
+            return local_idx
+    return None
+
+
+def build_kda_fla_cp_context(
+    metadata: KDAPrefillContextParallelMetadata,
+    group,
+    conv1d_kernel_size: int | None = None,
+):
+    """Build a forward-only ``FLACPContext`` from SGLang's remainder-aware
+    plain-split metadata (do NOT use flash-linear-attention's ``build_cp_context``,
+    which re-derives a uniform ``total // cp_size`` split and drops the remainder).
+    """
+    from sglang.srt.layers.attention.fla.cp import FLACPContext
+
+    cont_idx = kda_cp_continuation_segment_index(metadata)
+    is_first_rank = cont_idx is None
+    pre_num_ranks = 0
+    pre_num_conv_tokens = 0
+    if not is_first_rank:
+        req_start = metadata.local_req_global_starts_cpu[cont_idx]
+        seg_start = metadata.local_segment_global_starts_cpu[cont_idx]
+        prev_owner = kda_cp_owner_of_global_token(
+            seg_start - 1, metadata.total_tokens, metadata.cp_size
+        )
+        pre_num_ranks = metadata.cp_rank - prev_owner
+        pre_num_conv_tokens = max(0, seg_start - req_start)
+
+    # Whether the last local segment continues onto a following rank.
+    is_last_rank = True
+    for local_idx in range(len(metadata.local_seq_lens_cpu) - 1, -1, -1):
+        if (
+            metadata.local_segment_global_ends_cpu[local_idx]
+            < metadata.local_req_global_ends_cpu[local_idx]
+        ):
+            is_last_rank = False
+            break
+
+    return FLACPContext(
+        group=group,
+        cu_seqlens=metadata.local_query_start_loc,
+        cu_seqlens_cpu=None,
+        is_first_rank=is_first_rank,
+        is_last_rank=is_last_rank,
+        pre_num_ranks=pre_num_ranks,
+        pre_num_conv_tokens=pre_num_conv_tokens,
+    )

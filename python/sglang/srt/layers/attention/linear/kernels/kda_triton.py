@@ -75,6 +75,39 @@ class TritonKDAKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
         )
 
+    def extend_cp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cp_context,
+        continuation_h0: Optional[torch.Tensor] = None,
+        continuation_index: Optional[int] = None,
+        **kwargs,
+    ) -> tuple:
+        from sglang.srt.layers.attention.fla.kda import chunk_kda_cp
+
+        return chunk_kda_cp(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=query_start_loc,
+            cp_context=cp_context,
+            continuation_h0=continuation_h0,
+            continuation_index=continuation_index,
+        )
+
     def target_verify(
         self,
         A_log: torch.Tensor,

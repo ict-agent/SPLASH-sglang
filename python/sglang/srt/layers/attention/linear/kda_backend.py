@@ -5,7 +5,9 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_cp_utils import (
     KDAPrefillContextParallelMetadata,
+    build_kda_fla_cp_context,
     is_kda_prefill_cp_plain_split,
+    kda_cp_continuation_segment_index,
     kda_cp_owner_of_global_token,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
@@ -100,6 +102,10 @@ class KDAKernelDispatcher:
         # (FlashKDA/CuteDSL will raise NotImplementedError). Hard-bind
         # so verify works even when extend_backend is flash_kda.
         self.verify_kernel = triton_kernel
+        # KDA prefill context-parallel is only implemented for the Triton
+        # chunk_kda path (all-gather + merge). Bind it independently of the
+        # configured extend backend so CP works even when extend=flash_kda.
+        self.cp_kernel = triton_kernel
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__}, "
@@ -161,6 +167,37 @@ class KDAKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def extend_cp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cp_context,
+        continuation_h0=None,
+        continuation_index=None,
+        **kwargs,
+    ) -> tuple:
+        return self.cp_kernel.extend_cp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            cp_context=cp_context,
+            continuation_h0=continuation_h0,
+            continuation_index=continuation_index,
             **kwargs,
         )
 
@@ -288,11 +325,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
         metadata: KDAPrefillContextParallelMetadata,
+        cp_context,
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple:
         num_segments = len(metadata.local_seq_lens_cpu)
         local_cache_indices = torch.arange(
             num_segments, dtype=cache_indices.dtype, device=cache_indices.device
@@ -321,6 +359,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             (num_segments,) + tuple(full_ssm_by_req.shape[1:])
         )
 
+        # Prefix-cache seed for request-start segments (offset 0 with a prefix).
+        # The continuation segment (offset > 0) is intentionally skipped: its
+        # conv history comes from the cross-rank halo below and its SSM state
+        # from the all-gather + merge inside chunk_kda_cp.
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         for local_idx, req_idx in enumerate(metadata.local_req_indices_cpu):
             if (
@@ -330,81 +372,67 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 local_conv_states[local_idx].copy_(full_conv_by_req[req_idx])
                 local_ssm_states[local_idx].copy_(full_ssm_by_req[req_idx])
 
-        recv_idx = self._kda_cp_recv_segment_index(metadata)
-        if recv_idx is not None:
-            cp_group = get_attention_cp_group()
-            prev_rank = kda_cp_owner_of_global_token(
-                metadata.local_segment_global_starts_cpu[recv_idx] - 1,
-                metadata.total_tokens,
-                metadata.cp_size,
-            )
-            torch.distributed.recv(
-                local_conv_states[recv_idx],
-                src=cp_group.ranks[prev_rank],
-                group=cp_group.device_group,
-            )
-            torch.distributed.recv(
-                local_ssm_states[recv_idx],
-                src=cp_group.ranks[prev_rank],
-                group=cp_group.device_group,
-            )
+        # Cross-rank conv halo: all-gather each rank's W-1 tail tokens and use
+        # the previous rank's tail as the continuation segment's conv history
+        # (replaces the serial dist.recv of conv_states).
+        continuation_index = kda_cp_continuation_segment_index(metadata)
+        self._fill_kda_cp_conv_halo(
+            cp_context, mixed_qkv, local_conv_states, continuation_index
+        )
+
+        # Prefix seed for the continued sequence's SSM merge chain (the merge is
+        # done inside chunk_kda_cp; the seed is the whole sequence's prefix
+        # state, identical on every rank thanks to _gather_full_kda_state).
+        continuation_h0 = None
+        if continuation_index is not None:
+            cont_req_idx = metadata.local_req_indices_cpu[continuation_index]
+            if prefix_lens_cpu[cont_req_idx] > 0:
+                continuation_h0 = (
+                    full_ssm_by_req[cont_req_idx].to(torch.float32).contiguous()
+                )
 
         return (
             local_conv_states,
             local_ssm_states,
             local_cache_indices,
             has_initial_state,
+            continuation_index,
+            continuation_h0,
         )
 
-    def _kda_cp_recv_segment_index(
-        self, metadata: KDAPrefillContextParallelMetadata
-    ) -> Optional[int]:
-        for local_idx, (seg_start, req_start) in enumerate(
-            zip(
-                metadata.local_segment_global_starts_cpu,
-                metadata.local_req_global_starts_cpu,
-            )
-        ):
-            if seg_start > req_start:
-                return local_idx
-        return None
-
-    def _kda_cp_send_segment_index(
-        self, metadata: KDAPrefillContextParallelMetadata
-    ) -> Optional[int]:
-        for local_idx in range(len(metadata.local_seq_lens_cpu) - 1, -1, -1):
-            if (
-                metadata.local_segment_global_ends_cpu[local_idx]
-                < metadata.local_req_global_ends_cpu[local_idx]
-            ):
-                return local_idx
-        return None
-
-    def _send_kda_cp_boundary_state(
+    def _fill_kda_cp_conv_halo(
         self,
-        metadata: KDAPrefillContextParallelMetadata,
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
+        cp_context,
+        mixed_qkv: torch.Tensor,
+        local_conv_states: torch.Tensor,
+        continuation_index: Optional[int],
     ) -> None:
-        send_idx = self._kda_cp_send_segment_index(metadata)
-        if send_idx is None:
-            return
+        """All-gather each rank's last ``W-1`` tokens and load the previous
+        rank's tail as the continuation segment's conv1d history. Every rank
+        must call the collective, even when it has no continuation segment."""
+        from sglang.srt.layers.attention.fla.cp import all_gather_into_tensor
 
-        cp_group = get_attention_cp_group()
-        next_rank = kda_cp_owner_of_global_token(
-            metadata.local_segment_global_ends_cpu[send_idx],
-            metadata.total_tokens,
-            metadata.cp_size,
-        )
-        torch.distributed.send(
-            conv_states[send_idx].contiguous(),
-            dst=cp_group.ranks[next_rank],
-            group=cp_group.device_group,
-        )
-        torch.distributed.send(
-            ssm_states[send_idx].contiguous(),
-            dst=cp_group.ranks[next_rank],
-            group=cp_group.device_group,
+        state_len = local_conv_states.shape[-1]  # W - 1
+        n = mixed_qkv.shape[0]
+        tail = mixed_qkv.new_zeros(state_len, mixed_qkv.shape[-1])
+        take = min(state_len, n)
+        if take > 0:
+            tail[state_len - take :] = mixed_qkv[n - take :]
+        gathered, _ = all_gather_into_tensor(
+            tail.contiguous(), group=cp_context.group
+        )  # [cp_size, state_len, D]
+
+        if continuation_index is None:
+            return
+        prev = get_attention_cp_group().rank_in_group - 1
+        if prev < 0:
+            return
+        valid = min(state_len, int(cp_context.pre_num_conv_tokens or 0))
+        if valid <= 0:
+            return
+        heads = gathered[prev]  # [state_len, D]
+        local_conv_states[continuation_index][:, state_len - valid :] = (
+            heads[state_len - valid :].transpose(0, 1).to(local_conv_states.dtype)
         )
 
     def _track_kda_cp_state_extend(
@@ -414,9 +442,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
         metadata: KDAPrefillContextParallelMetadata,
         runtime_conv_states: torch.Tensor,
         runtime_ssm_states: torch.Tensor,
+        runtime_h: Optional[torch.Tensor],
+        raw_mixed_qkv: torch.Tensor,
+        track_q: torch.Tensor,
+        track_k: torch.Tensor,
+        track_v: torch.Tensor,
+        track_g: torch.Tensor,
+        track_beta: torch.Tensor,
         persistent_conv_states: torch.Tensor,
         persistent_ssm_states: torch.Tensor,
     ) -> None:
+        """Write the mamba-radix prefix-cache snapshot for extra_buffer mode.
+
+        The radix cache records each tracked request's state at the last
+        complete FLA chunk boundary ``bc = req_start + (lens // 64) * 64``
+        (``lens = track_seqlens - prefix``). The owner rank of ``bc`` provides:
+
+        * SSM state -- if ``bc`` is the owner's segment end, the segment-final
+          state; if ``bc`` lands on the owner's local FLA chunk grid, the
+          intermediate state read from ``h`` at ``bc``; otherwise (a request that
+          crosses a rank boundary with a non-64-aligned packed start, so its
+          per-request chunk grid is offset from the owner's local grid) the state
+          at the nearest local chunk boundary ``lb <= bc`` from ``h`` advanced by
+          the remaining ``m = bc - lb < 64`` tokens via a short ``chunk_kda``
+          recurrence. This makes every tracked request exact regardless of split
+          alignment, mirroring the non-CP ``_init_track_ssm_indices`` result.
+        * conv state -- the last ``W-1`` raw input tokens before ``bc``, sliced
+          from the rank-local ``mixed_qkv``.
+
+        ``track_{q,k,v,g,beta}`` are the rank-local post-conv / gated inputs
+        (``[1, n, H, D]`` / ``[1, n, H]``) that fed the main kernel; the short
+        recurrence replays the identical computation over the ``m``-token tail.
+        """
         if (
             forward_batch.mamba_track_mask is None
             or not forward_batch.mamba_track_mask.any()
@@ -435,39 +492,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
         prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
         conv_full_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        conv_state_len = persistent_conv_states.shape[-1]
+        conv_state_len = persistent_conv_states.shape[-1]  # W - 1
         ssm_full_shape = (layer.num_q_heads, layer.head_v_dim, layer.head_k_dim)
+        chunk = FLA_CHUNK_SIZE
+
+        # Cumulative per-segment h chunk offsets (this rank's local segments).
+        seg_h_offsets = [0]
+        for L in metadata.local_seq_lens_cpu:
+            seg_h_offsets.append(seg_h_offsets[-1] + (int(L) - 1) // chunk + 1)
 
         for req_idx, should_track in enumerate(track_mask_cpu):
             if not should_track:
                 continue
 
-            current_chunk_track_len = (
-                int(track_seqlens_cpu[req_idx]) - int(prefix_lens_cpu[req_idx])
-            )
-            if current_chunk_track_len <= 0:
+            lens = int(track_seqlens_cpu[req_idx]) - int(prefix_lens_cpu[req_idx])
+            if lens <= 0:
                 continue
 
             req_start = req_starts[req_idx]
             req_end = req_start + int(forward_batch.extend_seq_lens_cpu[req_idx])
-            boundary_end = req_start + current_chunk_track_len
-            if boundary_end > req_end:
+            # Position (relative to req start) of the last complete FLA chunk
+            # that the radix cache records this snapshot at.
+            cache_offset = lens if (lens % chunk == 0) else (lens // chunk) * chunk
+            bc = req_start + cache_offset
+            if bc > req_end:
                 continue
 
             owner_rank = kda_cp_owner_of_global_token(
-                boundary_end - 1, metadata.total_tokens, metadata.cp_size
+                bc - 1, metadata.total_tokens, metadata.cp_size
             )
-            _, owner_end = self._plain_split_bounds_for_rank(
-                metadata.total_tokens, owner_rank, metadata.cp_size
-            )
-            owner_segment_end = min(owner_end, req_end)
-
-            # The minimal write-back path handles boundaries whose state is the
-            # final state of one KDA-CP local segment. Branching points inside a
-            # segment still need h-index based extraction, mirroring the
-            # non-CP path's _init_track_ssm_indices logic.
-            if boundary_end != owner_segment_end:
-                continue
 
             full_conv_state = runtime_conv_states.new_empty(
                 (conv_full_dim, conv_state_len)
@@ -475,16 +528,73 @@ class KDAAttnBackend(MambaAttnBackendBase):
             full_ssm_state = runtime_ssm_states.new_empty(ssm_full_shape)
 
             if cp_rank == owner_rank:
-                local_idx = self._find_kda_cp_segment(
-                    metadata, req_idx=req_idx, segment_end=boundary_end
-                )
+                local_idx = None
+                for j, local_req_idx in enumerate(metadata.local_req_indices_cpu):
+                    if local_req_idx == req_idx:
+                        local_idx = j
+                        break
                 if local_idx is None:
                     raise RuntimeError(
-                        "KDA-CP state owner could not find its local segment "
-                        f"for req_idx={req_idx}, boundary_end={boundary_end}."
+                        "KDA-CP track: owner could not find its local segment "
+                        f"for req_idx={req_idx}, bc={bc}."
                     )
-                full_conv_state.copy_(runtime_conv_states[local_idx])
-                full_ssm_state.copy_(runtime_ssm_states[local_idx])
+                seg_start = metadata.local_segment_global_starts_cpu[local_idx]
+                seg_len = int(metadata.local_seq_lens_cpu[local_idx])
+                local_pos = bc - seg_start
+
+                # --- SSM state at bc ---
+                if local_pos == seg_len:
+                    # Boundary is the segment end -> final recurrent state.
+                    full_ssm_state.copy_(runtime_ssm_states[local_idx])
+                else:
+                    # Nearest local FLA chunk boundary lb <= bc (h has its state).
+                    lb_offset = (local_pos // chunk) * chunk
+                    h_index = seg_h_offsets[local_idx] + lb_offset // chunk
+                    state_lb = runtime_h[0, h_index]  # [HV, V, K] at seg_start+lb_offset
+                    m = local_pos - lb_offset
+                    if m == 0:
+                        full_ssm_state.copy_(state_lb)
+                    else:
+                        # Short recurrence: advance state_lb by the m (< 64) tokens
+                        # [lb, bc) to reach the per-request chunk boundary bc that
+                        # is off the owner's local grid. Replays the same kernel
+                        # math over just the tail.
+                        from sglang.srt.layers.attention.fla.kda import chunk_kda
+
+                        lb_local = seg_start + lb_offset - metadata.local_start
+                        bc_local = bc - metadata.local_start
+                        init = (
+                            state_lb.to(runtime_ssm_states.dtype)
+                            .unsqueeze(0)
+                            .contiguous()
+                        )
+                        sub_cu = torch.tensor(
+                            [0, m], dtype=torch.int32, device=init.device
+                        )
+                        chunk_kda(
+                            q=track_q[:, lb_local:bc_local],
+                            k=track_k[:, lb_local:bc_local],
+                            v=track_v[:, lb_local:bc_local],
+                            g=track_g[:, lb_local:bc_local],
+                            beta=track_beta[:, lb_local:bc_local],
+                            initial_state=init,
+                            initial_state_indices=torch.zeros(
+                                1, dtype=torch.int32, device=init.device
+                            ),
+                            use_qk_l2norm_in_kernel=True,
+                            cu_seqlens=sub_cu,
+                        )
+                        full_ssm_state.copy_(init[0])
+
+                # --- conv window at bc (last W-1 raw input tokens) ---
+                bc_local = bc - metadata.local_start
+                win = raw_mixed_qkv.new_zeros((conv_state_len, conv_full_dim))
+                take = min(conv_state_len, bc_local)
+                if take > 0:
+                    win[conv_state_len - take :] = raw_mixed_qkv[
+                        bc_local - take : bc_local
+                    ]
+                full_conv_state.copy_(win.transpose(0, 1))
 
             cp_group.broadcast(full_conv_state, src=owner_rank)
             cp_group.broadcast(full_ssm_state, src=owner_rank)
@@ -613,16 +723,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
     @staticmethod
-    def _plain_split_bounds_for_rank(
-        total_tokens: int, cp_rank: int, cp_size: int
-    ) -> tuple[int, int]:
-        base = total_tokens // cp_size
-        rem = total_tokens % cp_size
-        start = cp_rank * base + min(cp_rank, rem)
-        end = start + base + (1 if cp_rank < rem else 0)
-        return start, end
-
-    @staticmethod
     def _find_kda_cp_segment(
         metadata: KDAPrefillContextParallelMetadata,
         *,
@@ -748,10 +848,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not is_target_verify:
             kda_cp_active = self._use_kda_prefill_cp(forward_batch)
             kda_cp_replicated_state = is_kda_prefill_cp_plain_split()
+        cp_context = None
+        continuation_index = None
+        continuation_h0 = None
         if kda_cp_active:
             metadata = forward_batch.kda_cp_metadata
             query_start_loc = metadata.local_query_start_loc
             seq_lens_cpu = metadata.local_seq_lens_cpu
+            cp_group = get_attention_cp_group()
+            conv1d_kernel_size = self.conv_states_shape[-1] + 1
+            cp_context = build_kda_fla_cp_context(
+                metadata,
+                cp_group.device_group,
+                conv1d_kernel_size=conv1d_kernel_size,
+            )
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         persistent_conv_states = mamba_cache_params.conv[0]
@@ -791,10 +901,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     ssm_states,
                     cache_indices,
                     has_initial_state,
+                    continuation_index,
+                    continuation_h0,
                 ) = self._prepare_kda_cp_states(
                     layer,
                     forward_batch,
                     metadata,
+                    cp_context,
                     mixed_qkv,
                     conv_states,
                     ssm_states,
@@ -823,6 +936,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 has_initial_state = forward_batch.extend_prefix_lens > 0
             else:
                 has_initial_state = forward_batch.extend_prefix_lens > 0
+
+            # Keep the rank-local [n_valid, D] mixed_qkv (pre-transpose) for the
+            # KDA-CP prefix-cache conv snapshot (see _track_kda_cp_state_extend).
+            kda_cp_raw_mixed_qkv = mixed_qkv if kda_cp_active else None
 
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
@@ -909,7 +1026,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Apply KDA gate activation here unless the extend kernel does it
             # internally (e.g. FlashKDA). Model always passes raw g (a) and raw
             # beta logits (b); backend decides based on the dispatched kernel.
-            if not self.kernel_dispatcher.extend_applies_gate_internally:
+            # The CP path always runs the Triton chunk_kda_cp kernel, which does
+            # NOT apply the gate internally, so it must be gated here regardless
+            # of the configured extend backend.
+            if kda_cp_active or not self.kernel_dispatcher.extend_applies_gate_internally:
                 from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 
                 a, b = fused_kda_gate(
@@ -923,25 +1043,39 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     beta_scale=getattr(layer, "beta_scale", 1.0),
                 )
 
-            core_attn_out, h = self.kernel_dispatcher.extend(
-                q=q,
-                k=k,
-                v=v,
-                g=a,
-                beta=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                seq_lens_cpu=seq_lens_cpu,
-                safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
-            )
+            if kda_cp_active:
+                core_attn_out, h = self.kernel_dispatcher.extend_cp(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=a,
+                    beta=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    cp_context=cp_context,
+                    continuation_h0=continuation_h0,
+                    continuation_index=continuation_index,
+                )
+            else:
+                core_attn_out, h = self.kernel_dispatcher.extend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=a,
+                    beta=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    # Extra plumbing for FlashKDA; TritonKDAKernel ignores these via **kwargs.
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    seq_lens_cpu=seq_lens_cpu,
+                    safe_gate_lower_bound=getattr(layer, "safe_gate_lower_bound", -5.0),
+                )
 
             if kda_cp_active:
                 assert metadata is not None
-                self._send_kda_cp_boundary_state(metadata, conv_states, ssm_states)
                 self._writeback_kda_cp_final_states(
                     layer,
                     forward_batch,
@@ -958,6 +1092,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     metadata,
                     conv_states,
                     ssm_states,
+                    h,
+                    kda_cp_raw_mixed_qkv,
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
                     persistent_conv_states,
                     persistent_ssm_states,
                 )

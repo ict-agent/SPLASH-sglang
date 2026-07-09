@@ -960,6 +960,119 @@ def chunk_kda(
     return o, h
 
 
+def chunk_kda_cp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    initial_state_indices: torch.Tensor = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    cp_context=None,
+    continuation_h0: torch.Tensor | None = None,
+    continuation_index: int | None = None,
+    **kwargs,
+):
+    """Context-parallel KDA prefill forward (all-gather + merge; no serial send/recv).
+
+    Unlike ``chunk_kda`` (which reads the per-request incoming state from
+    ``initial_state[initial_state_indices]``), this variant reconstructs the
+    incoming state of the rank's first (continuation) local segment collectively:
+    every rank computes its local ``[S_ext | M]``, all-gathers it, then merges
+    contributions from previous ranks (optionally seeded by the sequence's prefix
+    state ``continuation_h0``). All other local segments keep whatever initial
+    state the caller pre-loaded into ``initial_state`` (prefix-cache state or
+    zero). ``initial_state`` is updated **in place** with the per-segment final
+    states, exactly like ``chunk_kda``.
+
+    Args:
+        initial_state: local ``[N, HV, V, K]`` state buffer (V-first), already
+            seeded with prefix state for request-start segments.
+        initial_state_indices: ``[N]`` slots into ``initial_state`` (usually
+            ``arange(N)``).
+        cp_context: ``FLACPContext`` for this layer's CP group.
+        continuation_h0: ``[HV, V, K]`` fp32 prefix state that seeds the merge
+            chain for the continued sequence, or ``None``.
+        continuation_index: index (into the local segments / ``initial_state``)
+            of the continuation segment that receives the merged state, or
+            ``None`` when this rank owns no continued sequence.
+
+    Returns:
+        ``(o, h)`` — output and intermediate chunk-boundary states, as in
+        ``chunk_kda``.
+    """
+    from sglang.srt.layers.attention.fla.cp import (
+        chunk_gated_delta_rule_fwd_h_pre_process,
+    )
+
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+    v = v.contiguous()
+    beta = beta.contiguous()
+
+    chunk_size = 64
+    g = chunk_local_cumsum(g.contiguous(), chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+
+    # Intra-chunk WY representation (pre-gated kg shared with the state kernel).
+    w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
+        q=q,
+        k=k,
+        v=v,
+        gk=g,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
+
+    # All-gather + merge → this rank's cross-rank incoming state (V-first).
+    merged = chunk_gated_delta_rule_fwd_h_pre_process(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        cu_seqlens=cu_seqlens,
+        context=cp_context,
+        h0=continuation_h0,
+        chunk_size=chunk_size,
+        state_v_first=True,
+    )
+    if merged is not None and continuation_index is not None:
+        slot = int(initial_state_indices[continuation_index].item())
+        initial_state[slot].copy_(merged.to(initial_state.dtype))
+
+    h, v_new = chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+    )
+    del w, u, kg
+    o = chunk_gla_fwd_o_gk(
+        q=q,
+        v=v_new,
+        g=g,
+        A=Aqk,
+        h=h,
+        o=v,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+    )
+    del Aqk, v_new
+    return o, h
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
