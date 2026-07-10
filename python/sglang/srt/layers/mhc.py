@@ -274,8 +274,11 @@ def mhc_post_torch(
         )
 
     out = post_layer_mix.float().unsqueeze(-1) * x.float().unsqueeze(1)
+    # comb_res_mix (n, i, j) mixes the input residual streams (indexed by i)
+    # into the output streams (indexed by j); contract over i to match the
+    # reference (upstream NV) semantics: einsum("nij,nik->njk").
     out = out + torch.einsum(
-        "nij,njk->nik", comb_res_mix.float(), residual.float()
+        "nij,nik->njk", comb_res_mix.float(), residual.float()
     )
     return out.to(x.dtype)
 
