@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -590,6 +590,19 @@ class IndexerKPool(Indexer):
 
         if metadata.topk_transform_method == TopkTransformMethod.PAGED:
             page_table = metadata.attn_metadata.page_table_1
+            if page_table.shape[0] != rows:
+                token_to_batch_idx = metadata.get_token_to_batch_idx()
+                if token_to_batch_idx is not None:
+                    page_table = page_table.index_select(
+                        0, token_to_batch_idx.to(page_table.device).to(torch.long)
+                    )
+                elif page_table.shape[0] == 1:
+                    page_table = page_table.expand(rows, -1)
+                else:
+                    raise RuntimeError(
+                        "Cannot align paged page_table rows with short-sequence "
+                        f"topk rows: page_table={tuple(page_table.shape)}, rows={rows}"
+                    )
             safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
             topk_full = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
         elif metadata.topk_transform_method == TopkTransformMethod.RAGGED:
@@ -713,6 +726,7 @@ class IndexerKPool(Indexer):
 
             num_pages = pool_block_tables.shape[1]
             page_ids = pool_block_tables.reshape(-1).to(torch.long)
+            page_ids = page_ids.clamp(min=0, max=kv_f32.shape[0] - 1)
             k_pages = kv_f32.index_select(0, page_ids).reshape(
                 n_real,
                 num_pages,

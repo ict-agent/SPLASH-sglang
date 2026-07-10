@@ -1,3 +1,7 @@
+import json
+import os
+import threading
+import time
 from typing import Optional
 
 import torch
@@ -6,6 +10,89 @@ import triton.language as tl
 
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+_KPOOL_CALL_LOG_LOCK = threading.Lock()
+_KPOOL_CALL_LOG_COUNTS: dict[str, int] = {}
+
+
+def _kpool_call_log_value(value):
+    if isinstance(value, torch.Tensor):
+        return {
+            "type": "torch.Tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "stride": list(value.stride()),
+            "is_contiguous": value.is_contiguous(),
+            "requires_grad": value.requires_grad,
+        }
+
+    value_type = f"{type(value).__module__}.{type(value).__qualname__}"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return {"type": value_type, "value": value}
+
+    result = {"type": value_type, "value": repr(value)}
+    for attr in ("index_kpool", "slots_per_page"):
+        if hasattr(value, attr):
+            attr_value = getattr(value, attr)
+            if isinstance(attr_value, (bool, int, float, str)):
+                result[attr] = attr_value
+            else:
+                result[attr] = repr(attr_value)
+    return result
+
+
+def _log_kpool_wrapper_call(function_name: str, **kwargs) -> None:
+    log_path = os.environ.get("SGLANG_KPOOL_CALL_LOG")
+    if not log_path:
+        return
+
+    try:
+        max_calls = int(os.environ.get("SGLANG_KPOOL_CALL_LOG_MAX", "512"))
+    except ValueError:
+        max_calls = 512
+
+    with _KPOOL_CALL_LOG_LOCK:
+        call_index = _KPOOL_CALL_LOG_COUNTS.get(function_name, 0)
+        if call_index > max_calls:
+            return
+        _KPOOL_CALL_LOG_COUNTS[function_name] = call_index + 1
+
+        if call_index == max_calls:
+            record = {
+                "event": "limit_reached",
+                "function": function_name,
+                "pid": os.getpid(),
+                "max_calls": max_calls,
+            }
+        else:
+            try:
+                is_capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception as exc:
+                is_capturing = f"unavailable:{type(exc).__name__}"
+            record = {
+                "event": "call",
+                "timestamp_ns": time.time_ns(),
+                "function": function_name,
+                "call_index": call_index,
+                "pid": os.getpid(),
+                "rank": os.environ.get("RANK"),
+                "local_rank": os.environ.get("LOCAL_RANK"),
+                "is_cuda_graph_capturing": is_capturing,
+                "args": {
+                    name: _kpool_call_log_value(value)
+                    for name, value in kwargs.items()
+                },
+            }
+
+        line = (
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+        ).encode()
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
 
 
 def gather_index_k_scale_prefix_into(
@@ -421,49 +508,44 @@ def append_kpool_tail_to_topk(
     """Append non-pooled tail tokens after selected expanded-history tokens."""
     rows, n_cols = topk_result.shape
     out_cols = n_cols + pool_size - 1
-    out = torch.empty(
-        (rows, out_cols), dtype=topk_result.dtype, device=topk_result.device
+    device = topk_result.device
+    cols = torch.arange(out_cols, device=device, dtype=torch.int64).unsqueeze(0)
+    seq_lens = seq_lens.to(device=device, dtype=torch.int64).reshape(rows, 1)
+    pool_lens = pool_lens.to(device=device, dtype=torch.int64).reshape(rows, 1)
+
+    history_len = (pool_lens * pool_size).clamp(max=n_cols)
+    history_mask = cols < history_len
+    safe_history_cols = cols.clamp(min=0, max=max(n_cols - 1, 0)).expand(rows, -1)
+    history_value = torch.gather(topk_result, dim=1, index=safe_history_cols)
+    out = torch.where(
+        history_mask,
+        history_value,
+        torch.full((rows, out_cols), -1, dtype=topk_result.dtype, device=device),
     )
 
-    if page_table is None:
-        page_table = topk_result
-        has_page_table = False
-        page_table_cols = 1
-    else:
-        has_page_table = True
-        page_table_cols = page_table.shape[1]
+    tail_offset = cols - history_len
+    tail_count = seq_lens % pool_size
+    tail_mask = (tail_offset >= 0) & (tail_offset < tail_count)
+    tail_raw = pool_lens * pool_size + tail_offset
 
-    if topk_offsets is None:
-        topk_offsets = seq_lens
-        has_topk_offsets = False
-    else:
+    if page_table is not None:
+        if page_table.shape[0] != rows:
+            if page_table.shape[0] == 1:
+                page_table = page_table.expand(rows, -1)
+            else:
+                page_table = page_table[:rows]
+        safe_tail = tail_raw.clamp(min=0, max=page_table.shape[1] - 1)
+        tail_value = torch.gather(page_table, dim=1, index=safe_tail)
+    elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
             topk_offsets = topk_offsets.squeeze(1)
-        has_topk_offsets = True
+        topk_offsets = topk_offsets.to(device=device, dtype=torch.int64).reshape(rows, 1)
+        tail_value = tail_raw + topk_offsets
+    else:
+        tail_value = tail_raw
 
-    block_cols = triton.next_power_of_2(out_cols)
-    _append_kpool_tail_to_topk_kernel[(rows,)](
-        topk_result,
-        seq_lens,
-        pool_lens,
-        page_table,
-        topk_offsets,
-        out,
-        topk_result.stride(0),
-        topk_result.stride(1),
-        page_table.stride(0),
-        page_table.stride(1),
-        out.stride(0),
-        out.stride(1),
-        N_COLS=n_cols,
-        OUT_COLS=out_cols,
-        PAGE_TABLE_COLS=page_table_cols,
-        POOL_SIZE=pool_size,
-        HAS_PAGE_TABLE=has_page_table,
-        HAS_TOPK_OFFSETS=has_topk_offsets,
-        BLOCK_COLS=block_cols,
-    )
-    return out
+    tail_value = tail_value.to(dtype=topk_result.dtype)
+    return torch.where(tail_mask, tail_value, out)
 
 
 @triton.jit
@@ -933,6 +1015,23 @@ def kpool_assemble_softmax_rotate_write_cache(
     ``tail_logical_base[r]`` is the logical position of the in-progress pool's
     first slot (used to ring-address the saved tail prefix).
     """
+    _log_kpool_wrapper_call(
+        "kpool_assemble_softmax_rotate_write_cache",
+        pool=pool,
+        buf=buf,
+        chunk_k=chunk_k,
+        chunk_score=chunk_score,
+        tail_k=tail_k,
+        tail_score=tail_score,
+        req_pool_idx=req_pool_idx,
+        n_from_tail=n_from_tail,
+        chunk_src_start=chunk_src_start,
+        tail_logical_base=tail_logical_base,
+        ape=ape,
+        loc=loc,
+        write_mask=write_mask,
+        round_scale=round_scale,
+    )
     pool_size = pool.index_kpool
     n_pools = req_pool_idx.shape[0]
 
@@ -1410,6 +1509,24 @@ def kpool_write_tail_and_maybe_compress(
     (cache slot 0 is the reserved sink); the kernel skips both write and
     compress so padded batches don't poison req=0's tail ring.
     """
+    _log_kpool_wrapper_call(
+        "kpool_write_tail_and_maybe_compress",
+        pool=pool,
+        buf=buf,
+        key=key,
+        score=score,
+        tail_k=tail_k,
+        tail_score=tail_score,
+        ape=ape,
+        req_pool_indices=req_pool_indices,
+        write_start=write_start,
+        tail_logical_start=tail_logical_start,
+        write_loc=write_loc,
+        out_cache_loc=out_cache_loc,
+        num_draft_tokens=num_draft_tokens,
+        round_scale=round_scale,
+        effective_n_per_batch=effective_n_per_batch,
+    )
     bn = key.shape[0]
     if bn == 0:
         return

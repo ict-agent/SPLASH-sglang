@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -325,7 +328,6 @@ def ds_bmm_wrapper(q: torch.Tensor, w: torch.Tensor, scale: float, dtype: torch.
         q_out = torch.bmm(q.to(dtype).transpose(0, 1), w.to(dtype) * scale)
     return q_out
 
-
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
     "nsa",
@@ -361,10 +363,12 @@ class DeepseekV2MLP(nn.Module):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         swiglu_limit: Optional[float] = None,
+        layer_id: int = -1,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
+        self.layer_id = layer_id
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -3160,6 +3164,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                layer_id=self.layer_id,
             )
         else:
             self.layer_communicator = LayerCommunicator(
@@ -3171,6 +3176,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                layer_id=self.layer_id,
             )
 
     def _detect_gfx95_quant_format(self) -> str:

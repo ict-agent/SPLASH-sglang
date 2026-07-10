@@ -39,7 +39,7 @@ from .fused_moe_triton_kernels import (
     moe_sum_reduce_triton,
     support_tensor_descriptor,
 )
-from .moe_align_block_size import moe_align_block_size
+from .moe_align_block_size import dcu_moe_align_block_size, moe_align_block_size
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -580,7 +580,9 @@ def _prepare_fused_moe_run(
         and down_config.pop("USE_TMA", False)
     )
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    # DCU: use lightop align in _prepare_fused_moe_run
+    align_fn = dcu_moe_align_block_size if _use_lightop else moe_align_block_size
+    sorted_token_ids, expert_ids, num_tokens_post_padded = align_fn(
         topk_ids, config["BLOCK_SIZE_M"], E
     )
 

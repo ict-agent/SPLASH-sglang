@@ -104,7 +104,6 @@ elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_bailing_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_RMS_QUANT")
-
 if _use_fused_bailing_rms_quant:
     from lightop import rms_norm_per_token_fp8_quant
 
@@ -438,6 +437,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        layer_id: int = -1,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -445,6 +445,7 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.layer_id = layer_id
 
         self._context = CommunicateContext.init_new()
         self._post_init_communicate()
@@ -510,6 +511,7 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        layer_id = self.layer_id if self.layer_id >= 0 else _get_comm_layer_id(self.qkv_latent_func)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
         if get_attn_tp_context().input_scattered:
@@ -707,13 +709,15 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        layer_id = self.layer_id if self.layer_id >= 0 else _get_comm_layer_id(self.qkv_latent_func)
+        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -721,13 +725,15 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._communicate_summable_tensor_pair_fn(
+        layer_id = self.layer_id if self.layer_id >= 0 else _get_comm_layer_id(self.qkv_latent_func)
+        hidden_states, residual = self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
+        return hidden_states, residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:

@@ -157,9 +157,12 @@ def dcu_moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
         if pad_sorted_ids:
             max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-        sorted_ids = torch.empty((max_num_tokens_padded, ),
-                                 dtype=torch.int32,
-                                 device=topk_ids.device)
+        # DCU lightop can leave padding slots untouched; prefill them with
+        # topk_ids.numel() so fused_moe_kernel masks padding rows safely.
+        sorted_ids = torch.full((max_num_tokens_padded, ),
+                                fill_value=topk_ids.numel(),
+                                dtype=torch.int32,
+                                device=topk_ids.device)
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     if expert_map is not None:
         expert_ids = torch.zeros((max_num_m_blocks, ),

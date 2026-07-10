@@ -388,8 +388,6 @@ class NativeSparseAttnBackend(
             getattr(model_runner.model_config.hf_config, "model_type", None)
             == "glm5_next"
         )
-        self._logged_flashmla_sparse_shapes = False
-        self._logged_flashmla_kv_shapes = False
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1787,6 +1785,7 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                layer_id=layer.layer_id,
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2044,6 +2043,7 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        layer_id: int = -1,
     ) -> torch.Tensor:
         if not _is_dcu:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -2061,7 +2061,21 @@ class NativeSparseAttnBackend(
         required_padding = 128 if self.device_sm_major >= 10 else 64
         need_padding = num_heads % required_padding != 0
 
-        if _is_dcu:
+        dcu_padded_q_heads = False
+        if _is_dcu and need_padding:
+            assert required_padding % num_heads == 0, (
+                f"num_heads {num_heads} cannot be padded to {required_padding}. "
+                f"TP size may be too large for this model."
+            )
+
+            # DCU FlashMLA sparse prefill has the same head-count restriction as
+            # decode; TP8 leaves GLM5-Next with only 4 local q heads, so pad to
+            # the supported head variant and trim the output below.
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_padded[:, :num_heads, :] = q_all
+            q_input = q_padded
+            dcu_padded_q_heads = True
+        elif _is_dcu:
             q_input = q_all
         elif need_padding:
             assert required_padding % num_heads == 0, (
@@ -2092,19 +2106,6 @@ class NativeSparseAttnBackend(
                 kv_padded[..., : kv_cache.shape[-1]] = kv_cache
                 kv_cache = kv_padded
 
-        if self._is_glm5_next and not self._logged_flashmla_sparse_shapes:
-            log_info_on_rank0(
-                logger,
-                "GLM5-Next FlashMLA sparse prefill shapes: "
-                f"kv_lora_rank={self.kv_lora_rank}, "
-                f"qk_nope_head_dim={self.qk_nope_head_dim}, "
-                f"qk_rope_head_dim={self.qk_rope_head_dim}, "
-                f"v_head_dim={v_head_dim}, "
-                f"q={original_q_shape}->{tuple(q_input.shape)} {q_input.dtype}, "
-                f"kv={original_kv_shape}->{tuple(kv_cache.shape)} {kv_cache.dtype}.",
-            )
-            self._logged_flashmla_sparse_shapes = True
-
         if _is_dcu and self.nsa_index_kpool > 1:
             # DCU FlashMLA sparse prefill requires a stricter topk alignment than
             # the logical KPool width (topk + kpool - 1), so pad invalid pages.
@@ -2132,7 +2133,7 @@ class NativeSparseAttnBackend(
         )
 
         # Trim output back to original num_heads if we padded
-        if (not _is_dcu) and need_padding:
+        if ((not _is_dcu) and need_padding) or dcu_padded_q_heads:
             o = o[:, :num_heads, :]
 
         return o
@@ -2181,20 +2182,6 @@ class NativeSparseAttnBackend(
 
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
-
-        if self._is_glm5_next and not self._logged_flashmla_kv_shapes:
-            log_info_on_rank0(
-                logger,
-                "GLM5-Next FlashMLA sparse decode shapes: "
-                f"kv_lora_rank={self.kv_lora_rank}, "
-                f"qk_nope_head_dim={self.qk_nope_head_dim}, "
-                f"qk_rope_head_dim={self.qk_rope_head_dim}, "
-                f"v_head_dim={v_head_dim}, "
-                f"q={original_q_shape}->{tuple(q_input.shape)} {q_input.dtype}, "
-                f"kv_cache={original_kv_shape}->{tuple(kv_cache.shape)} "
-                f"{kv_cache.dtype}, bytes_per_token={kv_cache.shape[-1]}.",
-            )
-            self._logged_flashmla_kv_shapes = True
 
         if _is_dcu and self.nsa_index_kpool > 1:
             # KPool appends up to kpool-1 uncompressed tail tokens after the

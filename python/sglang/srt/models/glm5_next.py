@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import os
 import re
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -136,6 +137,7 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
 
 KDA_SAFE_GATE_LOWER_BOUND = -5.0
 KDA_NEG_EIGVAL_BETA_SCALE = 2.0
@@ -620,6 +622,7 @@ class ModelNextDecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
                 swiglu_limit=config.swiglu_limit,
+                layer_id=self.layer_id,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -661,6 +664,7 @@ class ModelNextDecoderLayer(nn.Module):
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
             ),
+            layer_id=self.layer_id,
         )
 
         if self.config.mhc and self.nsa_enable_prefill_cp:
