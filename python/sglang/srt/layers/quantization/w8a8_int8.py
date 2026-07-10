@@ -106,6 +106,10 @@ class W8A8Int8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+             return None
 
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
