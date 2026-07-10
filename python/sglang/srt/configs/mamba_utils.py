@@ -138,6 +138,10 @@ class Mamba2StateShape:
     state_size: int
     conv_kernel: int
 
+    @property
+    def conv_dims(self) -> list[int]:
+        return [self.conv_dim]
+
     @staticmethod
     def create(
         *,
@@ -193,6 +197,14 @@ class KimiLinearStateShape:
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+
+    @property
+    def conv_dims(self) -> list[int]:
+        return [
+            self.num_heads * self.head_dim,
+            self.num_k_heads * self.head_k_dim,
+            self.num_k_heads * self.head_k_dim,
+        ]
 
     @staticmethod
     def create(

@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -36,7 +35,9 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_state_indices,
     get_kv_class,
+    is_hybrid_mla_backend,
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
@@ -56,6 +57,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -113,6 +115,14 @@ class PrefillBootstrapQueue:
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
+        self.is_hybrid_mla_backend = is_hybrid_mla_backend(token_to_kv_pool)
+        if (
+            self.is_hybrid_mla_backend
+            and transfer_backend != TransferBackend.MOONCAKE
+        ):
+            # Hybrid state-aware rank fan-in is currently implemented by
+            # Mooncake only. Preserve the existing behavior for other backends.
+            self.is_mla_backend = True
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -126,7 +136,9 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and (
+            self.is_mla_backend or self.is_hybrid_mla_backend
+        ):
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -166,7 +178,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        if not self.is_mla_backend:
+        if not self.is_mla_backend and not self.is_hybrid_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
@@ -196,17 +208,22 @@ class PrefillBootstrapQueue:
             )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager_kwargs = {}
+        if self.transfer_backend == TransferBackend.MOONCAKE:
+            kv_manager_kwargs["is_hybrid_mla_backend"] = self.is_hybrid_mla_backend
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            **kv_manager_kwargs,
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
         ):
             kv_pool = self.token_to_kv_pool
             if hasattr(kv_pool, "full_kv_pool"):
@@ -791,55 +808,37 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-            seq_len = len(req.fill_ids)
+            # fill_ids includes the token sampled during prefill, but decode
+            # registers state pages over origin_input_ids. Matching that length
+            # avoids emitting an extra state page when the sampled token crosses
+            # a page boundary.
+            seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
 
-            def _mamba_payload():
-                return [
+            token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            mamba_index = None
+            if isinstance(token_to_kv_pool, HybridLinearKVPool):
+                mamba_index = int(
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
-
-            def _nsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(
-                    kv_indices_full.cpu().numpy(), device_page_size
-                )
-
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+                    ].item()
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
-                    state_indices.append(_nsa_payload())
-                else:
-                    state_indices.append(None)
+            state_indices = build_state_indices(
+                token_to_kv_pool=token_to_kv_pool,
+                draft_token_to_kv_pool=(
+                    self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+                ),
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_idx=req.req_pool_idx,
+                seq_len=seq_len,
+                page_size=page_size,
+                mamba_index=mamba_index,
+                swa_window_size=self.sliding_window_size,
+                swa_translate_loc=getattr(
+                    self.token_to_kv_pool_allocator,
+                    "translate_loc_from_full_to_swa",
+                    None,
+                ),
+            )
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):

@@ -527,12 +527,17 @@ def filter_kv_indices_for_cp_rank(
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
-
-    if isinstance(target_kv_pool, HybridLinearKVPool):
-        target_kv_pool = target_kv_pool.full_kv_pool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+
+
+def is_hybrid_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+
+    return isinstance(target_kv_pool, HybridLinearKVPool) and isinstance(
+        target_kv_pool.full_kv_pool, MLATokenToKVPool
+    )
 
 
 def append_state_component(
@@ -542,14 +547,23 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    dim_components_per_tensor: Optional[List[List[int]]] = None,
+    dim_outer_per_tensor: Optional[List[int]] = None,
 ) -> None:
-    """Append one state component. Caller orders state_types consistently
-    on prefill and decode sides."""
+    """Append one side-state component.
+
+    Caller orders state_types consistently on prefill and decode sides.
+    A no-op when the buffer group is empty.
+    """
+    if not data_ptrs:
+        return
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_dim_components_per_tensor.append(dim_components_per_tensor or [])
+    kv_args.state_dim_outer_per_tensor.append(dim_outer_per_tensor or [])
 
 
 def setup_state_kv_args(
@@ -561,7 +575,12 @@ def setup_state_kv_args(
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
-    lives in one place.
+    lives in one place. Components are appended in this order when present:
+
+        mamba(MAMBA) -> target_nsa(NSA) -> draft_nsa(NSA)
+
+    NSA tail / per-component sub-dim metadata are intentionally not emitted in
+    this branch because the current KVArgs protocol does not carry those fields.
     """
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -573,6 +592,18 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_dim_components_per_tensor = []
+    kv_args.state_dim_outer_per_tensor = []
+
+    def _append_nsa(pool):
+        append_state_component(kv_args, StateType.NSA, *pool.get_state_buf_infos())
+
+    def _append_draft_nsa():
+        draft_nsa_pool = getattr(
+            draft_token_to_kv_pool, "full_kv_pool", draft_token_to_kv_pool
+        )
+        if isinstance(draft_nsa_pool, NSATokenToKVPool):
+            _append_nsa(draft_nsa_pool)
 
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
@@ -589,8 +620,25 @@ def setup_state_kv_args(
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
             )
+            dim_components = (
+                token_to_kv_pool.get_state_dim_components_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_dim_components_per_tensor")
+                else None
+            )
+            dim_outer = (
+                token_to_kv_pool.get_state_dim_outer_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_dim_outer_per_tensor")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                dim_components,
+                dim_outer,
             )
             if token_to_kv_pool.use_nsa:
                 nsa_ptrs, nsa_lens, nsa_item_lens = (
@@ -603,27 +651,16 @@ def setup_state_kv_args(
                     nsa_lens,
                     nsa_item_lens,
                 )
+                _append_draft_nsa()
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
-            if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, NSATokenToKVPool
-            ):
-                (
-                    draft_data_ptrs,
-                    draft_data_lens,
-                    draft_item_lens,
-                ) = draft_token_to_kv_pool.get_state_buf_infos()
-                data_ptrs = data_ptrs + draft_data_ptrs
-                data_lens = data_lens + draft_data_lens
-                item_lens = item_lens + draft_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
                     len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.total_kv_layers = total_kv_layers
             else:
-                append_state_component(
-                    kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
-                )
+                _append_nsa(token_to_kv_pool)
+                _append_draft_nsa()
 
     if (
         StateType.MAMBA not in kv_args.state_types
@@ -637,9 +674,93 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
-            append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            dim_components = (
+                req_to_token_pool.get_state_dim_components_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_dim_components_per_tensor")
+                else None
             )
+            dim_outer = (
+                req_to_token_pool.get_state_dim_outer_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_dim_outer_per_tensor")
+                else None
+            )
+            append_state_component(
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                dim_components,
+                dim_outer,
+            )
+
+
+def build_state_indices(
+    *,
+    token_to_kv_pool,
+    draft_token_to_kv_pool=None,
+    req_to_token,
+    req_pool_idx: int,
+    seq_len: int,
+    page_size: int,
+    mamba_index: Optional[int] = None,
+    swa_window_size: Optional[int] = None,
+    swa_translate_loc=None,
+) -> Optional[List[List[int]]]:
+    """Build per-request state indices in the same order as setup_state_kv_args.
+
+    This is the request-side dual of ``setup_state_kv_args``. The connection
+    layer pairs component ``i`` in ``state_indices`` with component ``i`` in
+    ``kv_args.state_types`` / ``state_data_ptrs``. Keep this order in sync with
+    ``setup_state_kv_args`` when adding new state components.
+    """
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+
+    components: List[List[int]] = []
+
+    def _nsa_pages(pool):
+        kv = req_to_token[req_pool_idx, :seq_len]
+        return kv_to_page_indices(kv.cpu().numpy(), pool.page_size).tolist()
+
+    def _append_nsa(pool):
+        components.append(_nsa_pages(pool))
+
+    def _append_draft_nsa():
+        draft_nsa_pool = getattr(
+            draft_token_to_kv_pool, "full_kv_pool", draft_token_to_kv_pool
+        )
+        if isinstance(draft_nsa_pool, NSATokenToKVPool):
+            _append_nsa(draft_nsa_pool)
+
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        assert mamba_index is not None, "HybridLinearKVPool requires mamba_index"
+        components.append([int(mamba_index)])
+        if token_to_kv_pool.use_nsa and isinstance(
+            token_to_kv_pool.full_kv_pool, NSATokenToKVPool
+        ):
+            _append_nsa(token_to_kv_pool.full_kv_pool)
+            _append_draft_nsa()
+    elif isinstance(token_to_kv_pool, BaseSWAKVPool):
+        assert (
+            swa_window_size is not None and swa_translate_loc is not None
+        ), "SWA state indices require window size and SWA loc translator"
+        window_start = max(0, seq_len - swa_window_size)
+        window_start = (window_start // page_size) * page_size
+        window_kv = req_to_token[req_pool_idx, window_start:seq_len]
+        swa_loc = swa_translate_loc(window_kv)
+        components.append(
+            kv_to_page_indices(swa_loc.cpu().numpy(), page_size).tolist()
+        )
+    elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+        _append_nsa(token_to_kv_pool)
+        _append_draft_nsa()
+
+    if not components:
+        return None
+    return components
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

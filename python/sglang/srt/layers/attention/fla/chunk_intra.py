@@ -24,6 +24,11 @@ else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
+@triton.jit
+def exp_e(x):
+    return exp2(x * 1.4426950408889634)
+
+
 ################################################################################
 # Fused inter + solve_tril kernel: compute off-diagonal Akk and solve in one pass
 ################################################################################
@@ -167,8 +172,8 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             b_q0 = tl.load(p_q0, boundary_check=(0, 1)).to(tl.float32)
             b_gn0 = tl.load(g + i_tc0 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             b_gm0 = tl.clamp(b_g0 - b_gn0[None, :], -126.0, 126.0)
-            b_gq0 = tl.where(m_tc0[:, None], exp2(b_gm0), 0.0)
-            b_gk0 = tl.where(m_tc0[:, None], exp2(-b_gm0), 0.0)
+            b_gq0 = tl.where(m_tc0[:, None], exp_e(b_gm0), 0.0)
+            b_gk0 = tl.where(m_tc0[:, None], exp_e(-b_gm0), 0.0)
             b_kgt_d0 = tl.trans(b_k0 * b_gk0)
             b_Aqk_d0 += tl.dot(b_q0 * b_gq0, b_kgt_d0)
             b_Akk_d0 += tl.dot(b_k0 * b_gq0, b_kgt_d0)
@@ -190,9 +195,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             # [BK]
             b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
-            b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
+            b_gqn = tl.where(m_tc1[:, None], exp_e(b_g1 - b_gn1[None, :]), 0)
             # [BK, BC]
-            b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
+            b_kgt = tl.trans(b_k0 * exp_e(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
             # [BC, BC]
             b_qg1 = (b_q1 * b_gqn).to(tl.bfloat16)
             b_kg1 = (b_k1 * b_gqn).to(tl.bfloat16)
@@ -201,7 +206,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
 
             if FUSE_DIAGONAL:
                 b_gm1_d = tl.clamp(b_gn1[None, :] - b_g1, -126.0, 126.0)
-                b_gk1_d = tl.where(m_tc1[:, None], exp2(b_gm1_d), 0.0)
+                b_gk1_d = tl.where(m_tc1[:, None], exp_e(b_gm1_d), 0.0)
                 b_kgt_d1 = tl.trans(b_k1 * b_gk1_d)
                 b_Aqk_d1 += tl.dot(b_q1 * b_gqn, b_kgt_d1)
                 b_Akk_d1 += tl.dot(b_k1 * b_gqn, b_kgt_d1)
@@ -225,22 +230,22 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     tl.float32
                 )
                 # [BC, BK]
-                b_gqn2 = tl.where(m_tc2[:, None], exp2(b_g2 - b_gn2[None, :]), 0)
+                b_gqn2 = tl.where(m_tc2[:, None], exp_e(b_g2 - b_gn2[None, :]), 0)
                 b_qg2 = (b_q2 * b_gqn2).to(tl.bfloat16)
                 b_kg2 = (b_k2 * b_gqn2).to(tl.bfloat16)
                 # [BK, BC]
-                b_kgt = tl.trans(b_k0 * exp2(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k0 * exp_e(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
                 b_Aqk20 += tl.dot(b_qg2, b_kgt)
                 b_Akk20 += tl.dot(b_kg2, b_kgt)
                 # [BC, BC]
-                b_kgt = tl.trans(b_k1 * exp2(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k1 * exp_e(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
                 # [BC, BC]
                 b_Aqk21 += tl.dot(b_qg2, b_kgt)
                 b_Akk21 += tl.dot(b_kg2, b_kgt)
 
                 if FUSE_DIAGONAL:
                     b_gm2_d = tl.clamp(b_gn2[None, :] - b_g2, -126.0, 126.0)
-                    b_gk2_d = tl.where(m_tc2[:, None], exp2(b_gm2_d), 0.0)
+                    b_gk2_d = tl.where(m_tc2[:, None], exp_e(b_gm2_d), 0.0)
                     b_kgt_d2 = tl.trans(b_k2 * b_gk2_d)
                     b_Aqk_d2 += tl.dot(b_q2 * b_gqn2, b_kgt_d2)
                     b_Akk_d2 += tl.dot(b_k2 * b_gqn2, b_kgt_d2)
@@ -264,28 +269,28 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                         tl.float32
                     )
                     # [BC, BK]
-                    b_gqn3 = tl.where(m_tc3[:, None], exp2(b_g3 - b_gn3[None, :]), 0)
+                    b_gqn3 = tl.where(m_tc3[:, None], exp_e(b_g3 - b_gn3[None, :]), 0)
                     b_qg3 = (b_q3 * b_gqn3).to(tl.bfloat16)
                     b_kg3 = (b_k3 * b_gqn3).to(tl.bfloat16)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k0 * exp2(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k0 * exp_e(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk30 += tl.dot(b_qg3, b_kgt)
                     b_Akk30 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k1 * exp2(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k1 * exp_e(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk31 += tl.dot(b_qg3, b_kgt)
                     b_Akk31 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k2 * exp2(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k2 * exp_e(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
                     # [BC, BC]
                     b_Aqk32 += tl.dot(b_qg3, b_kgt)
                     b_Akk32 += tl.dot(b_kg3, b_kgt)
 
                     if FUSE_DIAGONAL:
                         b_gm3_d = tl.clamp(b_gn3[None, :] - b_g3, -126.0, 126.0)
-                        b_gk3_d = tl.where(m_tc3[:, None], exp2(b_gm3_d), 0.0)
+                        b_gk3_d = tl.where(m_tc3[:, None], exp_e(b_gm3_d), 0.0)
                         b_kgt_d3 = tl.trans(b_k3 * b_gk3_d)
                         b_Aqk_d3 += tl.dot(b_q3 * b_gqn3, b_kgt_d3)
                         b_Akk_d3 += tl.dot(b_k3 * b_gqn3, b_kgt_d3)
@@ -866,8 +871,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
-    b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
-    b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.0)
+    b_gq = tl.where(m_c[:, None], exp_e(b_gm), 0.0)
+    b_gk = tl.where(m_c[:, None], exp_e(-b_gm), 0.0)
 
     b_kgt = tl.trans(b_k * b_gk)
 

@@ -8,7 +8,11 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashmla_kv_indices_triton,
+    get_dcu_mla_fp8_kv_cache_dim,
+    should_pad_dcu_mla_fp8_kv_cache,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
@@ -157,10 +161,15 @@ class DCUMLABackend(AttentionBackend):
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
-        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.kv_cache_dim = get_dcu_mla_fp8_kv_cache_dim(
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.qk_rope_head_dim,
+            self.data_type,
+            uses_dcu_mla=True,
+        )
 
         self.device = model_runner.device
         # self.k_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
@@ -716,6 +725,13 @@ class DCUMLABackend(AttentionBackend):
             )
         else:
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+            if should_pad_dcu_mla_fp8_kv_cache(
+                reshape_q.shape[-1],
+                self.qk_rope_head_dim,
+                self.data_type,
+                uses_dcu_mla=True,
+            ):
+                reshape_q = _pad_last_dim(reshape_q, self.kv_cache_dim)
             if is_fp8 and not is_bmz_fp8(k_cache):
                 reshape_q = reshape_q.to(k_cache_reshaped.dtype)
                 o, _ = flash_mla_with_kvcache_fp8(

@@ -2,12 +2,53 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_dcu
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
+
+DCU_MLA_FP8_PADDED_KV_CACHE_DIM = 576
+
+
+def is_dcu_mla_fp8_kv_dtype(kv_cache_dtype: torch.dtype) -> bool:
+    return kv_cache_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    )
+
+
+def should_pad_dcu_mla_fp8_kv_cache(
+    kv_cache_dim: int,
+    qk_rope_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+    uses_dcu_mla: bool,
+) -> bool:
+    return (
+        _is_dcu
+        and uses_dcu_mla
+        and qk_rope_head_dim == 0
+        and kv_cache_dim == 512
+        and is_dcu_mla_fp8_kv_dtype(kv_cache_dtype)
+    )
+
+
+def get_dcu_mla_fp8_kv_cache_dim(
+    kv_cache_dim: int,
+    qk_rope_head_dim: int,
+    kv_cache_dtype: torch.dtype,
+    uses_dcu_mla: bool,
+) -> int:
+    if should_pad_dcu_mla_fp8_kv_cache(
+        kv_cache_dim, qk_rope_head_dim, kv_cache_dtype, uses_dcu_mla
+    ):
+        return DCU_MLA_FP8_PADDED_KV_CACHE_DIM
+    return kv_cache_dim
+
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q

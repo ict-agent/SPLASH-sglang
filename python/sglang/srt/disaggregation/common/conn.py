@@ -94,11 +94,13 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_hybrid_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
+        self.is_hybrid_mla_backend = is_hybrid_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         # for p/d multi node infer
@@ -120,8 +122,12 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        hybrid_mla_needs_all_cp_ranks = is_hybrid_mla_backend and (
+            self.attn_cp_size > 1 or disaggregation_mode == DisaggregationMode.DECODE
+        )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or hybrid_mla_needs_all_cp_ranks
         )
         self.model_config = ModelConfig.from_server_args(server_args)
 
@@ -275,7 +281,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         elif self.attn_tp_size > info.attn_tp_size:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
@@ -286,7 +292,7 @@ class CommonKVManager(BaseKVManager):
             required_prefill_response_num = 1
             target_tp_ranks = [target_tp_rank]
         else:
-            if not self.is_mla_backend:
+            if not self.is_mla_backend and not self.is_hybrid_mla_backend:
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )

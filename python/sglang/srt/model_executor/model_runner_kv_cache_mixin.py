@@ -12,6 +12,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.utils import get_dcu_mla_fp8_kv_cache_dim
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -62,17 +63,17 @@ _is_dcu = is_dcu()
 
 
 class ModelRunnerKVCacheMixin:
+    def _uses_dcu_mla_backend(self: ModelRunner) -> bool:
+        return (
+            self.server_args.attention_backend == "dcu_mla"
+            or self.server_args.prefill_attention_backend == "dcu_mla"
+            or self.server_args.decode_attention_backend == "dcu_mla"
+        )
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            mla_kv_cache_dim = (
-                self.calculate_mla_kv_cache_dim()
-                if is_deepseek_nsa(self.model_config.hf_config)
-                else (
-                    self.model_config.kv_lora_rank
-                    + self.model_config.qk_rope_head_dim
-                )
-            )
+            mla_kv_cache_dim = self.calculate_mla_kv_cache_dim()
             cell_size = (
                 mla_kv_cache_dim * num_layers * kv_size
             )
@@ -230,9 +231,14 @@ class ModelRunnerKVCacheMixin:
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+        # Dense DCU MLA FP8 no-rope uses a padded physical KV cache width.
         if not is_nsa_model:
-            return kv_cache_dim
+            return get_dcu_mla_fp8_kv_cache_dim(
+                kv_cache_dim,
+                qk_rope_head_dim,
+                kv_cache_dtype,
+                self._uses_dcu_mla_backend(),
+            )
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
         # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
@@ -651,6 +657,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    override_kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                 )
         else:
             if self.is_hybrid_swa:
@@ -687,6 +694,7 @@ class ModelRunnerKVCacheMixin:
                     extra_args = {
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                        "kv_cache_dim": self.calculate_mla_kv_cache_dim(),
                     }
                     if is_nsa_model:
                         if self.enable_hisparse:
@@ -698,7 +706,6 @@ class ModelRunnerKVCacheMixin:
                             index_head_dim=get_nsa_index_head_dim(
                                 self.model_config.hf_config
                             ),
-                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,

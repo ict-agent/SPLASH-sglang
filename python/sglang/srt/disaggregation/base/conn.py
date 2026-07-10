@@ -41,6 +41,12 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Per-tensor packed component dims along the slice dim. Used by KDA conv
+    # states, whose [Q|K|V] segments must be sliced independently.
+    state_dim_components_per_tensor: List[List[List[int]]]
+    # Per-tensor outer dimension before the slice dim. KDA conv states use
+    # [kernel, qkv_dim/tp], so each component must be copied once per kernel row.
+    state_dim_outer_per_tensor: List[List[int]]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int

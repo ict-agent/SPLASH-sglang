@@ -352,6 +352,22 @@ class MambaPool:
             )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
+            self._state_dim_axis_by_type = []
+            self._state_dim_components_by_type = []
+            self._state_dim_outer_by_type = []
+            shape = cache_params.shape
+            for conv_shape in conv_state_shape:
+                components = list(getattr(shape, "conv_dims", []))
+                self._state_dim_components_by_type.append(components)
+                # KDA/Kimi packs [Q|K|V] after the conv-kernel dimension:
+                # [layers, slots, kernel, qkv_dim/tp]. Other Mamba2 states keep
+                # the TP-sharded feature dimension first.
+                is_kda_conv = len(components) > 1
+                self._state_dim_axis_by_type.append(1 if is_kda_conv else 0)
+                self._state_dim_outer_by_type.append(conv_shape[0] if is_kda_conv else 1)
+            self._state_dim_components_by_type.append([shape.num_heads])
+            self._state_dim_axis_by_type.append(0)
+            self._state_dim_outer_by_type.append(1)
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -467,13 +483,16 @@ class MambaPool:
 
         For mamba state, the layout is:
         - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - KDA conv_state: [num_layers, size+1, conv_kernel-1, qkv_dim/tp]
         - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
 
-        The 3rd dimension (index 2) is the one that gets sliced by TP.
-        Returns the size of this dimension for each tensor (repeated for each layer).
+        Returns the sliceable dimension size for each tensor (repeated for
+        each layer).
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
+            if field in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
             value = getattr(self.mamba_cache, field)
             if isinstance(value, list):
                 state_tensors.extend(value)
@@ -481,13 +500,28 @@ class MambaPool:
                 state_tensors.append(value)
 
         dim_per_tensor = []
-        for state_tensor in state_tensors:
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
+        for i, state_tensor in enumerate(state_tensors):
+            axis = (
+                self._state_dim_axis_by_type[i]
+                if i < len(self._state_dim_axis_by_type)
+                else 0
+            )
+            sliceable_dim = state_tensor.shape[2 + axis]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_dim_components_per_tensor(self):
+        comps_per_tensor = []
+        for components in self._state_dim_components_by_type:
+            comps_per_tensor += [components] * self.num_mamba_layers
+        return comps_per_tensor
+
+    def get_state_dim_outer_per_tensor(self):
+        outer_per_tensor = []
+        for outer_dim in self._state_dim_outer_by_type:
+            outer_per_tensor += [outer_dim] * self.num_mamba_layers
+        return outer_per_tensor
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -639,6 +673,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_dim_components_per_tensor(self):
+        return self.mamba_pool.get_state_dim_components_per_tensor()
+
+    def get_state_dim_outer_per_tensor(self):
+        return self.mamba_pool.get_state_dim_outer_per_tensor()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1565,6 +1605,10 @@ class HybridLinearKVPool(KVCache):
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
 
+            pool_kwargs = {}
+            if TokenToKVPoolClass is MLATokenToKVPool:
+                pool_kwargs["override_kv_cache_dim"] = kv_cache_dim
+
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -1574,6 +1618,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **pool_kwargs,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -1599,6 +1644,14 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_dim_components_per_tensor(self):
+        """Get packed sub-component sizes for each mamba state tensor."""
+        return self.mamba_pool.get_state_dim_components_per_tensor()
+
+    def get_state_dim_outer_per_tensor(self):
+        """Get outer dimensions before the slice dimension for mamba state tensors."""
+        return self.mamba_pool.get_state_dim_outer_per_tensor()
 
     def get_nsa_state_buf_infos(self):
         if not self.use_nsa:
@@ -1844,11 +1897,11 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
-        # override kv cache dim is correct and use it directly.
+        # When override_kv_cache_dim is provided, we assume the caller already
+        # selected the backend-specific physical KV cache width.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1931,6 +1984,16 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def _store_kv_cache(self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor):
+        kv_buffer = self.kv_buffer[layer_id - self.start_layer]
+        if cache_k.shape[-1] == self.kv_cache_dim:
+            kv_buffer[loc] = cache_k
+        else:
+            assert cache_k.shape[-1] < self.kv_cache_dim
+            pad_width = self.kv_cache_dim - cache_k.shape[-1]
+            padding = cache_k.new_zeros(*cache_k.shape[:-1], pad_width)
+            kv_buffer[loc] = torch.cat([cache_k, padding], dim=-1)
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1944,11 +2007,9 @@ class MLATokenToKVPool(KVCache):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            self._store_kv_cache(layer_id, loc, cache_k.view(self.store_dtype))
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self._store_kv_cache(layer_id, loc, cache_k)
     
     def set_kv_buffer_opt(  # TODO: handwrite kernel
         self,
@@ -1963,11 +2024,9 @@ class MLATokenToKVPool(KVCache):
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            self._store_kv_cache(layer_id, loc, cache_k.view(self.store_dtype))
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self._store_kv_cache(layer_id, loc, cache_k)
         
 
     def set_mla_kv_buffer(
@@ -2019,12 +2078,16 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                self.kv_buffer[layer_id - self.start_layer],
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            if cache_k_nope.shape[-1] + cache_k_rope.shape[-1] == self.kv_cache_dim:
+                set_mla_kv_buffer_triton(
+                    self.kv_buffer[layer_id - self.start_layer],
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                )
+            else:
+                cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+                self._store_kv_cache(layer_id, loc, cache_k)
 
     def get_mla_kv_buffer(
         self,

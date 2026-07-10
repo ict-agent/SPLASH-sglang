@@ -194,8 +194,15 @@ class MooncakeKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_hybrid_mla_backend: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(
+            args,
+            disaggregation_mode,
+            server_args,
+            is_mla_backend,
+            is_hybrid_mla_backend,
+        )
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -604,7 +611,7 @@ class MooncakeKVManager(CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        if self.is_mla_backend or self.is_hybrid_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -1032,16 +1039,47 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
+    def _should_skip_hybrid_mla(
+        self, info: Optional[KVArgsRegisterInfo]
+    ) -> Tuple[bool, bool]:
+        skip_kv = False
+        skip_state = False
+        if not self.is_hybrid_mla_backend:
+            return skip_kv, skip_state
+
+        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
+            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+                self.attn_tp_size // info.dst_attn_tp_size
+            )
+            if sub_rank != 0:
+                skip_kv = True
+                skip_state = True
+
+        if (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not getattr(
+                self.server_args, "enable_nsa_cache_layer_split", False
+            )
+        ):
+            skip_state = True
+
+        return skip_kv, skip_state
+
     def maybe_send_extra(
         self,
         req: TransferInfo,
         prefill_state_indices: List,
         executor: concurrent.futures.ThreadPoolExecutor,
         target_rank_registration_info: Optional[KVArgsRegisterInfo] = None,
+        skip_state: bool = False,
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
+            if skip_state and st != StateType.MAMBA:
+                continue
+
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
@@ -1052,6 +1090,16 @@ class MooncakeKVManager(CommonKVManager):
             src_dim_per_tensor = (
                 self.kv_args.state_dim_per_tensor[i]
                 if i < len(self.kv_args.state_dim_per_tensor)
+                else []
+            )
+            src_dim_components_per_tensor = (
+                self.kv_args.state_dim_components_per_tensor[i]
+                if i < len(getattr(self.kv_args, "state_dim_components_per_tensor", []))
+                else []
+            )
+            src_dim_outer_per_tensor = (
+                self.kv_args.state_dim_outer_per_tensor[i]
+                if i < len(getattr(self.kv_args, "state_dim_outer_per_tensor", []))
                 else []
             )
             if target_rank_registration_info is not None:
@@ -1079,22 +1127,21 @@ class MooncakeKVManager(CommonKVManager):
             if st == StateType.MAMBA:
                 if (
                     target_rank_registration_info is not None
-                    and self.attn_tp_size
-                    != target_rank_registration_info.dst_attn_tp_size
                 ):
                     rc = (
-                        self._send_mamba_state_slice(
+                        self._send_mamba_slot_state(
                             req,
                             indices,
                             src_data_ptrs,
                             src_item_lens,
                             src_dim_per_tensor,
+                            src_dim_components_per_tensor,
+                            src_dim_outer_per_tensor,
                             dst_data_ptrs,
                             dst_indices,
                             dst_item_lens,
                             dst_dim_per_tensor,
-                            target_rank_registration_info.dst_tp_rank,
-                            target_rank_registration_info.dst_attn_tp_size,
+                            target_rank_registration_info,
                         )
                         or rc
                     )
@@ -1114,6 +1161,7 @@ class MooncakeKVManager(CommonKVManager):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
+                    and not self.is_hybrid_mla_backend
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
@@ -1166,6 +1214,72 @@ class MooncakeKVManager(CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def _send_mamba_slot_state(
+        self,
+        req: TransferInfo,
+        prefill_mamba_index: list,
+        src_state_data_ptrs: list[int],
+        src_state_item_lens: list[int],
+        src_state_dim_per_tensor: list[int],
+        src_state_dim_components_per_tensor: list[list[int]],
+        src_state_dim_outer_per_tensor: list[int],
+        dst_state_data_ptrs: list[int],
+        dst_mamba_index: list,
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
+        target_rank_registration_info: KVArgsRegisterInfo,
+    ):
+        if self.attn_cp_size > 1:
+            src_shard_size, src_shard_rank = self.attn_cp_size, self.attn_cp_rank
+        else:
+            src_shard_size, src_shard_rank = self.attn_tp_size, self.attn_tp_rank
+
+        dst_shard_size = target_rank_registration_info.dst_attn_tp_size
+        dst_shard_rank = (
+            target_rank_registration_info.dst_tp_rank
+            % target_rank_registration_info.dst_attn_tp_size
+        )
+
+        if src_shard_size >= dst_shard_size:
+            heads_overlap = (
+                src_shard_rank * dst_shard_size // src_shard_size == dst_shard_rank
+            )
+        else:
+            heads_overlap = (
+                dst_shard_rank * src_shard_size // dst_shard_size == src_shard_rank
+            )
+
+        if not heads_overlap:
+            return 0
+
+        if src_shard_size == dst_shard_size:
+            return self._send_mamba_state(
+                req,
+                prefill_mamba_index,
+                src_state_data_ptrs,
+                src_state_item_lens,
+                dst_state_data_ptrs,
+                dst_mamba_index,
+            )
+
+        return self._send_mamba_state_slice(
+            req,
+            prefill_mamba_index,
+            src_state_data_ptrs,
+            src_state_item_lens,
+            src_state_dim_per_tensor,
+            src_state_dim_components_per_tensor,
+            src_state_dim_outer_per_tensor,
+            dst_state_data_ptrs,
+            dst_mamba_index,
+            dst_state_item_lens,
+            dst_state_dim_per_tensor,
+            src_shard_size,
+            src_shard_rank,
+            dst_shard_size,
+            dst_shard_rank,
+        )
+
     def _send_mamba_state_slice(
         self,
         req: TransferInfo,
@@ -1173,25 +1287,26 @@ class MooncakeKVManager(CommonKVManager):
         src_state_data_ptrs: list[int],
         src_state_item_lens: list[int],
         src_state_dim_per_tensor: list[int],
+        src_state_dim_components_per_tensor: list[list[int]],
+        src_state_dim_outer_per_tensor: list[int],
         dst_state_data_ptrs: list[int],
         dst_mamba_index: list,
         dst_state_item_lens: list[int],
         dst_state_dim_per_tensor: list[int],
-        dst_tp_rank: int,
-        dst_attn_tp_size: int,
+        src_shard_size: int,
+        src_shard_rank: int,
+        dst_shard_size: int,
+        dst_shard_rank: int,
     ):
-        """Transfer Mamba states with TP slice support.
+        """Transfer Mamba states with shard slice support.
 
-        Mamba state layout:
-        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
-        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
-
-        The 3rd dimension is sliced by TP. When prefill and decode have different
-        attn_tp_size, we need to slice the state accordingly.
+        The sliceable dim may pack heterogeneous components, e.g. KDA conv state
+        packs [Q|K|V]. Components must be copied separately so resizing from
+        prefill CP shards to decode TP shards preserves the packed layout.
         """
         logger.warning_once(
-            "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
-            f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
+            "Using Mamba state slice transfer for different shard sizes between prefill and decode. "
+            f"Prefill shard_size={src_shard_size}, Decode shard_size={dst_shard_size}. "
             "Performance may be affected."
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
@@ -1207,47 +1322,99 @@ class MooncakeKVManager(CommonKVManager):
                 dst_mamba_index,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
-
         transfer_blocks = []
+        if src_shard_size > dst_shard_size:
+            sub_rank = src_shard_rank % (src_shard_size // dst_shard_size)
+            src_inner_factor, dst_inner_factor = 0, 1
+        else:
+            sub_rank = dst_shard_rank % (dst_shard_size // src_shard_size)
+            src_inner_factor, dst_inner_factor = 1, 0
+
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             src_item_len = src_state_item_lens[i]
             dst_item_len = dst_state_item_lens[i]
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[i]
-
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
             src_bytes_per_dim = src_item_len // src_dim
             dst_bytes_per_dim = dst_item_len // dst_dim
+            if src_bytes_per_dim != dst_bytes_per_dim:
+                logger.error(
+                    "Mamba state slice bytes-per-dim mismatch: "
+                    f"src={src_bytes_per_dim}, dst={dst_bytes_per_dim}, "
+                    f"src_dim={src_dim}, dst_dim={dst_dim}, "
+                    f"src_item_len={src_item_len}, dst_item_len={dst_item_len}"
+                )
+                return -1
 
-            if self.attn_tp_size > dst_attn_tp_size:
-                # Multiple prefill ranks send to 1 decode rank
-                src_dim_start = 0
-                num_dims_to_send = src_dim
-                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
-                local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
-            else:
-                # 1 prefill rank sends to multiple decode ranks
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
-
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            src_addr = (
-                src_state_data_ptrs[i]
-                + src_item_len * int(prefill_mamba_index[0])
-                + src_dim_offset
+            components = (
+                src_state_dim_components_per_tensor[i]
+                if i < len(src_state_dim_components_per_tensor)
+                else []
             )
-            dst_addr = (
-                dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_dim_offset
+            components = components or [src_dim * src_shard_size]
+            outer_dim = (
+                src_state_dim_outer_per_tensor[i]
+                if i < len(src_state_dim_outer_per_tensor)
+                else 1
             )
 
-            transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+            src_base = (
+                src_state_data_ptrs[i] + src_item_len * int(prefill_mamba_index[0])
+            )
+            dst_base = dst_state_ptr + dst_item_len * int(dst_mamba_index[0])
+
+            src_comp_offset = 0
+            dst_comp_offset = 0
+            for comp_size in components:
+                comp_src_dim = comp_size // src_shard_size
+                comp_dst_dim = comp_size // dst_shard_size
+                chunk_dim = min(comp_src_dim, comp_dst_dim)
+                src_dim_offset = (
+                    src_comp_offset + src_inner_factor * sub_rank * chunk_dim
+                )
+                dst_dim_offset = (
+                    dst_comp_offset + dst_inner_factor * sub_rank * chunk_dim
+                )
+                if outer_dim > 1 and len(components) > 1:
+                    src_elem_bytes = src_bytes_per_dim // outer_dim
+                    dst_elem_bytes = dst_bytes_per_dim // outer_dim
+                    if (
+                        src_elem_bytes != dst_elem_bytes
+                        or src_bytes_per_dim % outer_dim != 0
+                        or dst_bytes_per_dim % outer_dim != 0
+                    ):
+                        logger.error(
+                            "Mamba state row-wise slice layout mismatch: "
+                            f"outer_dim={outer_dim}, "
+                            f"src_bytes_per_dim={src_bytes_per_dim}, "
+                            f"dst_bytes_per_dim={dst_bytes_per_dim}"
+                        )
+                        return -1
+                    src_row_stride = src_dim * src_elem_bytes
+                    dst_row_stride = dst_dim * dst_elem_bytes
+                    bytes_to_send = chunk_dim * src_elem_bytes
+                    for row in range(outer_dim):
+                        transfer_blocks.append(
+                            (
+                                src_base
+                                + row * src_row_stride
+                                + src_dim_offset * src_elem_bytes,
+                                dst_base
+                                + row * dst_row_stride
+                                + dst_dim_offset * dst_elem_bytes,
+                                bytes_to_send,
+                            )
+                        )
+                else:
+                    transfer_blocks.append(
+                        (
+                            src_base + src_dim_offset * src_bytes_per_dim,
+                            dst_base + dst_dim_offset * dst_bytes_per_dim,
+                            chunk_dim * src_bytes_per_dim,
+                        )
+                    )
+                src_comp_offset += comp_src_dim
+                dst_comp_offset += comp_dst_dim
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1332,9 +1499,12 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0:
+                        skip_kv, skip_state = self._should_skip_hybrid_mla(
+                            target_rank_registration_info
+                        )
+                        if skip_kv or len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
-                        elif self.is_mla_backend or (
+                        elif self.is_mla_backend or self.is_hybrid_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
@@ -1411,12 +1581,28 @@ class MooncakeKVManager(CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices:
-                                self.maybe_send_extra(
+                                ret = self.maybe_send_extra(
                                     req,
                                     kv_chunk.state_indices,
                                     executor,
                                     target_rank_registration_info,
+                                    skip_state,
                                 )
+                                if ret != 0:
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Failed to send state data of {kv_chunk.room} to "
+                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    )
+                                    self.update_status(req.room, KVPoll.Failed)
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                    )
+                                    break
 
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
