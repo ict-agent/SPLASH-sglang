@@ -54,6 +54,9 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.dcu_deepgemm_w8a8_utils import (
+    is_dcu_gfx936,
+)
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import ceil_div, dispose_tensor, get_bool_env_var, get_int_env_var, is_hip, is_npu, is_dcu, \
@@ -78,6 +81,7 @@ if _is_dcu:
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_i8_gemm_nt_contiguous,
         m_grouped_w4a8_gemm_nt_masked,
+        op as deepgemm_op,
     )
     from lightop import (
         fuse_silu_and_mul,
@@ -92,6 +96,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
+_use_int8_deepgemm_asm = get_bool_env_var("SGLANG_INT8_DEEPGEMM_ASM")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
@@ -455,6 +460,8 @@ class DeepEPMoE(FusedMoE):
             return
 
         self.use_int8_w8a8_deepgemm = False
+        self.use_int8_w8a8_deepgemm_asm = False
+        self.use_gfx936_w8a8_int8_deepgemm = False
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
             self.use_fp8_w8a8 = True
@@ -527,6 +534,10 @@ class DeepEPMoE(FusedMoE):
             and self._is_w8a8_int8_deepgemm_quant(quant_config)
         ):
             self.use_int8_w8a8_deepgemm = True
+            self.use_int8_w8a8_deepgemm_asm = _use_int8_deepgemm_asm
+            self.use_gfx936_w8a8_int8_deepgemm = (
+                is_dcu_gfx936() and not self.use_int8_w8a8_deepgemm_asm
+            )
             self.use_w8a8_marlin = False
 
         self.deepep_mode = get_deepep_mode()
@@ -889,12 +900,32 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
-        m_grouped_i8_gemm_nt_contiguous(
-            input_tensor,
-            w13_weight_int8,
-            gateup_output,
-            m_indices,
-        )
+        if self.use_int8_w8a8_deepgemm_asm:
+            deepgemm_op.m_grouped_w8a8_gemm_nt_contiguous(
+                input_tensor[0],
+                self.w13_weight_deepgemm,
+                gateup_output,
+                input_tensor[1],
+                self.w13_weight_scale,
+                m_indices,
+                1000,
+            )
+        elif self.use_gfx936_w8a8_int8_deepgemm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_contiguous_gfx936
+
+            m_grouped_w8a8_gemm_nt_contiguous_gfx936(
+                input_tensor,
+                w13_weight_int8,
+                gateup_output,
+                m_indices,
+            )
+        else:
+            m_grouped_i8_gemm_nt_contiguous(
+                input_tensor,
+                w13_weight_int8,
+                gateup_output,
+                m_indices,
+            )
         del input_tensor
 
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
@@ -906,12 +937,32 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
-        m_grouped_i8_gemm_nt_contiguous(
-            (q_a2_all, q_a2_scale),
-            w2_weight_int8,
-            down_output,
-            m_indices,
-        )
+        if self.use_int8_w8a8_deepgemm_asm:
+            deepgemm_op.m_grouped_w8a8_gemm_nt_contiguous(
+                q_a2_all,
+                self.w2_weight_deepgemm,
+                down_output,
+                q_a2_scale,
+                self.w2_weight_scale,
+                m_indices,
+                1000,
+            )
+        elif self.use_gfx936_w8a8_int8_deepgemm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_contiguous_gfx936
+
+            m_grouped_w8a8_gemm_nt_contiguous_gfx936(
+                (q_a2_all, q_a2_scale),
+                w2_weight_int8,
+                down_output,
+                m_indices,
+            )
+        else:
+            m_grouped_i8_gemm_nt_contiguous(
+                (q_a2_all, q_a2_scale),
+                w2_weight_int8,
+                down_output,
+                m_indices,
+            )
 
         gather_out = torch.empty(
             hidden_states_shape,
@@ -1407,8 +1458,6 @@ class DeepEPMoE(FusedMoE):
         num_groups, m, _ = hidden_states.size()
         expected_m = min(m, expected_m)
 
-        w13_weight_int8 = (self.w13_weight_deepgemm, self.w13_weight_scale)
-        w2_weight_int8 = (self.w2_weight_deepgemm, self.w2_weight_scale)
         n1 = self.w13_weight_scale.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n1),
@@ -1416,15 +1465,38 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
-        from deepgemm.m_group_gemm import m_grouped_w8a8_gemm_nt_masked_ll
+        if self.use_int8_w8a8_deepgemm_asm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_masked
 
-        m_grouped_w8a8_gemm_nt_masked_ll(
-            (hidden_states, hidden_states_scale),
-            w13_weight_int8,
-            gateup_output,
-            masked_m,
-            expected_m,
-        )
+            m_grouped_w8a8_gemm_nt_masked(
+                (hidden_states, hidden_states_scale),
+                (self.w13_weight_deepgemm_masked, self.w13_weight_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
+        elif self.use_gfx936_w8a8_int8_deepgemm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
+
+            w13_weight_int8 = (self.w13_weight_deepgemm, self.w13_weight_scale)
+            m_grouped_w8a8_gemm_nt_masked_gfx936(
+                (hidden_states, hidden_states_scale),
+                w13_weight_int8,
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
+        else:
+            from deepgemm.m_group_gemm import m_grouped_w8a8_gemm_nt_masked_ll
+
+            w13_weight_int8 = (self.w13_weight_deepgemm, self.w13_weight_scale)
+            m_grouped_w8a8_gemm_nt_masked_ll(
+                (hidden_states, hidden_states_scale),
+                w13_weight_int8,
+                gateup_output,
+                masked_m,
+                expected_m,
+            )
 
         q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
             gateup_output, masked_m
@@ -1438,13 +1510,36 @@ class DeepEPMoE(FusedMoE):
             dtype=torch.bfloat16,
         )
 
-        m_grouped_w8a8_gemm_nt_masked_ll(
-            (q_a2_all, q_a2_scale),
-            w2_weight_int8,
-            down_output,
-            masked_m,
-            expected_m,
-        )
+        if self.use_int8_w8a8_deepgemm_asm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_masked
+
+            m_grouped_w8a8_gemm_nt_masked(
+                (q_a2_all, q_a2_scale),
+                (self.w2_weight_deepgemm_masked, self.w2_weight_scale),
+                down_output,
+                masked_m,
+                expected_m,
+            )
+        elif self.use_gfx936_w8a8_int8_deepgemm:
+            from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
+
+            w2_weight_int8 = (self.w2_weight_deepgemm, self.w2_weight_scale)
+            m_grouped_w8a8_gemm_nt_masked_gfx936(
+                (q_a2_all, q_a2_scale),
+                w2_weight_int8,
+                down_output,
+                masked_m,
+                expected_m,
+            )
+        else:
+            w2_weight_int8 = (self.w2_weight_deepgemm, self.w2_weight_scale)
+            m_grouped_w8a8_gemm_nt_masked_ll(
+                (q_a2_all, q_a2_scale),
+                w2_weight_int8,
+                down_output,
+                masked_m,
+                expected_m,
+            )
 
         return down_output
 
