@@ -855,6 +855,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
+        if stop is None and not request.ignore_eos:
+            preferred = self.tokenizer_manager.server_args.preferred_sampling_params or {}
+            if isinstance(preferred, dict) and preferred.get("stop"):
+                stop = copy.copy(preferred["stop"])
+
         image_data = image_data if image_data else None
         audio_data = audio_data if audio_data else None
         video_data = video_data if video_data else None
