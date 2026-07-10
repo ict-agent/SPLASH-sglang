@@ -13,16 +13,25 @@ import logging
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.quantization.dcu_deepgemm_w8a8_utils import (
+    prepare_w8a8_int8_deepgemm_weights,
+)
 
-from sglang.srt.utils import set_weight_attrs, direct_register_custom_op
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    get_bool_env_var,
+    is_dcu,
+    set_weight_attrs,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 try:
     from lmslim.layers.fused_moe.fuse_moe_int8_marlin import fused_experts_impl_int8_marlin
 except Exception:
     print("INFO: Please install lmslim if you want to infer the quantitative model of moe.\n")
 
 logger = logging.getLogger(__name__)
+_is_dcu = is_dcu()
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 
 __all__ = [
     "CompressedTensorsW8A8Int8MarlinMoEMethod",
@@ -140,41 +149,6 @@ def get_w8a8_int8_marlin_weights(
 
     return weight
 
-def w8a8_nt_kpack2_marlin_weight(w8a8_w, # [size_n, size_k// 2 ]
-                                k_tile=16,
-                                n_tile=16, ):
-    assert w8a8_w.dtype == torch.int8, "w8a8_w 必须是 int8 类型"
-    size_n, size_k = w8a8_w.shape
-    assert size_n % k_tile == 0 and size_k % n_tile == 0, "k_tile / n_tile 必须能整除对应维度"
-
-    q = w8a8_w.reshape((size_n // n_tile,  n_tile, size_k // k_tile, k_tile))
-    q = q.permute((0, 2, 1, 3)).contiguous()
-    q = q.reshape((size_n // k_tile, size_k * k_tile))
-    return q
-
-def weight8bit_nt_kpack2_marlin1(weight, # [size_n, size_k// 2 ]
-                                k_tile=16,
-                                k_tile1=4,
-                                n_tile=16, 
-                                n_tile1=16):
-    assert weight.element_size() == 1, "weight 必须是 8 bit 类型"
-    if weight.dim() == 2:
-        size_n, size_k = weight.shape
-        assert size_n % k_tile == 0 and size_k % n_tile == 0, "k_tile / n_tile 必须能整除对应维度"
-
-        q = weight.reshape((size_n // (n_tile*n_tile1), n_tile1, n_tile, size_k // (k_tile*k_tile1), k_tile1, k_tile))
-        # q = q.permute((0, 2, 1, 3)).contiguous()
-        q = q.permute((0, 3, 1, 4, 2, 5)).contiguous()
-        # q = q.reshape((size_n // k_tile, size_k * k_tile))
-    elif weight.dim() == 3:
-        E, size_n, size_k = weight.shape
-        assert size_n % n_tile == 0 and size_k % k_tile == 0, "k_tile / n_tile 必须能整除对应维度"
-
-        q = weight.reshape((E, size_n // (n_tile*n_tile1), n_tile1, n_tile, size_k // (k_tile*k_tile1), k_tile1, k_tile))
-        q = q.permute((0, 1, 4, 2, 5, 3, 6)).contiguous()
-        # q = q.reshape((E, size_n // k_tile, size_k * k_tile))
-    return q
-
 class CompressedTensorsMarlinMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -201,7 +175,6 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
             "weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations")
-        self.use_deepep = get_moe_a2a_backend().is_deepep()
         per_channel = (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
             and self.input_quant.strategy == QuantizationStrategy.TOKEN)
@@ -272,21 +245,19 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_dcu and _use_deepgemm_moe:
+            prepare_w8a8_int8_deepgemm_weights(layer)
+            return
+
         w1_marlin_list = []
         for ii in range(layer.w13_weight.shape[0]):
-            if not self.use_deepep:
-                w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            else:
-                w1_marlin_in = weight8bit_nt_kpack2_marlin1(layer.w13_weight[ii])
+            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
             w1_marlin_list.append(w1_marlin_in)
         w1_marlin = torch.stack(w1_marlin_list, dim=0)
 
         w2_marlin_list = []
         for ii in range(layer.w2_weight.shape[0]):
-            if not self.use_deepep:
-                w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            else:
-                w2_marlin_in = weight8bit_nt_kpack2_marlin1(layer.w2_weight[ii])
+            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
             w2_marlin_list.append(w2_marlin_in)
         w2_marlin = torch.stack(w2_marlin_list, dim=0)
 
