@@ -1397,6 +1397,14 @@ class ModelNextForCausalLM(nn.Module):
                     if len(parts) >= 3 and int(parts[2]) >= config.num_hidden_layers:
                         continue
 
+            # Skip keys outside this PP rank's layer partition (noise otherwise)
+            if name.startswith("model.layers") and hasattr(self, "start_layer"):
+                parts = name.split(".")
+                if len(parts) >= 3:
+                    layer_id = int(parts[2])
+                    if not (self.start_layer <= layer_id < self.end_layer):
+                        continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
