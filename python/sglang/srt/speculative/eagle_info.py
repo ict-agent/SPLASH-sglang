@@ -649,7 +649,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     topk_index: torch.Tensor = None
     # shape: (b, hidden_size)
     hidden_states: torch.Tensor = None
-    # shape: (b, nsa_index_topk)
+    # shape: (b, nsa_index_topk). During draft_forward it can be temporarily
+    # expanded to (b * topk, nsa_index_topk) for per-branch draft tokens.
+    # Survives across draft steps: spec_info is shared by reference across the
+    # per-step forwards (each may run on a copied ForwardBatch).
     mtp_topk_indices: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 

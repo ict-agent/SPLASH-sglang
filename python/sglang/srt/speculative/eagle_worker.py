@@ -670,10 +670,17 @@ class EAGLEWorker(TpModelWorker):
         scores = None
         # Reuse NSA/DSA topk_indices from the first draft forward step for
         # subsequent steps, analogous to skip_topk in deepseek_v2.py layers.
-        index_share_for_mtp_iteration = is_mtp_index_share_enabled(self.model_config.hf_config)
+        index_share_for_mtp_iteration = is_mtp_index_share_enabled(
+            self.model_config.hf_config
+        )
         if index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = spec_info.mtp_topk_indices
+            if spec_info.mtp_topk_indices is not None and self.topk > 1:
+                # Expand the per-seq (bs, k) seed to per-branch (bs * topk, k)
+                # to match draft-step token rows.
+                spec_info.mtp_topk_indices = (
+                    spec_info.mtp_topk_indices.repeat_interleave(self.topk, dim=0)
+                )
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -719,6 +726,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states = logits_output.hidden_states
 
         if index_share_for_mtp_iteration:
+            spec_info.mtp_topk_indices = None
             forward_batch.topk_indices = None
             forward_batch.reuse_mtp_topk_indices = False
         parent_list, top_scores_index, draft_tokens = organize_draft_results(

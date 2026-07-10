@@ -426,8 +426,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    # Scratch buffer for NSA/DSA topk_indices emitted by draft-extend/capture
+    # paths. Cross-step MTP draft reuse carries the tensor on spec_info.
     topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing MTP draft-step topk_indices; see
+    # EagleDraftInput.mtp_topk_indices for the carried tensor.
     reuse_mtp_topk_indices: Optional[bool] = False
     capture_mtp_topk_indices: bool = False
 

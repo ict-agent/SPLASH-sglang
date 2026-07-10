@@ -190,6 +190,11 @@ class DeepseekModelNextN(nn.Module):
             forward_batch.reuse_mtp_topk_indices
             or forward_batch.capture_mtp_topk_indices
         )
+        prev_mtp_topk_indices = (
+            forward_batch.spec_info.mtp_topk_indices
+            if forward_batch.reuse_mtp_topk_indices
+            else None
+        )
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -197,7 +202,7 @@ class DeepseekModelNextN(nn.Module):
                 forward_batch,
                 residual,
                 zero_allocator,
-                prev_topk_indices=forward_batch.topk_indices if forward_batch.reuse_mtp_topk_indices else None,
+                prev_topk_indices=prev_mtp_topk_indices,
             )
 
         if not forward_batch.forward_mode.is_idle():
@@ -242,10 +247,16 @@ class DeepseekModelNextN(nn.Module):
                         torch.cuda.current_stream(),
                     )
 
-        # GLM NOTE: Write back AFTER the optional CP all-gather so forward_batch.topk_indices
-        # is always in the global token coordinate (matching extend_seq_lens).
+        # GLM NOTE: Write back AFTER the optional CP all-gather so the carried
+        # topk is always in the global token coordinate (matching extend_seq_lens).
+        # Reuse across draft steps must live on spec_info because per-step
+        # forwards may run on a copied ForwardBatch. Draft-extend capture still
+        # uses ForwardBatch.topk_indices as a scratch/output buffer.
         if should_update_mtp_topk_indices and topk_indices is not None:
-            forward_batch.topk_indices = topk_indices
+            if forward_batch.reuse_mtp_topk_indices:
+                forward_batch.spec_info.mtp_topk_indices = topk_indices
+            if forward_batch.capture_mtp_topk_indices:
+                forward_batch.topk_indices = topk_indices
 
         if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"

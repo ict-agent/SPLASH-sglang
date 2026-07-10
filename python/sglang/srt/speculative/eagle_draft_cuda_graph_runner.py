@@ -351,14 +351,16 @@ class EAGLEDraftCudaGraphRunner:
             )
             set_is_extend_in_batch(False)
 
-            # Backup two fields, which will be modified in-place in `draft_forward`.
+            # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            mtp_topk_indices_backup = forward_batch.spec_info.mtp_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.mtp_topk_indices = mtp_topk_indices_backup
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -453,6 +455,8 @@ class EAGLEDraftCudaGraphRunner:
         # Replay
         self._replay(forward_batch)
         out = self.output_buffers[bs]
+        if self.enable_mtp_index_share:
+            forward_batch.spec_info.mtp_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
