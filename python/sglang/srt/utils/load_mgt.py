@@ -16,6 +16,10 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.distributed.parallel_state import (
     get_tp_group as get_tensor_model_parallel_group,
 )
+from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
+    get_kda_qkvo_tp_local_rank,
+    get_kda_qkvo_tp_size,
+)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import (
@@ -875,6 +879,24 @@ def _build_kda_attn_sd(ctx, layer_sd):
         shard_size = ctx.attn_tp_size
         shard_rank = ctx.attn_tp_rank
 
+    # qkv_proj and o_proj can additionally be sharded across a KDA sub-TP
+    # group (independently of head-shard), matching the runtime tp_rank/tp_size
+    # set in Glm5NextLinearAttention under enable_glm_kda_qkvo_proj_tp_shard.
+    # The qkv-shard path requires the unfused qkvbfg pipeline (asserted in the
+    # model __init__).
+    server_args = get_global_server_args()
+    use_kda_qkvo_proj_tp_shard = server_args.enable_glm_kda_qkvo_proj_tp_shard
+    if use_kda_qkvo_proj_tp_shard:
+        qkvo_shard_size = get_kda_qkvo_tp_size()
+        qkvo_shard_rank = get_kda_qkvo_tp_local_rank()
+    else:
+        qkvo_shard_size = shard_size
+        qkvo_shard_rank = shard_rank
+
+    # Sub-fusion (fused_bfg_a_proj + fused_fg_b_proj) replaces b/f_a/g_a/f_b/g_b
+    # in the model — when active, emit the merged param names instead.
+    do_fuse_bfg = use_kda_qkvo_proj_tp_shard
+
     qkv_conv_weights = []
     for k in "qkv":
         conv_weight = ctx.merge(
@@ -913,13 +935,19 @@ def _build_kda_attn_sd(ctx, layer_sd):
         layer_sd["self_attn.fused_fg_b_proj.weight"] = torch.stack([f_b, g_b], dim=0)
 
         layer_sd["self_attn.o_proj.weight"] = ctx.merge(
-            "o_proj", target_tp=shard_size, current_tp=shard_rank, slice_dim=1
+            "o_proj",
+            target_tp=qkvo_shard_size,
+            current_tp=qkvo_shard_rank,
+            slice_dim=1,
         )
     else:
         qkv_proj_weights = []
         for k in "qkv":
             proj_weight = ctx.merge(
-                f"{k}_proj", target_tp=shard_size, current_tp=shard_rank, slice_dim=0
+                f"{k}_proj",
+                target_tp=qkvo_shard_size,
+                current_tp=qkvo_shard_rank,
+                slice_dim=0,
             )
             if hasattr(layer.self_attn, "qkv_proj"):
                 qkv_proj_weights.append(proj_weight)
@@ -928,12 +956,59 @@ def _build_kda_attn_sd(ctx, layer_sd):
         if qkv_proj_weights:
             layer_sd["self_attn.qkv_proj.weight"] = torch.cat(qkv_proj_weights, dim=0)
         for k in "g_a g_b f_a f_b b o".split():
-            replicated = k in ("f_a", "g_a")
+            # When sub-fusion is active, b/f_a/g_a/f_b/g_b are absorbed into
+            # fused_bfg_a_proj + fused_fg_b_proj below; skip emitting the
+            # per-proj names.
+            if do_fuse_bfg and k != "o":
+                continue
+            if k == "o":
+                key_target_tp, key_current_tp = qkvo_shard_size, qkvo_shard_rank
+            elif k in ("f_a", "g_a"):
+                key_target_tp, key_current_tp = 1, 0
+            else:
+                key_target_tp, key_current_tp = shard_size, shard_rank
             layer_sd[f"self_attn.{k}_proj.weight"] = ctx.merge(
                 f"{k}_proj",
-                target_tp=1 if replicated else shard_size,
-                current_tp=0 if replicated else shard_rank,
+                target_tp=key_target_tp,
+                current_tp=key_current_tp,
                 slice_dim=1 if k == "o" else 0,
+            )
+
+        if do_fuse_bfg:
+            # Order must match Glm5NextForCausalLM._STACKED_PARAMS_MAPPING for
+            # fused_bfg_a_proj: b (column, head-shard), then f_a, g_a
+            # (replicated). Under enable_glm_kda_qkvo_proj_tp_shard, head-shard
+            # collapses to 1, so b is effectively replicated too — but we keep
+            # the head-shard targets so the code stays correct if that ever
+            # changes.
+            b_part = ctx.merge(
+                "b_proj", target_tp=shard_size, current_tp=shard_rank, slice_dim=0
+            )
+            fa_part = ctx.merge(
+                "f_a_proj", target_tp=1, current_tp=0, slice_dim=0
+            )
+            ga_part = ctx.merge(
+                "g_a_proj", target_tp=1, current_tp=0, slice_dim=0
+            )
+            layer_sd["self_attn.fused_bfg_a_proj.weight"] = torch.cat(
+                [b_part, fa_part, ga_part], dim=0
+            )
+
+            # fused_fg_b_proj: stack(f_b, g_b) along batch dim 0.
+            f_b = ctx.merge(
+                "f_b_proj",
+                target_tp=shard_size,
+                current_tp=shard_rank,
+                slice_dim=0,
+            )
+            g_b = ctx.merge(
+                "g_b_proj",
+                target_tp=shard_size,
+                current_tp=shard_rank,
+                slice_dim=0,
+            )
+            layer_sd["self_attn.fused_fg_b_proj.weight"] = torch.stack(
+                [f_b, g_b], dim=0
             )
 
     layer_sd["self_attn.A_log"] = ctx.read("A_log").view(1, 1, -1, 1)

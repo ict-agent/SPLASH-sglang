@@ -3,6 +3,10 @@ from sglang.srt.distributed.device_communicators.triton_communicator.all_gather 
     all_gather_rerange,
     all_gather_rerange_supported,
 )
+from sglang.srt.distributed.device_communicators.triton_communicator.alltoall import (
+    alltoall_head_to_token,
+    alltoall_token_to_head,
+)
 from sglang.srt.distributed.device_communicators.triton_communicator.reduce_scatter import (
     reduce_scatter,
 )
@@ -18,6 +22,8 @@ __all__ = [
     "all_gather",
     "all_gather_rerange",
     "all_gather_rerange_supported",
+    "alltoall_head_to_token",
+    "alltoall_token_to_head",
     "create_state",
     "fits_comm_buffer",
     "get_even_token_distribution",

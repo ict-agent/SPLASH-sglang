@@ -1493,6 +1493,26 @@ get_tensor_model_parallel_group = get_tp_group
 _PP: Optional[GroupCoordinator] = None
 
 
+# ---------------------------------------------------------------------------
+# Symmetric-memory group: a contiguous slice of the global tp_group used as
+# the rendezvous group for symm-mem (multimem) collectives. Today it carries
+# the GLM5-Next KDA qkv_proj / o_proj head-shard collectives (AG / A2A / RS);
+# the name is generic because future symm-mem-eligible features can ride on
+# the same group. Distinct from _TP only when the chosen subgroup size is
+# smaller than tp_size (multi-node deployments where multimem must stay
+# node-local). Lives here so the lifecycle is uniform with _MOE_TP / _PP.
+# ---------------------------------------------------------------------------
+
+_SYMMETRIC_GROUP: Optional[GroupCoordinator] = None
+# Cap the symmetric-memory group at one node (8 ranks) — multimem rendezvous
+# is node-local. Smaller worlds collapse to the full tp_group.
+_SYMMETRIC_GROUP_NODE_CAP = 8
+
+def get_symmetric_group() -> GroupCoordinator:
+    assert _SYMMETRIC_GROUP is not None, "symmetric-memory group is not initialized"
+    return _SYMMETRIC_GROUP
+
+
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
@@ -1715,6 +1735,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    enable_symmetric_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1978,6 +1999,47 @@ def initialize_model_parallel(
         group_name="pp",
     )
 
+    # Build the symmetric-memory group (today's consumer: GLM5-Next KDA qkv/o
+    # head-shard). Kept as a subgroup of _TP so all ranks in it are at the same
+    # layer, and capped at _SYMMETRIC_GROUP_NODE_CAP because multimem rendezvous
+    # is node-local.
+    global _SYMMETRIC_GROUP
+    assert _SYMMETRIC_GROUP is None, "symmetric-memory group is already initialized"
+    if enable_symmetric_group:
+        tp_size = tensor_model_parallel_size
+        sym_group_size = min(tp_size, _SYMMETRIC_GROUP_NODE_CAP)
+        if sym_group_size <= 1:
+            pass  # trivial subgroup — leave _SYMMETRIC_GROUP as None
+        elif _TP is not None and tp_size == sym_group_size:
+            # Subgroup covers the entire tp_group — reuse _TP, no new ProcessGroup.
+            _SYMMETRIC_GROUP = _TP
+            logger.info(
+                "initialize_model_parallel: aliasing _TP as _SYMMETRIC_GROUP "
+                "(sym_group_size=%d)",
+                sym_group_size,
+            )
+        else:
+            assert tp_size % sym_group_size == 0, (
+                f"tp_size={tp_size} not divisible by sym_group_size={sym_group_size}"
+            )
+            subgroups_per_tp = tp_size // sym_group_size
+            group_ranks = []
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                tp_base = tp_group_idx * tp_size
+                for sub_idx in range(subgroups_per_tp):
+                    st = tp_base + sub_idx * sym_group_size
+                    group_ranks.append(list(range(st, st + sym_group_size)))
+            _SYMMETRIC_GROUP = init_model_parallel_group(
+                group_ranks=group_ranks,
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                use_pynccl=False,
+                use_mscclpp_allreduce=False,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="symmetric_group",
+            )
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2200,6 +2262,11 @@ def destroy_model_parallel():
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
+
+    global _SYMMETRIC_GROUP
+    if _SYMMETRIC_GROUP:
+        _SYMMETRIC_GROUP.destroy()
+    _SYMMETRIC_GROUP = None
 
     global _ATTN_CP
     if _ATTN_CP:

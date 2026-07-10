@@ -2820,6 +2820,12 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        # KDA qkv-o proj tp-shard (Glm5NextForCausalLM only, gated in ServerArgs)
+        # relies on cross-DP equal-length AllGather / AllToAll / ReduceScatter,
+        # which only the mlp_tp_gather=True contract provides (scheduler pads
+        # global_num_tokens to max across all DPs).
+        if server_args.enable_glm_kda_qkvo_proj_tp_shard:
+            return True
         if (
             server_args.moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers

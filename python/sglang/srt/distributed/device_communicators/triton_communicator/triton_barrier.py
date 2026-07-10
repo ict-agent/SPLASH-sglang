@@ -168,3 +168,37 @@ def symm_mem_barrier(
     local_signal = tl.load(signal_ptrs + rank).to(tl.pointer_type(tl.uint32))
     send_signal_to_peers(signal_ptrs, block_id, rank, world_size)
     wait_signal_from_peers(local_signal, block_id, world_size)
+
+
+@triton.jit
+def gdc_wait():
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def sync_kernel(
+    symm_mem_signal_pad_ptrs,
+    USE_GDC: tl.constexpr,
+    rank: tl.constexpr,
+    world_size: tl.constexpr,
+):
+    """One post-copy barrier for a symm-mem AllToAll.
+
+    The copy kernel runs first on the same stream. This tiny kernel cannot
+    start until all local remote stores have completed. The cross-rank
+    signal/wait then ensures every rank's copy kernel is done before later
+    kernels consume the local symmetric-memory output.
+    """
+    if USE_GDC:
+        gdc_wait()
+
+    blockwise_barrier(
+        symm_mem_signal_pad_ptrs, None, rank, world_size, sem="acq_rel"
+    )

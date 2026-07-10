@@ -634,6 +634,13 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
+    # GLM5-Next:lightweight KDA-TP that ONLY shards qkv_proj across
+    # the full tp_group. AllGather hidden (A) + qkv_proj + AllToAll head→token
+    # (B) bridge the layout at the qkv GEMM boundary; o_proj keeps the
+    # per-DP (attn_tp) sharding so the post-attn path is unchanged. Intended
+    # for the D-node of PD disaggregation: requires `--disaggregation-mode=decode`
+    # and DP attention.
+    enable_glm_kda_qkvo_proj_tp_shard: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
@@ -2773,6 +2780,66 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+        if self.enable_glm_kda_qkvo_proj_tp_shard:
+            # This flag is a GLM5-Next-specific optimization.
+            glm5_next_arches = {
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
+            }
+            model_arch = self.get_model_config().hf_config.architectures[0]
+            if model_arch not in glm5_next_arches:
+                logger.warning(
+                    "--enable-glm-kda-qkvo-proj-tp-shard is a GLM5-Next-only "
+                    "optimization; disabling it for model_arch=%s.",
+                    model_arch,
+                )
+                self.enable_glm_kda_qkvo_proj_tp_shard = False
+
+        if self.enable_glm_kda_qkvo_proj_tp_shard:
+            assert self.enable_dp_attention, (
+                "--enable-glm-kda-qkvo-proj-tp-shard requires --enable-dp-attention "
+                "(shards qkv_proj across the full tp_group while keeping per-DP "
+                "mamba state and per-DP o_proj)."
+            )
+            assert self.disaggregation_mode == "decode", (
+                "--enable-glm-kda-qkvo-proj-tp-shard is only valid on the D-node of "
+                "PD disaggregation (requires --disaggregation-mode=decode). "
+                "On the P-node the KDA layer goes through the CP path and "
+                "this flag is bypassed."
+            )
+            # KDA-TP requires attention_tp_size == 1: the intermediate ops
+            # (f_b / g_b / b_proj / conv1d / kda / o_norm) keep full heads per
+            # rank under that assumption, and the AG/AlltoAll bridges around
+            # qkv_proj and o_proj are wired against the full TP group, not the
+            # per-DP attention-TP group. With DP attention enabled this is
+            # equivalent to tp_size == dp_size.
+            assert self.tp_size == self.dp_size, (
+                "--enable-glm-kda-qkvo-proj-tp-shard "
+                f"requires attention_tp_size == 1, i.e. tp_size == dp_size; "
+                f"got tp_size={self.tp_size}, dp_size={self.dp_size}."
+            )
+            if not envs.SGLANG_ENABLE_TRITON_MULTIMEM.get():
+                logger.warning(
+                    "--enable-glm-kda-qkvo-proj-tp-shard requires the triton "
+                    "multimem fast path; forcing SGLANG_ENABLE_TRITON_MULTIMEM=1."
+                )
+                envs.SGLANG_ENABLE_TRITON_MULTIMEM.set(True)
+            if envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.get():
+                # The fused qkvbfg path packs qkv with f_a / g_a / b_proj at
+                # different desired shard granularities, so the unfused path
+                # is required under this flag.
+                logger.warning(
+                    "--enable-glm-kda-qkvo-proj-tp-shard requires the unfused "
+                    "qkvbfg path; forcing SGLANG_GLM5_NEXT_FUSE_QKVBFG=0."
+                )
+                envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.set(False)
+            if self.disable_cuda_graph:
+                logger.warning(
+                    "--enable-glm-kda-qkvo-proj-tp-shard is currently only "
+                    "supported with cuda graph; forcing disable_cuda_graph=False."
+                )
+                self.disable_cuda_graph = False
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -5591,6 +5658,16 @@ class ServerArgs:
             "--enable-dp-lm-head",
             action="store_true",
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--enable-glm-kda-qkvo-proj-tp-shard",
+            action="store_true",
+            help="GLM5-Next only (PD disaggregation D-node): lightweight KDA-TP that "
+            "shards both qkv_proj and o_proj weights to the full tp_group; mamba pool, "
+            "conv1d, fused_recurrent_kda, o_norm all stay per-DP (zero change). Layout "
+            "is bridged with AllGather + AllToAll (head→token) around the qkv GEMM and "
+            "AllToAll (token→head) + ReduceScatter around o_proj. "
+            "Requires --disaggregation-mode=decode and --enable-dp-attention. ",
         )
         parser.add_argument(
             "--enable-two-batch-overlap",

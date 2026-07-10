@@ -1563,6 +1563,13 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             quant_config=quant_config,
             prefix=prefix,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        assert isinstance(self.quant_method, UnquantizedLinearMethod), (
+            f"{type(self).__name__} does not support quantization "
+            f"(prefix={prefix!r}, got quant_method="
+            f"{type(self.quant_method).__name__}); "
+            f"pass quant_config=None or exclude this prefix from the quant config."
+        )
         self.num_column_parallel = len(column_output_sizes)
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()

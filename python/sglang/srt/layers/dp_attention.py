@@ -43,6 +43,7 @@ _ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_SIZE: Optional[int] = None
 _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
+_ENABLE_GLM_KDA_QKVO_PROJ_TP_SHARD_FLAG: bool = False
 
 _TRITON_MULTIMEM_STATE = None
 
@@ -246,10 +247,17 @@ def initialize_triton_multimem_comm():
         create_state,
     )
 
-    # Rendezvous on the group the multimem collectives actually run over: the
-    # attention CP group when CP is active (>1), else the attention TP group.
-    cp_group = get_attention_cp_group()
-    group = cp_group if cp_group.world_size > 1 else get_attention_tp_group()
+    # Rendezvous on the group the multimem collectives actually run over:
+    #   * symmetric-memory group when KDA qkvo-tp shard is enabled (D-node only);
+    if _ENABLE_GLM_KDA_QKVO_PROJ_TP_SHARD_FLAG:
+        from sglang.srt.distributed.parallel_state import get_symmetric_group
+
+        group = get_symmetric_group()
+    else:
+        # Rendezvous on the group the multimem collectives actually run over: the
+        # attention CP group when CP is active (>1), else the attention TP group.
+        cp_group = get_attention_cp_group()
+        group = cp_group if cp_group.world_size > 1 else get_attention_tp_group()
 
     # Multimem rides NVLink multicast, which only spans a single node.
     from sglang.srt.server_args import get_global_server_args
@@ -327,12 +335,16 @@ def initialize_dp_attention(
 ):
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
+    global _ENABLE_GLM_KDA_QKVO_PROJ_TP_SHARD_FLAG
     enable_dp_attention = server_args.enable_dp_attention
     dp_size = server_args.dp_size
     moe_dense_tp_size = server_args.moe_dense_tp_size
     attn_cp_size = server_args.attn_cp_size
 
     _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    _ENABLE_GLM_KDA_QKVO_PROJ_TP_SHARD_FLAG = (
+        server_args.enable_glm_kda_qkvo_proj_tp_shard
+    )
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
@@ -365,6 +377,18 @@ def initialize_dp_attention(
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
+
+
+def is_glm_kda_qkvo_proj_tp_shard_enabled() -> bool:
+    """Whether GLM5-Next KDA layers should run with qkv_proj and o_proj
+    sharded on the full tp_group (D-node only).
+
+    This is the lightweight KDA-TP that shards both qkv_proj and o_proj
+    weights to the full tp_group. Mamba pool, conv1d, fused_recurrent_kda and
+    o_norm all stay per-DP. Only valid on the D-node of PD disaggregation
+    (gated on ``--disaggregation-mode=decode`` at initialization time).
+    """
+    return _ENABLE_GLM_KDA_QKVO_PROJ_TP_SHARD_FLAG
 
 
 def is_allocation_symmetric() -> bool:

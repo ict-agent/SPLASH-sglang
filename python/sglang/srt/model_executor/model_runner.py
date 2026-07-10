@@ -970,6 +970,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_symmetric_group=self.server_args.enable_glm_kda_qkvo_proj_tp_shard,
             )
             initialize_dp_attention(
                 server_args=self.server_args,

@@ -25,6 +25,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
 )
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
@@ -65,6 +66,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+    is_glm_kda_qkvo_proj_tp_shard_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -118,7 +120,10 @@ from sglang.srt.utils.common import (
     make_layers,
     set_weight_attrs,
 )
-
+from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
+    get_kda_qkvo_tp_local_rank,
+    get_kda_qkvo_tp_size,
+)
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
@@ -141,9 +146,18 @@ class Glm5NextLinearAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
         reduce_results: bool = False,
+        alt_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ) -> None:
         super().__init__()
+        # KDA-TP (D-node only): a lightweight variant
+        # of TP that ONLY shards qkv_proj across the full tp_group. o_proj
+        # and everything else (mamba pool, conv1d, fused_recurrent_kda,
+        # o_norm, b_proj/f_b_proj/g_b_proj/dt_bias/A_log) stays per-DP with
+        # full heads — zero change. Layout is bridged with AllGather +
+        # AllToAll(head→token) around the qkv GEMM (see
+        # Glm5NextLinearAttention.forward).
+        self.use_kda_qkvo_proj_tp_shard = is_glm_kda_qkvo_proj_tp_shard_enabled()
         if is_nsa_enable_prefill_cp():
             head_shard_size = get_attention_cp_size()
             head_shard_rank = get_attention_cp_rank()
@@ -152,6 +166,17 @@ class Glm5NextLinearAttention(nn.Module):
             head_shard_size = get_attention_tp_size()
             head_shard_rank = get_attention_tp_rank()
             _head_shard_rank_getter = get_attention_tp_rank
+
+        # When enabled, shard qkv_proj and o_proj on the KDA sub-TP group
+        # while keeping the intermediate projections (b_proj / f_b_proj /
+        # g_b_proj / qkv_conv1d / dt_bias / A_log) on the attention_tp group
+        # (== 1 under DP), so kernels still see full heads per rank.
+        if self.use_kda_qkvo_proj_tp_shard:
+            qkvo_tp_size = get_kda_qkvo_tp_size()
+            qkvo_tp_rank = get_kda_qkvo_tp_local_rank()
+        else:
+            qkvo_tp_size = head_shard_size
+            qkvo_tp_rank = head_shard_rank
 
         self.hidden_size = hidden_size
         self.config = config
@@ -205,7 +230,13 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
             )
+            # Sub-fusion is mutually exclusive with full qkvbfg fusion.
+            self.fuse_bfg = False
         else:
+            # Only shard qkv_proj on the full tp_group; everything
+            # else below keeps the per-DP (head_shard_*) sharding so the
+            # intermediate ops (f_b / g_b / b_proj / conv1d / kda / o_norm)
+            # see full heads on each rank and need ZERO change.
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -213,55 +244,91 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
+                tp_rank=qkvo_tp_rank,
+                tp_size=qkvo_tp_size,
                 prefix=f"{prefix}.qkv_proj",
             )
 
-            self.f_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_a_proj",
-            )
+            # Sub-fusion: collapse the 5 small "gate-and-beta" GEMMs
+            # (b / f_a / g_a / f_b / g_b) into 2 GEMMs. Only meaningful
+            # under enable_glm_kda_qkvo_proj_tp_shard — that path forces
+            # head_shard_size == 1, so b / f_a / g_a / f_b / g_b are all
+            # replicated and merging is purely a launch-overhead win.
+            self.fuse_bfg = self.use_kda_qkvo_proj_tp_shard
+            if self.fuse_bfg:
+                # Stage A: [b | f_a | g_a] on local_hidden, h -> num_heads + 2*head_dim.
+                # b is "column" (sharded by head_shard_size, == 1 here);
+                # f_a, g_a are "repeated" (replicated regardless of tp_size).
+                self.fused_bfg_a_proj = MergedColumnParallelRepeatedLinear(
+                    input_size=self.hidden_size,
+                    column_output_sizes=[self.num_heads],
+                    repeated_output_sizes=[self.head_dim, self.head_dim],
+                    quant_config=quant_config,
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                    prefix=f"{prefix}.fused_bfg_a_proj",
+                )
+                # split sizes for the (n, num_heads/shard + 2*head_dim) output:
+                # [beta, f_a||g_a]. f_a||g_a is kept as one slice so we can
+                # reshape (n, 2*head_dim) -> (n, 2, head_dim) -> (2, n, head_dim)
+                # for the batched bmm below — same pattern as forward_qkvbfg_fused.
+                self.bfg_split_sizes = [
+                    self.num_heads // head_shard_size,
+                    2 * self.head_dim,
+                ]
+                # Stage B: [f_b ; g_b] as one batched GEMM, head_dim -> projection_size.
+                self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                    2,
+                    self.head_dim,
+                    projection_size,
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
+            else:
+                self.f_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_a_proj",
+                )
 
-            self.f_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.f_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
-            self.b_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.b_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_heads,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
-            self.g_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.g_a_proj",
-            )
-            self.g_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.g_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.g_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.g_a_proj",
+                )
+                self.g_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.g_b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
@@ -310,8 +377,8 @@ class Glm5NextLinearAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=reduce_results,
-            tp_rank=head_shard_rank,
-            tp_size=head_shard_size,
+            tp_rank=qkvo_tp_rank,
+            tp_size=qkvo_tp_size,
         )
 
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
@@ -341,6 +408,8 @@ class Glm5NextLinearAttention(nn.Module):
 
         self._cp_fuse_symm_mem = envs.SGLANG_NSA_CP_FUSE_SYMM_MEM.get()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+
+        self.alt_stream = alt_stream
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         cp_prefill = nsa_use_prefill_cp(forward_batch)
@@ -407,6 +476,69 @@ class Glm5NextLinearAttention(nn.Module):
         )
         return qkv, beta, forget_gate, g_proj_states
 
+    def forward_qkvbfg_kda_qkvo_tp_shard(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        # (A) AllGather hidden_states on the FULL tp_group:
+        #         (n_local, h)  →  (n_global, h)
+        # We only feed this gathered hidden to qkv_proj. f_a/g_a/b_proj remain
+        # on the local (n_local, h) hidden because their outputs are consumed
+        # by the per-rank (full-head) intermediate kernels.
+        from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
+            assert_kda_qkvo_tp_padding,
+            kda_qkvo_tp_all_gather_hidden_sym,
+            kda_qkvo_tp_alltoall_head_to_token_sym,
+        )
+
+        assert_kda_qkvo_tp_padding(forward_batch)
+        local_hidden = hidden_states
+
+        def _compute_mixed_qkv():
+            # The "qkv-side" path: (A) AllGather + qkv_proj + (B) AllToAll.
+            # Each *_sym wrapper tries symm-mem multimem first and falls
+            # back to NCCL on a miss.
+            g_hidden = kda_qkvo_tp_all_gather_hidden_sym(
+                local_hidden, forward_batch
+            )
+            qkv_shard = self.qkv_proj(g_hidden)[0]
+            return kda_qkvo_tp_alltoall_head_to_token_sym(qkv_shard)
+
+        def _compute_gate_and_beta():
+            # Small GEMMs on local_hidden — independent of qkv-side.
+            # Outputs are the non-qkv inputs to the KDA kernel:
+            # forget_gate (f), g_proj_states (g), beta (b).
+            if self.fuse_bfg:
+                # 2-GEMM path: (b||f_a||g_a) then batched (f_b ; g_b).
+                fused_a = self.fused_bfg_a_proj(local_hidden)
+                be, fg_a_states = torch.split(
+                    fused_a, self.bfg_split_sizes, dim=-1
+                )
+                fg, gp = self.fused_fg_b_proj(
+                    fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+                )
+            else:
+                # 5-GEMM unfused path.
+                fa = self.f_a_proj(local_hidden)[0]
+                ga = self.g_a_proj(local_hidden)[0]
+                be = self.b_proj(local_hidden)[0]
+                fg = self.f_b_proj(fa)[0]
+                gp = self.g_b_proj(ga)[0]
+            return be, fg, gp
+
+        if self.alt_stream is not None:
+            main_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(main_stream)
+            mixed_qkv = _compute_mixed_qkv()
+            with torch.cuda.stream(self.alt_stream):
+                beta, forget_gate, g_proj_states = _compute_gate_and_beta()
+            main_stream.wait_stream(self.alt_stream)
+        else:
+            # Serialized fallback: qkv-side then gate-and-beta on the main stream.
+            mixed_qkv = _compute_mixed_qkv()
+            beta, forget_gate, g_proj_states = _compute_gate_and_beta()
+
+        return mixed_qkv, beta, forget_gate, g_proj_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -415,10 +547,18 @@ class Glm5NextLinearAttention(nn.Module):
         zero_allocator: BumpAllocator,
         **kwargs,
     ) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
+        # the AG/AllToAll/RS pairs on the full tp_group must run on
+        # every rank, so idle ranks cannot return early — peers that are
+        # EXTEND/DECODE proceed into the KDA backend and would deadlock on the
+        # collectives otherwise.
+        if forward_batch.forward_mode.is_idle() and not self.use_kda_qkvo_proj_tp_shard:
             return hidden_states
 
-        if self.do_fuse_qkvbfg:
+        if self.use_kda_qkvo_proj_tp_shard:
+            mixed_qkv, beta, forget_gate, g_proj_states = (
+                self.forward_qkvbfg_kda_qkvo_tp_shard(hidden_states, forward_batch)
+            )
+        elif self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states, forward_batch
             )
@@ -461,6 +601,25 @@ class Glm5NextLinearAttention(nn.Module):
                 scatter_dim=0,
                 group_name=get_attention_cp_group().device_group.group_name,
             )
+
+        if self.use_kda_qkvo_proj_tp_shard:
+            from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
+                assert_kda_qkvo_tp_padding,
+                kda_qkvo_tp_alltoall_token_to_head_sym,
+                kda_qkvo_tp_reduce_scatter_hidden_sym,
+            )
+
+            # AG token→head and RS hidden both assume every rank carries the
+            # same padded n_local (n_global = tp * n_local). dp_padding_mode
+            # != MAX_LEN would silently scatter mis-sized chunks into the
+            # local DP buffer.
+            assert_kda_qkvo_tp_padding(forward_batch)
+            core_attn_global_shard = kda_qkvo_tp_alltoall_token_to_head_sym(
+                core_attn_out
+            )
+            core_attn_global_shard = self.o_proj(core_attn_global_shard)[0]
+            return kda_qkvo_tp_reduce_scatter_hidden_sym(core_attn_global_shard)
+
         output = self.o_proj(core_attn_out)[0]
         if cp_prefill:
             output = cp_plain_reduce_scatter(output, get_attention_cp_size())
@@ -514,6 +673,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 rms_norm_eps=rms_norm_eps,
                 reduce_results=False,
+                alt_stream=alt_stream,
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
@@ -1114,6 +1274,13 @@ class Glm5NextForCausalLM(nn.Module):
         # Fused KDA "b" projections (used when do_fuse_qkvbfg=True).
         ("fused_fg_b_proj", "f_b_proj", 0),
         ("fused_fg_b_proj", "g_b_proj", 1),
+        # Sub-fused KDA "a" projections (used under enable_glm_kda_qkvo_proj_tp_shard).
+        # Only covers b/f_a/g_a here — qkv stays on the separate sharded qkv_proj.
+        # The loader falls through to the unfused b/f_a/g_a params when
+        # fused_bfg_a_proj is absent.
+        ("fused_bfg_a_proj", "b_proj", 0),
+        ("fused_bfg_a_proj", "f_a_proj", 1),
+        ("fused_bfg_a_proj", "g_a_proj", 2),
         ("qkv_proj", "q_proj", "q"),
         ("qkv_proj", "k_proj", "k"),
         ("qkv_proj", "v_proj", "v"),
@@ -1138,6 +1305,7 @@ class Glm5NextForCausalLM(nn.Module):
             "g_a_proj",
         ],
         "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+        "fused_bfg_a_proj": ["b_proj", "f_a_proj", "g_a_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
         "gate_up_proj": ["gate_proj", "up_proj"],
