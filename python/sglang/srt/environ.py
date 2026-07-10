@@ -543,6 +543,7 @@ class Envs:
     # GLM
     GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
     SGLANG_GLM5_NEXT_FUSE_QKVBFG = EnvBool(True)
+    GLM_USE_DISAGG_ASYNC_HEARTBEAT = EnvBool(True)
 
     # MHC (multi hyper-connection) operator backend selection (covers both
     # mhc_pre and mhc_post).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import ctypes
 import dataclasses
@@ -11,6 +12,7 @@ import time
 from collections import defaultdict
 from typing import List, Optional, Tuple
 
+import aiohttp
 import numpy as np
 import numpy.typing as npt
 import zmq
@@ -1967,8 +1969,70 @@ class MooncakeKVManager(CommonKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
+        async def _heartbeat_check_one(
+            session: aiohttp.ClientSession, bootstrap_addr: str
+        ):
+            ok = False
+            try:
+                async with session.get(
+                    f"http://{bootstrap_addr}/health",
+                    headers={"Connection": "keep-alive"},
+                ) as response:
+                    ok = response.status == 200
+            except Exception:
+                ok = False
+
+            if ok:
+                self.heartbeat_failures[bootstrap_addr] = 0
+                current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
+                for bootstrap_room in current_rooms:
+                    # Remove KVPoll.Success requests from the tracker
+                    if bootstrap_room not in self.request_status:
+                        self.addr_to_rooms_tracker[bootstrap_addr].discard(
+                            bootstrap_room
+                        )
+            else:
+                logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                self.heartbeat_failures[bootstrap_addr] = (
+                    self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                )
+
+            if (
+                self.heartbeat_failures.get(bootstrap_addr, 0)
+                >= self.max_failures
+            ):
+                self._handle_node_failure(bootstrap_addr)
+
+        async def heartbeat_checker_async():
+            timeout = aiohttp.ClientTimeout(sock_connect=2, total=3)
+            connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+            async with aiohttp.ClientSession(
+                timeout=timeout, connector=connector
+            ) as session:
+                while True:
+                    await asyncio.sleep(self.heartbeat_interval)
+                    with self.connection_lock:
+                        addresses = list(self.prefill_info_table.keys())
+                    if not addresses:
+                        continue
+                    await asyncio.gather(
+                        *(
+                            _heartbeat_check_one(session, addr)
+                            for addr in addresses
+                        ),
+                        return_exceptions=True,
+                    )
+
+        def heartbeat_checker_async_runner():
+            asyncio.run(heartbeat_checker_async())
+
+        use_async_heartbeat = envs.GLM_USE_DISAGG_ASYNC_HEARTBEAT.get()
+
         threading.Thread(target=decode_thread).start()
-        threading.Thread(target=heartbeat_checker).start()
+        if use_async_heartbeat:
+            threading.Thread(target=heartbeat_checker_async_runner).start()
+        else:
+            threading.Thread(target=heartbeat_checker).start()
 
     def add_transfer_request(
         self,
