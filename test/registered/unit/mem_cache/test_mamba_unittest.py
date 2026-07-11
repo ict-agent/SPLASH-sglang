@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -15,7 +16,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    MambaPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -34,6 +39,146 @@ class TestMamba(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_mamba_cow_waits_for_last_layer_before_copy(self):
+        actions = []
+
+        class RecordingCounter:
+            consumer_index = 1
+
+            def wait_until(self, threshold):
+                actions.append(("wait", threshold))
+
+        class RecordingMambaPool:
+            def copy_from(self, src_index, dst_index):
+                actions.append(("copy", src_index, dst_index))
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_map = {2: 0, 4: 1, 7: 2}
+        pool.start_layer = 2
+        pool.layer_transfer_counter = RecordingCounter()
+        pool.mamba_pool = RecordingMambaPool()
+        src = torch.tensor([1])
+        dst = torch.tensor([2])
+
+        pool.copy_mamba_state(src, dst)
+
+        self.assertEqual(actions[0], ("wait", 5))
+        self.assertEqual(actions[1][0], "copy")
+        self.assertIs(actions[1][1], src)
+        self.assertIs(actions[1][2], dst)
+
+    def test_mamba_cow_without_hicache_consumer_does_not_wait(self):
+        actions = []
+
+        class RecordingCounter:
+            consumer_index = -1
+
+            def wait_until(self, threshold):
+                actions.append(("wait", threshold))
+
+        class RecordingMambaPool:
+            def copy_from(self, src_index, dst_index):
+                actions.append("copy")
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_map = {0: 0}
+        pool.start_layer = 0
+        pool.mamba_pool = RecordingMambaPool()
+
+        for counter in (None, RecordingCounter()):
+            with self.subTest(counter=counter):
+                actions.clear()
+                pool.layer_transfer_counter = counter
+                pool.copy_mamba_state(torch.tensor([1]), torch.tensor([2]))
+                self.assertEqual(actions, ["copy"])
+
+    def test_empty_mamba_cow_does_not_wait_or_copy(self):
+        actions = []
+
+        class RecordingCounter:
+            consumer_index = 0
+
+            def wait_until(self, threshold):
+                actions.append("wait")
+
+        class RecordingMambaPool:
+            def copy_from(self, src_index, dst_index):
+                actions.append("copy")
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_map = {0: 0}
+        pool.start_layer = 0
+        pool.layer_transfer_counter = RecordingCounter()
+        pool.mamba_pool = RecordingMambaPool()
+
+        empty = torch.empty(0, dtype=torch.int64)
+        pool.copy_mamba_state(empty, empty)
+
+        self.assertEqual(actions, [])
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "An NVIDIA GPU is required for the dual-stream COW regression test.",
+    )
+    def test_mamba_cow_waits_for_h2d_event_on_forward_stream(self):
+        device = torch.device("cuda")
+        src = torch.tensor([1], dtype=torch.int64, device=device)
+        dst = torch.tensor([2], dtype=torch.int64, device=device)
+
+        mamba_pool = object.__new__(MambaPool)
+        mamba_pool.mamba_cache = MambaPool.State(
+            conv=[
+                torch.zeros((2, 3, 2, 3), device=device),
+                torch.zeros((2, 3, 4, 2), device=device),
+            ],
+            temporal=torch.zeros((2, 3, 2, 2, 2), device=device),
+        )
+        mamba_pool.mamba_cache.temporal[:, dst] = -1
+        for conv in mamba_pool.mamba_cache.conv:
+            conv[:, dst] = -1
+        initialized = torch.cuda.Event()
+        initialized.record()
+
+        conv_host = [
+            torch.full(conv[:, 1].shape, value, pin_memory=True)
+            for value, conv in enumerate(mamba_pool.mamba_cache.conv, start=11)
+        ]
+        temporal_host = torch.full(
+            mamba_pool.mamba_cache.temporal[:, 1].shape, 23, pin_memory=True
+        )
+
+        counter = LayerDoneCounter(num_layers=3)
+        counter.set_consumer(0)
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_map = {0: 0, 2: 1}
+        pool.start_layer = 0
+        pool.layer_transfer_counter = counter
+        pool.mamba_pool = mamba_pool
+
+        load_stream = torch.cuda.Stream()
+        forward_stream = torch.cuda.Stream()
+        with torch.cuda.stream(load_stream):
+            load_stream.wait_event(initialized)
+            torch.cuda._sleep(50_000_000)
+            for host, conv in zip(conv_host, mamba_pool.mamba_cache.conv):
+                conv[:, 1].copy_(host, non_blocking=True)
+            mamba_pool.mamba_cache.temporal[:, 1].copy_(
+                temporal_host, non_blocking=True
+            )
+            counter.events[counter.consumer_index].complete(2)
+
+        with torch.cuda.stream(forward_stream):
+            forward_stream.wait_event(initialized)
+            pool.copy_mamba_state(src, dst)
+            cow_done = torch.cuda.Event()
+            cow_done.record()
+
+        torch.cuda.current_stream().wait_event(cow_done)
+
+        for value, conv in enumerate(mamba_pool.mamba_cache.conv, start=11):
+            self.assertTrue(torch.all(conv[:, dst] == value))
+        self.assertTrue(torch.all(mamba_pool.mamba_cache.temporal[:, dst] == 23))
 
     def test_hybrid_linear_kv_pool(self):
         size = 16

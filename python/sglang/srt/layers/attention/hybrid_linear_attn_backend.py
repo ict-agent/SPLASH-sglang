@@ -167,7 +167,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
-            self.req_to_token_pool.mamba_pool.copy_from(
+            self.req_to_token_pool.copy_mamba_state(
                 forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
             )
         forward_batch.mamba_clear_indices = None

@@ -659,6 +659,22 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
+    def copy_mamba_state(
+        self, src_index: torch.Tensor, dst_index: torch.Tensor
+    ) -> None:
+        """Copy all Mamba layers after any active HiCache load is ready."""
+        if src_index.numel() == 0:
+            return
+        if (
+            self.layer_transfer_counter is not None
+            and self.layer_transfer_counter.consumer_index >= 0
+        ):
+            last_mamba_layer = max(self.mamba_map)
+            self.layer_transfer_counter.wait_until(
+                last_mamba_layer - self.start_layer
+            )
+        self.mamba_pool.copy_from(src_index, dst_index)
+
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
