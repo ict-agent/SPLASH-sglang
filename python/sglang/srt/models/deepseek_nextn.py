@@ -197,10 +197,12 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.eh_proj(eh_input)
 
-        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        use_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+        if use_cp:
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
+        should_update_mtp_topk_indices = forward_batch.reuse_mtp_topk_indices
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -214,8 +216,6 @@ class DeepseekModelNextN(nn.Module):
                     else None
                 ),
             )
-            if forward_batch.reuse_mtp_topk_indices:
-                forward_batch.topk_indices = topk_indices
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
@@ -223,7 +223,7 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
 
-            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            if use_cp:
                 # allgather + rerrange
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
@@ -231,6 +231,21 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     torch.cuda.current_stream(),
                 )
+                # The NSA decoder produces CP-local per-token top-k indices.
+                # Restore the global token order before speculative decoding
+                # reuses or captures them as the seed for the next MTP step.
+                if should_update_mtp_topk_indices and topk_indices is not None:
+                    topk_indices = cp_all_gather_rerange_output(
+                        topk_indices,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+
+        # Keep top-k indices in the same global token coordinate system as
+        # hidden_states and extend_seq_lens.
+        if should_update_mtp_topk_indices and topk_indices is not None:
+            forward_batch.topk_indices = topk_indices
 
         if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"

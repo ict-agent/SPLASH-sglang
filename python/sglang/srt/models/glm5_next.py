@@ -465,9 +465,13 @@ class ModelNextLinearAttention(nn.Module):
             )
 
         # For prefill, chunk_kda expects raw gate as [B, T, H, K], while beta is
-        # already sigmoid-activated by the caller. Decode keeps raw gate/beta so
-        # the recurrent kernel can update state in one fused pass.
-        if not forward_batch.forward_mode.is_decode():
+        # already sigmoid-activated by the caller. Decode and target verification
+        # keep raw gate/beta so the recurrent kernel can update state in one
+        # fused pass.
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             beta = self.attn.beta_scale * beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)

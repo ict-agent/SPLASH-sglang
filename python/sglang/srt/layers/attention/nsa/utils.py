@@ -80,8 +80,30 @@ def is_nsa_prefill_cp_round_robin_split():
     )
 
 
+def effective_forward_mode(forward_batch: "ForwardBatch"):
+    """Return the pre-DP-padding forward mode.
+
+    ``ForwardBatch.prepare_mlp_sync_batch`` temporarily rewrites
+    ``forward_mode`` from DECODE/TARGET_VERIFY/DRAFT_EXTEND to EXTEND so the
+    padded MLP sync path can be reused. Code that decides *what algorithm to
+    run* (prefill vs. verify vs. decode kernels, CP scatter/gather, mamba
+    metadata layout, etc.) must consult the ORIGINAL mode, not the remap.
+    Reading raw ``forward_mode`` in those places causes the KDA/NSA kernels to
+    interpret verify tree metadata as chunked prefill and step off the end of
+    ``query_start_loc`` / ``extend_seq_lens``.
+    """
+
+    return getattr(
+        forward_batch, "_original_forward_mode", forward_batch.forward_mode
+    )
+
+
+# Legacy alias kept for existing internal call sites.
+_effective_forward_mode = effective_forward_mode
+
+
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
+    if not _effective_forward_mode(forward_batch).is_context_parallel_extend():
         return False
     cp_size = get_attention_cp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
@@ -178,7 +200,7 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         cur_cp_seq_len != 0
         and cp_size > 1
         and use_nsa
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and _effective_forward_mode(forward_batch).is_context_parallel_extend()
         and is_nsa_enable_prefill_cp()
         and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
     ):
@@ -256,10 +278,16 @@ def nsa_cp_round_robin_split_q_seqs(
 def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
     if nsa_enable_prefill_cp is None:
         nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+    # DP max-length padding temporarily maps decode/target-verify/speculative
+    # modes to EXTEND so they can share the padded MLP synchronization path.
+    # That mapping must not enable prefill CP: its token layout and CP metadata
+    # still describe the original mode, and running the round-robin gather on
+    # the padded speculative tensor can overrun the collective output buffer.
+    effective_forward_mode = _effective_forward_mode(forward_batch)
     if (
         forward_batch.attn_cp_metadata is not None
         and nsa_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
+        and effective_forward_mode.is_context_parallel_extend()
     ):
         return True
     else:

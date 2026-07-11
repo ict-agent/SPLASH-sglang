@@ -69,6 +69,8 @@ from sglang.srt.utils.common import ceil_align
 from sgl_kernel.kvcacheio import dcu_create_chunked_prefix_cache_kv_indices
 
 import logging
+import warnings
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -84,6 +86,8 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_dcu = is_dcu()
+_skip_attn_backend_init_warned = False
+
 
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
@@ -337,6 +341,50 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     topk_indices: Optional[torch.Tensor] = None
     reuse_mtp_topk_indices: Optional[bool] = False
 
+    # Attention planning state. Set by callers that initialize attention
+    # metadata outside ModelRunner.forward, e.g. multi-step draft pre-planning.
+    forward_metadata_ready: bool = False
+    forward_metadata_planned_bs: Optional[int] = None
+    forward_metadata_planned_num_tokens: Optional[int] = None
+    forward_metadata_replan_equivalent: bool = False
+
+    def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
+        self.forward_metadata_ready = True
+        self.forward_metadata_planned_bs = self.batch_size
+        self.forward_metadata_planned_num_tokens = (
+            self.input_ids.shape[0] if self.input_ids is not None else 0
+        )
+        self.forward_metadata_replan_equivalent = replan_equivalent
+
+    def needs_forward_metadata_init(self) -> bool:
+        if not self.forward_metadata_ready:
+            return True
+        if not self.forward_metadata_replan_equivalent:
+            return False
+        num_tokens = self.input_ids.shape[0] if self.input_ids is not None else 0
+        return (
+            self.batch_size != self.forward_metadata_planned_bs
+            or num_tokens != self.forward_metadata_planned_num_tokens
+        )
+
+    def apply_deprecated_skip_attn_backend_init(
+        self, skip_attn_backend_init: Optional[bool]
+    ) -> None:
+        if not skip_attn_backend_init:
+            return
+        global _skip_attn_backend_init_warned
+        if not _skip_attn_backend_init_warned:
+            _skip_attn_backend_init_warned = True
+            warnings.warn(
+                "skip_attn_backend_init is deprecated and will be removed; "
+                "pre-planners should call "
+                "ForwardBatch.mark_forward_metadata_ready() after planning "
+                "instead. The flag is mapped onto the marker for now.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        self.mark_forward_metadata_ready()
+
     # For extend
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
@@ -455,6 +503,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    @property
+    def extend_num_valid_tokens(self) -> Optional[int]:
+        """Return the real extend-token count before DP/CP input padding.
+
+        ``extend_num_tokens`` may describe the padded tensor size.  Consumers
+        that cannot accept padding rows should use this property, strip to the
+        returned size, and restore the padded output shape afterwards.
+        """
+        if self.extend_seq_lens_cpu is not None:
+            return int(sum(self.extend_seq_lens_cpu))
+        return self.extend_num_tokens
 
     @classmethod
     def init_new(

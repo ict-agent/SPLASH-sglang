@@ -3164,7 +3164,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # Set extra arguments
-        if not skip_attn_backend_init:
+        if forward_batch.needs_forward_metadata_init():
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -3240,7 +3240,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return (ret, can_run_graph)
 
         # Launch model forward
-        if not skip_attn_backend_init:
+        if forward_batch.needs_forward_metadata_init():
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
@@ -3322,6 +3322,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:

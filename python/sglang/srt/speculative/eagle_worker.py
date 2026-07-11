@@ -796,6 +796,7 @@ class EAGLEWorker(TpModelWorker):
             ):
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -920,7 +921,7 @@ class EAGLEWorker(TpModelWorker):
 
             # Run forward
             logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -1024,11 +1025,7 @@ class EAGLEWorker(TpModelWorker):
                 res.accept_indices
             ]
 
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
+        if self.target_worker.model_runner.mambaish_config is not None:
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
             )
@@ -1252,8 +1249,9 @@ class EAGLEWorker(TpModelWorker):
                 )
                 attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = attn_backend
+                forward_batch.mark_forward_metadata_ready()
             logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch
             ).logits_output
             # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)

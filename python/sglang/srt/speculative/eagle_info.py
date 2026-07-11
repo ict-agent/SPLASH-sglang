@@ -814,7 +814,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         consume the field (e.g., STANDALONE)."""
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
+        return _draft_runner_of(worker).model_config.hidden_size
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:

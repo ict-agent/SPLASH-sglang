@@ -1546,6 +1546,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif nsa_impl == "fa3":
             return self._forward_fa3(
@@ -1673,6 +1674,7 @@ class NativeSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1695,6 +1697,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
             )
         elif self.nsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -1789,7 +1792,7 @@ class NativeSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         if not _is_dcu:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd 
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
         else:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
 
@@ -1874,6 +1877,7 @@ class NativeSparseAttnBackend(
         layer,
         metadata: NSAMetadata,
         page_table_1,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not _is_dcu:
             from sgl_kernel.flash_mla import flash_mla_with_kvcache
@@ -1928,24 +1932,61 @@ class NativeSparseAttnBackend(
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
+        # DP/CP padding may append zero-length target-verify rows.  The CUDA
+        # FlashMLA implementation tolerates them, but the current DCU kernel
+        # can access invalid memory when cache_seqlens=0 and the corresponding
+        # index row is all -1.  Follow the strip/re-pad convention used by the
+        # sglang-zp KDA backend: run the kernel only for real tokens, recompute
+        # its schedule for that exact batch, then restore the caller's shape.
+        n_total = q_input.shape[0]
+        n_valid = forward_batch.extend_num_valid_tokens
+        needs_repad = (
+            _is_dcu
+            and n_valid is not None
+            and 0 <= n_valid < n_total
         )
+        flashmla_metadata = metadata.flashmla_metadata
+        if needs_repad:
+            q_input = q_input[:n_valid]
+            indices = indices[:n_valid]
+            cache_seqlens = cache_seqlens[:n_valid]
+            if n_valid > 0:
+                flashmla_metadata = self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens,
+                    seq_len_q=1,
+                )
+
+        if needs_repad and n_valid == 0:
+            o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
+        else:
+            o, _ = flash_mla_with_kvcache(
+                q=q_input,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+                num_splits=flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
+                ),
+                is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
+            )
+
+        if needs_repad:
+            full_o = o.new_zeros((n_total, *o.shape[1:]))
+            full_o[:n_valid] = o
+            o = full_o
 
         if target_q_heads != num_q_heads:
-            o = o[:, :, :num_q_heads, :]
+            # Head padding leaves a gap of ``target_q_heads`` between token
+            # rows.  A plain slice therefore returns a non-contiguous view
+            # whose token stride still describes all padded heads.  The next
+            # MLA stage feeds this tensor directly to DCU torch.bmm; materialize
+            # the compact [tokens, 1, real_heads, d_v] layout first.
+            o = o[:, :, :num_q_heads, :].contiguous()
 
         return o
 

@@ -3092,6 +3092,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
             is_nextn=is_nextn,
             input_layernorm=self.input_layernorm,
+            skip_rope=(
+                config.qk_rope_head_dim == 0 or getattr(config, "mla_nope", False)
+            ),
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(

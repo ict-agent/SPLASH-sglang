@@ -297,10 +297,14 @@ class Glm5NextConfig(PretrainedConfig):
         return len(self.linear_layer_ids) > 0
 
     def is_kda_layer(self, layer_idx: int):
+        if self.linear_attn_config is None:
+            return False
         return layer_idx in set(self.linear_attn_config.get("kda_layers", []))
 
     @property
     def linear_layer_ids(self):
+        if self.linear_attn_config is None:
+            return []
         layers = self.linear_attn_config.get("kda_layers")
         if layers is not None:
             return list(layers)
@@ -308,6 +312,8 @@ class Glm5NextConfig(PretrainedConfig):
 
     @property
     def full_attention_layer_ids(self):
+        if self.linear_attn_config is None:
+            return list(range(self.num_hidden_layers))
         layers = self.linear_attn_config.get("full_attn_layers")
         if layers is not None:
             return list(layers)

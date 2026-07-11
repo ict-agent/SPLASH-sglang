@@ -360,6 +360,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -1075,11 +1076,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-        ):
+        # Update mamba state for linear-attention hybrid models after verification.
+        if self.target_worker.model_runner.mambaish_config is not None:
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
             )
