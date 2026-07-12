@@ -782,6 +782,8 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "round-robin-split"
     # Split NSA GPU KV/indexer cache layers across CP ranks.
     enable_nsa_cache_layer_split: bool = False
+    # Number of MLA KV broadcast scratch slots used by layer-shard prefetch.
+    mla_kv_prefetch_ring_size: int = 1
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -1779,6 +1781,34 @@ class ServerArgs:
             return
 
         hf_config = self.get_model_config().hf_config
+
+        if (
+            not is_deepseek_nsa(hf_config)
+            or not self.enable_nsa_prefill_context_parallel
+            or self.nsa_prefill_cp_mode != "round-robin-split"
+        ):
+            if self.enable_nsa_cache_layer_split:
+                logger.info(
+                    "Disabling NSA cache layer split: it requires a DSA model, "
+                    "and round-robin NSA prefill CP."
+                )
+            self.enable_nsa_cache_layer_split = False
+
+        if self.mla_kv_prefetch_ring_size < 1:
+            logger.info(
+                "mla_kv_prefetch_ring_size=%s is invalid; clamping to 1.",
+                self.mla_kv_prefetch_ring_size,
+            )
+            self.mla_kv_prefetch_ring_size = 1
+        if (
+            self.mla_kv_prefetch_ring_size > 1
+            and not self.enable_nsa_cache_layer_split
+        ):
+            logger.info(
+                "mla_kv_prefetch_ring_size has no effect without "
+                "--enable-nsa-cache-layer-split; resetting to 1."
+            )
+            self.mla_kv_prefetch_ring_size = 1
         model_arch = hf_config.architectures[0]
         is_nsa_model = is_deepseek_nsa(hf_config)
 
@@ -6976,6 +7006,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_nsa_cache_layer_split,
             help="Enable NSA GPU KV/indexer cache layer split across CP ranks.",
+        )
+        parser.add_argument(
+            "--mla-kv-prefetch-ring-size",
+            type=int,
+            default=ServerArgs.mla_kv_prefetch_ring_size,
+            help="MLA KV broadcast prefetch ring size for NSA cache layer split.",
         )
         parser.add_argument(
             "--enable-prefill-context-parallel",

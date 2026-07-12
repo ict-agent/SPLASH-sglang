@@ -38,8 +38,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
+    nsa_prefill_has_history,
     nsa_cp_round_robin_split_data,
     nsa_cp_round_robin_split_q_seqs,
+    nsa_use_prefill_cp,
     pad_nsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (
@@ -1694,7 +1696,24 @@ class NativeSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        get_key_buffer_with_history = (
+            getattr(
+                forward_batch.token_to_kv_pool,
+                "get_key_buffer_with_prefetch_history",
+                None,
+            )
+            if _is_dcu and nsa_use_prefill_cp(forward_batch)
+            else None
+        )
+        if get_key_buffer_with_history is not None:
+            kv_cache = get_key_buffer_with_history(
+                layer.layer_id,
+                has_history=nsa_prefill_has_history(forward_batch),
+            )
+        else:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                layer.layer_id
+            )
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)

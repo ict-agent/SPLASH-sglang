@@ -92,7 +92,8 @@ class ModelRunnerKVCacheMixin:
 
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
-        effective_num_layers = num_layers
+        kv_cache_num_layers = num_layers
+        index_cache_num_layers = num_layers
         if (
             self.use_mla_backend
             and is_deepseek_nsa(self.model_config.hf_config)
@@ -100,14 +101,21 @@ class ModelRunnerKVCacheMixin:
         ):
             shard_rank, shard_size = _get_nsa_cp_layer_shard_info(self)
             if shard_rank is not None:
-                owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
-                # One extra layer is the remote scratch buffer for a layer owned
-                # by another CP rank.
-                effective_num_layers = max(1, owned_layers_upper_bound + 1)
+                owned_layers_upper_bound = (
+                    num_layers + shard_size - 1
+                ) // shard_size
+                kv_cache_num_layers = max(
+                    1,
+                    owned_layers_upper_bound
+                    + self.server_args.mla_kv_prefetch_ring_size,
+                )
+                # NSA index cache has one remote-layer scratch buffer. It does
+                # not use the MLA KV prefetch ring.
+                index_cache_num_layers = max(1, owned_layers_upper_bound + 1)
         if self.use_mla_backend:
             mla_kv_cache_dim = self.calculate_mla_kv_cache_dim()
             cell_size = (
-                mla_kv_cache_dim * effective_num_layers * kv_size
+                mla_kv_cache_dim * kv_cache_num_layers * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -120,7 +128,7 @@ class ModelRunnerKVCacheMixin:
                         )
                         // scale_block_size
                     )
-                    * effective_num_layers
+                    * kv_cache_num_layers
                     * kv_size
                 )
 
@@ -143,7 +151,9 @@ class ModelRunnerKVCacheMixin:
                     element_size = torch._utils._element_size(
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += indexer_size_per_token * effective_num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token * index_cache_num_layers * element_size
+                )
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -675,6 +685,7 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
                 layer_shard_rank=nsa_cp_layer_shard_rank,
                 layer_shard_size=nsa_cp_layer_shard_size,
+                mla_kv_prefetch_ring_size=self.server_args.mla_kv_prefetch_ring_size,
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
@@ -758,6 +769,7 @@ class ModelRunnerKVCacheMixin:
                             max_running_requests=self.max_running_requests,
                             layer_shard_rank=nsa_cp_layer_shard_rank,
                             layer_shard_size=nsa_cp_layer_shard_size,
+                            mla_kv_prefetch_ring_size=self.server_args.mla_kv_prefetch_ring_size,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,

@@ -142,7 +142,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             is_nsa = is_deepseek_nsa(model_config.hf_config)
             # Dense MLA is not layer-sharded. Only NSA reuses this MLA-family
             # pool with its KV and index cache split across prefill CP ranks.
-            cache_num_layers = num_layers
+            kv_cache_num_layers = num_layers
+            index_cache_num_layers = num_layers
             if (
                 is_nsa
                 and not mr.is_draft_worker
@@ -155,15 +156,22 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     owned_layers_upper_bound = (
                         num_layers + layer_shard_size - 1
                     ) // layer_shard_size
-                    # Each rank allocates its owned layers plus one scratch
-                    # buffer used when broadcasting a remote layer.
-                    cache_num_layers = max(1, owned_layers_upper_bound + 1)
+                    kv_cache_num_layers = max(
+                        1,
+                        owned_layers_upper_bound
+                        + mr.server_args.mla_kv_prefetch_ring_size,
+                    )
+                    # Index cache uses one remote-layer scratch buffer and does
+                    # not share the MLA KV prefetch ring.
+                    index_cache_num_layers = max(
+                        1, owned_layers_upper_bound + 1
+                    )
             kv_cache_dim = (
                 mr.calculate_mla_kv_cache_dim()
                 if is_nsa
                 else model_config.kv_lora_rank + model_config.qk_rope_head_dim
             )
-            cell_size = kv_cache_dim * cache_num_layers * kv_size
+            cell_size = kv_cache_dim * kv_cache_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -172,7 +180,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                         // scale_block_size
                     )
-                    * cache_num_layers
+                    * kv_cache_num_layers
                     * kv_size
                 )
 
@@ -197,7 +205,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
                 cell_size += (
                     indexer_size_per_token
-                    * cache_num_layers
+                    * index_cache_num_layers
                     * element_size
                 )
         else:

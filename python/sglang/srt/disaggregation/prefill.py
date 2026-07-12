@@ -162,11 +162,8 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
         kv_args.prefill_start_layer = (
-            getattr(
-                self.token_to_kv_pool,
-                "layer_shard_start",
-                self.token_to_kv_pool.start_layer,
-            )
+            self.token_to_kv_pool.start_layer
+            + self.token_to_kv_pool.layer_shard_start
             if layer_shard_enabled
             else self.token_to_kv_pool.start_layer
         )

@@ -114,6 +114,15 @@ def effective_forward_mode(forward_batch: "ForwardBatch"):
 _effective_forward_mode = effective_forward_mode
 
 
+def nsa_prefill_has_history(forward_batch: "ForwardBatch") -> bool:
+    """Whether this prefill batch needs previously cached NSA K/V state."""
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is None:
+        # Be conservative for modes that do not expose CPU prefix lengths.
+        return True
+    return any(int(prefix_len) > 0 for prefix_len in prefix_lens)
+
+
 def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not _effective_forward_mode(forward_batch).is_context_parallel_extend():
         return False

@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
+    nsa_prefill_has_history,
+    nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -959,13 +961,34 @@ class Indexer(MultiPlatformOp):
             )
             k_offset = kv_bf16.shape[0]
         else:
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-                layer_id,
-                metadata.get_indexer_seq_len(),
-                block_tables,
-                seq_len_sum,
-                max_seq_len,
+            get_index_buffer_with_history = (
+                getattr(
+                    forward_batch.token_to_kv_pool,
+                    "get_index_k_scale_buffer_with_prefetch_history",
+                    None,
+                )
+                if _is_dcu and nsa_use_prefill_cp(forward_batch)
+                else None
             )
+            if get_index_buffer_with_history is not None:
+                k_fp8, k_scale = get_index_buffer_with_history(
+                    layer_id,
+                    metadata.get_indexer_seq_len(),
+                    block_tables,
+                    seq_len_sum,
+                    max_seq_len,
+                    has_history=nsa_prefill_has_history(forward_batch),
+                )
+            else:
+                k_fp8, k_scale = (
+                    forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+                        layer_id,
+                        metadata.get_indexer_seq_len(),
+                        block_tables,
+                        seq_len_sum,
+                        max_seq_len,
+                    )
+                )
             if _is_fp8_fnuz:
                 k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
             else:
@@ -1472,6 +1495,12 @@ class Indexer(MultiPlatformOp):
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
         """
 
+        pool = forward_batch.token_to_kv_pool
+        if getattr(pool, "layer_shard_enabled", False):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+            if not pool._is_layer_owned(layer_id):
+                return
+
         # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
         if (
             _is_cuda
@@ -1483,9 +1512,7 @@ class Indexer(MultiPlatformOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
@@ -1501,9 +1528,7 @@ class Indexer(MultiPlatformOp):
         # because page_size is 1 there.
         if _use_aiter:
             page_size = forward_batch.token_to_kv_pool.page_size
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
@@ -1555,7 +1580,7 @@ class Indexer(MultiPlatformOp):
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+        pool.set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_loc,
             index_k=k_fp8,
