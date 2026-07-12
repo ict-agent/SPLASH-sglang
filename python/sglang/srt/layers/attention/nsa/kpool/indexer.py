@@ -372,9 +372,10 @@ class IndexerKPool(Indexer):
             "kpool_write_plan must be built before _compress_write_decode; "
             "see _build_kpool_metadata / init_kpool_write_plan_capture"
         )
+        write_loc = plan.write_loc[:batch]
         kpool_write_tail_and_maybe_compress(
             pool=pool,
-            buf=pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+            buf=pool.get_kpool_index_k_with_scale_write_buffer(layer_id=layer_id),
             key=key,
             score=gate_score,
             tail_k=tail_k_buf,
@@ -383,11 +384,12 @@ class IndexerKPool(Indexer):
             req_pool_indices=plan.req[:batch],
             write_start=plan.write_start[:batch],
             tail_logical_start=plan.tail_logical_start[:batch],
-            write_loc=plan.write_loc[:batch],
+            write_loc=write_loc,
             out_cache_loc=forward_batch.out_cache_loc[:batch],
             num_draft_tokens=1,
             round_scale=self.scale_fmt is not None,
         )
+        pool.commit_kpool_index_k_with_scale_write_buffer(layer_id, write_loc)
 
     def _compress_write_extend(
         self,
@@ -429,7 +431,11 @@ class IndexerKPool(Indexer):
 
         # --- assemble + compress (owned pools under CP, all otherwise) ---
         if not writes.is_empty:
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = (
+                pool.get_kpool_index_k_with_scale_write_buffer(layer_id=layer_id)
+                if write_cache
+                else pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            )
             # Fused gather + softmax + Hadamard + fp8 quant + cache write.
             kpool_assemble_softmax_rotate_write_cache(
                 pool=pool,
@@ -458,6 +464,10 @@ class IndexerKPool(Indexer):
                     cp_size=cp.size,
                     cp_rank=cp.rank,
                     slots_per_page=forward_batch.token_to_kv_pool.slots_per_page,
+                )
+            if write_cache:
+                pool.commit_kpool_index_k_with_scale_write_buffer(
+                    layer_id, writes.write_loc
                 )
 
         # --- scatter tail updates --------------------------------------------
@@ -1121,7 +1131,7 @@ class IndexerKPool(Indexer):
             # compress half is gated in-kernel on pool-boundary crossing.
             pool = forward_batch.token_to_kv_pool
             tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            buf = pool.get_kpool_index_k_with_scale_write_buffer(layer_id=layer_id)
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
@@ -1140,6 +1150,9 @@ class IndexerKPool(Indexer):
                 # v2 only (None for target_verify): defer compress to the
                 # round whose real advance crosses a pool boundary.
                 effective_n_per_batch=plan.effective_n_per_batch,
+            )
+            pool.commit_kpool_index_k_with_scale_write_buffer(
+                layer_id, plan.write_loc
             )
 
         # (2) Run tail/compress on the alt stream while the current stream

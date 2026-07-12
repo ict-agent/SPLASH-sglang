@@ -2045,10 +2045,24 @@ class HybridLinearKVPool(KVCache):
             self._get_nsa_layer_id(layer_id)
         )
 
+    def get_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        return self.full_kv_pool.get_kpool_index_k_with_scale_write_buffer(
+            self._get_nsa_layer_id(layer_id)
+        )
+
     def commit_dcu_index_k_with_scale_write_buffer(
         self, layer_id: int, loc: torch.Tensor
     ) -> None:
         self.full_kv_pool.commit_dcu_index_k_with_scale_write_buffer(
+            self._get_nsa_layer_id(layer_id), loc
+        )
+
+    def commit_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_kpool_index_k_with_scale_write_buffer(
             self._get_nsa_layer_id(layer_id), loc
         )
 
@@ -3066,6 +3080,29 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self.remote_index_layer_id = None
         return self.remote_index_k_with_scale_buffer
 
+    def get_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        """Return a LayerSplit-aware persistent kpool write target.
+
+        All ranks first make the shared scratch current for this layer (a cold
+        layer with no history can skip the broadcast). The layer owner writes
+        its persistent buffer while the other ranks update scratch. The caller
+        must invoke
+        ``commit_kpool_index_k_with_scale_write_buffer`` after the write (and
+        after the CP slot all-gather, when present) so the owner's scratch
+        copy remains valid for the following index read.
+        """
+        assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        assert self.index_kpool > 1, "kpool write buffer requires index_kpool > 1"
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        broadcast_buf = self._get_broadcastable_index_buffer(layer_id)
+        if not self.layer_shard_enabled or not self._is_layer_owned(layer_id):
+            return broadcast_buf
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
     def commit_dcu_index_k_with_scale_write_buffer(
         self, layer_id: int, loc: torch.Tensor
     ) -> None:
@@ -3100,6 +3137,52 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
         remote_scale[page_indices, token_offsets] = local_scale[
             page_indices, token_offsets
+        ]
+
+    def commit_kpool_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        """Mirror newly written owner kpool slots into broadcast scratch.
+
+        ``loc`` addresses compressed pool slots, so each physical page has
+        ``slots_per_page`` entries. It must not use the token-level
+        ``page_size`` addressing from the regular DCU index write path.
+        """
+        if (
+            not self.layer_shard_enabled
+            or not self._is_layer_owned(layer_id)
+            or loc.numel() == 0
+        ):
+            return
+        if not self._prepare_remote_index_write(layer_id):
+            return
+
+        local_buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        remote_buf = self.remote_index_k_with_scale_buffer
+        slots_per_page = self.slots_per_page
+        page_indices = loc // slots_per_page
+        slot_offsets = loc % slots_per_page
+        k_bytes_per_page = slots_per_page * self.index_head_dim
+        scale_bytes_per_slot = (
+            self.index_head_dim // self.quant_block_size * torch.float32.itemsize
+        )
+
+        local_k = local_buf[:, :k_bytes_per_page].view(
+            -1, slots_per_page, self.index_head_dim
+        )
+        remote_k = remote_buf[:, :k_bytes_per_page].view(
+            -1, slots_per_page, self.index_head_dim
+        )
+        remote_k[page_indices, slot_offsets] = local_k[page_indices, slot_offsets]
+
+        local_scale = local_buf[:, k_bytes_per_page:].view(
+            -1, slots_per_page, scale_bytes_per_slot
+        )
+        remote_scale = remote_buf[:, k_bytes_per_page:].view(
+            -1, slots_per_page, scale_bytes_per_slot
+        )
+        remote_scale[page_indices, slot_offsets] = local_scale[
+            page_indices, slot_offsets
         ]
 
     def get_index_k_with_scale_buffer_broadcast(self, layer_id: int) -> torch.Tensor:
