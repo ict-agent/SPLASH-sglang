@@ -2224,6 +2224,7 @@ class NativeSparseAttnBackend(
             _is_dcu
             and n_valid is not None
             and 0 <= n_valid < n_total
+        )
         flashmla_metadata = metadata.flashmla_metadata
         if needs_repad:
             q_input = q_input[:n_valid]
