@@ -748,6 +748,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        # Reserve the DCU NSA indexer workspace before sizing the KV cache.
+        self._init_dcu_nsa_mqa_logits_workspace()
+
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
@@ -2200,6 +2203,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(max_bs={max_bs}, max_loras={max_loras})"
                 )
                 break
+
+    def _init_dcu_nsa_mqa_logits_workspace(self):
+        """Reserve the LightOp D_out buffer before KV-cache sizing."""
+        if self.device != "cuda" or not self.use_mla_backend:
+            return
+
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.utils import is_dcu, is_dcu_native_fp8_supported
+
+        if not is_dcu() or not is_deepseek_nsa(self.model_config.hf_config):
+            return
+
+        from sglang.srt.layers.attention.nsa.nsa_indexer import (
+            reserve_dcu_mqa_logits_workspace,
+        )
+
+        workspace_device = torch.device(self.device, self.gpu_id)
+        use_fp8_index_cache = (
+            self.kv_cache_dtype
+            in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            and is_dcu_native_fp8_supported()
+        )
+        indexer_dtype = torch.float8_e4m3fn if use_fp8_index_cache else torch.bfloat16
+        reserve_dcu_mqa_logits_workspace(workspace_device, indexer_dtype)
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""

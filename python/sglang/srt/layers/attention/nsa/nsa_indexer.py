@@ -105,6 +105,154 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
+_DCU_MQA_LOGITS_ALIGNMENT = 128
+# With a 16K prefill chunk and CP8, each rank has at most 2048 Q rows. A 2 GiB
+# FP32 D_out buffer bounds the peak while preserving more KV-cache capacity;
+# the current ~484K context is processed in two large Q chunks.
+_DCU_MQA_LOGITS_MAX_ELEMENTS = 16384 * 32768
+_dcu_mqa_logits_workspaces: Dict[torch.device, torch.Tensor] = {}
+
+
+def _is_dcu_mqa_logits_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype == torch.float8_e4m3fn
+
+
+def reserve_dcu_mqa_logits_workspace(
+    device: Union[str, torch.device],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reserve the shared 2 GiB FP32 LightOp D_out buffer for one DCU device."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(
+            f"DCU mqa_logits workspace requires a CUDA device, got {device}"
+        )
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    if dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(f"Unsupported DCU mqa_logits input dtype: {dtype}")
+    required_numel = _DCU_MQA_LOGITS_MAX_ELEMENTS
+
+    workspace = _dcu_mqa_logits_workspaces.get(device)
+    if workspace is None or workspace.numel() < required_numel:
+        workspace = torch.empty(required_numel, dtype=torch.float32, device=device)
+        _dcu_mqa_logits_workspaces[device] = workspace
+        logger.info(
+            "Reserved %.2f GiB DCU mqa_logits workspace on %s for input dtype %s",
+            workspace.numel() * workspace.element_size() / (1 << 30),
+            device,
+            dtype,
+        )
+    return workspace
+
+
+def _get_dcu_mqa_logits_output_shape(
+    num_q: int, num_k: int, dtype: torch.dtype
+) -> Tuple[int, int]:
+    """Return the physical D_out shape required by the LightOp kernel."""
+    if dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(f"Unsupported DCU mqa_logits input dtype: {dtype}")
+    if _is_dcu_mqa_logits_fp8_dtype(dtype) or num_q < _DCU_MQA_LOGITS_ALIGNMENT:
+        return num_q, num_k
+    return (
+        ceil_align(num_q, _DCU_MQA_LOGITS_ALIGNMENT),
+        ceil_align(num_k, _DCU_MQA_LOGITS_ALIGNMENT),
+    )
+
+
+def _get_dcu_mqa_logits_max_rows(
+    workspace_numel: int, num_q: int, num_k: int, dtype: torch.dtype
+) -> int:
+    """Compute a chunk size that obeys LightOp's dtype-dependent D_out layout."""
+    if workspace_numel <= 0 or num_q <= 0 or num_k <= 0:
+        raise ValueError(
+            "workspace_numel, num_q, and num_k must all be positive, got "
+            f"{workspace_numel=}, {num_q=}, {num_k=}"
+        )
+
+    if _is_dcu_mqa_logits_fp8_dtype(dtype):
+        max_rows = workspace_numel // num_k
+    elif dtype in (torch.float16, torch.bfloat16):
+        aligned_k = ceil_align(num_k, _DCU_MQA_LOGITS_ALIGNMENT)
+        max_aligned_rows = (
+            workspace_numel // aligned_k // _DCU_MQA_LOGITS_ALIGNMENT
+        ) * _DCU_MQA_LOGITS_ALIGNMENT
+        if max_aligned_rows >= _DCU_MQA_LOGITS_ALIGNMENT:
+            max_rows = max_aligned_rows
+        else:
+            # LightOp's M < 128 fallback writes a compact [M, N] tensor.
+            max_rows = min(workspace_numel // num_k, _DCU_MQA_LOGITS_ALIGNMENT - 1)
+    else:
+        raise ValueError(f"Unsupported DCU mqa_logits input dtype: {dtype}")
+
+    if max_rows < 1:
+        raise RuntimeError(
+            "DCU mqa_logits workspace cannot hold one logits row: "
+            f"workspace_numel={workspace_numel}, num_k={num_k}, dtype={dtype}."
+        )
+    return min(num_q, max_rows)
+
+
+def _run_dcu_mqa_logits_with_workspace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    kv_scale: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Run LightOp mqa_logits without an internal full-logits allocation."""
+    num_q, num_heads, head_dim = q.shape
+    num_k = k.shape[0]
+    output_rows, output_cols = _get_dcu_mqa_logits_output_shape(num_q, num_k, q.dtype)
+    required_numel = output_rows * output_cols
+    if required_numel > workspace.numel():
+        raise RuntimeError(
+            "DCU mqa_logits chunk exceeds its workspace: "
+            f"required_numel={required_numel}, workspace_numel={workspace.numel()}"
+        )
+    if workspace.dtype != torch.float32 or workspace.device != q.device:
+        raise ValueError(
+            "DCU mqa_logits workspace must be FP32 on the same device as Q, got "
+            f"workspace dtype={workspace.dtype}, device={workspace.device}, "
+            f"q device={q.device}"
+        )
+
+    if _is_dcu_mqa_logits_fp8_dtype(q.dtype):
+        if kv_scale is None:
+            raise ValueError("FP8 DCU mqa_logits requires a KV scale tensor")
+        kv_scale = kv_scale.to(torch.float32).flatten().contiguous()
+    elif q.dtype in (torch.float16, torch.bfloat16):
+        if kv_scale is not None:
+            raise ValueError("FP16/BF16 DCU mqa_logits does not accept KV scale")
+    else:
+        raise ValueError(f"Unsupported DCU mqa_logits input dtype: {q.dtype}")
+
+    output = workspace[:required_numel].view(output_rows, output_cols)
+    logits = op.mqa_logits(
+        q,
+        k,
+        weights.to(torch.float32),
+        ks,
+        ke,
+        num_q,
+        num_k,
+        num_heads,
+        head_dim,
+        kv_scale,
+        True,
+        output,
+    )
+    if logits.shape != (num_q, num_k):
+        raise RuntimeError(
+            "LightOp mqa_logits returned an unexpected logical shape: "
+            f"got {tuple(logits.shape)}, expected {(num_q, num_k)}"
+        )
+    return logits
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -831,47 +979,36 @@ class Indexer(MultiPlatformOp):
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        if _is_dcu:
+            if use_bf16_index_cache:
+                dcu_k = kv_bf16
+                dcu_k_scale = None
+            else:
+                dcu_k, dcu_k_scale = kv_fp8
+                dcu_k_scale = dcu_k_scale.flatten().contiguous()
+
+            # Always use the bounded external output on DCU. This deliberately
+            # avoids torch.cuda.mem_get_info(), whose reported free bytes can be
+            # invalid on affected HIP runtimes and can incorrectly skip chunking.
+            dcu_logits_workspace = reserve_dcu_mqa_logits_workspace(device, q.dtype)
+            max_rows = _get_dcu_mqa_logits_max_rows(
+                dcu_logits_workspace.numel(), q_offset, k_offset, q.dtype
+            )
+            need_chunk = True
+            free_mem = 0
+        else:
+            need_chunk, free_mem = self._should_chunk_mqa_logits(
+                q_offset, k_offset, device
+            )
         if not need_chunk:
             assert q[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if use_bf16_index_cache:
-                    # BF16 ragged path uses scale=None because K is already stored
-                    # as full-precision BF16 values instead of fp8 payload + scale.
-                    logits = op.mqa_logits(
-                        q[:q_offset],
-                        kv_bf16,
-                        weights[:q_offset].to(torch.float32),
-                        ks,
-                        ke,
-                        q[:q_offset].shape[0],
-                        kv_bf16.shape[0],
-                        q.shape[1],
-                        q.shape[2],
-                        None,
-                        True,
-                    )
-                elif _is_hip and not _is_dcu:
+                if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
                     logits = fp8_mqa_logits(
                         q[:q_offset], kv, scale, weights[:q_offset], ks, ke
-                    )
-                elif _is_dcu:
-                    kv, scale = kv_fp8
-                    logits = op.mqa_logits(
-                        q[:q_offset],
-                        kv,
-                        weights[:q_offset],
-                        ks,
-                        ke,
-                        q[:q_offset].shape[0],
-                        kv.shape[0],
-                        q.shape[1],
-                        q.shape[2],
-                        scale.view(torch.float32).flatten(),
-                        True
                     )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
@@ -891,11 +1028,12 @@ class Indexer(MultiPlatformOp):
             return topk_result
 
         # Chunk path
-        bytes_per_elem = 4  # float32
-        bytes_per_row = k_offset * bytes_per_elem
-        # Reserve 50% of free memory for logits
-        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        if not _is_dcu:
+            bytes_per_elem = 4  # float32
+            bytes_per_row = k_offset * bytes_per_elem
+            # Reserve 50% of free memory for logits
+            max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, q_offset)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
 
@@ -912,23 +1050,17 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                if use_bf16_index_cache:
-                    # Chunked BF16 ragged path is the same kernel contract as above:
-                    # continuous BF16 K, fp32 weights, and no quant scale tensor.
-                    logits_chunk = op.mqa_logits(
+                if _is_dcu:
+                    logits_chunk = _run_dcu_mqa_logits_with_workspace(
                         q[start:end],
-                        kv_bf16,
-                        weights[start:end].to(torch.float32),
+                        dcu_k,
+                        weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        q[start:end].shape[0],
-                        kv_bf16.shape[0],
-                        q.shape[1],
-                        q.shape[2],
-                        None,
-                        True,
+                        dcu_k_scale,
+                        dcu_logits_workspace,
                     )
-                elif _is_hip and not _is_dcu:
+                elif _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -940,16 +1072,6 @@ class Indexer(MultiPlatformOp):
                         ks[start:end],
                         ke[start:end],
                     )
-                elif _is_dcu:
-                    kv, scale = kv_fp8
-                    logits_chunk = lightop.mqa_logits(
-                        q[start:end],
-                        kv,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
-                        scale
-                    )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
                         q[start:end],
@@ -960,10 +1082,9 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
 
-
-            assert logits_chunk.shape[0] == (end - start), (
-                f"logits_chunk rows mismatch: {logits_chunk.shape[0]} != {end - start}"
-            )
+            assert logits_chunk.shape[0] == (
+                end - start
+            ), f"logits_chunk rows mismatch: {logits_chunk.shape[0]} != {end - start}"
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -974,13 +1095,15 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q_chunk = None
                 batch_idx_chunk = None
             else:
-                # PAGED path: treat each token as a length-1 sequence
+                # PAGED path: keep one page-table row per consecutive request run.
+                # Repeating a batch id for every token would materialize a
+                # [chunk_rows, max_seq_len] page-table copy in topk_transform.
                 topk_offset_chunk = None
-                B_chunk = logits_chunk.shape[0]
-                cu_seqlens_q_chunk = torch.ones(
-                    B_chunk, dtype=torch.int32, device=device
+                batch_idx_chunk, cu_seqlens_q_chunk = torch.unique_consecutive(
+                    token_to_batch_idx[start:end], return_counts=True
                 )
-                batch_idx_chunk = token_to_batch_idx[start:end]
+                cu_seqlens_q_chunk = cu_seqlens_q_chunk.to(torch.int32)
+                batch_idx_chunk = batch_idx_chunk.to(torch.long)
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
