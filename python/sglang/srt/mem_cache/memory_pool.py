@@ -420,7 +420,7 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time �?expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        # clear at alloc time - expand a scalar GPU zero to the right shape, no CPU-GPU sync
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(

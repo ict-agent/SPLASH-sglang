@@ -319,7 +319,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# 暂时先放�?
 def ds_bmm_wrapper(q: torch.Tensor, w: torch.Tensor, scale: float, dtype: torch.dtype):
     # # scale=1时去掉elementwise数乘
     if abs(scale - 1) < 1e-6:
@@ -621,7 +620,7 @@ class DeepseekV2MoE(nn.Module):
         _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
-        # mlp.shared_experts �?mlp.experts.256 when > 0.
+        # mlp.shared_experts - mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
 
         # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
@@ -2513,7 +2512,7 @@ class DeepseekV2AttentionMLA(
                 #     ).transpose(0, 1),
                 # )
         output, _ = self.o_proj(attn_bmm_output)
-        # 如果第一维是1�?squeeze
+        # 如果第一维是1个squeeze
         if self.next_skip_topk is None:
             return output
         if not self.next_skip_topk:
@@ -3276,7 +3275,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
-        # 前三层dense，开融合时返回值为4�?
+        # 前三层dense，开融合时返回值为4个
         if _use_fused_rms_quant and residual is not None and self.post_attention_layernorm.weight.data is not None and isinstance(self.mlp, DeepseekV2MLP):
             hidden_states, _, _, _ = self.mlp(
                 hidden_states,
@@ -3287,7 +3286,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 rms_weight=self.post_attention_layernorm.weight.data,
                 residual=residual,
             )
-        else:  # 不管开不开融合，结果是一个就�?
+        else:  # 不管开不开融合，结果是一个就行
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
