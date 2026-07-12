@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.nsa.kpool.kernels import (
     _torch_topk_pooled_history,
     all_gather_and_scatter_pool_slots,
     gather_index_k_scale_prefix_into,
+    kpool_bf16_paged_mqa_logits,
     kpool_assemble_softmax_rotate_write_cache,
     kpool_write_tail_and_maybe_compress,
     scatter_kpool_tail_updates,
@@ -682,7 +683,7 @@ class IndexerKPool(Indexer):
         page_size = forward_batch.token_to_kv_pool.page_size
 
         block_tables = metadata.get_page_table_64()
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+        kv_cache_buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
 
@@ -694,15 +695,12 @@ class IndexerKPool(Indexer):
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)
-        assert len(kv_cache_fp8.shape) == 2
+        assert len(kv_cache_buf.shape) == 2
         # Anchor: index_kpool=1  -> block_kv=64, row=8448 B/page
         # Dense : index_kpool=16 -> block_kv=4,  row=528  B/page
         block_kv = page_size // self.index_kpool
         num_heads_kv = 1
         head_dim_with_sf = self.head_dim + 4  # +4 bytes for fp32 scale factor
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
@@ -713,50 +711,19 @@ class IndexerKPool(Indexer):
         )
         pool_max_seq_len = pool_block_tables.shape[1] * block_kv
         if is_dcu():
-            # DCU lightop.paged_mqa_logits requires a 64-slot page, while the
-            # pooled KPool cache has page_size / kpool slots per real page.
-            # Repack the paged pooled cache into a ragged contiguous BF16 K and
-            # use the same op.mqa_logits BF16 contract as nsa_indexer.py.
-            kv_u8 = kv_cache_fp8[..., : self.head_dim].contiguous()
-            kv_scale = kv_cache_fp8[..., self.head_dim :].contiguous().view(
-                torch.float32
-            )
-            kv_f32 = kv_u8.view(torch.float8_e4m3fn).to(torch.float32)
-            kv_f32 = kv_f32 * kv_scale
-
-            num_pages = pool_block_tables.shape[1]
-            page_ids = pool_block_tables.reshape(-1).to(torch.long)
-            page_ids = page_ids.clamp(min=0, max=kv_f32.shape[0] - 1)
-            k_pages = kv_f32.index_select(0, page_ids).reshape(
-                n_real,
-                num_pages,
+            logits = kpool_bf16_paged_mqa_logits(
+                q_fp8,
+                kv_cache_buf,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
                 block_kv,
-                num_heads_kv,
-                self.head_dim,
-            )
-            k_flat = k_pages.reshape(
-                n_real, num_pages * block_kv, num_heads_kv, self.head_dim
-            )[:, :pool_max_seq_len, :, :]
-            kv_bf16 = k_flat.reshape(
-                n_real * pool_max_seq_len, num_heads_kv, self.head_dim
-            ).to(torch.bfloat16).contiguous()
-            row_base = torch.arange(n_real, device=q_fp8.device, dtype=torch.int32) * pool_max_seq_len
-            ks = row_base
-            ke = row_base + pool_seqlens.to(torch.int32)
-            logits = op.mqa_logits(
-                q_fp8.squeeze(1)[:n_real].to(torch.bfloat16).contiguous(),
-                kv_bf16,
-                weights[:n_real].to(torch.float32).contiguous(),
-                ks,
-                ke,
-                n_real,
-                kv_bf16.shape[0],
-                q_fp8.shape[2],
-                q_fp8.shape[3],
-                None,
-                True,
             )
         else:
+            kv_cache_fp8 = kv_cache_buf.view(
+                kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,

@@ -95,6 +95,187 @@ def _log_kpool_wrapper_call(function_name: str, **kwargs) -> None:
             os.close(fd)
 
 
+def kpool_bf16_paged_mqa_logits(
+    q: torch.Tensor,
+    buf: torch.Tensor,
+    weights: torch.Tensor,
+    pool_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seq_len: int,
+    slots_per_page: int,
+) -> torch.Tensor:
+    """Run kpool decode MQA logits directly from the packed FP8 page cache.
+
+    KPool stores each physical page as ``[all K bytes][all FP32 scales]``.
+    The generic LightOp paged kernel requires 64 K slots per page, while a
+    kpool page has ``page_size / index_kpool`` slots. This Triton fallback
+    keeps the native layout and dequantizes each FP8 K slot to BF16 in
+    registers. The caller has already applied the matching normalized
+    Hadamard rotation to Q before entering this kernel.
+    """
+
+    assert q.ndim == 4 and q.shape[1] == 1
+    assert q.shape[-1] == INDEX_HEAD_DIM
+    assert buf.dtype == torch.uint8 and buf.ndim == 2 and buf.is_contiguous()
+    assert slots_per_page > 0
+    assert buf.shape[1] == slots_per_page * (INDEX_HEAD_DIM + 4)
+    assert weights.shape == (q.shape[0], q.shape[2])
+    assert pool_seqlens.shape == (q.shape[0],)
+    assert page_table.shape[0] == q.shape[0]
+    assert page_table.shape[1] * slots_per_page == max_seq_len
+    assert page_table.is_contiguous()
+
+    q = q.squeeze(1).to(torch.bfloat16).contiguous()
+    weights = weights.to(torch.float32).contiguous()
+    pool_seqlens = pool_seqlens.to(torch.int32).contiguous()
+    page_table = page_table.to(torch.int32).contiguous()
+    logits = torch.empty(
+        (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
+    )
+    if max_seq_len == 0 or q.shape[0] == 0:
+        return logits
+
+    _kpool_bf16_paged_mqa_logits_kernel[
+        (q.shape[0], triton.cdiv(max_seq_len, 4))
+    ](
+        q,
+        buf,
+        buf.view(torch.float32),
+        weights,
+        pool_seqlens,
+        page_table,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        max_seq_len,
+        NUM_HEADS=q.shape[1],
+        SLOTS_PER_PAGE=slots_per_page,
+        BUF_NUMEL_PER_PAGE=buf.shape[1],
+        HEAD_DIM=INDEX_HEAD_DIM,
+        BLOCK_K=4,
+        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        num_warps=4,
+    )
+    return logits
+
+
+@triton.jit
+def _decode_e4m3fn(raw):
+    """Decode raw E4M3FN bytes without Triton's FP8 load conversion.
+
+    DCU's current Triton FP8 pointer cast does not preserve E4M3FN values.
+    ``raw`` contains the cache byte so decode it using the IEEE-like E4M3FN
+    layout: sign[7], exponent[6:3] with bias 7, and mantissa[2:0].
+    """
+
+    raw = raw.to(tl.int32)
+    sign = tl.where((raw & 0x80) != 0, -1.0, 1.0)
+    exponent = (raw >> 3) & 0x0F
+    mantissa = raw & 0x07
+    normal = tl.exp2(exponent.to(tl.float32) - 7.0) * (
+        1.0 + mantissa.to(tl.float32) * 0.125
+    )
+    subnormal = mantissa.to(tl.float32) * 0.001953125
+    value = tl.where(exponent == 0, subnormal, normal)
+    # E4M3FN reserves exponent=15,mantissa=7 as NaN. Valid cache writes are
+    # clamped to the largest finite value, but treat an unexpected NaN byte as
+    # zero so it cannot poison a sparse score row.
+    value = tl.where((exponent == 15) & (mantissa == 7), 0.0, value)
+    return sign * value
+
+
+@triton.jit
+def _kpool_bf16_paged_mqa_logits_kernel(
+    q_ptr,
+    buf_u8_ptr,
+    buf_fp32_ptr,
+    weights_ptr,
+    pool_seqlens_ptr,
+    page_table_ptr,
+    logits_ptr,
+    q_stride_0,
+    q_stride_1,
+    weights_stride_0,
+    weights_stride_1,
+    page_table_stride_0,
+    page_table_stride_1,
+    logits_stride_0,
+    max_seq_len,
+    NUM_HEADS: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    pool_offset = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    valid_output = pool_offset < max_seq_len
+    pool_seqlen = tl.load(pool_seqlens_ptr + batch_idx).to(tl.int32)
+    valid_pool = valid_output & (pool_offset < pool_seqlen)
+
+    logical_page = pool_offset // SLOTS_PER_PAGE
+    slot = pool_offset % SLOTS_PER_PAGE
+    physical_page = tl.load(
+        page_table_ptr
+        + batch_idx * page_table_stride_0
+        + logical_page * page_table_stride_1,
+        mask=valid_pool,
+        other=0,
+    ).to(tl.int32)
+    physical_page = tl.maximum(physical_page, 0)
+
+    dims = tl.arange(0, BLOCK_D)
+    scores = tl.zeros([BLOCK_K], dtype=tl.float32)
+    scale_offsets = (
+        physical_page * (BUF_NUMEL_PER_PAGE // 4)
+        + (SLOTS_PER_PAGE * HEAD_DIM // 4)
+        + slot
+    )
+    scales = tl.load(buf_fp32_ptr + scale_offsets, mask=valid_pool, other=0.0).to(
+        tl.float32
+    )
+
+    for head_idx in tl.static_range(0, NUM_HEADS):
+        q = tl.load(
+            q_ptr + batch_idx * q_stride_0 + head_idx * q_stride_1 + dims,
+            mask=dims < HEAD_DIM,
+            other=0.0,
+        ).to(tl.bfloat16)
+        k_offsets = (
+            physical_page[:, None] * BUF_NUMEL_PER_PAGE
+            + slot[:, None] * HEAD_DIM
+            + dims[None, :]
+        )
+        raw_k = tl.load(
+            buf_u8_ptr + k_offsets,
+            mask=valid_pool[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        k = _decode_e4m3fn(raw_k)
+        k = (k * scales[:, None]).to(tl.bfloat16)
+        # Match the BF16 MQA reference: round the elementwise product to BF16
+        # before accumulating it in FP32.
+        dot = tl.sum(
+            (k * q[None, :]).to(tl.bfloat16).to(tl.float32), axis=1
+        )
+        weight = tl.load(
+            weights_ptr + batch_idx * weights_stride_0 + head_idx * weights_stride_1
+        ).to(tl.float32)
+        scores += tl.maximum(dot, 0.0) * weight
+
+    tl.store(
+        logits_ptr + batch_idx * logits_stride_0 + pool_offset,
+        tl.where(valid_pool, scores, 0.0),
+        mask=valid_output,
+    )
+
+
 def gather_index_k_scale_prefix_into(
     pool,
     buf: torch.Tensor,
