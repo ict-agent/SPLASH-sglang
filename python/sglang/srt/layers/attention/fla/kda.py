@@ -1005,11 +1005,27 @@ def chunk_kda_cp(
         ``chunk_kda``.
     """
     from sglang.srt.layers.attention.fla.cp import (
+        all_gather_into_tensor,
         chunk_gated_delta_rule_fwd_h_pre_process,
     )
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
+
+    # Empty local segment: this CP rank's token slice is all padding (e.g. a
+    # short request split across more ranks than it has tokens). There is no
+    # local KDA work, but the rank must still join the single pre-process
+    # all-gather so the CP group does not hang. Contribute a zero [S_ext | M]
+    # and return an empty output (repadded by the caller).
+    if cp_context is not None and (
+        cu_seqlens is None or cu_seqlens.numel() <= 1
+    ):
+        HV, V = v.shape[2], v.shape[3]
+        K = k.shape[3]
+        hm = k.new_zeros(HV, K, V + K, dtype=torch.float32)
+        all_gather_into_tensor(hm, group=cp_context.group)
+        o = q.new_zeros((q.shape[0], q.shape[1], HV, V))
+        return o, None
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())

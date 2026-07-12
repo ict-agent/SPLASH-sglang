@@ -584,6 +584,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                             state_lb.to(runtime_ssm_states.dtype)
                             .unsqueeze(0)
                             .contiguous()
+                            .clone()  # never alias runtime_h; chunk_kda writes init in place
                         )
                         sub_cu = torch.tensor(
                             [0, m], dtype=torch.int32, device=init.device
@@ -1165,6 +1166,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 )
 
             if kda_cp_active:
+                # The Triton KDA kernel writes its attention output IN PLACE over
+                # the `v` buffer (chunk_gla_fwd_o_gk(o=v)) and normalizes q/k /
+                # cumsums g on their contiguous inputs, so after extend_cp `v`
+                # holds the output — not the post-conv value — and q/k/g may be
+                # mutated too. The extra_buffer radix-cache track short recurrence
+                # must replay chunk_kda over the ORIGINAL post-conv inputs, so
+                # snapshot them here before the kernel clobbers `v`. (Also avoids
+                # the track kernel writing its own o=v back into core_attn_out,
+                # which aliases `v`.) Only needed when tracking is active.
+                if forward_batch.mamba_track_mask is not None:
+                    track_q, track_k = q.clone(), k.clone()
+                    track_v, track_g, track_beta = v.clone(), a.clone(), b.clone()
+                else:
+                    track_q = track_k = track_v = track_g = track_beta = None
                 core_attn_out, h = self.kernel_dispatcher.extend_cp(
                     q=q,
                     k=k,
@@ -1215,11 +1230,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     ssm_states,
                     h,
                     kda_cp_raw_mixed_qkv,
-                    q,
-                    k,
-                    v,
-                    a,
-                    b,
+                    track_q,
+                    track_k,
+                    track_v,
+                    track_g,
+                    track_beta,
                     persistent_conv_states,
                     persistent_ssm_states,
                 )

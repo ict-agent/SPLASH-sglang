@@ -179,10 +179,20 @@ def build_kda_fla_cp_context(
     if not is_first_rank:
         req_start = metadata.local_req_global_starts_cpu[cont_idx]
         seg_start = metadata.local_segment_global_starts_cpu[cont_idx]
-        prev_owner = kda_cp_owner_of_global_token(
-            seg_start - 1, metadata.total_tokens, metadata.cp_size
+        # The merge chains EVERY preceding rank that holds part of this request
+        # (ranks [first_owner, cp_rank-1]) — each rank's [S_ext | M] is local
+        # (assumes S0=0), so all of them must be chained to reconstruct this
+        # rank's true incoming state. Counting back only to the *immediately*
+        # previous rank (owner of seg_start-1) gives pre_num_ranks==1 for every
+        # rank, which merges just the last rank's local state and drops the rest
+        # of the chain. That is accidentally correct at cp_size==2 (a continuation
+        # is always exactly 1 hop) but wrong for cp_size>=4, where ranks >=2 hops
+        # from the request start miss the chain. Count back to the request's
+        # FIRST rank instead.
+        first_owner = kda_cp_owner_of_global_token(
+            req_start, metadata.total_tokens, metadata.cp_size
         )
-        pre_num_ranks = metadata.cp_rank - prev_owner
+        pre_num_ranks = metadata.cp_rank - first_owner
         pre_num_conv_tokens = max(0, seg_start - req_start)
 
     # Whether the last local segment continues onto a following rank.

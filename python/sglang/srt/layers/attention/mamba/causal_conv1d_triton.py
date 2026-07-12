@@ -500,7 +500,10 @@ def causal_conv1d_fn(
         assert is_channel_last, "Need to run in channel-last layout"
 
     def grid(META):
-        max_seq_len = max(seq_lens_cpu)
+        # Empty batch (e.g. a KDA/NSA CP rank whose token slice is all padding
+        # for a short request) -> zero grid, kernel is a no-op instead of
+        # crashing on max([]).
+        max_seq_len = max(seq_lens_cpu) if len(seq_lens_cpu) > 0 else 0
         return (
             len(seq_lens_cpu),  # batch_size
             (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
