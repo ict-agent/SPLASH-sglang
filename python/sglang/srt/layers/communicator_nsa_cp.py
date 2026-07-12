@@ -57,6 +57,7 @@ class NSACPLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        layer_id: int = -1,
     ):
         super().__init__(
             layer_scatter_modes,
@@ -65,6 +66,7 @@ class NSACPLayerCommunicator(LayerCommunicator):
             allow_reduce_scatter,
             is_last_layer,
             qkv_latent_func,
+            layer_id,
         )
 
     def _post_init_communicate(self):
