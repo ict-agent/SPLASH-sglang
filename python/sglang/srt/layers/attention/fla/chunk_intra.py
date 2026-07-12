@@ -197,10 +197,10 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             # [BC, BK]
             b_gqn = tl.where(m_tc1[:, None], exp_e(b_g1 - b_gn1[None, :]), 0)
             # [BK, BC]
-            b_kgt = tl.trans(b_k0 * exp_e(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
+            b_kgt = tl.trans(b_k0 * exp_e(b_gn1[None, :] - b_g0))
             # [BC, BC]
-            b_qg1 = (b_q1 * b_gqn).to(tl.bfloat16)
-            b_kg1 = (b_k1 * b_gqn).to(tl.bfloat16)
+            b_qg1 = b_q1 * b_gqn
+            b_kg1 = b_k1 * b_gqn
             b_Aqk10 += tl.dot(b_qg1, b_kgt)
             b_Akk10 += tl.dot(b_kg1, b_kgt)
 
@@ -231,14 +231,14 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                 )
                 # [BC, BK]
                 b_gqn2 = tl.where(m_tc2[:, None], exp_e(b_g2 - b_gn2[None, :]), 0)
-                b_qg2 = (b_q2 * b_gqn2).to(tl.bfloat16)
-                b_kg2 = (b_k2 * b_gqn2).to(tl.bfloat16)
+                b_qg2 = b_q2 * b_gqn2
+                b_kg2 = b_k2 * b_gqn2
                 # [BK, BC]
-                b_kgt = tl.trans(b_k0 * exp_e(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k0 * exp_e(b_gn2[None, :] - b_g0))
                 b_Aqk20 += tl.dot(b_qg2, b_kgt)
                 b_Akk20 += tl.dot(b_kg2, b_kgt)
                 # [BC, BC]
-                b_kgt = tl.trans(b_k1 * exp_e(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
+                b_kgt = tl.trans(b_k1 * exp_e(b_gn2[None, :] - b_g1))
                 # [BC, BC]
                 b_Aqk21 += tl.dot(b_qg2, b_kgt)
                 b_Akk21 += tl.dot(b_kg2, b_kgt)
@@ -270,20 +270,20 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     )
                     # [BC, BK]
                     b_gqn3 = tl.where(m_tc3[:, None], exp_e(b_g3 - b_gn3[None, :]), 0)
-                    b_qg3 = (b_q3 * b_gqn3).to(tl.bfloat16)
-                    b_kg3 = (b_k3 * b_gqn3).to(tl.bfloat16)
+                    b_qg3 = b_q3 * b_gqn3
+                    b_kg3 = b_k3 * b_gqn3
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k0 * exp_e(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k0 * exp_e(b_gn3[None, :] - b_g0))
                     # [BC, BC]
                     b_Aqk30 += tl.dot(b_qg3, b_kgt)
                     b_Akk30 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k1 * exp_e(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k1 * exp_e(b_gn3[None, :] - b_g1))
                     # [BC, BC]
                     b_Aqk31 += tl.dot(b_qg3, b_kgt)
                     b_Akk31 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k2 * exp_e(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
+                    b_kgt = tl.trans(b_k2 * exp_e(b_gn3[None, :] - b_g2))
                     # [BC, BC]
                     b_Aqk32 += tl.dot(b_qg3, b_kgt)
                     b_Akk32 += tl.dot(b_kg3, b_kgt)

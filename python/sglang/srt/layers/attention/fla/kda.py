@@ -684,7 +684,7 @@ def recompute_w_u_fwd(
         STORE_QG=False,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="tf32",
+        DOT_PRECISION="ieee",
     )
     return w, u, None, kg
 
@@ -804,7 +804,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v)
+    b_o += tl.dot(b_A, b_v, input_precision="ieee")
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1083,7 +1083,9 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    # Accuracy A/B against the H100 reference, which uses separate diagonal,
+    # solve, and recompute kernels rather than the small-grid fused path.
+    _small_grid = False
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
