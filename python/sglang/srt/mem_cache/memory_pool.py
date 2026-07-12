@@ -46,6 +46,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
@@ -127,6 +128,27 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
+
+
+def _get_layer_shard_range(
+    rank: int, shard_size: int, total_layers: int
+) -> tuple[int, int]:
+    base = total_layers // shard_size
+    rem = total_layers % shard_size
+    start = rank * base + min(rank, rem)
+    end = start + base + (1 if rank < rem else 0)
+    return start, end
+
+
+def _get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) -> int:
+    for rank in range(shard_size):
+        start, end = _get_layer_shard_range(rank, shard_size, total_layers)
+        if start <= local_layer_idx < end:
+            return rank
+    raise ValueError(
+        f"Invalid local_layer_idx={local_layer_idx} for "
+        f"shard_size={shard_size}, total_layers={total_layers}"
+    )
 
 
 def _set_kv_buffer_impl(
@@ -783,6 +805,8 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
     ):
         self.size = size
         self.page_size = page_size
@@ -796,6 +820,19 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+        self.layer_shard_rank = layer_shard_rank
+        self.layer_shard_size = layer_shard_size
+        self.layer_shard_enabled = (
+            layer_shard_rank is not None and layer_shard_size > 1
+        )
+        self.layer_shard_start = self.start_layer
+        if self.layer_shard_enabled:
+            self._log_layer_shard_plan()
+            chunk = self.layer_num // self.layer_shard_size
+            rem = self.layer_num % self.layer_shard_size
+            self.layer_shard_start = self.layer_shard_rank * chunk + min(
+                self.layer_shard_rank, rem
+            )
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -806,11 +843,97 @@ class KVCache(abc.ABC):
 
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
+        self.layer_broadcast_comm = None
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def _local_layer_idx(self, layer_id: int) -> int:
+        return layer_id - self.start_layer
+
+    def _owned_local_layer_range(self) -> tuple[int, int]:
+        assert self.layer_shard_rank is not None
+        return _get_layer_shard_range(
+            self.layer_shard_rank, self.layer_shard_size, self.layer_num
+        )
+
+    def _log_layer_shard_plan(self):
+        assert self.layer_shard_rank is not None
+        partitions = []
+        for rank in range(self.layer_shard_size):
+            st, ed = _get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
+            partitions.append(f"r{rank}:[{st},{ed})")
+        my_start, my_end = self._owned_local_layer_range()
+        logger.info(
+            "Layer shard plan (continuous): "
+            f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
+            f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
+            f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
+            f"partitions={'; '.join(partitions)}"
+        )
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        if not self.layer_shard_enabled:
+            return True
+        local_idx = self._local_layer_idx(layer_id)
+        owned_start, owned_end = self._owned_local_layer_range()
+        return owned_start <= local_idx < owned_end
+
+    def _get_layer_owner_rank(self, layer_id: int) -> int:
+        return _get_layer_owner(
+            self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
+        )
+
+    def _init_layer_broadcast_comm(self) -> None:
+        if not self.layer_shard_enabled:
+            return
+
+        cp_group = get_attention_cp_group()
+        if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
+            return
+
+        from sglang.srt.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+
+        self.layer_broadcast_comm = PyNcclCommunicator(
+            group=cp_group.cpu_group,
+            device=cp_group.device,
+        )
+        logger.info(
+            "Initialized dedicated layer-shard broadcast NCCL communicator: "
+            f"rank={cp_group.rank_in_group}, world_size={cp_group.world_size}"
+        )
+
+    def _broadcast_tensor_from_owner(
+        self,
+        tensor: torch.Tensor,
+        layer_id: int,
+        src_tensor: Optional[torch.Tensor] = None,
+        use_layer_broadcast_comm: bool = False,
+    ) -> torch.Tensor:
+        if not self.layer_shard_enabled:
+            return tensor
+
+        owner_rank = self._get_layer_owner_rank(layer_id)
+        if self.layer_shard_rank == owner_rank:
+            assert src_tensor is not None
+            tensor.copy_(src_tensor)
+
+        if use_layer_broadcast_comm and self.layer_broadcast_comm is not None:
+            with self.layer_broadcast_comm.change_state(enable=True):
+                self.layer_broadcast_comm.broadcast(tensor, owner_rank)
+        else:
+            cp_group = get_attention_cp_group()
+            pynccl_comm = cp_group.pynccl_comm
+            if pynccl_comm is not None:
+                with pynccl_comm.change_state(enable=True):
+                    pynccl_comm.broadcast(tensor, owner_rank)
+            else:
+                cp_group.broadcast(tensor, src=owner_rank)
+        return tensor
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -1567,6 +1690,8 @@ class HybridLinearKVPool(KVCache):
         nsa_index_kpool: int = 1,
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
     ):
         self.size = size
         self.dtype = dtype
@@ -1623,6 +1748,8 @@ class HybridLinearKVPool(KVCache):
                 nsa_index_kpool=nsa_index_kpool,
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
+                layer_shard_rank=layer_shard_rank,
+                layer_shard_size=layer_shard_size,
             )
             self.use_fp8_index_k_cache = (
                 self.full_kv_pool.use_fp8_index_k_cache
@@ -1710,6 +1837,34 @@ class HybridLinearKVPool(KVCache):
                 f"{layer_id=} not in full attention layers: {self.full_attention_layer_id_mapping.keys()}"
             )
         return self.full_attention_layer_id_mapping[layer_id]
+
+    @property
+    def layer_shard_enabled(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
+
+    @property
+    def layer_shard_rank(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "layer_shard_rank", None)
+
+    @property
+    def layer_shard_size(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_size", 1)
+
+    @property
+    def layer_shard_start(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_start", self.start_layer)
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        if not self.use_nsa:
+            return True
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool._is_layer_owned(full_layer_id)
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
+        if not self.use_nsa:
+            return
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.invalidate_index_buffer_for_layer(full_layer_id)
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: "LayerDoneCounter"
@@ -1829,6 +1984,37 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
+    def prefetch_mla_kv_buffer(
+        self, layer_id: int, *, has_history: bool = True
+    ) -> None:
+        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
+            return
+        if layer_id not in self.full_attention_layer_id_mapping:
+            return
+
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        layer_transfer_idx = layer_id - self.start_layer
+        # The cold-chunk scratch fill is implemented by the DCU NSA write
+        # paths below. Preserve the existing broadcast behavior elsewhere.
+        has_history = has_history or not _is_dcu
+        if (
+            self.use_nsa
+            and _is_dcu
+            and hasattr(self.full_kv_pool, "prefetch_index_buffer")
+        ):
+            self.full_kv_pool.prefetch_index_buffer(
+                full_layer_id,
+                layer_transfer_counter=self.layer_transfer_counter,
+                layer_transfer_idx=layer_transfer_idx,
+                has_history=has_history,
+            )
+        self.full_kv_pool.prefetch_kv_buffer(
+            full_layer_id,
+            layer_transfer_counter=self.layer_transfer_counter,
+            layer_transfer_idx=layer_transfer_idx,
+            has_history=has_history,
+        )
+
     def _get_nsa_layer_id(self, layer_id: int) -> int:
         assert self.use_nsa, "NSA index cache called when use_nsa is False"
         self._wait_for_layer(layer_id)
@@ -1845,6 +2031,20 @@ class HybridLinearKVPool(KVCache):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.full_kv_pool.get_index_k_with_scale_buffer(
             self._get_nsa_layer_id(layer_id)
+        )
+
+    def get_dcu_index_k_with_scale_write_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        return self.full_kv_pool.get_dcu_index_k_with_scale_write_buffer(
+            self._get_nsa_layer_id(layer_id)
+        )
+
+    def commit_dcu_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.commit_dcu_index_k_with_scale_write_buffer(
+            self._get_nsa_layer_id(layer_id), loc
         )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
@@ -1928,6 +2128,8 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_nsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
     ):
         super().__init__(
             size,
@@ -1938,6 +2140,8 @@ class MLATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            layer_shard_rank,
+            layer_shard_size,
         )
 
         self.kv_lora_rank = kv_lora_rank
@@ -1977,15 +2181,36 @@ class MLATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
+                        (
+                            (self.size + self.page_size)
+                            if self._is_layer_owned(self.start_layer + i)
+                            else 0,
+                            1,
+                            self.kv_cache_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for i in range(self.layer_num)
+                ]
+                if self.layer_shard_enabled:
+                    self.remote_kv_buffer = torch.zeros(
                         (self.size + self.page_size, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
-                ]
+                    self.remote_kv_layer_id: Optional[int] = None
+                    self.device_module = torch.get_device_module(self.device)
+                    self.kv_broadcast_stream = self.device_module.Stream()
+                    self.pending_remote_kv_event = self.device_module.Event()
+                    self.pending_remote_kv_layer_id: Optional[int] = None
+                    self.pending_remote_kv_broadcast = False
+        self._init_layer_broadcast_comm()
 
     def _clear_buffers(self):
         del self.kv_buffer
+        if hasattr(self, "remote_kv_buffer"):
+            del self.remote_kv_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "kv_buffer")
@@ -1996,11 +2221,24 @@ class MLATokenToKVPool(KVCache):
 
     # for disagg
     def get_contiguous_buf_infos(self):
-        # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        if self.layer_shard_enabled:
+            owned_layer_ids = [
+                i
+                for i in range(self.layer_num)
+                if self._is_layer_owned(self.start_layer + i)
+            ]
+        else:
+            owned_layer_ids = list(range(self.layer_num))
+
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in owned_layer_ids]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in owned_layer_ids]
         kv_item_lens = [
-            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+            (
+                self.kv_buffer[i][0].nbytes * self.page_size
+                if self.kv_buffer[i].shape[0] > 0
+                else 0
+            )
+            for i in owned_layer_ids
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -2008,35 +2246,37 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            return kv_buffer.view(self.dtype)
 
-        return self.kv_buffer[layer_id - self.start_layer]
+        return kv_buffer
 
     def get_key_buffer_DeepSeekV2(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype and self.dtype not in (
             torch.float8_e5m2, torch.float8_e4m3fn):
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.kv_buffer[layer_id - self.start_layer], self.dtype
+            return kv_buffer.view(self.dtype)
+        return kv_buffer, self.dtype
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer][
-                ..., : self.kv_lora_rank
-            ].view(self.dtype)
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+            return kv_buffer[..., : self.kv_lora_rank].view(self.dtype)
+        return kv_buffer[..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    def _store_kv_cache(self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor):
-        kv_buffer = self.kv_buffer[layer_id - self.start_layer]
+    def _store_kv_cache_to_buffer(
+        self, kv_buffer: torch.Tensor, loc: torch.Tensor, cache_k: torch.Tensor
+    ):
         if cache_k.shape[-1] == self.kv_cache_dim:
             kv_buffer[loc] = cache_k
         else:
@@ -2044,6 +2284,10 @@ class MLATokenToKVPool(KVCache):
             pad_width = self.kv_cache_dim - cache_k.shape[-1]
             padding = cache_k.new_zeros(*cache_k.shape[:-1], pad_width)
             kv_buffer[loc] = torch.cat([cache_k, padding], dim=-1)
+
+    def _store_kv_cache(self, layer_id: int, loc: torch.Tensor, cache_k: torch.Tensor):
+        kv_buffer = self.kv_buffer[layer_id - self.start_layer]
+        self._store_kv_cache_to_buffer(kv_buffer, loc, cache_k)
 
     def set_kv_buffer(
         self,
@@ -2054,6 +2298,18 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not self.nsa_kv_cache_store_fp8
+        if (
+            self.layer_shard_enabled
+            and getattr(self, "pending_remote_kv_layer_id", None) == layer_id
+        ):
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if (
+            self.layer_shard_enabled
+            and getattr(self, "remote_kv_layer_id", None) == layer_id
+        ):
+            self.remote_kv_layer_id = None
+        if not self._is_layer_owned(layer_id):
+            return
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -2071,6 +2327,8 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+        if not self._is_layer_owned(layer_id):
+            return
         cache_k = torch.cat([cache_k_nope, cache_k_rope],dim=-1)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
@@ -2078,22 +2336,19 @@ class MLATokenToKVPool(KVCache):
             self._store_kv_cache(layer_id, loc, cache_k.view(self.store_dtype))
         else:
             self._store_kv_cache(layer_id, loc, cache_k)
-        
 
-    def set_mla_kv_buffer(
+    def _write_mla_kv_buffer(
         self,
-        layer: RadixAttention,
+        dst_buffer: torch.Tensor,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-    ):
-        layer_id = layer.layer_id
-
+    ) -> None:
         if _is_hip and not _is_dcu and self.use_nsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
-                self.kv_buffer[layer_id - self.start_layer],
+                dst_buffer,
                 loc,
                 cache_k_nope,
                 cache_k_rope,
@@ -2106,7 +2361,7 @@ class MLATokenToKVPool(KVCache):
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope, 
                     cache_k_rope, 
-                    self.kv_buffer[layer_id - self.start_layer], 
+                    dst_buffer,
                     loc,
                     "fp8_e4m3",
                     1e-6,
@@ -2116,7 +2371,7 @@ class MLATokenToKVPool(KVCache):
                     cache_k_nope, cache_k_rope
                 )
                 set_mla_kv_buffer_triton(
-                    self.kv_buffer[layer_id - self.start_layer],
+                    dst_buffer,
                     loc,
                     cache_k_nope_fp8,
                     cache_k_rope_fp8,
@@ -2131,14 +2386,152 @@ class MLATokenToKVPool(KVCache):
 
             if cache_k_nope.shape[-1] + cache_k_rope.shape[-1] == self.kv_cache_dim:
                 set_mla_kv_buffer_triton(
-                    self.kv_buffer[layer_id - self.start_layer],
+                    dst_buffer,
                     loc,
                     cache_k_nope,
                     cache_k_rope,
                 )
             else:
                 cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
-                self._store_kv_cache(layer_id, loc, cache_k)
+                self._store_kv_cache_to_buffer(dst_buffer, loc, cache_k)
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        remote_kv_updatable = False
+        if self.layer_shard_enabled:
+            if getattr(self, "pending_remote_kv_layer_id", None) == layer_id:
+                self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
+            remote_kv_updatable = (
+                getattr(self, "remote_kv_layer_id", None) == layer_id
+            )
+
+        if remote_kv_updatable:
+            self._write_mla_kv_buffer(
+                self.remote_kv_buffer, loc, cache_k_nope, cache_k_rope
+            )
+        if not self._is_layer_owned(layer_id):
+            return
+
+        self._write_mla_kv_buffer(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
+        if (
+            self.layer_shard_enabled
+            and not remote_kv_updatable
+            and getattr(self, "remote_kv_layer_id", None) == layer_id
+        ):
+            self.remote_kv_layer_id = None
+
+    def _finalize_pending_kv_broadcast(
+        self, *, set_remote_layer_id: bool = True
+    ) -> None:
+        if (
+            not self.layer_shard_enabled
+            or not getattr(self, "pending_remote_kv_broadcast", False)
+        ):
+            return
+        self.device_module.current_stream().wait_event(self.pending_remote_kv_event)
+        self.pending_remote_kv_broadcast = False
+        if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
+            self.remote_kv_layer_id = self.pending_remote_kv_layer_id
+        elif not set_remote_layer_id:
+            self.remote_kv_layer_id = None
+        self.pending_remote_kv_layer_id = None
+
+    def _drain_pending_layer_broadcasts(self) -> None:
+        """Order a synchronous fallback after all side-stream broadcasts."""
+        finalize_index = getattr(self, "_finalize_pending_index_broadcast", None)
+        if finalize_index is not None:
+            finalize_index(set_remote_layer_id=False)
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+
+    def prefetch_kv_buffer(
+        self,
+        layer_id: int,
+        layer_transfer_counter: Optional["LayerDoneCounter"] = None,
+        layer_transfer_idx: Optional[int] = None,
+        has_history: bool = True,
+    ) -> None:
+        if not self.layer_shard_enabled:
+            return
+        if self.remote_kv_layer_id == layer_id:
+            return
+        if getattr(self, "pending_remote_kv_broadcast", False):
+            if self.pending_remote_kv_layer_id == layer_id:
+                return
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+
+        if not has_history:
+            # The current step starts without reusable tokens. The gathered K
+            # will populate this scratch directly, so an empty owner broadcast
+            # would only duplicate data movement.
+            self.remote_kv_layer_id = layer_id
+            return
+
+        local_idx = self._local_layer_idx(layer_id)
+        src_tensor = (
+            self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+        )
+        if self.layer_broadcast_comm is None:
+            self._broadcast_tensor_from_owner(
+                self.remote_kv_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.pending_remote_kv_event.record()
+            self.remote_kv_layer_id = layer_id
+            return
+
+        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.kv_broadcast_stream):
+            if layer_transfer_counter is not None and layer_transfer_idx is not None:
+                layer_transfer_counter.wait_until(layer_transfer_idx)
+            self._broadcast_tensor_from_owner(
+                self.remote_kv_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.pending_remote_kv_event.record()
+        self.remote_kv_layer_id = None
+        self.pending_remote_kv_layer_id = layer_id
+        self.pending_remote_kv_broadcast = True
+
+    def _get_broadcastable_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        if not self.layer_shard_enabled:
+            return self.kv_buffer[layer_id - self.start_layer]
+        if getattr(self, "pending_remote_kv_broadcast", False):
+            if self.pending_remote_kv_layer_id == layer_id:
+                self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
+            else:
+                self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if self.remote_kv_layer_id != layer_id:
+            # The main and index broadcasts share one communicator. A fallback
+            # broadcast on the current stream must not race with work still
+            # queued on the communication stream.
+            self._drain_pending_layer_broadcasts()
+            local_idx = self._local_layer_idx(layer_id)
+            src_tensor = (
+                self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+            )
+            self._broadcast_tensor_from_owner(
+                self.remote_kv_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.remote_kv_layer_id = layer_id
+        return self.remote_kv_buffer
 
     def get_mla_kv_buffer(
         self,
@@ -2169,6 +2562,8 @@ class MLATokenToKVPool(KVCache):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
+            if self.kv_buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
@@ -2182,6 +2577,8 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
+            if self.kv_buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
@@ -2343,6 +2740,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         nsa_index_kpool: int = 1,
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
+        layer_shard_rank: Optional[int] = None,
+        layer_shard_size: int = 1,
     ):
 
         override_dim = (
@@ -2362,6 +2761,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_nsa=True,
             override_kv_cache_dim=override_dim,
+            layer_shard_rank=layer_shard_rank,
+            layer_shard_size=layer_shard_size,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -2374,6 +2775,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self._tail_score = None
         if index_buf_size is None:
             index_buf_size = size
+        num_pages = (index_buf_size + page_size + 1) // self.page_size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
         if _is_dcu:
@@ -2414,7 +2816,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         #         * buf[i, :page_size * head_dim] for fp8 data
                         #         * buf[i, page_size * head_dim:].view(float32) for scale
                         (
-                            (index_buf_size + page_size + 1) // self.page_size,
+                            num_pages
+                            if self._is_layer_owned(self.start_layer + i)
+                            else 0,
                             self.slots_per_page
                             * (
                                 index_head_dim
@@ -2424,13 +2828,15 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         dtype=self.index_k_with_scale_buffer_dtype,
                         device=device,
                     )
-                    for _ in range(layer_num)
+                    for i in range(layer_num)
                 ]
             else:
                 self.index_k_buffer = [
                     torch.zeros(
                         (
-                            (index_buf_size + page_size + 1) // self.page_size,
+                            num_pages
+                            if self._is_layer_owned(self.start_layer + i)
+                            else 0,
                             self.page_size,
                             1,
                             self.index_head_dim,
@@ -2438,7 +2844,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         dtype=self.index_k_buffer_dtype,
                         device=device,
                     )
-                    for _ in range(layer_num)
+                    for i in range(layer_num)
                 ]
             if self.index_kpool > 1:
                 assert max_running_requests is not None, (
@@ -2457,14 +2863,45 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     torch.zeros(tail_shape, dtype=torch.bfloat16, device=device)
                     for _ in range(layer_num)
                 ]
+            if self.layer_shard_enabled:
+                if self.use_fp8_index_k_cache:
+                    self.remote_index_k_with_scale_buffer = torch.zeros(
+                        (
+                            num_pages,
+                            self.page_size
+                            * (
+                                index_head_dim
+                                + index_head_dim // self.quant_block_size * 4
+                            ),
+                        ),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                else:
+                    self.remote_index_k_buffer = torch.zeros(
+                        (num_pages, self.page_size, 1, self.index_head_dim),
+                        dtype=self.index_k_buffer_dtype,
+                        device=device,
+                    )
+                self.remote_index_layer_id: Optional[int] = None
+                self.pending_remote_index_event = self.device_module.Event()
+                self.pending_remote_index_layer_id: Optional[int] = None
+                self.pending_remote_index_broadcast = False
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
-        del self.kv_buffer
-        del self.index_k_with_scale_buffer
+        super()._clear_buffers()
+        if self.index_k_with_scale_buffer is not None:
+            del self.index_k_with_scale_buffer
+        if self.index_k_buffer is not None:
+            del self.index_k_buffer
         if self._tail_k is not None:
             del self._tail_k
             del self._tail_score
+        if hasattr(self, "remote_index_k_with_scale_buffer"):
+            del self.remote_index_k_with_scale_buffer
+        if hasattr(self, "remote_index_k_buffer"):
+            del self.remote_index_k_buffer
 
     def get_tail_buffers(self, layer_id: int):
         assert self._tail_k is not None and self._tail_score is not None
@@ -2481,18 +2918,71 @@ class NSATokenToKVPool(MLATokenToKVPool):
             [b[0].nbytes for b in bufs],
         )
 
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return self._get_broadcastable_index_buffer(layer_id)
+
+    def get_dcu_index_k_with_scale_write_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        """Return the DCU fused-write target for the current index K."""
+        assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        remote_updatable = self._prepare_remote_index_write(layer_id)
+
+        local_idx = layer_id - self.start_layer
+        if not self.layer_shard_enabled or self._is_layer_owned(layer_id):
+            return self.index_k_with_scale_buffer[local_idx]
+        if not remote_updatable:
+            self.remote_index_layer_id = None
+        return self.remote_index_k_with_scale_buffer
+
+    def commit_dcu_index_k_with_scale_write_buffer(
+        self, layer_id: int, loc: torch.Tensor
+    ) -> None:
+        """Mirror owner fused writes into an already-prefetched scratch."""
+        if not self.layer_shard_enabled or not self._is_layer_owned(layer_id):
+            return
+        if not self._prepare_remote_index_write(layer_id):
+            return
+
+        local_buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        remote_buf = self.remote_index_k_with_scale_buffer
+        page_indices = loc // self.page_size
+        token_offsets = loc % self.page_size
+        k_bytes_per_page = self.page_size * self.index_head_dim
+        scale_bytes_per_token = (
+            self.index_head_dim // self.quant_block_size * torch.float32.itemsize
+        )
+
+        local_k = local_buf[:, :k_bytes_per_page].view(
+            -1, self.page_size, self.index_head_dim
+        )
+        remote_k = remote_buf[:, :k_bytes_per_page].view(
+            -1, self.page_size, self.index_head_dim
+        )
+        remote_k[page_indices, token_offsets] = local_k[page_indices, token_offsets]
+
+        local_scale = local_buf[:, k_bytes_per_page:].view(
+            -1, self.page_size, scale_bytes_per_token
+        )
+        remote_scale = remote_buf[:, k_bytes_per_page:].view(
+            -1, self.page_size, scale_bytes_per_token
+        )
+        remote_scale[page_indices, token_offsets] = local_scale[
+            page_indices, token_offsets
+        ]
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         assert self.index_k_buffer is not None, "BF16 index K cache is not enabled"
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        return self.index_k_buffer[layer_id - self.start_layer]
+        return self._get_broadcastable_index_buffer(layer_id)
 
     def get_index_k_continuous(
         self,
@@ -2502,13 +2992,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         if not self.use_fp8_index_k_cache:
             num_pages = (seq_len + self.page_size - 1) // self.page_size
-            buf = self.get_index_k_buffer(layer_id)
+            buf = self._get_broadcastable_index_buffer(layer_id)
             return buf[page_indices[:num_pages]].view(-1, 1, self.index_head_dim)[
                 :seq_len
             ]
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_broadcastable_index_buffer(layer_id)
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -2521,7 +3011,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_broadcastable_index_buffer(layer_id)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -2547,7 +3037,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        buf = self._get_broadcastable_index_buffer(layer_id)
+        self.prefetch_kv_buffer(layer_id)
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -2565,10 +3056,158 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
+        remote_updatable = self._prepare_remote_index_write(layer_id)
+        if remote_updatable:
+            index_buf_accessor.SetKAndS.execute(
+                pool=self,
+                buf=self.remote_index_k_with_scale_buffer,
+                loc=loc,
+                index_k=index_k,
+                index_k_scale=index_k_scale,
+            )
+        if not self._is_layer_owned(layer_id):
+            return
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def _finalize_pending_index_broadcast(
+        self, *, set_remote_layer_id: bool = True
+    ) -> None:
+        if (
+            not self.layer_shard_enabled
+            or not getattr(self, "pending_remote_index_broadcast", False)
+        ):
+            return
+        self.device_module.current_stream().wait_event(
+            self.pending_remote_index_event
+        )
+        self.pending_remote_index_broadcast = False
+        if (
+            set_remote_layer_id
+            and self.pending_remote_index_layer_id is not None
+        ):
+            self.remote_index_layer_id = self.pending_remote_index_layer_id
+        elif not set_remote_layer_id:
+            self.remote_index_layer_id = None
+        self.pending_remote_index_layer_id = None
+
+    def prefetch_index_buffer(
+        self,
+        layer_id: int,
+        layer_transfer_counter: Optional["LayerDoneCounter"] = None,
+        layer_transfer_idx: Optional[int] = None,
+        has_history: bool = True,
+    ) -> None:
+        if not self.layer_shard_enabled:
+            return
+        if self.remote_index_layer_id == layer_id:
+            return
+        if getattr(self, "pending_remote_index_broadcast", False):
+            if self.pending_remote_index_layer_id == layer_id:
+                return
+            self._finalize_pending_index_broadcast(set_remote_layer_id=False)
+
+        if not has_history:
+            self.remote_index_layer_id = layer_id
+            return
+
+        if self.use_fp8_index_k_cache:
+            local_buffer = self.index_k_with_scale_buffer
+            remote_buffer = self.remote_index_k_with_scale_buffer
+        else:
+            local_buffer = self.index_k_buffer
+            remote_buffer = self.remote_index_k_buffer
+        local_idx = self._local_layer_idx(layer_id)
+        src_tensor = (
+            local_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+        )
+
+        if self.layer_broadcast_comm is None:
+            self._broadcast_tensor_from_owner(
+                remote_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.pending_remote_index_event.record()
+            self.remote_index_layer_id = layer_id
+            return
+
+        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(self.kv_broadcast_stream):
+            if layer_transfer_counter is not None and layer_transfer_idx is not None:
+                layer_transfer_counter.wait_until(layer_transfer_idx)
+            self._broadcast_tensor_from_owner(
+                remote_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.pending_remote_index_event.record()
+        self.remote_index_layer_id = None
+        self.pending_remote_index_layer_id = layer_id
+        self.pending_remote_index_broadcast = True
+
+    def _prepare_remote_index_write(self, layer_id: int) -> bool:
+        if not self.layer_shard_enabled:
+            return False
+        if getattr(self, "pending_remote_index_broadcast", False):
+            self._finalize_pending_index_broadcast(
+                set_remote_layer_id=(
+                    self.pending_remote_index_layer_id == layer_id
+                )
+            )
+        return self.remote_index_layer_id == layer_id
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
+        if (
+            self.layer_shard_enabled
+            and getattr(self, "pending_remote_index_broadcast", False)
+            and self.pending_remote_index_layer_id == layer_id
+        ):
+            self._finalize_pending_index_broadcast(set_remote_layer_id=False)
+        if (
+            self.layer_shard_enabled
+            and getattr(self, "remote_index_layer_id", None) == layer_id
+        ):
+            self.remote_index_layer_id = None
+
+    def _get_broadcastable_index_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.use_fp8_index_k_cache:
+            local_buffer = self.index_k_with_scale_buffer
+            remote_attr = "remote_index_k_with_scale_buffer"
+        else:
+            local_buffer = self.index_k_buffer
+            remote_attr = "remote_index_k_buffer"
+
+        if not self.layer_shard_enabled:
+            return local_buffer[layer_id - self.start_layer]
+        if getattr(self, "pending_remote_index_broadcast", False):
+            self._finalize_pending_index_broadcast(
+                set_remote_layer_id=(
+                    self.pending_remote_index_layer_id == layer_id
+                )
+            )
+        if self.remote_index_layer_id != layer_id:
+            # Main KV prefetch is queued after index prefetch on the same
+            # communicator. Drain both before issuing a synchronous fallback
+            # from the current stream.
+            self._drain_pending_layer_broadcasts()
+            local_idx = self._local_layer_idx(layer_id)
+            src_tensor = (
+                local_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+            )
+            remote_buffer = getattr(self, remote_attr)
+            self._broadcast_tensor_from_owner(
+                remote_buffer,
+                layer_id,
+                src_tensor=src_tensor,
+                use_layer_broadcast_comm=True,
+            )
+            self.remote_index_layer_id = layer_id
+        return getattr(self, remote_attr)
 
     def get_cpu_copy(self, indices):
         # NSA keeps a page-indexed indexer cache alongside kv_buffer.
@@ -2590,6 +3229,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
             index_k_cpu.append([])
+            if index_k_cache[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cache[layer_id][chunk_page_indices].to(
@@ -2614,6 +3255,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
+            if index_k_cache[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
@@ -2634,6 +3277,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.index_k_buffer_dtype:
             index_k = index_k.to(self.index_k_buffer_dtype)
 
+        remote_updatable = self._prepare_remote_index_write(layer_id)
+        if remote_updatable:
+            self.remote_index_k_buffer[
+                loc // self.page_size, loc % self.page_size
+            ] = index_k
+        if not self._is_layer_owned(layer_id):
+            return
         self.index_k_buffer[layer_id - self.start_layer][
             loc // self.page_size, loc % self.page_size
         ] = index_k
@@ -2644,9 +3294,21 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.use_fp8_index_k_cache
             else self.index_k_buffer
         )
-        data_ptrs = [index_cache[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [index_cache[i].nbytes for i in range(self.layer_num)]
-        item_lens = [index_cache[i][0].nbytes for i in range(self.layer_num)]
+        if self.layer_shard_enabled:
+            owned_layer_ids = [
+                i
+                for i in range(self.layer_num)
+                if self._is_layer_owned(self.start_layer + i)
+            ]
+        else:
+            owned_layer_ids = list(range(self.layer_num))
+
+        data_ptrs = [index_cache[i].data_ptr() for i in owned_layer_ids]
+        data_lens = [index_cache[i].nbytes for i in owned_layer_ids]
+        item_lens = [
+            index_cache[i][0].nbytes if index_cache[i].shape[0] > 0 else 0
+            for i in owned_layer_ids
+        ]
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
@@ -2675,4 +3337,3 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
-

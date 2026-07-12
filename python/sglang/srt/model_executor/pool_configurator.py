@@ -25,7 +25,10 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import (
@@ -137,14 +140,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if mr.use_mla_backend:
             is_nsa = is_deepseek_nsa(model_config.hf_config)
+            # Dense MLA is not layer-sharded. Only NSA reuses this MLA-family
+            # pool with its KV and index cache split across prefill CP ranks.
+            cache_num_layers = num_layers
+            if (
+                is_nsa
+                and not mr.is_draft_worker
+                and getattr(
+                    mr.server_args, "enable_nsa_cache_layer_split", False
+                )
+            ):
+                layer_shard_size = get_attention_cp_size()
+                if layer_shard_size > 1:
+                    owned_layers_upper_bound = (
+                        num_layers + layer_shard_size - 1
+                    ) // layer_shard_size
+                    # Each rank allocates its owned layers plus one scratch
+                    # buffer used when broadcasting a remote layer.
+                    cache_num_layers = max(1, owned_layers_upper_bound + 1)
             kv_cache_dim = (
                 mr.calculate_mla_kv_cache_dim()
                 if is_nsa
                 else model_config.kv_lora_rank + model_config.qk_rope_head_dim
             )
-            cell_size = (
-                kv_cache_dim * num_layers * kv_size
-            )
+            cell_size = kv_cache_dim * cache_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -153,7 +172,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                         // scale_block_size
                     )
-                    * num_layers
+                    * cache_num_layers
                     * kv_size
                 )
 
@@ -176,7 +195,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size = torch._utils._element_size(
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token
+                    * cache_num_layers
+                    * element_size
+                )
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)

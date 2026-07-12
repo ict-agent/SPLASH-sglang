@@ -1395,8 +1395,10 @@ class Indexer(MultiPlatformOp):
                     index_k=key,
                 )
                 return
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
+            buf = (
+                forward_batch.token_to_kv_pool.get_dcu_index_k_with_scale_write_buffer(
+                    layer_id=layer_id
+                )
             )
             is_e4m3 = not _is_fp8_fnuz
             op.fuse_act_quant_and_store_index_k_cache(
@@ -1407,6 +1409,11 @@ class Indexer(MultiPlatformOp):
                 1e-5,                                     # eps
                 False,                                    # use_ue8m0
                 is_e4m3                                   # is_e4m3
+            )
+            (
+                forward_batch.token_to_kv_pool.commit_dcu_index_k_with_scale_write_buffer(
+                    layer_id, forward_batch.out_cache_loc
+                )
             )
             return
         # Fallback: original path
@@ -1515,7 +1522,11 @@ class Indexer(MultiPlatformOp):
                         q_lora, x, positions, False, forward_batch=forward_batch,
                         apply_hadamard_scale=False
                     )
-                    k_buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+                    k_buf = (
+                        forward_batch.token_to_kv_pool.get_dcu_index_k_with_scale_write_buffer(
+                            layer_id=layer_id
+                        )
+                    )
                     k_loc = forward_batch.out_cache_loc
                     page_size = forward_batch.token_to_kv_pool.page_size
                     is_e4m3 = not _is_fp8_fnuz
@@ -1537,6 +1548,11 @@ class Indexer(MultiPlatformOp):
                             False,             # use_ue8m0
                             is_e4m3            # is_e4m3
                         )
+                    (
+                        forward_batch.token_to_kv_pool.commit_dcu_index_k_with_scale_write_buffer(
+                            layer_id, k_loc
+                        )
+                    )
                     q_index = q_fp8.view(torch.float8_e4m3fnuz) if _is_fp8_fnuz else q_fp8.view(torch.float8_e4m3fn)
             else:
                 weights = self._project_and_scale_head_gates(x)
@@ -1579,7 +1595,7 @@ class Indexer(MultiPlatformOp):
                         apply_hadamard_scale=False,
                     )
                     k_buf = (
-                        forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                        forward_batch.token_to_kv_pool.get_dcu_index_k_with_scale_write_buffer(
                             layer_id=layer_id
                         )
                     )
@@ -1603,6 +1619,11 @@ class Indexer(MultiPlatformOp):
                         1e-5,              # eps
                         False,             # use_ue8m0
                         is_e4m3            # is_e4m3
+                    )
+                    (
+                        forward_batch.token_to_kv_pool.commit_dcu_index_k_with_scale_write_buffer(
+                            layer_id, k_loc
+                        )
                     )
                     q_index = (
                         q_fp8.view(torch.float8_e4m3fnuz)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -13,7 +13,11 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import get_dcu_mla_fp8_kv_cache_dim
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -62,6 +66,22 @@ _is_hip = is_hip()
 _is_dcu = is_dcu()
 
 
+def _is_nsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
+    return (
+        not model_runner.is_draft_worker
+        and model_runner.server_args.enable_nsa_cache_layer_split
+    )
+
+
+def _get_nsa_cp_layer_shard_info(model_runner: ModelRunner) -> tuple[Optional[int], int]:
+    if not _is_nsa_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_attention_cp_size()
+    if shard_size <= 1:
+        return None, 1
+    return get_attention_cp_rank(), shard_size
+
+
 class ModelRunnerKVCacheMixin:
     def _uses_dcu_mla_backend(self: ModelRunner) -> bool:
         return (
@@ -72,10 +92,22 @@ class ModelRunnerKVCacheMixin:
 
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        effective_num_layers = num_layers
+        if (
+            self.use_mla_backend
+            and is_deepseek_nsa(self.model_config.hf_config)
+            and _is_nsa_cache_layer_split_enabled(self)
+        ):
+            shard_rank, shard_size = _get_nsa_cp_layer_shard_info(self)
+            if shard_rank is not None:
+                owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
+                # One extra layer is the remote scratch buffer for a layer owned
+                # by another CP rank.
+                effective_num_layers = max(1, owned_layers_upper_bound + 1)
         if self.use_mla_backend:
             mla_kv_cache_dim = self.calculate_mla_kv_cache_dim()
             cell_size = (
-                mla_kv_cache_dim * num_layers * kv_size
+                mla_kv_cache_dim * effective_num_layers * kv_size
             )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
@@ -88,7 +120,7 @@ class ModelRunnerKVCacheMixin:
                         )
                         // scale_block_size
                     )
-                    * num_layers
+                    * effective_num_layers
                     * kv_size
                 )
 
@@ -111,7 +143,7 @@ class ModelRunnerKVCacheMixin:
                     element_size = torch._utils._element_size(
                         NSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += indexer_size_per_token * effective_num_layers * element_size
         else:
             if self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
@@ -431,6 +463,9 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        nsa_cp_layer_shard_rank, nsa_cp_layer_shard_size = (
+            _get_nsa_cp_layer_shard_info(self)
+        )
 
         # Out-of-tree platform plugin system â€?used by elif below
         from sglang.srt.platforms import current_platform
@@ -638,6 +673,8 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                layer_shard_rank=nsa_cp_layer_shard_rank,
+                layer_shard_size=nsa_cp_layer_shard_size,
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
@@ -719,6 +756,8 @@ class ModelRunnerKVCacheMixin:
                             nsa_index_kpool=self.model_config.nsa_index_kpool,
                             tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
                             max_running_requests=self.max_running_requests,
+                            layer_shard_rank=nsa_cp_layer_shard_rank,
+                            layer_shard_size=nsa_cp_layer_shard_size,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,

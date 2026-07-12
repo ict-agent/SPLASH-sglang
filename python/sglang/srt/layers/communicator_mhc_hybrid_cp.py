@@ -1,5 +1,10 @@
+from typing import Optional
+
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.communicator_nsa_cp import (
+    maybe_prefetch_next_full_attention_kv,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils.cp_utils import (
     cp_plain_all_gather,
@@ -57,4 +62,13 @@ class MHCHybridNSACPLayerCommunicator(MHCLayerCommunicator):
         return self._use_cp_plain_moe_tp_fallback(
             forward_batch,
             self.is_layer_sparse,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )

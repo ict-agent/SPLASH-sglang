@@ -589,6 +589,80 @@ class MooncakeKVManager(CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    @staticmethod
+    def _get_layer_shard_range(
+        shard_rank: int, shard_size: int, total_layers: int
+    ) -> Tuple[int, int]:
+        base = total_layers // shard_size
+        rem = total_layers % shard_size
+        start = shard_rank * base + min(shard_rank, rem)
+        end = start + base + (1 if shard_rank < rem else 0)
+        return start, end
+
+    def _slice_dst_nsa_layer_shard_ptrs(
+        self,
+        req: TransferInfo,
+        src_data_ptrs: list[int],
+        src_item_lens: list[int],
+        dst_data_ptrs: list[int],
+    ) -> Optional[list[int]]:
+        if (
+            not self.server_args.enable_nsa_cache_layer_split
+            or self.attn_cp_size <= 1
+            or len(src_data_ptrs) == len(dst_data_ptrs)
+        ):
+            return dst_data_ptrs
+
+        total_layers = len(dst_data_ptrs)
+        start, end = self._get_layer_shard_range(
+            self.attn_cp_rank, self.attn_cp_size, total_layers
+        )
+        expected_layers = end - start
+        if expected_layers != len(src_data_ptrs) or expected_layers != len(
+            src_item_lens
+        ):
+            logger.error(
+                "NSA layer-split state ptr mismatch for room %s: "
+                "cp_rank=%s, cp_size=%s, dst_total_layers=%s, "
+                "dst_shard=[%s,%s), src_ptrs=%s, src_item_lens=%s",
+                req.room,
+                self.attn_cp_rank,
+                self.attn_cp_size,
+                total_layers,
+                start,
+                end,
+                len(src_data_ptrs),
+                len(src_item_lens),
+            )
+            return None
+
+        return dst_data_ptrs[start:end]
+
+    def _should_skip_hybrid_mla(
+        self, info: Optional[KVArgsRegisterInfo]
+    ) -> Tuple[bool, bool]:
+        skip_kv = False
+        skip_state = False
+        if not self.is_hybrid_mla_backend:
+            return skip_kv, skip_state
+
+        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
+            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
+                self.attn_tp_size // info.dst_attn_tp_size
+            )
+            if sub_rank != 0:
+                skip_kv = True
+                skip_state = True
+
+        if (
+            self.attn_cp_size > 1
+            and self.attn_cp_rank != 0
+            and not self.server_args.enable_nsa_cache_layer_split
+        ):
+            skip_state = True
+
+        return skip_kv, skip_state
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -1069,33 +1143,6 @@ class MooncakeKVManager(CommonKVManager):
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
 
-    def _should_skip_hybrid_mla(
-        self, info: Optional[KVArgsRegisterInfo]
-    ) -> Tuple[bool, bool]:
-        skip_kv = False
-        skip_state = False
-        if not self.is_hybrid_mla_backend:
-            return skip_kv, skip_state
-
-        if info is not None and self.attn_tp_size > info.dst_attn_tp_size:
-            sub_rank = (self.kv_args.engine_rank % self.attn_tp_size) % (
-                self.attn_tp_size // info.dst_attn_tp_size
-            )
-            if sub_rank != 0:
-                skip_kv = True
-                skip_state = True
-
-        if (
-            self.attn_cp_size > 1
-            and self.attn_cp_rank != 0
-            and not getattr(
-                self.server_args, "enable_nsa_cache_layer_split", False
-            )
-        ):
-            skip_state = True
-
-        return skip_kv, skip_state
-
     def maybe_send_extra(
         self,
         req: TransferInfo,
@@ -1107,13 +1154,12 @@ class MooncakeKVManager(CommonKVManager):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
         for i, st in enumerate(state_types):
-            if skip_state and st != StateType.MAMBA:
-                continue
-
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
             if indices is None:
+                continue
+            if skip_state and st != StateType.MAMBA:
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
@@ -1200,6 +1246,16 @@ class MooncakeKVManager(CommonKVManager):
                     )
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
+                dst_data_ptrs_for_send = dst_data_ptrs
+                if st == StateType.NSA:
+                    dst_data_ptrs_for_send = self._slice_dst_nsa_layer_shard_ptrs(
+                        req,
+                        src_data_ptrs,
+                        src_item_lens,
+                        dst_data_ptrs,
+                    )
+                    if dst_data_ptrs_for_send is None:
+                        return -1
                 if len(src_indices) > len(dst_indices_local):
                     logger.warning(
                         f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
@@ -1214,7 +1270,7 @@ class MooncakeKVManager(CommonKVManager):
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
                         src_data_ptrs=src_data_ptrs,
-                        dst_data_ptrs=dst_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs_for_send,
                         item_lens=src_item_lens,
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
@@ -1222,6 +1278,9 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     or rc
                 )
+            else:
+                logger.error(f"Unknown state type: {st}")
+                return -1
         return rc
 
     def _send_mamba_state(
@@ -1241,6 +1300,55 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
+
+        return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_slot_state(
+        self,
+        req: TransferInfo,
+        src_ptrs: list[int],
+        src_item_lens: list[int],
+        dst_ptrs: list[int],
+        src_indices: list[int],
+        dst_indices: list[int],
+        label: str,
+    ):
+        """Transfer one state component using a per-request ring-slot index."""
+
+        if not src_indices and not dst_indices:
+            return 0
+        if not src_indices or not dst_indices:
+            logger.error(
+                f"{label} slot index missing: src={src_indices}, dst={dst_indices}"
+            )
+            return -1
+        if len(src_indices) != 6 or len(dst_indices) != 6:
+            logger.error(
+                f"{label} slot indices must be a 6-tuple "
+                f"(got src={src_indices}, dst={dst_indices}); "
+                f"PD nodes must run matching versions."
+            )
+            return -1
+
+        src_idx = int(src_indices[0])
+        dst_idx = int(dst_indices[0])
+        tail_size = int(src_indices[5])
+        transfer_blocks = []
+        for j, dst_ptr in enumerate(dst_ptrs):
+            row_bytes = src_item_lens[j]
+            slot_bytes = row_bytes // tail_size
+            src_row_base = src_ptrs[j] + row_bytes * src_idx
+            dst_row_base = dst_ptr + row_bytes * dst_idx
+            for seg in (1, 2):
+                n = int(src_indices[seg * 2])
+                if n == 0:
+                    continue
+                src_off = int(src_indices[seg * 2 - 1]) * slot_bytes
+                dst_off = int(dst_indices[seg * 2 - 1]) * slot_bytes
+                length = n * slot_bytes
+                transfer_blocks.append(
+                    (src_row_base + src_off, dst_row_base + dst_off, length)
+                )
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1968,12 +2076,18 @@ class MooncakeKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        # Special handling for cp
-        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+        # Special handling for cp. In layer-split mode each CP rank owns a
+        # distinct layer shard, so every rank transfers the full page list for
+        # its local layers instead of partitioning pages across CP ranks.
+        if (
+            self.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not self.kv_mgr.server_args.enable_nsa_cache_layer_split
+        ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:

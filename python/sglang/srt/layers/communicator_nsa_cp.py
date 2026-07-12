@@ -47,6 +47,38 @@ def nsa_enable_prefill_cp():
     return is_nsa_enable_prefill_cp()
 
 
+def _has_historical_kv(forward_batch: ForwardBatch) -> bool:
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is None:
+        # Be conservative for modes that do not expose CPU prefix lengths.
+        return True
+    return any(int(prefix_len) > 0 for prefix_len in prefix_lens)
+
+
+def maybe_prefetch_full_attention_kv(
+    forward_batch: ForwardBatch,
+    full_attention_layer_id: Optional[int],
+) -> None:
+    if full_attention_layer_id is None or not nsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_mla_kv = getattr(
+        forward_batch.token_to_kv_pool, "prefetch_mla_kv_buffer", None
+    )
+    if prefetch_mla_kv is not None:
+        prefetch_mla_kv(
+            full_attention_layer_id,
+            has_history=_has_historical_kv(forward_batch),
+        )
+
+
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: ForwardBatch,
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    maybe_prefetch_full_attention_kv(forward_batch, next_full_attention_layer_id)
+
+
 class NSACPLayerCommunicator(LayerCommunicator):
     def __init__(
         self,
@@ -92,6 +124,15 @@ class NSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
 

@@ -51,7 +51,10 @@ from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.communicator_mhc_hybrid_cp import (
     MHCHybridNSACPLayerCommunicator,
 )
-from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
+from sglang.srt.layers.communicator_nsa_cp import (
+    NSACPLayerCommunicator,
+    maybe_prefetch_full_attention_kv,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_attention_cp_rank,
@@ -111,6 +114,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
+    _is_dcu,
     _is_cuda,
     _is_gfx95_supported,
     _use_aiter_gfx95,
@@ -953,6 +957,11 @@ class ModelNextModel(nn.Module):
             for layer_id in config.full_attention_layer_ids
             if self.start_layer <= layer_id < self.end_layer
         ]
+        self.first_full_attention_layer_id = (
+            local_full_attention_layer_ids[0]
+            if local_full_attention_layer_ids
+            else None
+        )
         self.next_full_attention_layer_id = dict(
             zip(
                 local_full_attention_layer_ids,
@@ -1098,6 +1107,11 @@ class ModelNextModel(nn.Module):
                     "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
                     "cp_split_and_rebuild_position after "
                     "cp_all_gather_rerange_output is not identity on positions."
+                )
+
+            if _is_dcu:
+                maybe_prefetch_full_attention_kv(
+                    forward_batch, self.first_full_attention_layer_id
                 )
 
         aux_hidden_states = []
