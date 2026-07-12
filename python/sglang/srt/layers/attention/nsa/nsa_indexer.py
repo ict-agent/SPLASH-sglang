@@ -1003,7 +1003,7 @@ class Indexer(MultiPlatformOp):
         if not need_chunk:
             assert q[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
+                if _is_hip and not _is_dcu:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1060,7 +1060,7 @@ class Indexer(MultiPlatformOp):
                         dcu_k_scale,
                         dcu_logits_workspace,
                     )
-                elif _is_hip:
+                elif _is_hip and not _is_dcu:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
                     kv, scale = kv_fp8
@@ -1095,15 +1095,23 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q_chunk = None
                 batch_idx_chunk = None
             else:
-                # PAGED path: keep one page-table row per consecutive request run.
-                # Repeating a batch id for every token would materialize a
-                # [chunk_rows, max_seq_len] page-table copy in topk_transform.
                 topk_offset_chunk = None
-                batch_idx_chunk, cu_seqlens_q_chunk = torch.unique_consecutive(
-                    token_to_batch_idx[start:end], return_counts=True
-                )
-                cu_seqlens_q_chunk = cu_seqlens_q_chunk.to(torch.int32)
-                batch_idx_chunk = batch_idx_chunk.to(torch.long)
+                if _is_dcu:
+                    # Keep one page-table row per consecutive request run.
+                    # Repeating a batch id for every token would materialize a
+                    # [chunk_rows, max_seq_len] page-table copy.
+                    batch_idx_chunk, cu_seqlens_q_chunk = torch.unique_consecutive(
+                        token_to_batch_idx[start:end], return_counts=True
+                    )
+                    cu_seqlens_q_chunk = cu_seqlens_q_chunk.to(torch.int32)
+                    batch_idx_chunk = batch_idx_chunk.to(torch.long)
+                else:
+                    # Preserve the existing CUDA/ROCm chunk metadata path.
+                    B_chunk = logits_chunk.shape[0]
+                    cu_seqlens_q_chunk = torch.ones(
+                        B_chunk, dtype=torch.int32, device=device
+                    )
+                    batch_idx_chunk = token_to_batch_idx[start:end]
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
