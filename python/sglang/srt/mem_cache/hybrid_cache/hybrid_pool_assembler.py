@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -17,6 +19,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
     NSATokenToKVPoolHost,
+    NSATokenToKVPoolHostShared,
+    NSATokenToKVPoolHostSharedLayerGroup,
     PoolEntry,
 )
 
@@ -510,6 +514,52 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    layer_group_cache_group = (
+        attn_cp_group
+        if server_args.glm_nsa_shared_layer_group_hicache
+        else tp_group
+    )
+    # Split --hicache-size (total host budget in GB) between the full-attention
+    # host pool and the mamba-state host pool, using --mamba-full-memory-ratio
+    # (same semantics as the device-side split in model_runner_kv_cache_mixin).
+    # Without this split the same hicache_size value would be passed to both
+    # pools independently, doubling actual host memory usage on hybrid models.
+    if server_args.hicache_size > 0:
+        r = server_args.mamba_full_memory_ratio
+        mamba_host_size_gb = server_args.hicache_size * r / (1 + r)
+        full_host_size_gb = server_args.hicache_size - mamba_host_size_gb
+        if getattr(kv_pool, "use_nsa", False) and (
+            server_args.glm_nsa_shared_hicache
+            or server_args.glm_nsa_shared_layer_group_hicache
+        ):
+            # With a shared NSA host pool, --hicache-size is a machine-total
+            # budget: the full-attention pool is deduped across the cache
+            # group via shm, but MambaPoolHost stays per-rank private. Slice
+            # the mamba share per rank so summed physical usage stays within
+            # budget.
+            cache_group_world = (
+                1
+                if layer_group_cache_group is None
+                else torch.distributed.get_world_size(
+                    group=layer_group_cache_group
+                )
+            )
+            mamba_host_size_gb /= cache_group_world
+            logger.info(
+                "shared NSA host pool enabled: mamba host budget sliced "
+                f"to {mamba_host_size_gb:.2f} GB per rank "
+                f"(cache group world size {cache_group_world})."
+            )
+        logger.info(
+            f"hybrid host hicache split: full={full_host_size_gb:.2f} GB, "
+            f"mamba={mamba_host_size_gb:.2f} GB "
+            f"(hicache_size={server_args.hicache_size}, "
+            f"mamba_full_memory_ratio={r})"
+        )
+    else:
+        mamba_host_size_gb = 0
+        full_host_size_gb = 0
+
     # NSA/DSA (e.g. GLM5-Next) full-attention KV pools carry a separate indexer
     # buffer in addition to the latent KV, and their device KV buffer is
     # kv_cache_dim wide (kv_lora_rank + fp8 scale + FlashMLA rope padding on
@@ -519,26 +569,72 @@ def build_hybrid_mamba_stack(
     # sizes the host KV from the device kv_cache_dim and backs up/loads the
     # indexer together with the latent KV. Non-NSA Mamba hybrids keep the plain
     # MLA/MHA host pool.
-    if getattr(kv_pool, "use_nsa", False):
+    if getattr(kv_pool, "use_nsa", False) and server_args.glm_nsa_shared_hicache:
+        kv_host_pool = NSATokenToKVPoolHostShared(
+            kv_pool,
+            server_args.hicache_ratio,
+            full_host_size_gb,
+            page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+            tp_group=tp_group,
+        )
+    elif (
+        getattr(kv_pool, "use_nsa", False)
+        and server_args.glm_nsa_shared_layer_group_hicache
+    ):
+        kv_host_pool = NSATokenToKVPoolHostSharedLayerGroup(
+            kv_pool,
+            server_args.hicache_ratio,
+            full_host_size_gb,
+            page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+            tp_group=attn_cp_group,
+        )
+    elif getattr(kv_pool, "use_nsa", False):
         kv_host_pool = NSATokenToKVPoolHost(
             kv_pool,
             server_args.hicache_ratio,
-            server_args.hicache_size,
+            full_host_size_gb,
             page_size,
             server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
     else:
-        kv_host_pool = build_kv_host_pool(
-            kv_pool=kv_pool,
-            page_size=page_size,
-            server_args=server_args,
-            use_mla=use_mla,
+        kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
+        kv_host_pool = kv_host_pool_cls(
+            kv_pool,
+            server_args.hicache_ratio,
+            full_host_size_gb,
+            page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+    if (
+        isinstance(kv_host_pool, NSATokenToKVPoolHostSharedLayerGroup)
+        and getattr(kv_pool, "layer_shard_enabled", False)
+        and (
+            kv_pool.layer_shard_size != kv_host_pool.tp_size
+            or kv_pool.layer_shard_rank != kv_host_pool.tp_rank
+        )
+    ):
+        # The shared layer-group backup writes only the intersection of the
+        # host shard and device-owned layers per rank. If the rank spaces
+        # diverge, some layers are never written by any rank and later load-back
+        # would read stale host data.
+        raise ValueError(
+            "NSA shared layer-group hicache requires the device layer "
+            "split rank space to match the shared host cache group: "
+            f"layer_shard_rank={kv_pool.layer_shard_rank}, "
+            f"layer_shard_size={kv_pool.layer_shard_size} vs "
+            f"cache_rank={kv_host_pool.tp_rank}, "
+            f"cache_size={kv_host_pool.tp_size}."
         )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        mamba_host_size_gb,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )

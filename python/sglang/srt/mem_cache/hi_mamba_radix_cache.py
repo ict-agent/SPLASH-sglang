@@ -117,6 +117,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.kvcache = self.hybrid_kv_cache.full_kv_pool
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = (
             1
             if self.tp_group is None
@@ -181,6 +183,33 @@ class HiMambaRadixCache(MambaRadixCache):
         atexit.register(self.shutdown)
 
         super().__init__(params=params)
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op) -> None:
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self) -> None:
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
+
+    def _is_ancestor_node(
+        self, ancestor: Optional[TreeNode], node: Optional[TreeNode]
+    ) -> bool:
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent
+        return False
 
     def reset(self) -> None:
         TreeNode.counter = 0
@@ -351,10 +380,21 @@ class HiMambaRadixCache(MambaRadixCache):
         if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
+                result_last_node = last_node
+                if (
+                    req is not None
+                    and len(loading_values) == 0
+                    and self._is_ancestor_node(last_node, req.last_node)
+                    and not req.last_node.evicted
+                ):
+                    # Mamba-only restore should not shorten the protected full-KV
+                    # prefix. The request still depends on device-resident
+                    # descendants under last_node.
+                    result_last_node = req.last_node
                 logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    f"loading back {len(loading_values)} tokens for node {result_last_node.id}"
                 )
-                return loading_values, last_node
+                return loading_values, result_last_node
 
             while last_node is not self.root_node and (
                 last_node.evicted or last_node.mamba_evicted
@@ -402,12 +442,7 @@ class HiMambaRadixCache(MambaRadixCache):
             finish_count += 1
 
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
         finish_count = int(queue_size.item())
 
         while finish_count > 0:
@@ -420,6 +455,25 @@ class HiMambaRadixCache(MambaRadixCache):
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
+
+    def _drain_write_through_acks_blocking(
+        self, target_id: Optional[int] = None
+    ) -> bool:
+        """Drain write-through backups, optionally stopping after target commits."""
+        while len(self.ongoing_write_through) > 0:
+            if target_id is not None and target_id not in self.ongoing_write_through:
+                return True
+            if not self.cache_controller.ack_write_queue:
+                return target_id is None
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                backuped_node = self.ongoing_write_through.pop(ack_id)
+                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
+                self.dec_lock_ref(backuped_node)
+                if self.enable_storage:
+                    self.write_backup_storage(backuped_node)
+        return True
 
     def loading_check(self):
         finish_count = 0
@@ -691,22 +745,56 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_num_evicted = 0
 
         if full_num_tokens > 0:
-            leaves = list(self.evictable_full_device_leaves)
-            eviction_heap = [(n.last_access_time, n) for n in leaves]
-            heapq.heapify(eviction_heap)
+            eviction_heap = []
+            full_num_evicted_at_last_rebuild = -1
 
-            while full_num_evicted < full_num_tokens and eviction_heap:
+            while full_num_evicted < full_num_tokens:
+                if not eviction_heap:
+                    if not self.evictable_full_device_leaves:
+                        break
+                    if full_num_evicted_at_last_rebuild == full_num_evicted:
+                        logger.warning(
+                            "HiMamba full eviction made no progress after heap "
+                            "rebuild: requested=%s evicted=%s "
+                            "full_evictable_size=%s device_leaf_candidates=%s",
+                            full_num_tokens,
+                            full_num_evicted,
+                            self.full_evictable_size_,
+                            len(self.evictable_full_device_leaves),
+                        )
+                        break
+                    full_num_evicted_at_last_rebuild = full_num_evicted
+                    eviction_heap = [
+                        (n.last_access_time, n)
+                        for n in self.evictable_full_device_leaves
+                    ]
+                    heapq.heapify(eviction_heap)
+
                 _, x = heapq.heappop(eviction_heap)
                 if x not in self.evictable_full_device_leaves:
                     continue
 
+                parent = x.parent
                 evicted_full, evicted_mamba = self._evict_device_leaf(x)
                 full_num_evicted += evicted_full
                 mamba_num_evicted += evicted_mamba
 
-                parent = x.parent
                 if parent in self.evictable_full_device_leaves:
                     heapq.heappush(eviction_heap, (parent.last_access_time, parent))
+
+            if (
+                full_num_evicted < full_num_tokens
+                and self.full_evictable_size_ > 0
+                and len(self.evictable_full_device_leaves) > 0
+            ):
+                logger.warning(
+                    "HiMamba full eviction returned short: requested=%s evicted=%s "
+                    "full_evictable_size=%s device_leaf_candidates=%s",
+                    full_num_tokens,
+                    full_num_evicted,
+                    self.full_evictable_size_,
+                    len(self.evictable_full_device_leaves),
+                )
 
         if params.mamba_num > 0:
             mamba_num_evicted += self.evict_mamba(params.mamba_num)
@@ -718,11 +806,29 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def evict_host(self, num_tokens: int):
         """Evict host-resident leaf nodes: free host KV + mamba, delete from tree, cascade."""
-        heap = [(n.last_access_time, n) for n in self.evictable_full_host_leaves]
-        heapq.heapify(heap)
-
+        heap = []
         num_evicted = 0
-        while num_evicted < num_tokens and heap:
+        num_evicted_at_last_rebuild = -1
+
+        while num_evicted < num_tokens:
+            if not heap:
+                if not self.evictable_full_host_leaves:
+                    break
+                if num_evicted_at_last_rebuild == num_evicted:
+                    logger.warning(
+                        "HiMamba host eviction made no progress after heap "
+                        "rebuild: requested=%s evicted=%s host_leaf_candidates=%s",
+                        num_tokens,
+                        num_evicted,
+                        len(self.evictable_full_host_leaves),
+                    )
+                    break
+                num_evicted_at_last_rebuild = num_evicted
+                heap = [
+                    (n.last_access_time, n) for n in self.evictable_full_host_leaves
+                ]
+                heapq.heapify(heap)
+
             _, x = heapq.heappop(heap)
             if x not in self.evictable_full_host_leaves:
                 continue
@@ -731,6 +837,15 @@ class HiMambaRadixCache(MambaRadixCache):
 
             if x.parent in self.evictable_full_host_leaves:
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+
+        if num_evicted < num_tokens and len(self.evictable_full_host_leaves) > 0:
+            logger.warning(
+                "HiMamba host eviction returned short: requested=%s evicted=%s "
+                "host_leaf_candidates=%s",
+                num_tokens,
+                num_evicted,
+                len(self.evictable_full_host_leaves),
+            )
 
     def evict_mamba_host(self, num_mamba_hosts: int) -> int:
         """Evict host mamba states.
@@ -870,9 +985,9 @@ class HiMambaRadixCache(MambaRadixCache):
                 if prev_prefix_len < total_prefix_length + prefix_len:
                     start = max(0, prev_prefix_len - total_prefix_length)
                     self.token_to_kv_pool_allocator.free(value[start:prefix_len])
-                total_prefix_length += prefix_len
                 self._inc_hit_count(node, chunked)
 
+            total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
 
@@ -1049,13 +1164,9 @@ class HiMambaRadixCache(MambaRadixCache):
                     lock_node=mamba_node,
                     error_message="Can not alloc mamba cache",
                 )
-                src_index = mamba_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = mamba_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+            req.mamba_cow_src_index = mamba_node.mamba_value
+            req.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1077,6 +1188,8 @@ class HiMambaRadixCache(MambaRadixCache):
         if child.evicted:
             return self._split_evicted_node(key, child, split_len)
 
+        if child.id in self.ongoing_write_through:
+            self._drain_write_through_acks_blocking(target_id=child.id)
         self.evictable_full_device_leaves.discard(child)
 
         new_node = super()._split_node(key, child, split_len)
@@ -1616,10 +1729,7 @@ class HiMambaRadixCache(MambaRadixCache):
             ],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1656,18 +1766,13 @@ class HiMambaRadixCache(MambaRadixCache):
             return True
 
         operation_terminated = operation.is_terminated()
-        if self.tp_world_size > 1:
-            states = torch.tensor(
-                [1 - int(can_terminate), int(operation_terminated)],
-                dtype=torch.int,
-            )
-            torch.distributed.all_reduce(
-                states,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
-            )
-            can_terminate = states[0].item() == 0
-            operation_terminated = states[1].item() == 1
+        states = torch.tensor(
+            [1 - int(can_terminate), int(operation_terminated)],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        can_terminate = states[0].item() == 0
+        operation_terminated = states[1].item() == 1
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
@@ -1779,16 +1884,11 @@ class HiMambaRadixCache(MambaRadixCache):
         )
 
         min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
+        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        )
+        min_completed_tokens = completed_tokens_tensor.item()
 
         mamba_host_indices = None
         mamba_loaded = False
@@ -1916,8 +2016,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         self._release_host_node(last_host_node)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])

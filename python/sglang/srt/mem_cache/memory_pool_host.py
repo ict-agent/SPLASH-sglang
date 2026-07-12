@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
+import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
@@ -14,6 +17,7 @@ if TYPE_CHECKING:
 import numpy as np
 import psutil
 import torch
+import torch.distributed as dist
 
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
@@ -30,7 +34,23 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
+from sglang.srt.mem_cache.glm.hugepage_utils import (
+    GLM_HICACHE_SHM_DIR,
+    _align_up,
+    _hugepage_enabled,
+    _hugepage_size,
+)
 from sglang.srt.mem_cache.memory_pool import (
+    _get_layer_shard_range,
     KVCache,
     MambaPool,
     MHATokenToKVPool,
@@ -140,6 +160,28 @@ def alloc_with_host_register(
     return buffer
 
 
+def register_host_tensor_for_kernel_access(tensor: torch.Tensor, nbytes: int) -> int:
+    """Register host tensor pages for GPU-kernel access.
+
+    DCU/ROCm needs cudaHostRegisterMapped because kernel hicache translates
+    host pointers with hipHostGetDevicePointer. CUDA keeps the existing flag 0
+    behavior because UVA makes raw host pointers usable there.
+    """
+    flags = 2 if _is_dcu else 0
+    return torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), nbytes, flags)
+
+
+def checked_register_host_tensor_for_kernel_access(
+    tensor: torch.Tensor, nbytes: int, name: str
+) -> None:
+    err = register_host_tensor_for_kernel_access(tensor, nbytes)
+    if err != 0:
+        raise RuntimeError(
+            f"Failed to register host tensor for kernel access: {name}, "
+            f"nbytes={nbytes}, error={err}."
+        )
+
+
 def alloc_with_pin_memory(
     dims,
     dtype: torch.dtype,
@@ -174,7 +216,25 @@ def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
     # DCU host tensor: translate the host pointer to a GPU-accessible one.
     # torch's cudart python binding does not expose HostGetDevicePointer, so we
     # call the HIP runtime directly via ctypes.
-    return _hip_host_get_device_pointer(tensor.data_ptr())
+    try:
+        return _hip_host_get_device_pointer(tensor.data_ptr())
+    except RuntimeError as first_err:
+        nbytes = tensor.numel() * tensor.element_size()
+        reg_err = register_host_tensor_for_kernel_access(tensor, nbytes)
+        if reg_err != 0:
+            raise RuntimeError(
+                "hipHostGetDevicePointer failed and retry registration failed: "
+                f"shape={tuple(tensor.shape)}, nbytes={nbytes}, "
+                f"host_ptr=0x{tensor.data_ptr():x}, register_error={reg_err}"
+            ) from first_err
+        try:
+            return _hip_host_get_device_pointer(tensor.data_ptr())
+        except RuntimeError as second_err:
+            raise RuntimeError(
+                "hipHostGetDevicePointer failed after mapped retry registration: "
+                f"shape={tuple(tensor.shape)}, nbytes={nbytes}, "
+                f"host_ptr=0x{tensor.data_ptr():x}"
+            ) from second_err
 
 
 _HIP_RT = None
@@ -258,9 +318,13 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self._get_physical_allocation_bytes()
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
+        if (
+            requested_bytes > 0
+            and requested_bytes > available_bytes
+            and not _hugepage_enabled()
+        ):
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -281,6 +345,31 @@ class HostKVCache(abc.ABC):
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
+
+    def _get_physical_allocation_bytes(self) -> int:
+        """Bytes this rank will physically allocate for the host pool."""
+        return self.size * self.size_per_token
+
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        device_pool = device_pool or self.device_pool
+        return bool(getattr(device_pool, "layer_shard_enabled", False))
+
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        if not self._is_device_layer_sharded(device_pool):
+            return True
+        return device_pool._is_layer_owned(
+            getattr(device_pool, "start_layer", 0) + layer_id
+        )
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        layer_num = getattr(device_pool, "layer_num", self.layer_num)
+        if not self._is_device_layer_sharded(device_pool):
+            return list(range(layer_num))
+        return [
+            layer_id
+            for layer_id in range(layer_num)
+            if self._is_device_layer_owned(device_pool, layer_id)
+        ]
 
     @abc.abstractmethod
     def init_kv_buffer(self):
@@ -470,6 +559,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -579,9 +670,82 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_buffer[layer_id],
+                        v_cache_dst=self.v_buffer[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=device_pool.k_buffer[layer_id],
+                        dst_k=self.k_buffer[layer_id],
+                        src_v=device_pool.v_buffer[layer_id],
+                        dst_v=self.v_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=self.k_data_refs[layer_id],
+                        v_cache_dst=self.v_data_refs[layer_id],
+                        k_cache_src=device_pool.k_buffer[layer_id],
+                        v_cache_src=device_pool.v_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded MHA HiCache backup with page_first layout "
+                        "requires the JIT one-layer kernel."
+                    )
+            else:
+                raise ValueError(
+                    f"Layer-sharded HiCache backup does not support layout: {self.layout}"
+                )
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[
+                        device_pool.k_buffer[layer_id],
+                        device_pool.v_buffer[layer_id],
+                    ],
+                    dst_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct HiCache backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -993,6 +1157,8 @@ class MLATokenToKVPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -1073,9 +1239,73 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.kv_buffer[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=device_pool.kv_buffer[layer_id],
+                        dst=self.kv_buffer[layer_id],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.data_refs[layer_id],
+                        cache_src=device_pool.kv_buffer[layer_id],
+                        indices_dst=host_indices,
+                        indices_src=device_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    raise ValueError(
+                        "Layer-sharded MLA HiCache backup with page_first layout "
+                        "requires the JIT one-layer kernel."
+                    )
+            else:
+                raise ValueError(
+                    f"Layer-sharded HiCache backup does not support layout: {self.layout}"
+                )
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_pool.kv_buffer[layer_id]],
+                    dst_layers=[self.kv_buffer[layer_id]],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct HiCache backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(
+                f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
+            )
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -2405,20 +2635,24 @@ class NSAIndexerPoolHost(HostKVCache):
                 + self.index_head_dim // self.indexer_quant_block_size * 4
             )
         else:
-            self.indexer_size_per_token = (
-                device_pool.index_k_buffer[0][0].nbytes // self.page_size
+            self.indexer_size_per_token = self._infer_bf16_indexer_size_per_token(
+                device_pool
             )
 
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
         self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.page_size
+            * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.layer_num
+            * self.indexer_dtype.itemsize
         )
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
@@ -2440,17 +2674,29 @@ class NSAIndexerPoolHost(HostKVCache):
         self.lock = threading.RLock()
         self.clear()
 
+    def _infer_bf16_indexer_size_per_token(self, device_pool: NSATokenToKVPool) -> int:
+        for buf in device_pool.index_k_buffer:
+            if buf is not None and buf.shape[0] > 0:
+                return buf[0].nbytes // self.page_size
+
+        dtype = getattr(device_pool, "index_k_buffer_dtype", torch.bfloat16)
+        elem_size = torch.empty((), dtype=dtype).element_size()
+        return self.index_head_dim * elem_size
+
     def _get_device_index_k_cache_for_transfer(self, device_pool):
         if self.use_fp8:
             return device_pool.index_k_with_scale_buffer
+        row_width = self.page_size * self.indexer_size_per_token
         return [
-            buf.view(torch.uint8).view(buf.shape[0], -1)
+            buf.view(torch.uint8).view(buf.shape[0], row_width)
             for buf in device_pool.index_k_buffer
         ]
 
     def get_size_per_token(self):
         return (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+            self.indexer_size_per_token
+            * self.layer_num
+            * self.indexer_dtype.itemsize
         )
 
     def get_ksize_per_token(self):
@@ -2519,6 +2765,8 @@ class NSAIndexerPoolHost(HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        if not self._is_device_layer_owned(device_pool, layer_id):
+            return
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -2568,9 +2816,56 @@ class NSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _backup_indexer_from_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
+        if use_kernel:
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=device_index_k_cache[layer_id],
+                    dst=self.index_k_with_scale_buffer[layer_id],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    item_size=self.indexer_page_stride_size,
+                )
+            elif self.layout == "page_first":
+                raise ValueError(
+                    "Layer-sharded NSA indexer HiCache backup with page_first "
+                    "layout is not supported without a per-layer LF->PF kernel."
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[device_index_k_cache[layer_id]],
+                    dst_layers=[self.index_k_with_scale_buffer[layer_id]],
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    f"Layer-sharded direct NSA indexer backup does not support layout: {self.layout}"
+                )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if self._is_device_layer_sharded(device_pool):
+            for layer_id in self._owned_device_layer_ids(device_pool):
+                self._backup_indexer_from_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            return
+
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
         )
@@ -2704,6 +2999,26 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     device_pool: NSATokenToKVPool
 
+    def _init_indexer_geometry(
+        self, device_pool: NSATokenToKVPool, page_size: int
+    ) -> None:
+        self.index_head_dim = device_pool.index_head_dim
+        self.indexer_quant_block_size = device_pool.quant_block_size
+        self.use_fp8_index_k_cache = device_pool.use_fp8_index_k_cache
+        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        if self.use_fp8_index_k_cache:
+            self.indexer_size_per_token = (
+                self.index_head_dim
+                + self.index_head_dim // self.indexer_quant_block_size * 4
+            )
+            self.indexer_page_slots = page_size
+        else:
+            elem_size = torch.empty(
+                (), dtype=device_pool.index_k_buffer_dtype
+            ).element_size()
+            self.indexer_size_per_token = self.index_head_dim * elem_size
+            self.indexer_page_slots = page_size
+
     def __init__(
         self,
         device_pool: NSATokenToKVPool,
@@ -2715,6 +3030,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        # HostKVCache.__init__ asks get_size_per_token() before allocating any
+        # buffers. Account for the NSA index cache in --hicache-size up front.
+        self._init_indexer_geometry(device_pool, page_size)
         # Main latent KV host buffer. device_pool.kv_cache_dim already accounts
         # for DCU FlashMLA rope padding + fp8 scale, so forward it as override so
         # the host buffer width always matches the device buffer width.
@@ -2732,33 +3050,58 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         # Indexer host buffer + transfer logic. The sidecar shares this pool's
         # host slot layout (same size / page_num), so it consumes the same
         # host_indices we allocate for the main KV.
-        self.indexer_host = NSAIndexerPoolHost(
-            device_pool,
-            self,
-            layout,
-            pin_memory=pin_memory,
-            device=device,
-            allocator_type=allocator_type,
-        )
+        if getattr(self, "_skip_nsa_indexer_host", False):
+            self.indexer_host = None
+        else:
+            self.indexer_host = NSAIndexerPoolHost(
+                device_pool,
+                self,
+                layout,
+                pin_memory=pin_memory,
+                device=device,
+                allocator_type=allocator_type,
+            )
 
+    # `pool_transfers` is forwarded by `HybridCacheController` to keep the call
+    # signature uniform with `HostPoolGroup`, which dispatches per-pool
+    # transfers for sibling pools. This pool only handles its own KV /
+    # indexer, so the kwarg is accepted-but-ignored here.
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
     ):
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend
         )
-        self.indexer_host.load_to_device_per_layer(
-            device_pool, host_indices, device_indices, layer_id, io_backend
-        )
+        if self.indexer_host is not None:
+            self.indexer_host.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend,
     ):
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
-        self.indexer_host.backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
+        if self.indexer_host is not None:
+            self.indexer_host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
+
+    def get_size_per_token(self):
+        base = super().get_size_per_token()
+        return (
+            base
+            + self.indexer_size_per_token
+            * self.layer_num
+            * self.indexer_dtype.itemsize
+            * self.indexer_page_slots
+            // self.page_size
         )
 
     def clear(self):
@@ -2767,3 +3110,848 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         # so guard against the first call during base construction.
         if getattr(self, "indexer_host", None) is not None:
             self.indexer_host.clear()
+
+
+class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
+    """NSA host cache backed by shared memory across tensor-parallel ranks."""
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ):
+        logger.info(
+            "Using NSATokenToKVPoolHostShared for zero-copy shared host cache (NSA)."
+        )
+
+        self.index_head_dim = device_pool.index_head_dim
+        self.indexer_quant_block_size = device_pool.quant_block_size
+        self.use_fp8_index_k_cache = device_pool.use_fp8_index_k_cache
+        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        if self.use_fp8_index_k_cache:
+            self.indexer_size_per_token = (
+                self.index_head_dim
+                + self.index_head_dim // self.indexer_quant_block_size * 4
+            )
+            self.indexer_page_slots = page_size
+        else:
+            elem_size = torch.empty(
+                (), dtype=device_pool.index_k_buffer_dtype
+            ).element_size()
+            self.indexer_size_per_token = self.index_head_dim * elem_size
+            self.indexer_page_slots = page_size
+
+        if is_dp_attention_enabled():
+            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_attention_tp_size()
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_group = tp_group
+        self._shared_mmap_refs = []
+        self._skip_nsa_indexer_host = True
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+        self._init_indexer_buffers()
+
+        self.index_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.index_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _init_indexer_buffers(self):
+        index_buffer_second_dim = (
+            self.indexer_page_slots * self.indexer_size_per_token
+        )
+        self.index_stride_size = (
+            self.indexer_size_per_token
+        ) * self.indexer_dtype.itemsize
+
+        index_dims = (self.layer_num, self.page_num, index_buffer_second_dim)
+
+        full_index_buffer = self._allocate_shared_buffer(
+            "index", index_dims, self.indexer_dtype
+        )
+        self._shared_mmap_refs.append(full_index_buffer)
+
+        self.index_k_with_scale_buffer = [
+            full_index_buffer[i] for i in range(self.layer_num)
+        ]
+
+        self.index_k_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_k_data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.index_k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.index_k_device_ptrs = torch.tensor(
+            self.device_pool.index_k_device_ptrs_for_host_transfer(),
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _get_physical_allocation_bytes(self) -> int:
+        # Every rank maps the complete pool, but rank 0 alone creates the two
+        # backing files. Non-zero ranks must not compare the machine-total pool
+        # size against memory that rank 0 may already have allocated.
+        return super()._get_physical_allocation_bytes() if self.tp_rank == 0 else 0
+
+    def _get_index_device_cache_for_transfer(self, device_pool):
+        if self.use_fp8_index_k_cache:
+            return device_pool.index_k_with_scale_buffer
+        row_width = self.page_size * self.indexer_size_per_token
+        return [
+            buf.view(torch.uint8).view(buf.shape[0], row_width)
+            for buf in device_pool.index_k_buffer
+        ]
+
+    def _allocate_shared_buffer(self, name_suffix: str, shape: tuple, dtype: torch.dtype):
+        numel = 1
+        for d in shape:
+            numel *= d
+        total_bytes = numel * dtype.itemsize
+        size_gb = total_bytes / (1024**3)
+
+        t_start_all = time.perf_counter()
+
+        if self.tp_rank == 0:
+            logger.info(
+                f"[{name_suffix}] Allocating shared memory buffer: {size_gb:.2f} GB"
+            )
+
+        shared_filename = None
+        if self.tp_rank == 0:
+            t_file_start = time.perf_counter()
+            unique_id = str(uuid.uuid4())
+            shared_filename = f"/dev/shm/sglang_nsa_{name_suffix}_{unique_id}.bin"
+            with open(shared_filename, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, total_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(total_bytes)
+            logger.info(
+                f"[{name_suffix}] Rank 0 created shared file in "
+                f"{time.perf_counter() - t_file_start:.3f}s"
+            )
+
+        object_list = [shared_filename]
+        dist.broadcast_object_list(object_list, src=0, group=self.tp_group)
+        shared_filename = object_list[0]
+
+        dist.barrier(group=self.tp_group)
+
+        try:
+            t_map_start = time.perf_counter()
+            flat_tensor = torch.from_file(
+                shared_filename,
+                shared=True,
+                size=numel,
+                dtype=dtype,
+                device="cpu",
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[{name_suffix}] Memory mapping took "
+                    f"{time.perf_counter() - t_map_start:.3f}s"
+                )
+
+            t_zero_start = time.perf_counter()
+
+            chunk_size = numel // self.tp_size
+            start_idx = self.tp_rank * chunk_size
+            end_idx = (
+                numel if self.tp_rank == self.tp_size - 1 else start_idx + chunk_size
+            )
+
+            flat_tensor[start_idx:end_idx].zero_()
+
+            t_zero_end = time.perf_counter()
+            logger.info(
+                f"[{name_suffix}] Rank {self.tp_rank} finished zeroing chunk in "
+                f"{t_zero_end - t_zero_start:.3f}s"
+            )
+
+            dist.barrier(group=self.tp_group)
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[{name_suffix}] Parallel page faulting (all ranks) completed "
+                    f"in {time.perf_counter() - t_zero_start:.3f}s"
+                )
+
+            buffer = flat_tensor.view(shape)
+
+            if self.pin_memory and (_is_cuda or _is_dcu):
+                t_pin_start = time.perf_counter()
+                err = register_host_tensor_for_kernel_access(buffer, total_bytes)
+                if err != 0:
+                    logger.warning(
+                        f"Failed to pin shared memory for {name_suffix}. "
+                        f"Error code: {err}"
+                    )
+                t_pin_end = time.perf_counter()
+                if self.tp_rank == 0:
+                    logger.info(
+                        f"[{name_suffix}] cudaHostRegister took "
+                        f"{t_pin_end - t_pin_start:.3f}s"
+                    )
+
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[{name_suffix}] Total allocation pipeline took "
+                    f"{time.perf_counter() - t_start_all:.3f}s"
+                )
+
+            return buffer
+        finally:
+            dist.barrier(group=self.tp_group)
+            if self.tp_rank == 0 and os.path.exists(shared_filename):
+                os.remove(shared_filename)
+
+    def init_kv_buffer(self):
+        if self.layout == "layer_first":
+            kv_dims = (
+                self.layer_num,
+                self.size,
+                1,
+                self.kv_cache_dim,
+            )
+        else:
+            raise ValueError(
+                f"Shared pool currently only supports layer_first layout, got {self.layout}"
+            )
+
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.kv_buffer = self._allocate_shared_buffer("kv", kv_dims, self.dtype)
+
+        return self.kv_buffer
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        pool_transfers=None,
+    ):
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        page_indices_host = host_indices[:: self.page_size] // self.page_size
+        page_indices_device = device_indices[:: self.page_size] // self.page_size
+        item_size = self.index_stride_size * self.indexer_page_slots
+        device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
+
+        if io_backend == "kernel":
+            transfer_kv_per_layer_mla(
+                src=self.index_k_with_scale_buffer[layer_id],
+                dst=device_index_k_cache[layer_id],
+                src_indices=page_indices_host,
+                dst_indices=page_indices_device,
+                item_size=item_size,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[self.index_k_with_scale_buffer[layer_id]],
+                dst_layers=[device_index_k_cache[layer_id]],
+                src_indices=page_indices_host,
+                dst_indices=page_indices_device,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        pool_transfers=None,
+    ) -> None:
+        if self.tp_rank == 0:
+            super().backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
+            page_indices_host = host_indices[:: self.page_size] // self.page_size
+            page_indices_device = device_indices[:: self.page_size] // self.page_size
+            item_size = self.index_stride_size * self.indexer_page_slots
+
+            if io_backend == "kernel":
+                transfer_kv_all_layer_mla(
+                    src_layers=self.index_k_device_ptrs,
+                    dst_layers=self.index_data_ptrs,
+                    src_indices=page_indices_device,
+                    dst_indices=page_indices_host,
+                    item_size=item_size,
+                    num_layers=self.layer_num,
+                )
+            elif io_backend == "direct":
+                device_index_k_cache = self._get_index_device_cache_for_transfer(
+                    device_pool
+                )
+                transfer_kv_direct(
+                    src_layers=device_index_k_cache,
+                    dst_layers=self.index_k_with_scale_buffer,
+                    src_indices=page_indices_device,
+                    dst_indices=page_indices_host,
+                    page_size=1,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported IO backend for NSA indexer: {io_backend}"
+                )
+
+
+class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
+    """NSA host cache backed by per-rank shared-memory layer shards."""
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ):
+        logger.info(
+            "Using NSATokenToKVPoolHostSharedLayerGroup (Per-Rank Distributed Shards) "
+            "for zero-copy host cache (NSA)."
+        )
+
+        if allocator_type not in (None, "default"):
+            raise ValueError(
+                "NSA shared layer-group HiCache does not support an L3/storage "
+                f"backend yet, got allocator_type={allocator_type!r}."
+            )
+
+        self.index_head_dim = device_pool.index_head_dim
+        self.indexer_quant_block_size = device_pool.quant_block_size
+        self.use_fp8_index_k_cache = device_pool.use_fp8_index_k_cache
+        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        if self.use_fp8_index_k_cache:
+            self.indexer_size_per_token = (
+                self.index_head_dim
+                + self.index_head_dim // self.indexer_quant_block_size * 4
+            )
+            self.indexer_page_slots = page_size
+        else:
+            elem_size = torch.empty(
+                (), dtype=device_pool.index_k_buffer_dtype
+            ).element_size()
+            self.indexer_size_per_token = self.index_head_dim * elem_size
+            self.indexer_page_slots = page_size
+
+        if tp_group is None:
+            raise ValueError(
+                "NSA shared layer-group HiCache requires an attention CP group."
+            )
+        self.tp_group = tp_group
+        self.tp_rank = dist.get_rank(group=self.tp_group)
+        self.tp_size = dist.get_world_size(group=self.tp_group)
+
+        if getattr(device_pool, "layer_shard_enabled", False) and (
+            device_pool.layer_shard_size != self.tp_size
+            or device_pool.layer_shard_rank != self.tp_rank
+        ):
+            raise ValueError(
+                "NSA shared layer-group HiCache requires the device layer "
+                "split rank space to match the shared host cache group: "
+                f"layer_shard_rank={device_pool.layer_shard_rank}, "
+                f"layer_shard_size={device_pool.layer_shard_size} vs "
+                f"cache_rank={self.tp_rank}, cache_size={self.tp_size}."
+            )
+
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+        local_layer_num = device_pool.layer_num
+
+        self.my_rel_start, self.my_rel_end = _get_layer_shard_range(
+            self.tp_rank, self.tp_size, local_layer_num
+        )
+        self.my_num_layers = self.my_rel_end - self.my_rel_start
+
+        self.my_abs_start = self.start_layer + self.my_rel_start
+        self.my_abs_end = self.start_layer + self.my_rel_end
+
+        logger.info(
+            f"Host Cache Sharding: Rank {self.tp_rank}/{self.tp_size} owns relative layers "
+            f"[{self.my_rel_start}, {self.my_rel_end}) -> absolute layers "
+            f"[{self.my_abs_start}, {self.my_abs_end})."
+        )
+
+        # Keep the root mmap tensors alive. The layer entries below are views
+        # into these mappings; retaining only views is not enough for every
+        # backend/runtime combination when querying mapped device pointers.
+        self._shared_mmap_refs = []
+        self._skip_nsa_indexer_host = True
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+        self._init_indexer_buffers()
+
+        self.index_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.index_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _init_indexer_buffers(self):
+        all_files = self._shared_all_files
+        my_files = self._shared_my_files
+
+        index_buffer_second_dim = (
+            self.indexer_page_slots * self.indexer_size_per_token
+        )
+        self.index_stride_size = (
+            self.indexer_size_per_token * self.indexer_dtype.itemsize
+        )
+
+        self.index_k_with_scale_buffer = [None] * self.layer_num
+
+        for step in range(self.tp_size):
+            file_idx = (step + self.tp_rank) % self.tp_size
+
+            r_rel_start, r_rel_end = _get_layer_shard_range(
+                file_idx, self.tp_size, self.layer_num
+            )
+            r_num = r_rel_end - r_rel_start
+
+            if r_num == 0:
+                continue
+
+            files = all_files[file_idx]
+
+            t_pin = time.perf_counter()
+
+            idx_shape = (r_num, self.page_num, index_buffer_second_dim)
+            idx_numel = r_num * self.page_num * index_buffer_second_dim
+            idx_mapped_numel = (
+                _align_up(idx_numel * self.indexer_dtype.itemsize)
+                // self.indexer_dtype.itemsize
+                if _hugepage_enabled()
+                else idx_numel
+            )
+            idx_tensor = torch.from_file(
+                files["index"],
+                shared=True,
+                size=idx_mapped_numel,
+                dtype=self.indexer_dtype,
+                device="cpu",
+            )[:idx_numel].view(idx_shape)
+            self._shared_mmap_refs.append(idx_tensor)
+            logger.info(
+                f"Rank {self.tp_rank} finish Indexer cudaHostRegister for Rank "
+                f"{file_idx}'s file in {time.perf_counter() - t_pin:.3f}s"
+            )
+
+            for i in range(r_num):
+                global_layer_idx = r_rel_start + i
+                layer_tensor = idx_tensor[i]
+                if self.pin_memory and (_is_cuda or _is_dcu):
+                    checked_register_host_tensor_for_kernel_access(
+                        layer_tensor,
+                        layer_tensor.numel() * layer_tensor.element_size(),
+                        f"nsa_layer_group_index_rank{file_idx}_layer{global_layer_idx}",
+                    )
+                self.index_k_with_scale_buffer[global_layer_idx] = layer_tensor
+
+        dist.barrier(group=self.tp_group)
+        if my_files:
+            idx_file = my_files.get("index")
+            if idx_file and os.path.exists(idx_file):
+                os.remove(idx_file)
+
+        del self._shared_all_files
+        del self._shared_my_files
+
+        self.index_k_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_k_data_ptrs = torch.tensor(
+            [kernel_accessible_host_ptr(x) for x in self.index_k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        device_index_k_cache = self._get_index_device_cache_for_transfer(
+            self.device_pool
+        )
+        self.index_k_device_ptrs = torch.tensor(
+            [x.data_ptr() for x in device_index_k_cache],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def _get_physical_allocation_bytes(self) -> int:
+        # Capacity is still computed from all NSA layers because the rank-local
+        # files form one logical shared pool. The startup availability check,
+        # however, must use only the files this rank actually creates.
+        main_bytes = (
+            self.my_num_layers
+            * self.size
+            * self.kv_cache_dim
+            * self.dtype.itemsize
+        )
+        index_bytes = (
+            self.my_num_layers
+            * self.page_num
+            * self.indexer_page_slots
+            * self.indexer_size_per_token
+            * self.indexer_dtype.itemsize
+        )
+        return main_bytes + index_bytes
+
+    def _get_index_device_cache_for_transfer(self, device_pool):
+        if self.use_fp8_index_k_cache:
+            return device_pool.index_k_with_scale_buffer
+        row_width = self.page_size * self.indexer_size_per_token
+        return [
+            buf.view(torch.uint8).view(buf.shape[0], row_width)
+            for buf in device_pool.index_k_buffer
+        ]
+
+    def init_kv_buffer(self):
+        if self.layout != "layer_first":
+            raise ValueError(
+                f"Shared pool currently only supports layer_first layout, got {self.layout}"
+            )
+
+        if _hugepage_enabled():
+            logger.info(
+                f"HugePage enabled. Using shared host cache directory: "
+                f"{GLM_HICACHE_SHM_DIR}, PageSize = {_hugepage_size()}."
+            )
+
+        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+        kv_element_dim = self.kv_cache_dim
+
+        index_buffer_second_dim = (
+            self.indexer_page_slots * self.indexer_size_per_token
+        )
+
+        my_files = None
+        if self.my_num_layers > 0:
+            uid = str(uuid.uuid4())
+            kv_name = (
+                f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_kv_"
+                f"{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
+            )
+            idx_name = (
+                f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_idx_"
+                f"{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
+            )
+
+            kv_bytes = (
+                self.my_num_layers
+                * self.size
+                * kv_element_dim
+                * self.dtype.itemsize
+            )
+            idx_bytes = (
+                self.my_num_layers
+                * self.page_num
+                * index_buffer_second_dim
+                * self.indexer_dtype.itemsize
+            )
+            kv_alloc_bytes = _align_up(kv_bytes) if _hugepage_enabled() else kv_bytes
+            idx_alloc_bytes = (
+                _align_up(idx_bytes) if _hugepage_enabled() else idx_bytes
+            )
+
+            t_zero_alloc = time.perf_counter()
+            with open(kv_name, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, kv_alloc_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(kv_alloc_bytes)
+
+            with open(idx_name, "wb") as f:
+                try:
+                    os.posix_fallocate(f.fileno(), 0, idx_alloc_bytes)
+                except (AttributeError, OSError):
+                    f.truncate(idx_alloc_bytes)
+            logger.info(
+                f"Rank {self.tp_rank} cache file creation finished in "
+                f"{time.perf_counter() - t_zero_alloc:.3f}s"
+            )
+
+            t_zero_alloc = time.perf_counter()
+            my_kv_numel = self.my_num_layers * self.size * 1 * kv_element_dim
+            tmp_kv_numel = kv_alloc_bytes // self.dtype.itemsize
+            tmp_kv = torch.from_file(
+                kv_name,
+                shared=True,
+                size=tmp_kv_numel,
+                dtype=self.dtype,
+                device="cpu",
+            )
+            tmp_kv[:my_kv_numel].zero_()
+            del tmp_kv
+
+            my_idx_numel = self.my_num_layers * self.page_num * index_buffer_second_dim
+            tmp_idx_numel = idx_alloc_bytes // self.indexer_dtype.itemsize
+            tmp_idx = torch.from_file(
+                idx_name,
+                shared=True,
+                size=tmp_idx_numel,
+                dtype=self.indexer_dtype,
+                device="cpu",
+            )
+            tmp_idx[:my_idx_numel].zero_()
+            del tmp_idx
+            logger.info(
+                f"Rank {self.tp_rank} allocated and zeroed its own physical memory "
+                f"locally in {time.perf_counter() - t_zero_alloc:.3f}s"
+            )
+
+            my_files = {"kv": kv_name, "index": idx_name}
+
+        all_files = [None] * self.tp_size
+        dist.all_gather_object(all_files, my_files, group=self.tp_group)
+
+        self.kv_buffer = [None] * self.layer_num
+
+        for step in range(self.tp_size):
+            file_idx = (step + self.tp_rank) % self.tp_size
+
+            r_rel_start, r_rel_end = _get_layer_shard_range(
+                file_idx, self.tp_size, self.layer_num
+            )
+            r_num = r_rel_end - r_rel_start
+
+            if r_num == 0:
+                continue
+
+            files = all_files[file_idx]
+
+            t_pin = time.perf_counter()
+
+            kv_shape = (r_num, self.size, 1, kv_element_dim)
+            kv_numel = r_num * self.size * 1 * kv_element_dim
+            kv_mapped_numel = (
+                _align_up(kv_numel * self.dtype.itemsize) // self.dtype.itemsize
+                if _hugepage_enabled()
+                else kv_numel
+            )
+            kv_tensor = torch.from_file(
+                files["kv"],
+                shared=True,
+                size=kv_mapped_numel,
+                dtype=self.dtype,
+                device="cpu",
+            )[:kv_numel].view(kv_shape)
+            self._shared_mmap_refs.append(kv_tensor)
+            logger.info(
+                f"Rank {self.tp_rank} finish KV cudaHostRegister for Rank "
+                f"{file_idx}'s file in {time.perf_counter() - t_pin:.3f}s"
+            )
+
+            for i in range(r_num):
+                global_layer_idx = r_rel_start + i
+                layer_tensor = kv_tensor[i]
+                if self.pin_memory and (_is_cuda or _is_dcu):
+                    checked_register_host_tensor_for_kernel_access(
+                        layer_tensor,
+                        layer_tensor.numel() * layer_tensor.element_size(),
+                        f"nsa_layer_group_kv_rank{file_idx}_layer{global_layer_idx}",
+                    )
+                self.kv_buffer[global_layer_idx] = layer_tensor
+
+        dist.barrier(group=self.tp_group)
+        if my_files:
+            kv_file = my_files.get("kv")
+            if kv_file and os.path.exists(kv_file):
+                os.remove(kv_file)
+
+        self._shared_all_files = all_files
+        self._shared_my_files = my_files
+
+        return self.kv_buffer
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        pool_transfers=None,
+    ):
+        if getattr(device_pool, "layer_shard_enabled", False):
+            absolute_layer_id = device_pool.start_layer + layer_id
+            device_pool.invalidate_remote_kv_buffer_for_layer(absolute_layer_id)
+            device_pool.invalidate_index_buffer_for_layer(absolute_layer_id)
+        if (
+            getattr(device_pool, "layer_shard_enabled", False)
+            and (layer_id < self.my_rel_start or layer_id >= self.my_rel_end)
+        ):
+            return
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        page_indices_host = host_indices[:: self.page_size] // self.page_size
+        page_indices_device = device_indices[:: self.page_size] // self.page_size
+        item_size = self.index_stride_size * self.indexer_page_slots
+        device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
+
+        if io_backend == "kernel":
+            transfer_kv_per_layer_mla(
+                src=self.index_k_with_scale_buffer[layer_id],
+                dst=device_index_k_cache[layer_id],
+                src_indices=page_indices_host,
+                dst_indices=page_indices_device,
+                item_size=item_size,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[self.index_k_with_scale_buffer[layer_id]],
+                dst_layers=[device_index_k_cache[layer_id]],
+                src_indices=page_indices_host,
+                dst_indices=page_indices_device,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        pool_transfers=None,
+    ) -> None:
+        if self.my_num_layers == 0:
+            return
+
+        if io_backend == "kernel":
+            src_ptrs = device_pool.data_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
+            dst_ptrs = self.data_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
+
+            transfer_kv_all_layer_mla(
+                src_layers=src_ptrs,
+                dst_layers=dst_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.token_stride_size,
+                num_layers=self.my_num_layers,
+            )
+        elif io_backend == "direct":
+            src_layers = [
+                device_pool.kv_buffer[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            dst_layers = [
+                self.data_refs[i] for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        page_indices_host = host_indices[:: self.page_size] // self.page_size
+        page_indices_device = device_indices[:: self.page_size] // self.page_size
+        item_size = self.index_stride_size * self.indexer_page_slots
+
+        if io_backend == "kernel":
+            src_ptrs = self.index_k_device_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
+            dst_ptrs = self.index_data_ptrs[
+                self.my_rel_start : self.my_rel_end
+            ].contiguous()
+
+            transfer_kv_all_layer_mla(
+                src_layers=src_ptrs,
+                dst_layers=dst_ptrs,
+                src_indices=page_indices_device,
+                dst_indices=page_indices_host,
+                item_size=item_size,
+                num_layers=self.my_num_layers,
+            )
+        elif io_backend == "direct":
+            device_index_k_cache = self._get_index_device_cache_for_transfer(
+                device_pool
+            )
+            src_layers = [
+                device_index_k_cache[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            dst_layers = [
+                self.index_k_with_scale_buffer[i]
+                for i in range(self.my_rel_start, self.my_rel_end)
+            ]
+            transfer_kv_direct(
+                src_layers=src_layers,
+                dst_layers=dst_layers,
+                src_indices=page_indices_device,
+                dst_indices=page_indices_host,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")

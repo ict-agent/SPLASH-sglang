@@ -676,6 +676,8 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    glm_nsa_shared_hicache: bool = False
+    glm_nsa_shared_layer_group_hicache: bool = False
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -1793,6 +1795,31 @@ class ServerArgs:
                     "and round-robin NSA prefill CP."
                 )
             self.enable_nsa_cache_layer_split = False
+
+        if (
+            self.glm_nsa_shared_hicache
+            and self.glm_nsa_shared_layer_group_hicache
+        ):
+            raise ValueError(
+                "--glm-nsa-shared-hicache and "
+                "--glm-nsa-shared-layer-group-hicache are mutually exclusive."
+            )
+        if self.glm_nsa_shared_layer_group_hicache:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--glm-nsa-shared-layer-group-hicache requires "
+                    "--enable-hierarchical-cache."
+                )
+            if not self.enable_nsa_cache_layer_split:
+                raise ValueError(
+                    "--glm-nsa-shared-layer-group-hicache requires active "
+                    "--enable-nsa-cache-layer-split."
+                )
+        elif self.enable_hierarchical_cache and self.enable_nsa_cache_layer_split:
+            raise ValueError(
+                "Layer-split HiCache requires "
+                "--glm-nsa-shared-layer-group-hicache."
+            )
 
         if self.mla_kv_prefetch_ring_size < 1:
             logger.info(
@@ -3669,6 +3696,23 @@ class ServerArgs:
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
         """
+        if self.glm_nsa_shared_layer_group_hicache:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--glm-nsa-shared-layer-group-hicache requires "
+                    "--enable-hierarchical-cache."
+                )
+            if not self.enable_nsa_cache_layer_split:
+                raise ValueError(
+                    "--glm-nsa-shared-layer-group-hicache requires active "
+                    "--enable-nsa-cache-layer-split on a PD prefill worker."
+                )
+        elif self.enable_hierarchical_cache and self.enable_nsa_cache_layer_split:
+            raise ValueError(
+                "Layer-split HiCache requires "
+                "--glm-nsa-shared-layer-group-hicache."
+            )
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -3688,6 +3732,16 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+        if (
+            self.glm_nsa_shared_layer_group_hicache
+            and self.hicache_mem_layout != "layer_first"
+        ):
+            raise ValueError(
+                "NSA shared layer-group HiCache currently requires "
+                "--hicache-mem-layout layer_first. The selected storage/I/O "
+                f"configuration resolved it to {self.hicache_mem_layout!r}."
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (
@@ -6395,7 +6449,9 @@ class ServerArgs:
             "--mamba-full-memory-ratio",
             type=float,
             default=ServerArgs.mamba_full_memory_ratio,
-            help="The ratio of mamba state memory to full kv cache memory.",
+            help="The ratio of mamba state memory to full kv cache memory. "
+            "Also used to split --hicache-size between the mamba and full-attention "
+            "host KV pools in hybrid models.",
         )
         parser.add_argument(
             "--mamba-scheduler-strategy",
@@ -6520,6 +6576,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--glm-nsa-shared-hicache",
+            action="store_true",
+            help="Enable shared-memory optimization for GLM-NSA host KV cache in tensor parallel mode. "
+            "All intra-node ranks map one shared host memory region for the NSA KV/indexer cache, "
+            "which avoids per-rank host replicas. Only single-node setups are supported.",
+        )
+        parser.add_argument(
+            "--glm-nsa-shared-layer-group-hicache",
+            action="store_true",
+            help="Enable CP layer-group shared-memory optimization for GLM-NSA host KV cache. "
+            "Each CP rank owns one layer shard and maps the other ranks' shared shards.",
         )
 
         # Hierarchical sparse attention

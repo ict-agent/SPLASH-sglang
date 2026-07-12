@@ -2822,6 +2822,8 @@ class Scheduler(
                         req.mamba_pool_idx.unsqueeze(-1)
                     )
                     req.mamba_pool_idx = None
+                    req.mamba_cow_src_index = None
+                    req.mamba_needs_clear = False
                 break
 
         # Update waiting queue

@@ -87,6 +87,8 @@ class SessionSlot:
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
