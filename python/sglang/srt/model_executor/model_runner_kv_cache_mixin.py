@@ -218,9 +218,12 @@ class ModelRunnerKVCacheMixin:
             max_running_requests = server_args.max_running_requests // (
                 self.dp_size if server_args.enable_dp_attention else 1
             )
+            # MambaPool allocates one padding row in addition to the runnable
+            # request rows.  Account for it here so KV sizing does not consume
+            # memory that the intermediate speculative state will later use.
             mamba_state_intermediate_size = (
                 config.mamba2_cache_params.mamba_cache_per_req
-                * max_running_requests
+                * (max_running_requests + 1)
                 * server_args.speculative_num_draft_tokens
             )
             total_rest_memory = total_rest_memory - (
@@ -260,7 +263,8 @@ class ModelRunnerKVCacheMixin:
             )
 
         mamba_state_memory = (
-            server_args.max_mamba_cache_size
+            # The main Mamba state pool also has one padding row.
+            (server_args.max_mamba_cache_size + 1)
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )
