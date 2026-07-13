@@ -544,8 +544,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                    mtp_indices = getattr(batch.spec_info, "mtp_topk_indices", None)
+                    req.mtp_topk_indices_tensor = (
+                        mtp_indices[i].cpu().clone()
+                        if mtp_indices is not None
+                        else None
+                    )
                 else:
                     req.hidden_states_tensor = None
+                    req.mtp_topk_indices_tensor = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None

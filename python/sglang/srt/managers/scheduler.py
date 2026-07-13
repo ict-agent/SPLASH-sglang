@@ -38,7 +38,11 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    ModelImpl,
+    get_mtp_index_share_topk,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -1231,6 +1235,20 @@ class Scheduler(
         if model_config is None:
             model_config = self.model_config
 
+        draft_arch = (
+            model_config.hf_config.architectures[0]
+            if getattr(model_config.hf_config, "architectures", None)
+            else ""
+        )
+        spec_metadata_hidden_size = (
+            getattr(model_config, "spec_hidden_size", model_config.hidden_size)
+            if draft_arch == "DeepseekV4ForCausalLMNextN"
+            else model_config.hidden_size
+        )
+        # The metadata layout is a P/D wire protocol. Derive it only from
+        # model config so both sides provision the same aux buffers.
+        mtp_topk_indices_dim = get_mtp_index_share_topk(model_config.hf_config)
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1241,7 +1259,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    getattr(model_config, "spec_hidden_size", model_config.hidden_size)
+                    spec_metadata_hidden_size
                     if self.spec_algorithm.is_eagle()
                     else 16  # minimal padding size for RDMA
                 ),
@@ -1251,6 +1269,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                mtp_topk_indices_dim=mtp_topk_indices_dim,
             )
 
             # The decode requests polling kv cache
@@ -1294,7 +1313,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    getattr(model_config, "spec_hidden_size", model_config.hidden_size)
+                    spec_metadata_hidden_size
                     if self.spec_algorithm.is_eagle()
                     or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
@@ -1306,6 +1325,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                mtp_topk_indices_dim=mtp_topk_indices_dim,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

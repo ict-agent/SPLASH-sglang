@@ -163,6 +163,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
+            mtp_indices_list = [
+                req.mtp_topk_indices_tensor for req in self.reqs
+            ]
+            mtp_topk_indices = (
+                torch.stack(mtp_indices_list, dim=0).to(self.device)
+                if mtp_indices_list and all(x is not None for x in mtp_indices_list)
+                else None
+            )
+
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -170,6 +179,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p=topk_p,
                 topk_index=topk_index,
                 hidden_states=hidden_states,
+                mtp_topk_indices=mtp_topk_indices,
                 bonus_tokens=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )

@@ -158,6 +158,16 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
+def is_mtp_index_share_enabled(hf_config) -> bool:
+    return getattr(hf_config, "index_share_for_mtp_iteration", False)
+
+
+def get_mtp_index_share_topk(hf_config) -> int:
+    if not is_mtp_index_share_enabled(hf_config):
+        return 0
+    return get_nsa_index_topk(hf_config)
+
+
 class ModelConfig:
     def __init__(
         self,

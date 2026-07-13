@@ -148,8 +148,10 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        mtp_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.mtp_topk_indices_dim = mtp_topk_indices_dim
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -197,6 +199,18 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            if self.mtp_topk_indices_dim > 0:
+                self.output_mtp_topk_indices = torch.zeros(
+                    (size, self.mtp_topk_indices_dim),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.output_mtp_topk_indices_valid = torch.zeros(
+                    (size, 1), dtype=torch.uint8, device=device
+                )
+            else:
+                self.output_mtp_topk_indices = None
+                self.output_mtp_topk_indices_valid = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -239,6 +253,19 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if self.output_mtp_topk_indices is not None:
+            ptrs[-1:-1] = [
+                self.output_mtp_topk_indices.data_ptr(),
+                self.output_mtp_topk_indices_valid.data_ptr(),
+            ]
+            data_lens[-1:-1] = [
+                self.output_mtp_topk_indices.nbytes,
+                self.output_mtp_topk_indices_valid.nbytes,
+            ]
+            item_lens[-1:-1] = [
+                self.output_mtp_topk_indices[0].nbytes,
+                self.output_mtp_topk_indices_valid[0].nbytes,
+            ]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
@@ -252,6 +279,12 @@ class MetadataBuffers:
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            (
+                self.output_mtp_topk_indices[idx].clone()
+                if self.output_mtp_topk_indices is not None
+                and bool(self.output_mtp_topk_indices_valid[idx, 0].item())
+                else None
+            ),
             self.bootstrap_room[idx].clone(),
         )
 
@@ -298,6 +331,15 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+        if self.output_mtp_topk_indices is not None:
+            valid = req.mtp_topk_indices_tensor is not None
+            self.output_mtp_topk_indices_valid[
+                req.metadata_buffer_index, 0
+            ] = valid
+            if valid:
+                self.output_mtp_topk_indices[req.metadata_buffer_index].copy_(
+                    req.mtp_topk_indices_tensor
+                )
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0

@@ -30,6 +30,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -202,7 +203,10 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
-        should_update_mtp_topk_indices = forward_batch.reuse_mtp_topk_indices
+        should_update_mtp_topk_indices = (
+            forward_batch.reuse_mtp_topk_indices
+            or forward_batch.capture_mtp_topk_indices
+        )
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual, topk_indices = self.decoder(
                 positions,
@@ -225,6 +229,7 @@ class DeepseekModelNextN(nn.Module):
 
             if use_cp:
                 # allgather + rerrange
+                local_num_tokens = hidden_states.shape[0]
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
                     self.cp_size,
@@ -235,6 +240,25 @@ class DeepseekModelNextN(nn.Module):
                 # Restore the global token order before speculative decoding
                 # reuses or captures them as the seed for the next MTP step.
                 if should_update_mtp_topk_indices and topk_indices is not None:
+                    # CP round-robin split leaves each rank with an uneven
+                    # local row count (e.g. 168/167/167/167 for len=669, cp=4);
+                    # pad to match hidden_states so cp_all_gather_rerange_output
+                    # doesn't produce a jagged result and the subsequent
+                    # index_select stays in bounds. (!936)
+                    if (
+                        is_nsa_prefill_cp_round_robin_split()
+                        and topk_indices.shape[0] < local_num_tokens
+                    ):
+                        pad_rows = local_num_tokens - topk_indices.shape[0]
+                        topk_indices = torch.cat(
+                            [
+                                topk_indices,
+                                topk_indices.new_full(
+                                    (pad_rows, topk_indices.shape[1]), -1
+                                ),
+                            ],
+                            dim=0,
+                        )
                     topk_indices = cp_all_gather_rerange_output(
                         topk_indices,
                         self.cp_size,

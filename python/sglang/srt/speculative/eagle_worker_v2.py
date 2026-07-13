@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -443,6 +444,25 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        index_share_for_mtp_iteration = is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config
+        )
+        if index_share_for_mtp_iteration:
+            forward_batch.reuse_mtp_topk_indices = True
+            if spec_info.mtp_topk_indices is not None:
+                expected_rows = forward_batch.batch_size * self.topk
+                if spec_info.mtp_topk_indices.shape[0] == forward_batch.batch_size:
+                    spec_info.mtp_topk_indices = (
+                        spec_info.mtp_topk_indices.repeat_interleave(self.topk, dim=0)
+                    )
+                elif spec_info.mtp_topk_indices.shape[0] != expected_rows:
+                    logger.debug(
+                        "Draft MTP index share seed has unexpected rows "
+                        f"(got={spec_info.mtp_topk_indices.shape[0]}, "
+                        f"expected={expected_rows}); recomputing locally"
+                    )
+                    spec_info.mtp_topk_indices = None
+            forward_batch.topk_indices = spec_info.mtp_topk_indices
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -479,6 +499,11 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
 
+        if index_share_for_mtp_iteration:
+            spec_info.mtp_topk_indices = None
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
+
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
             1
@@ -509,6 +534,60 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft_extend(self):
         pass
+
+    def _capture_mtp_topk_indices(
+        self,
+        next_draft_input: EagleDraftInput,
+        forward_batch: ForwardBatch,
+        *,
+        source: Optional[torch.Tensor] = None,
+        select_index: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Store one NSA index-share seed row per request.
+
+        Eager draft-extend writes to ``forward_batch.topk_indices``; CUDA graph
+        draft-extend exposes the same tensor on its logits output. Prefill uses
+        the last row of each ragged extend range, while decode-v2 selects the
+        last accepted row already used for logits/hidden states.
+        """
+        next_draft_input.mtp_topk_indices = None
+        if not is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config
+        ):
+            return
+
+        topk_indices = forward_batch.topk_indices if source is None else source
+        if topk_indices is None or forward_batch.forward_mode.is_idle():
+            return
+
+        if select_index is None:
+            if forward_batch.extend_seq_lens is None:
+                return
+            select_index = (
+                torch.cumsum(
+                    forward_batch.extend_seq_lens.to(
+                        device=topk_indices.device, dtype=torch.int64
+                    ),
+                    dim=0,
+                )
+                - 1
+            )
+        else:
+            select_index = select_index.to(
+                device=topk_indices.device, dtype=torch.int64
+            )
+
+        if select_index.numel() == 0 or int(select_index.max().item()) >= len(
+            topk_indices
+        ):
+            logger.debug(
+                "EAGLE v2 MTP index-share output is shorter than its selection "
+                "indices; falling back to local indexer compute"
+            )
+            return
+        next_draft_input.mtp_topk_indices = topk_indices.index_select(
+            0, select_index
+        ).clone()
 
     def _draft_extend_for_prefill(
         self,
@@ -550,6 +629,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
+        if is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
+            forward_batch.capture_mtp_topk_indices = True
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
@@ -561,6 +642,7 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        self._capture_mtp_topk_indices(next_draft_input, forward_batch)
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -599,6 +681,9 @@ class EagleDraftWorker(BaseDraftWorker):
             # directly for `num_accept_tokens` and subtract 1 for `num_correct_drafts`.
             forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
             forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
+
+        if is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
+            forward_batch.capture_mtp_topk_indices = True
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -644,6 +729,12 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_p,
             ret_topk_index,
             ret_hidden_states,
+        )
+        self._capture_mtp_topk_indices(
+            next_draft_input,
+            forward_batch,
+            source=getattr(draft_logits_output, "mtp_topk_indices", None),
+            select_index=select_index,
         )
 
 

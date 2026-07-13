@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import (
+    get_mtp_index_share_topk,
+    is_mtp_index_share_enabled,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -54,6 +58,9 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: Optional[torch.Tensor]
+    # NSA MTP index share seed buffer. Allocated only when
+    # is_mtp_index_share_enabled(hf_config) is True.
+    mtp_topk_indices: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -90,6 +97,12 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
+        self.enable_mtp_index_share = is_mtp_index_share_enabled(
+            model_runner.model_config.hf_config
+        )
+        self.mtp_index_share_topk = get_mtp_index_share_topk(
+            model_runner.model_config.hf_config
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -141,6 +154,13 @@ class EAGLEDraftCudaGraphRunner:
                 if _hidden_size is not None
                 else None
             )
+            mtp_topk_indices = (
+                torch.zeros(
+                    (self.max_bs, self.mtp_index_share_topk), dtype=torch.int32
+                )
+                if self.enable_mtp_index_share
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -172,6 +192,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            mtp_topk_indices=mtp_topk_indices,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -208,6 +229,18 @@ class EAGLEDraftCudaGraphRunner:
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+
+        if self.enable_mtp_index_share:
+            mtp_topk_indices = getattr(
+                forward_batch.spec_info, "mtp_topk_indices", None
+            )
+            if (
+                mtp_topk_indices is None
+                or mtp_topk_indices.shape[0] != forward_batch.batch_size
+            ):
+                # The graph input is per-request. Let eager mode compute a
+                # missing/misaligned seed instead of replaying a zero seed.
+                is_bs_supported = False
 
         return is_bs_supported
 
@@ -268,6 +301,11 @@ class EAGLEDraftCudaGraphRunner:
         )
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
+        mtp_topk_indices = (
+            buffers.mtp_topk_indices[:num_seqs]
+            if buffers.mtp_topk_indices is not None
+            else None
+        )
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -319,6 +357,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p=topk_p,
             topk_index=topk_index,
             hidden_states=hidden_states,
+            mtp_topk_indices=mtp_topk_indices,
             capture_hidden_mode=capture_mode,
         )
 
@@ -367,11 +406,17 @@ class EAGLEDraftCudaGraphRunner:
             # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            mtp_topk_indices_backup = forward_batch.spec_info.mtp_topk_indices
+            topk_indices_backup = forward_batch.topk_indices
+            reuse_mtp_topk_indices_backup = forward_batch.reuse_mtp_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.mtp_topk_indices = mtp_topk_indices_backup
+            forward_batch.topk_indices = topk_indices_backup
+            forward_batch.reuse_mtp_topk_indices = reuse_mtp_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -421,6 +466,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.topk_index.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.mtp_topk_indices is not None:
+                buffers.mtp_topk_indices.zero_()
             buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
@@ -449,6 +496,16 @@ class EAGLEDraftCudaGraphRunner:
             and forward_batch.spec_info.hidden_states is not None
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        if buffers.mtp_topk_indices is not None:
+            if forward_batch.spec_info.mtp_topk_indices is None:
+                # Idle batch (dp attention w/o reqs) or feature just enabled
+                # with no capture yet. Zero the static buffer so the first
+                # draft step falls back to computing fresh topk_indices.
+                buffers.mtp_topk_indices[:raw_bs].zero_()
+            else:
+                buffers.mtp_topk_indices[:raw_bs].copy_(
+                    forward_batch.spec_info.mtp_topk_indices
+                )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
@@ -479,6 +536,8 @@ class EAGLEDraftCudaGraphRunner:
         # Replay
         self._replay(forward_batch)
         out = self.output_buffers[bs]
+        if self.enable_mtp_index_share:
+            forward_batch.spec_info.mtp_topk_indices = None
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)

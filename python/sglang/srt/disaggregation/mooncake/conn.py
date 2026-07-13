@@ -952,6 +952,16 @@ class MooncakeKVManager(CommonKVManager):
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
     ):
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        if len(dst_aux_ptrs) != len(prefill_aux_ptrs):
+            raise RuntimeError(
+                "Prefill/decode aux buffer count mismatch: "
+                f"prefill has {len(prefill_aux_ptrs)} slots, "
+                f"decode sent {len(dst_aux_ptrs)}. "
+                "Check that P/D use the same model and speculative-decoding "
+                "configuration."
+            )
+
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
             self.enable_custom_mem_pool
@@ -960,7 +970,6 @@ class MooncakeKVManager(CommonKVManager):
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
-        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
 
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
@@ -1026,6 +1035,27 @@ class MooncakeKVManager(CommonKVManager):
         aux_index = int(msg[3].decode("ascii"))
         data_length = struct.unpack(">I", msg[4])[0]
         data = msg[5]
+
+        aux_buffer_count = len(self.kv_args.aux_data_ptrs)
+        if not 0 <= buffer_index < aux_buffer_count:
+            raise RuntimeError(
+                "AUX_DATA buffer index out of range: "
+                f"received {buffer_index}, decode has {aux_buffer_count} aux slots. "
+                "This usually indicates a P/D aux buffer count mismatch."
+            )
+
+        item_len = self.kv_args.aux_item_lens[buffer_index]
+        item_count = self.kv_args.aux_data_lens[buffer_index] // item_len
+        if not 0 <= aux_index < item_count:
+            raise RuntimeError(
+                "AUX_DATA item index out of range: "
+                f"received {aux_index}, buffer {buffer_index} has {item_count} items"
+            )
+        if data_length != item_len:
+            raise RuntimeError(
+                "AUX_DATA item length mismatch: "
+                f"received {data_length}, expected {item_len} for buffer {buffer_index}"
+            )
 
         if len(data) != data_length:
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")

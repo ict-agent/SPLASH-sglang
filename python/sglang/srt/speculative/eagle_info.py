@@ -766,6 +766,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # the worker copies it here for next iter's draft.
     bonus_tokens: torch.Tensor = None
 
+    # NSA MTP index share: per-req seed topk_indices captured on prefill's
+    # draft-extend (or decode's draft-extend-after-decode) for reuse as the
+    # first-step topk_indices in the next draft. Shape: (b, index_topk).
+    # Only populated when index_share_for_mtp_iteration is enabled.
+    mtp_topk_indices: Optional[torch.Tensor] = None
+
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
@@ -865,6 +871,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
+            if self.mtp_topk_indices is not None:
+                self.mtp_topk_indices = self.mtp_topk_indices[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -872,6 +880,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.mtp_topk_indices is not None:
+                self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -891,6 +901,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.mtp_topk_indices = spec_info.mtp_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -903,6 +914,15 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        # NSA MTP index share: cat when both sides have seeds. If one side is
+        # missing we rely on !929 (MHA fast path also emits seed indices) to
+        # guarantee this state can't arise once the feature is enabled.
+        if self.mtp_topk_indices is None:
+            self.mtp_topk_indices = spec_info.mtp_topk_indices
+        elif spec_info.mtp_topk_indices is not None:
+            self.mtp_topk_indices = torch.cat(
+                [self.mtp_topk_indices, spec_info.mtp_topk_indices]
+            )
 
 
 @dataclass

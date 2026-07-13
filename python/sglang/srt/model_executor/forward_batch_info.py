@@ -340,6 +340,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
     topk_indices: Optional[torch.Tensor] = None
     reuse_mtp_topk_indices: Optional[bool] = False
+    # For NSA MTP index share: when True, deepseek_nextn writes the freshly
+    # computed topk_indices back to forward_batch.topk_indices so eagle_worker
+    # can extract per-request seed indices for the next draft iteration.
+    capture_mtp_topk_indices: bool = False
 
     # Attention planning state. Set by callers that initialize attention
     # metadata outside ModelRunner.forward, e.g. multi-step draft pre-planning.
@@ -1138,6 +1142,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.num_accept_tokens = self._pad_tensor_to_size(
                     spec_info.num_accept_tokens, bs
                 )
+            if getattr(spec_info, "mtp_topk_indices", None) is not None:
+                spec_info.mtp_topk_indices = self._pad_tensor_to_size(
+                    spec_info.mtp_topk_indices, bs
+                )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )
@@ -1184,6 +1192,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     :bs
                 ]
                 self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[:bs]
+                # MTP index-share seed extraction cumsums extend_seq_lens after
+                # this returns; keep it unpadded like num_accept_tokens or the
+                # padded zero-length rows duplicate the last request's seed.
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2

@@ -818,6 +818,7 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        self.mtp_topk_indices_tensor = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts

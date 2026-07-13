@@ -107,6 +107,12 @@ class LogitsProcessorOutput:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    ## Part 6: NSA MTP index share.
+    # Captured NSA topk_indices from draft-extend for reuse across draft
+    # iterations. Only populated when index_share_for_mtp_iteration is enabled
+    # and forward_batch.capture_mtp_topk_indices is set.
+    mtp_topk_indices: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
