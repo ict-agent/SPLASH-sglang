@@ -1762,6 +1762,7 @@ class HybridLinearKVPool(KVCache):
             )
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
             self.index_kpool = self.full_kv_pool.index_kpool
+            self.tail_extra_slots = self.full_kv_pool.tail_extra_slots
             self.slots_per_page = self.full_kv_pool.slots_per_page
         else:
 
