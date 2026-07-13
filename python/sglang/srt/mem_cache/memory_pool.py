@@ -2993,7 +2993,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     self.remote_index_k_with_scale_buffer = torch.zeros(
                         (
                             num_pages,
-                            self.page_size
+                            self.slots_per_page
                             * (
                                 index_head_dim
                                 + index_head_dim // self.quant_block_size * 4

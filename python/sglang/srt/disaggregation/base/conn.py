@@ -18,6 +18,8 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     NSA = "nsa"
+    # NSA dense kpool tail: one per-request ring slot component.
+    NSA_TAIL = "nsa_tail"
 
 
 @dataclasses.dataclass

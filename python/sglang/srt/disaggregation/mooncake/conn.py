@@ -1278,6 +1278,19 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     or rc
                 )
+            elif st == StateType.NSA_TAIL:
+                rc = (
+                    self._send_slot_state(
+                        req,
+                        src_data_ptrs,
+                        src_item_lens,
+                        dst_data_ptrs,
+                        indices,
+                        dst_indices,
+                        st.value,
+                    )
+                    or rc
+                )
             else:
                 logger.error(f"Unknown state type: {st}")
                 return -1

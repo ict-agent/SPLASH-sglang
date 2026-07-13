@@ -550,30 +550,8 @@ def filter_kv_indices_for_cp_rank(
     sends a contiguous positional slice of that page list; together the slices
     tile the request exactly once.
     """
-    # Mooncake passes the request-wide page count so chunk boundaries can be
-    # intersected with one stable CP partition. Other backends still call this
-    # helper per chunk; preserve their pre-existing value-based behavior.
     if total_pages is None:
-        chunk_pages = len(kv_indices)
-        rank_page_indices = page_indices_to_cp_rank_page_indices(
-            page_indices=kv_indices,
-            total_pages=chunk_pages,
-            cp_rank=kv_mgr.attn_cp_rank,
-            cp_size=kv_mgr.attn_cp_size,
-        )
-        if rank_page_indices.size == 0:
-            return kv_indices[:0], slice(index_slice.start, index_slice.start)
-
-        mask = np.isin(kv_indices, rank_page_indices)
-        if not mask.any():
-            return kv_indices[:0], slice(index_slice.start, index_slice.start)
-
-        first_pos = int(mask.argmax())
-        last_pos = len(mask) - int(mask[::-1].argmax())
-        return kv_indices[first_pos:last_pos], slice(
-            index_slice.start + first_pos,
-            index_slice.start + last_pos,
-        )
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
@@ -655,10 +633,11 @@ def setup_state_kv_args(
     Shared by prefill and decode bootstrap paths so the state_type dispatch
     lives in one place. Components are appended in this order when present:
 
-        mamba(MAMBA) -> target_nsa(NSA) -> draft_nsa(NSA)
+        mamba(MAMBA) -> target_nsa(NSA) -> target_tail(NSA_TAIL)
+                     -> draft_nsa(NSA)  -> draft_tail(NSA_TAIL)
 
-    NSA tail / per-component sub-dim metadata are intentionally not emitted in
-    this branch because the current KVArgs protocol does not carry those fields.
+    NSA tail components are emitted only when the pool exposes dense kpool tail
+    buffers. Anchor-layout NSA keeps the old component order.
     """
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -675,6 +654,12 @@ def setup_state_kv_args(
 
     def _append_nsa(pool):
         append_state_component(kv_args, StateType.NSA, *pool.get_state_buf_infos())
+        if getattr(pool, "index_kpool", 1) > 1 and hasattr(
+            pool, "get_tail_buf_infos"
+        ):
+            append_state_component(
+                kv_args, StateType.NSA_TAIL, *pool.get_tail_buf_infos()
+            )
 
     def _append_draft_nsa():
         draft_nsa_pool = getattr(
@@ -805,6 +790,23 @@ def build_state_indices(
 
     def _append_nsa(pool):
         components.append(_nsa_pages(pool))
+        if getattr(pool, "index_kpool", 1) > 1 and hasattr(
+            pool, "get_tail_buf_infos"
+        ):
+            # Dense kpool tail is a ring of size index_kpool + tail_extra_slots.
+            # Only the open pool's accumulated prefix slots contain live data.
+            pool_size = pool.index_kpool
+            tail_size = pool_size + getattr(pool, "tail_extra_slots", 0)
+            n_valid = seq_len % pool_size
+            if n_valid:
+                start_phys = (seq_len - n_valid) % tail_size
+                first_n = min(n_valid, tail_size - start_phys)
+                second_n = n_valid - first_n
+                components.append(
+                    [req_pool_idx, start_phys, first_n, 0, second_n, tail_size]
+                )
+            else:
+                components.append([])
 
     def _append_draft_nsa():
         draft_nsa_pool = getattr(
