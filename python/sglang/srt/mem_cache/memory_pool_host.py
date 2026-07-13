@@ -1055,10 +1055,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
-            [kernel_accessible_host_ptr(x) for x in self.data_refs],
+            self._build_data_pointer_values(self.data_refs),
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+
+    def _build_data_pointer_values(self, data_refs) -> list[int]:
+        return [kernel_accessible_host_ptr(x) for x in data_refs]
 
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
@@ -3520,39 +3523,88 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         # into these mappings; retaining only views is not enough for every
         # backend/runtime combination when querying mapped device pointers.
         self._shared_mmap_refs = []
+        self._shared_my_files = None
+        self._owned_kv_data_ptr_values = None
+        self._kv_root_tensor = None
+        self._index_root_tensor = None
         self._skip_nsa_indexer_host = True
 
-        super().__init__(
-            device_pool,
-            host_to_device_ratio,
-            host_size,
-            page_size,
-            layout,
-            pin_memory,
-            device,
-            allocator_type,
-        )
+        try:
+            super().__init__(
+                device_pool,
+                host_to_device_ratio,
+                host_size,
+                page_size,
+                layout,
+                pin_memory,
+                device,
+                allocator_type,
+            )
 
-        self._init_indexer_buffers()
+            self._init_indexer_buffers()
+        finally:
+            self._unlink_owned_cache_files()
 
         self.index_data_refs = [
             self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
         ]
         self.index_data_ptrs = torch.tensor(
-            [kernel_accessible_host_ptr(x) for x in self.index_data_refs],
+            self._build_owned_root_pointer_values(
+                self._index_root_tensor, self.index_data_refs
+            ),
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
 
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
-            [kernel_accessible_host_ptr(x) for x in self.data_refs],
+            self._build_data_pointer_values(self.data_refs),
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
 
+    def _build_data_pointer_values(self, data_refs) -> list[int]:
+        if self._owned_kv_data_ptr_values is not None:
+            return self._owned_kv_data_ptr_values
+        return super()._build_data_pointer_values(data_refs)
+
+    def _build_owned_root_pointer_values(
+        self, root_tensor: Optional[torch.Tensor], layer_refs
+    ) -> list[int]:
+        ptrs = [0] * self.layer_num
+        if root_tensor is None:
+            return ptrs
+
+        if _is_dcu:
+            root_device_ptr = _hip_host_get_device_pointer(root_tensor.data_ptr())
+        else:
+            root_device_ptr = kernel_accessible_host_ptr(root_tensor)
+        root_host_ptr = root_tensor.data_ptr()
+        for layer_idx in range(self.my_rel_start, self.my_rel_end):
+            layer_ref = layer_refs[layer_idx]
+            if layer_ref is None:
+                raise RuntimeError(
+                    f"Missing owned host layer {layer_idx} on rank {self.tp_rank}."
+                )
+            offset = layer_ref.data_ptr() - root_host_ptr
+            if offset < 0 or offset >= root_tensor.nbytes:
+                raise RuntimeError(
+                    "Owned host layer view is outside its mapped root: "
+                    f"rank={self.tp_rank}, layer={layer_idx}, offset={offset}, "
+                    f"root_nbytes={root_tensor.nbytes}."
+                )
+            ptrs[layer_idx] = root_device_ptr + offset
+        return ptrs
+
+    def _unlink_owned_cache_files(self) -> None:
+        for path in (self._shared_my_files or {}).values():
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    logger.warning("Failed to unlink NSA HiCache file %s: %s", path, exc)
+
     def _init_indexer_buffers(self):
-        all_files = self._shared_all_files
         my_files = self._shared_my_files
 
         index_buffer_second_dim = (
@@ -3564,21 +3616,14 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
         self.index_k_with_scale_buffer = [None] * self.layer_num
 
-        for step in range(self.tp_size):
-            file_idx = (step + self.tp_rank) % self.tp_size
-
-            r_rel_start, r_rel_end = _get_layer_shard_range(
-                file_idx, self.tp_size, self.layer_num
-            )
-            r_num = r_rel_end - r_rel_start
-
-            if r_num == 0:
-                continue
-
-            files = all_files[file_idx]
-
-            t_pin = time.perf_counter()
-
+        file_idx = self.tp_rank
+        r_rel_start, r_rel_end = self.my_rel_start, self.my_rel_end
+        r_num = r_rel_end - r_rel_start
+        if r_num > 0:
+            if not my_files or "index" not in my_files:
+                raise RuntimeError(
+                    f"Rank {self.tp_rank} has owned layers but no index cache file."
+                )
             idx_shape = (r_num, self.page_num, index_buffer_second_dim)
             idx_numel = r_num * self.page_num * index_buffer_second_dim
             idx_mapped_numel = (
@@ -3588,43 +3633,38 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 else idx_numel
             )
             idx_tensor = torch.from_file(
-                files["index"],
+                my_files["index"],
                 shared=True,
                 size=idx_mapped_numel,
                 dtype=self.indexer_dtype,
                 device="cpu",
             )[:idx_numel].view(idx_shape)
+            self._index_root_tensor = idx_tensor
             self._shared_mmap_refs.append(idx_tensor)
+            if self.pin_memory and (_is_cuda or _is_dcu):
+                checked_register_host_tensor_for_kernel_access(
+                    idx_tensor,
+                    idx_tensor.numel() * idx_tensor.element_size(),
+                    f"nsa_layer_group_index_rank{file_idx}_root",
+                )
             logger.info(
-                f"Rank {self.tp_rank} finish Indexer cudaHostRegister for Rank "
-                f"{file_idx}'s file in {time.perf_counter() - t_pin:.3f}s"
+                f"Rank {self.tp_rank} mapped and registered only its own Indexer "
+                f"root for relative layers [{r_rel_start}, {r_rel_end})."
             )
 
             for i in range(r_num):
                 global_layer_idx = r_rel_start + i
-                layer_tensor = idx_tensor[i]
-                if self.pin_memory and (_is_cuda or _is_dcu):
-                    checked_register_host_tensor_for_kernel_access(
-                        layer_tensor,
-                        layer_tensor.numel() * layer_tensor.element_size(),
-                        f"nsa_layer_group_index_rank{file_idx}_layer{global_layer_idx}",
-                    )
-                self.index_k_with_scale_buffer[global_layer_idx] = layer_tensor
+                self.index_k_with_scale_buffer[global_layer_idx] = idx_tensor[i]
 
         dist.barrier(group=self.tp_group)
-        if my_files:
-            idx_file = my_files.get("index")
-            if idx_file and os.path.exists(idx_file):
-                os.remove(idx_file)
-
-        del self._shared_all_files
-        del self._shared_my_files
 
         self.index_k_data_refs = [
             self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
         ]
         self.index_k_data_ptrs = torch.tensor(
-            [kernel_accessible_host_ptr(x) for x in self.index_k_data_refs],
+            self._build_owned_root_pointer_values(
+                self._index_root_tensor, self.index_k_data_refs
+            ),
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
@@ -3696,6 +3736,8 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 f"{GLM_HICACHE_SHM_DIR}/sglang_nsa_idx_"
                 f"{self.my_abs_start}_{self.my_abs_end}_{uid}.bin"
             )
+            my_files = {"kv": kv_name, "index": idx_name}
+            self._shared_my_files = my_files
 
             kv_bytes = (
                 self.my_num_layers
@@ -3760,28 +3802,16 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 f"locally in {time.perf_counter() - t_zero_alloc:.3f}s"
             )
 
-            my_files = {"kv": kv_name, "index": idx_name}
-
-        all_files = [None] * self.tp_size
-        dist.all_gather_object(all_files, my_files, group=self.tp_group)
-
         self.kv_buffer = [None] * self.layer_num
 
-        for step in range(self.tp_size):
-            file_idx = (step + self.tp_rank) % self.tp_size
-
-            r_rel_start, r_rel_end = _get_layer_shard_range(
-                file_idx, self.tp_size, self.layer_num
-            )
-            r_num = r_rel_end - r_rel_start
-
-            if r_num == 0:
-                continue
-
-            files = all_files[file_idx]
-
-            t_pin = time.perf_counter()
-
+        file_idx = self.tp_rank
+        r_rel_start, r_rel_end = self.my_rel_start, self.my_rel_end
+        r_num = r_rel_end - r_rel_start
+        if r_num > 0:
+            if not my_files or "kv" not in my_files:
+                raise RuntimeError(
+                    f"Rank {self.tp_rank} has owned layers but no KV cache file."
+                )
             kv_shape = (r_num, self.size, 1, kv_element_dim)
             kv_numel = r_num * self.size * 1 * kv_element_dim
             kv_mapped_numel = (
@@ -3790,37 +3820,34 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 else kv_numel
             )
             kv_tensor = torch.from_file(
-                files["kv"],
+                my_files["kv"],
                 shared=True,
                 size=kv_mapped_numel,
                 dtype=self.dtype,
                 device="cpu",
             )[:kv_numel].view(kv_shape)
+            self._kv_root_tensor = kv_tensor
             self._shared_mmap_refs.append(kv_tensor)
+            if self.pin_memory and (_is_cuda or _is_dcu):
+                checked_register_host_tensor_for_kernel_access(
+                    kv_tensor,
+                    kv_tensor.numel() * kv_tensor.element_size(),
+                    f"nsa_layer_group_kv_rank{file_idx}_root",
+                )
             logger.info(
-                f"Rank {self.tp_rank} finish KV cudaHostRegister for Rank "
-                f"{file_idx}'s file in {time.perf_counter() - t_pin:.3f}s"
+                f"Rank {self.tp_rank} mapped and registered only its own KV root "
+                f"for relative layers [{r_rel_start}, {r_rel_end})."
             )
 
             for i in range(r_num):
                 global_layer_idx = r_rel_start + i
-                layer_tensor = kv_tensor[i]
-                if self.pin_memory and (_is_cuda or _is_dcu):
-                    checked_register_host_tensor_for_kernel_access(
-                        layer_tensor,
-                        layer_tensor.numel() * layer_tensor.element_size(),
-                        f"nsa_layer_group_kv_rank{file_idx}_layer{global_layer_idx}",
-                    )
-                self.kv_buffer[global_layer_idx] = layer_tensor
+                self.kv_buffer[global_layer_idx] = kv_tensor[i]
+
+            self._owned_kv_data_ptr_values = self._build_owned_root_pointer_values(
+                self._kv_root_tensor, self.kv_buffer
+            )
 
         dist.barrier(group=self.tp_group)
-        if my_files:
-            kv_file = my_files.get("kv")
-            if kv_file and os.path.exists(kv_file):
-                os.remove(kv_file)
-
-        self._shared_all_files = all_files
-        self._shared_my_files = my_files
 
         return self.kv_buffer
 
