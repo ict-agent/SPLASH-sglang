@@ -39,6 +39,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -1809,6 +1810,25 @@ class PoolEntry:
     device_evict_fn: Optional[Callable] = None
 
 
+def prepare_mamba_h2d_direct_indices(
+    host_indices: torch.Tensor, device_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return CPU indices sorted as source/destination pairs for direct H2D."""
+    if host_indices.ndim != 1 or device_indices.ndim != 1:
+        raise ValueError("Mamba H2D indices must be one-dimensional")
+    if host_indices.numel() != device_indices.numel():
+        raise ValueError("Mamba H2D indices must have equal length")
+
+    host_indices_cpu = (
+        host_indices if host_indices.device.type == "cpu" else host_indices.cpu()
+    )
+    device_indices_cpu = (
+        device_indices if device_indices.device.type == "cpu" else device_indices.cpu()
+    )
+    sorted_host_indices, order = host_indices_cpu.sort()
+    return sorted_host_indices, device_indices_cpu.index_select(0, order)
+
+
 class HostPoolGroup:
     def __init__(self, entries: list[PoolEntry]):
         if not entries:
@@ -1824,6 +1844,9 @@ class HostPoolGroup:
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
         self.size = self.anchor_entry.host_pool.size
+        self.mamba_h2d_direct_enabled = (
+            not envs.SGLANG_DISABLE_HICACHE_MAMBA_H2D_DIRECT.get()
+        )
 
     def clear(self) -> None:
         for entry in self.entries:
@@ -1873,12 +1896,21 @@ class HostPoolGroup:
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
                 continue
+            effective_backend = io_backend
+            if (
+                self.mamba_h2d_direct_enabled
+                and io_backend == "kernel"
+                and isinstance(entry.host_pool, MambaPoolHost)
+                and entry.host_pool.layout == "layer_first"
+                and entry.host_pool.pin_memory
+            ):
+                effective_backend = "direct"
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
                 transfer.host_indices,
                 transfer.device_indices,
                 local_layer_id,
-                io_backend,
+                effective_backend,
             )
 
     def backup_from_device_all_layer(

@@ -21,10 +21,15 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import (
+    MambaPoolHost,
+    PoolEntry,
+    prepare_mamba_h2d_direct_indices,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -322,7 +327,10 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self.move_hybrid_indices(op)
+        host_indices, device_indices, pool_transfers = self.move_hybrid_indices(
+            op,
+            prepare_mamba_h2d_direct=self.mem_pool_host.mamba_h2d_direct_enabled,
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -454,7 +462,9 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def move_hybrid_indices(
-        self, operation: CacheOperation
+        self,
+        operation: CacheOperation,
+        prepare_mamba_h2d_direct: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
@@ -463,9 +473,28 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
-                transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
-                )
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                if (
+                    prepare_mamba_h2d_direct
+                    and self.io_backend == "kernel"
+                    and transfer.name == PoolName.MAMBA
+                    and transfer.host_indices is not None
+                    and transfer.device_indices is not None
+                    and transfer.host_indices.numel() > 0
+                    and entry is not None
+                    and isinstance(entry.host_pool, MambaPoolHost)
+                    and entry.host_pool.layout == "layer_first"
+                    and entry.host_pool.pin_memory
+                ):
+                    transfer_host_indices, transfer_device_indices = (
+                        prepare_mamba_h2d_direct_indices(
+                            transfer.host_indices, transfer.device_indices
+                        )
+                    )
+                else:
+                    transfer_host_indices, transfer_device_indices = self.move_indices(
+                        transfer.host_indices, transfer.device_indices
+                    )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The
                 # controller only needs a normalized execution-time copy.
