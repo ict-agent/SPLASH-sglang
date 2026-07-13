@@ -38,6 +38,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func=None,
+        layer_id: int = -1,
         is_first_layer: bool = False,
         hc_mult: int = 1,
         hc_attn_pre: Optional[Callable] = None,
@@ -62,6 +63,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             allow_reduce_scatter=allow_reduce_scatter,
             is_last_layer=is_last_layer,
             qkv_latent_func=qkv_latent_func,
+            layer_id=layer_id,
         )
 
     def _post_init_communicate(self):

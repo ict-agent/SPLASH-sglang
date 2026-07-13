@@ -622,7 +622,7 @@ class ModelRunnerKVCacheMixin:
             else:
                 pool_kwargs.update(
                     nsa_index_kpool=self.model_config.nsa_index_kpool,
-                    tail_extra_slots=self.server_args.speculative_num_draft_tokens or 0,
+                    tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
                     max_running_requests=self.max_running_requests,
                 )
             self.token_to_kv_pool = PoolCls(
@@ -717,7 +717,7 @@ class ModelRunnerKVCacheMixin:
                                 self.model_config.hf_config
                             ),
                             nsa_index_kpool=self.model_config.nsa_index_kpool,
-                            tail_extra_slots=self.server_args.speculative_num_draft_tokens or 0,
+                            tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
                             max_running_requests=self.max_running_requests,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
