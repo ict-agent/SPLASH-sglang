@@ -2645,9 +2645,14 @@ class NSAIndexerPoolHost(HostKVCache):
         self.size = anchor_host.size
         self.page_num = anchor_host.page_num
 
+        # Mirror the device-side kpool layout (`slots_per_page` in
+        # sglang_glm_kpool_v1); anchor mode falls back to page_size.
+        self.slots_per_pool_page = getattr(
+            device_pool, "slots_per_page", self.page_size
+        )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token
-            * self.page_size
+            * self.slots_per_pool_page
             * self.indexer_dtype.itemsize
         )
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
@@ -2656,6 +2661,8 @@ class NSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token
             * self.layer_num
             * self.indexer_dtype.itemsize
+            * self.slots_per_pool_page
+            // self.page_size
         )
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
@@ -2700,6 +2707,8 @@ class NSAIndexerPoolHost(HostKVCache):
             self.indexer_size_per_token
             * self.layer_num
             * self.indexer_dtype.itemsize
+            * self.slots_per_pool_page
+            // self.page_size
         )
 
     def get_ksize_per_token(self):
@@ -3014,13 +3023,15 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
                 self.index_head_dim
                 + self.index_head_dim // self.indexer_quant_block_size * 4
             )
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = getattr(
+                device_pool, "slots_per_page", page_size
+            )
         else:
             elem_size = torch.empty(
                 (), dtype=device_pool.index_k_buffer_dtype
             ).element_size()
             self.indexer_size_per_token = self.index_head_dim * elem_size
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = page_size
 
     def __init__(
         self,
@@ -3039,6 +3050,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         # Main latent KV host buffer. device_pool.kv_cache_dim already accounts
         # for DCU FlashMLA rope padding + fp8 scale, so forward it as override so
         # the host buffer width always matches the device buffer width.
+        self.slots_per_pool_page = getattr(
+            device_pool, "slots_per_page", page_size
+        )
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -3103,7 +3117,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             + self.indexer_size_per_token
             * self.layer_num
             * self.indexer_dtype.itemsize
-            * self.indexer_page_slots
+            * self.indexer_slots_per_pool_page
             // self.page_size
         )
 
@@ -3143,13 +3157,15 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
                 self.index_head_dim
                 + self.index_head_dim // self.indexer_quant_block_size * 4
             )
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = getattr(
+                device_pool, "slots_per_page", page_size
+            )
         else:
             elem_size = torch.empty(
                 (), dtype=device_pool.index_k_buffer_dtype
             ).element_size()
             self.indexer_size_per_token = self.index_head_dim * elem_size
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = page_size
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -3192,7 +3208,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
 
     def _init_indexer_buffers(self):
         index_buffer_second_dim = (
-            self.indexer_page_slots * self.indexer_size_per_token
+            self.indexer_slots_per_pool_page * self.indexer_size_per_token
         )
         self.index_stride_size = (
             self.indexer_size_per_token
@@ -3374,7 +3390,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         )
         page_indices_host = host_indices[:: self.page_size] // self.page_size
         page_indices_device = device_indices[:: self.page_size] // self.page_size
-        item_size = self.index_stride_size * self.indexer_page_slots
+        item_size = self.index_stride_size * self.indexer_slots_per_pool_page
         device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
 
         if io_backend == "kernel":
@@ -3410,7 +3426,7 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
             )
             page_indices_host = host_indices[:: self.page_size] // self.page_size
             page_indices_device = device_indices[:: self.page_size] // self.page_size
-            item_size = self.index_stride_size * self.indexer_page_slots
+            item_size = self.index_stride_size * self.indexer_slots_per_pool_page
 
             if io_backend == "kernel":
                 transfer_kv_all_layer_mla(
@@ -3464,6 +3480,17 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 f"backend yet, got allocator_type={allocator_type!r}."
             )
 
+        if getattr(device_pool, "slots_per_page", page_size) != page_size:
+            # Dense kpool-compress layout: the indexer row shrinks to
+            # slots_per_pool_page (= page_size // index_kpool) slots per page.
+            # All indexer geometry below derives from self.slots_per_pool_page,
+            # so anchor and dense kpool layouts share the same code path.
+            logger.info(
+                "NSATokenToKVPoolHostSharedLayerGroup using dense kpool indexer "
+                f"layout: slots_per_page={device_pool.slots_per_page}, "
+                f"page_size={page_size}."
+            )
+
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
         self.use_fp8_index_k_cache = device_pool.use_fp8_index_k_cache
@@ -3473,13 +3500,15 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
                 self.index_head_dim
                 + self.index_head_dim // self.indexer_quant_block_size * 4
             )
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = getattr(
+                device_pool, "slots_per_page", page_size
+            )
         else:
             elem_size = torch.empty(
                 (), dtype=device_pool.index_k_buffer_dtype
             ).element_size()
             self.indexer_size_per_token = self.index_head_dim * elem_size
-            self.indexer_page_slots = page_size
+            self.indexer_slots_per_pool_page = page_size
 
         if tp_group is None:
             raise ValueError(
@@ -3607,8 +3636,10 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
     def _init_indexer_buffers(self):
         my_files = self._shared_my_files
 
+        # slots_per_pool_page = page_size (anchor) or page_size // index_kpool
+        # (dense kpool-compress), mirroring the device row geometry.
         index_buffer_second_dim = (
-            self.indexer_page_slots * self.indexer_size_per_token
+            self.indexer_slots_per_pool_page * self.indexer_size_per_token
         )
         self.index_stride_size = (
             self.indexer_size_per_token * self.indexer_dtype.itemsize
@@ -3690,7 +3721,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         index_bytes = (
             self.my_num_layers
             * self.page_num
-            * self.indexer_page_slots
+            * self.indexer_slots_per_pool_page
             * self.indexer_size_per_token
             * self.indexer_dtype.itemsize
         )
@@ -3722,7 +3753,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         kv_element_dim = self.kv_cache_dim
 
         index_buffer_second_dim = (
-            self.indexer_page_slots * self.indexer_size_per_token
+            self.indexer_slots_per_pool_page * self.indexer_size_per_token
         )
 
         my_files = None
@@ -3874,7 +3905,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         )
         page_indices_host = host_indices[:: self.page_size] // self.page_size
         page_indices_device = device_indices[:: self.page_size] // self.page_size
-        item_size = self.index_stride_size * self.indexer_page_slots
+        item_size = self.index_stride_size * self.indexer_slots_per_pool_page
         device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
 
         if io_backend == "kernel":
@@ -3943,7 +3974,7 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
 
         page_indices_host = host_indices[:: self.page_size] // self.page_size
         page_indices_device = device_indices[:: self.page_size] // self.page_size
-        item_size = self.index_stride_size * self.indexer_page_slots
+        item_size = self.index_stride_size * self.indexer_slots_per_pool_page
 
         if io_backend == "kernel":
             src_ptrs = self.index_k_device_ptrs[
