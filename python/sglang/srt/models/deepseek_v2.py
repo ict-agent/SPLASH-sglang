@@ -2824,6 +2824,7 @@ class DeepseekV2AttentionMLA(
                 .view(dtype)
                 .to(q.dtype)
             )
+            latent_cache = self._trim_mla_kv_cache_padding(latent_cache)
 
             kv_a_normed, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -2971,6 +2972,7 @@ class DeepseekV2AttentionMLA(
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            latent_cache = self._trim_mla_kv_cache_padding(latent_cache)
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1

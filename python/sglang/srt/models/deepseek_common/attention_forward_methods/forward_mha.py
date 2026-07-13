@@ -87,6 +87,14 @@ if _use_aiter_gfx95:
 
 class DeepseekMHAForwardMixin:
 
+    def _trim_mla_kv_cache_padding(
+        self: DeepseekV2AttentionMLA, latent_cache: torch.Tensor
+    ) -> torch.Tensor:
+        logical_kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if latent_cache.shape[-1] > logical_kv_dim:
+            latent_cache = latent_cache[..., :logical_kv_dim]
+        return latent_cache
+
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_global_server_args().disable_chunked_prefix_cache
@@ -466,6 +474,7 @@ class DeepseekMHAForwardMixin:
                 self.attn_mha.layer_id
             )
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
+            latent_cache = self._trim_mla_kv_cache_padding(latent_cache)
 
             kv_a, k_pe = latent_cache.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
