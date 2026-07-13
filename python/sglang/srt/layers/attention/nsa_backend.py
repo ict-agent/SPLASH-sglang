@@ -872,7 +872,11 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
-            nsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            nsa_extend_seq_lens_list=self._get_nsa_page_table_transform_lens(
+                forward_batch.forward_mode,
+                extend_seq_lens_cpu,
+                page_table.shape[0],
+            ),
             real_page_table=self._transform_table_1_to_real(page_table),
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
@@ -2645,6 +2649,27 @@ class NativeSparseAttnBackend(
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+    @staticmethod
+    def _get_nsa_page_table_transform_lens(
+        forward_mode: ForwardMode,
+        extend_seq_lens_cpu: List[int],
+        page_table_rows: int,
+    ) -> List[int]:
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            expanded_rows = sum(extend_seq_lens_cpu)
+            assert expanded_rows == page_table_rows, (
+                "Speculative page-table rows must equal the expanded request "
+                f"lengths: rows={page_table_rows}, expanded_rows={expanded_rows}."
+            )
+            # Speculative modes repeat each request's page-table row once per
+            # physical query token. The unfused PAGED transform must consume
+            # that representation one row at a time. Keeping the original
+            # per-request lengths here would describe the pre-repeat layout.
+            return [1] * page_table_rows
+        return extend_seq_lens_cpu
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
