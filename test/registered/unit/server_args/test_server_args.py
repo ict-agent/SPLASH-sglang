@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -46,6 +47,76 @@ class TestLoadBalanceMethod(unittest.TestCase):
     def test_pd_decode_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
+
+
+class TestMemFractionStaticReserve(unittest.TestCase):
+    def _make_args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.get_model_config = lambda: SimpleNamespace(is_multimodal=False)
+        server_args.device = "cuda"
+        server_args.mem_fraction_static = None
+        server_args.chunked_prefill_size = 4096
+        server_args.max_prefill_tokens = 16384
+        server_args.cuda_graph_max_bs = 128
+        server_args.cuda_graph_bs = [128]
+        server_args.disable_cuda_graph = False
+        server_args.disable_piecewise_cuda_graph = True
+        server_args.piecewise_cuda_graph_max_tokens = 2048
+        server_args.piecewise_cuda_graph_tokens = []
+        server_args.enable_dp_attention = False
+        server_args.dp_size = 1
+        server_args.tp_size = 1
+        server_args.pp_size = 1
+        server_args.disaggregation_mode = "null"
+        server_args.max_running_requests = None
+        server_args.speculative_num_draft_tokens = None
+        server_args.speculative_algorithm = None
+        server_args.moe_a2a_backend = "none"
+        server_args.enable_symm_mem = False
+        for key, value in overrides.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    def test_unified_mode_keeps_existing_reserve_formula(self):
+        server_args = self._make_args()
+
+        server_args._handle_gpu_memory_settings(gpu_mem=40 * 1024)
+
+        self.assertEqual(server_args.mem_fraction_static, 0.828)
+
+    def test_prefill_mode_skips_decode_graph_and_dp_padding_reserve(self):
+        server_args = self._make_args(
+            disaggregation_mode="prefill",
+            enable_dp_attention=True,
+            dp_size=4,
+        )
+
+        server_args._handle_gpu_memory_settings(gpu_mem=40 * 1024)
+
+        self.assertEqual(server_args.mem_fraction_static, 0.834)
+
+    def test_decode_mode_sizes_activation_to_decode_batch(self):
+        server_args = self._make_args(
+            disaggregation_mode="decode",
+            chunked_prefill_size=8192,
+            max_running_requests=1024,
+            speculative_num_draft_tokens=4,
+        )
+
+        server_args._handle_gpu_memory_settings(gpu_mem=40 * 1024)
+
+        self.assertEqual(server_args.mem_fraction_static, 0.828)
+
+    def test_deepep_reserve_is_added_after_large_gpu_floor(self):
+        server_args = self._make_args(
+            disaggregation_mode="decode",
+            chunked_prefill_size=2048,
+            moe_a2a_backend="deepep",
+        )
+
+        server_args._handle_gpu_memory_settings(gpu_mem=80 * 1024)
+
+        self.assertEqual(server_args.mem_fraction_static, 0.85)
 
 
 class TestPortArgs(unittest.TestCase):
