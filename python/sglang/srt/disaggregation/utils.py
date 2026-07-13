@@ -45,9 +45,10 @@ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
 def poll_and_all_reduce(pollers, gloo_group: dist.ProcessGroup):
-    from sglang.srt.disaggregation.base import KVPoll
-
+    # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
+        from sglang.srt.disaggregation.base import KVPoll
+
         polls = [
             int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
             for poller in pollers

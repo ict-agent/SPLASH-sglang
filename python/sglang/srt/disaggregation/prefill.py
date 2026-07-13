@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import deque
 from http import HTTPStatus
@@ -670,9 +669,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # Transfer timeout: if a request has been in the inflight queue for too long
         # (e.g., stuck in WaitingForInput/Transferring), treat it as failed.
-        transfer_timeout = float(
-            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
-        )
+        transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
         now = time.perf_counter()
 
         undone_reqs: List[Req] = []
@@ -685,12 +682,13 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
+                # state (Success/Failed/StoppedSafe) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
                 # Treat non-terminal states as undone instead of crashing.
                 if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
+                    KVPoll.StoppedSafe,
                 ):
                     logger.warning(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
@@ -732,6 +730,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+            elif poll == KVPoll.StoppedSafe:
+                error_message = f"Prefill transfer stopped safe for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                logger.error(error_message)
+                release_kv_cache(req, self.tree_cache)
+                req.finished_reason = FINISH_LENGTH(length=0)
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
+                done_reqs.append(req)
+
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
@@ -808,7 +815,7 @@ class SchedulerDisaggregationPrefillMixin:
         transferred_rids: List[str] = []
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
+            if poll == KVPoll.Success or poll == KVPoll.Failed or poll == KVPoll.StoppedSafe:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
@@ -861,6 +868,10 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
+
+        if hasattr(req.disagg_kv_sender, "should_skip_transfer"):
+            if req.disagg_kv_sender.should_skip_transfer():
+                return
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]

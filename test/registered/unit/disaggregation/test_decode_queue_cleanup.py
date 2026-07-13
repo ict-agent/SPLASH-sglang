@@ -63,6 +63,61 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         queue.scheduler.stream_output.assert_called_once_with([req], req.return_logprob)
 
+    def test_prealloc_abort_also_drops_from_pending_reqs(self):
+        class BadEqReceiver(FakeReceiver):
+            def __eq__(self, other):
+                raise TypeError("use identity comparison, not value equality")
+
+            __hash__ = object.__hash__
+
+        receiver = BadEqReceiver()
+        req = SimpleNamespace(
+            rid="abort-shared",
+            finished_reason=FINISH_ABORT("aborted"),
+            return_logprob=False,
+        )
+        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pending_reqs = [decode_req]
+        queue.retracted_queue = []
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._allocatable_tokens = MagicMock(return_value=0)
+        queue.scheduler = SimpleNamespace(
+            running_batch=SimpleNamespace(reqs=[]),
+            stream_output=MagicMock(),
+        )
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [decode_req])
+        self.assertEqual(queue.queue, [])
+        self.assertTrue(all(r is not decode_req for r in queue.pending_reqs))
+        self.assertIsNone(decode_req.kv_receiver)
+
+    def test_ensure_prefill_info_tolerates_cleared_receiver(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._max_ensure_retries = 1
+        queue._ensure_retry_interval = 0
+        queue._ensure_retry_count = {"127.0.0.1:11500": 0}
+        queue._ensure_last_attempt_time = {}
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.try_ensure_parallel_info.return_value = False
+
+        cleared_req = SimpleNamespace(
+            req=SimpleNamespace(rid="cleared"), kv_receiver=None
+        )
+
+        ready, remaining = queue._ensure_prefill_info(
+            {"127.0.0.1:11500": [cleared_req]}
+        )
+
+        self.assertEqual(ready, {})
+        self.assertEqual(remaining, [])
+
     @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
@@ -74,11 +129,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="failed-transfer",
             bootstrap_room=7,
             return_logprob=False,
+            time_stats=SimpleNamespace(decode_transfer_queue_entry_time=None),
         )
         decode_req = SimpleNamespace(
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,
+            timeout_cancel_issued=False,
         )
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
@@ -86,6 +143,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.enable_staging = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.metadata_buffers = SimpleNamespace(bootstrap_room=[0, 0, 0, 0])
         queue.tp_rank = 0
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(

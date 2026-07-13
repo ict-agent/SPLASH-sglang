@@ -113,6 +113,3 @@ class FakeKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
-
-    def enter_cancelled(self):
-        pass

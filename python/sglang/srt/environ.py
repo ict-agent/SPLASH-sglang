@@ -241,8 +241,14 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
-    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
-    SGLANG_DISAGGREGATION_CANCEL_TIMEOUT = EnvFloat(60.0)
+    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(360)
+    # Decode issues a safe cancel to prefill at this timeout, keeping the
+    # effective transfer deadline at the historical 300s; the waiting timeout
+    # above is the fallback for a prefill that never answers the cancel. When
+    # overriding, adjust BOTH and keep enough margin for the handshake to
+    # drain an in-flight chunk (rule of thumb:
+    # TRANSFER <= WAITING - max(60s, worst single-chunk transfer time)).
+    SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT = EnvFloat(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when

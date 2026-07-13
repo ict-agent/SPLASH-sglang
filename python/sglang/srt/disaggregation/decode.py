@@ -246,6 +246,7 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    timeout_cancel_issued: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -570,8 +571,6 @@ class DecodePreallocQueue:
                 )
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-            elif poll == KVPoll.Cancelled:
-                pass
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -609,7 +608,10 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    # kv_receiver may already have been cleared by the failed
+                    # request cleanup in pop_preallocated().
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -693,6 +695,16 @@ class DecodePreallocQueue:
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
+
+        # DecodeRequest objects on the slow bootstrap path are shared between
+        # queue and pending_reqs. Keep both containers in sync when cleanup
+        # clears the receiver and removes a failed request from queue. Compare
+        # by identity because receiver equality may involve tensors.
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -1112,10 +1124,66 @@ class DecodeTransferQueue:
                 [dr.kv_receiver for dr in self.queue], self.gloo_group
             )
 
+        transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
+        now = time.perf_counter()
+
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+
+            entry_time = getattr(
+                decode_req.req.time_stats,
+                "decode_transfer_queue_entry_time",
+                None,
+            )
+
+            if (
+                not decode_req.timeout_cancel_issued
+                and entry_time is not None
+                and now - entry_time >= transfer_timeout
+            ):
+                error_message = (
+                    f"Decode transfer timed out after {now - entry_time:.1f}s and issued cancel transfer to prefill "
+                    f"for request rank={self.tp_rank} "
+                    f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                )
+                logger.error(error_message)
+                decode_req.kv_receiver.cancel_transfer()
+                decode_req.timeout_cancel_issued = True
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                continue
+            if poll == KVPoll.StoppedSafe and not decode_req.timeout_cancel_issued:
+                # A peer rank may have issued the cancel that stopped prefill.
+                # Adopt that terminal state locally so all ranks discard the
+                # request instead of treating StoppedSafe as an unknown poll.
+                decode_req.timeout_cancel_issued = True
+                prepare_abort(
+                    decode_req.req,
+                    f"Decode transfer stopped safely by prefill after a peer-rank cancel "
+                    f"rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}",
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+            if decode_req.timeout_cancel_issued and poll in [KVPoll.Failed, KVPoll.Success, KVPoll.StoppedSafe]:
+                finished_reason = (
+                    decode_req.req.finished_reason.message
+                    if decode_req.req.finished_reason
+                    else f"Decode transfer finished since cancel transfer issued {decode_req.req.bootstrap_room=}"
+                )
+                logger.warning(f"{finished_reason}, poll status is {poll}")
+
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                indices_to_remove.add(i)
                 continue
 
             if poll == KVPoll.Failed:
@@ -1135,7 +1203,6 @@ class DecodeTransferQueue:
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
@@ -1147,7 +1214,6 @@ class DecodeTransferQueue:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
@@ -1163,10 +1229,6 @@ class DecodeTransferQueue:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
-            elif poll == KVPoll.Cancelled:
-                # MIN propagated Cancelled from some D rank: every rank must
-                # also send CANCEL to its own P set so all of P stops writing.
-                decode_req.kv_receiver.enter_cancelled()
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
