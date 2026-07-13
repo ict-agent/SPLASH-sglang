@@ -704,16 +704,7 @@ def setup_state_kv_args(
                 dim_outer,
             )
             if token_to_kv_pool.use_nsa:
-                nsa_ptrs, nsa_lens, nsa_item_lens = (
-                    token_to_kv_pool.get_nsa_state_buf_infos()
-                )
-                append_state_component(
-                    kv_args,
-                    StateType.NSA,
-                    nsa_ptrs,
-                    nsa_lens,
-                    nsa_item_lens,
-                )
+                _append_nsa(token_to_kv_pool.full_kv_pool)
                 _append_draft_nsa()
         elif isinstance(token_to_kv_pool, (NSATokenToKVPool, NPUMLATokenToKVPool)):
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):

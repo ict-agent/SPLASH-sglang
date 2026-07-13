@@ -1353,12 +1353,12 @@ class MooncakeKVManager(CommonKVManager):
             return -1
 
         src_req_idx, dst_req_idx = int(src_indices[0]), int(dst_indices[0])
-        tail_size, dst_tail_size = int(src_indices[5]), int(dst_indices[5])
-        if tail_size <= 0 or tail_size != dst_tail_size:
+        src_tail_size, dst_tail_size = int(src_indices[5]), int(dst_indices[5])
+        if src_tail_size <= 0 or dst_tail_size <= 0:
             logger.error(
-                "%s tail size mismatch: src=%s, dst=%s",
+                "%s invalid tail size: src=%s, dst=%s",
                 label,
-                tail_size,
+                src_tail_size,
                 dst_tail_size,
             )
             return -1
@@ -1378,38 +1378,69 @@ class MooncakeKVManager(CommonKVManager):
                 len(dst_item_lens),
             )
             return -1
-        if src_indices[2] != dst_indices[2] or src_indices[4] != dst_indices[4]:
+
+        def _valid_ring(indices: list[int], tail_size: int) -> bool:
+            start, first, wrap_start, second = map(int, indices[1:5])
+            total = first + second
+            return (
+                0 <= start < tail_size
+                and first >= 0
+                and second >= 0
+                and 0 < total <= tail_size
+                and start + first <= tail_size
+                and (not second or (start + first == tail_size and wrap_start == 0))
+            )
+
+        src_count = int(src_indices[2]) + int(src_indices[4])
+        dst_count = int(dst_indices[2]) + int(dst_indices[4])
+        if (
+            not _valid_ring(src_indices, src_tail_size)
+            or not _valid_ring(dst_indices, dst_tail_size)
+            or src_count != dst_count
+        ):
             logger.error(
-                "%s live-ring span mismatch: src=%s, dst=%s",
+                "%s incompatible live-ring spans: src=%s, dst=%s",
                 label,
                 src_indices,
                 dst_indices,
             )
             return -1
 
+        logical_segments = []
+        src_pos = int(src_indices[1])
+        dst_pos = int(dst_indices[1])
+        remaining = src_count
+        while remaining:
+            count = min(
+                remaining, src_tail_size - src_pos, dst_tail_size - dst_pos
+            )
+            logical_segments.append((src_pos, dst_pos, count))
+            remaining -= count
+            src_pos = (src_pos + count) % src_tail_size
+            dst_pos = (dst_pos + count) % dst_tail_size
+
         transfer_blocks = []
         for src_ptr, src_row_bytes, dst_ptr, dst_row_bytes in zip(
             src_ptrs, src_item_lens, dst_ptrs, dst_item_lens
         ):
-            if src_row_bytes != dst_row_bytes or src_row_bytes % tail_size:
+            src_slot_bytes, src_remainder = divmod(src_row_bytes, src_tail_size)
+            dst_slot_bytes, dst_remainder = divmod(dst_row_bytes, dst_tail_size)
+            if src_remainder or dst_remainder or src_slot_bytes != dst_slot_bytes:
                 logger.error(
-                    "%s row layout mismatch: src_bytes=%s, dst_bytes=%s, tail=%s",
+                    "%s incompatible row layout: src=%s/%s, dst=%s/%s",
                     label,
                     src_row_bytes,
+                    src_tail_size,
                     dst_row_bytes,
-                    tail_size,
+                    dst_tail_size,
                 )
                 return -1
-            slot_bytes = src_row_bytes // tail_size
             src_row_base = src_ptr + src_row_bytes * src_req_idx
             dst_row_base = dst_ptr + dst_row_bytes * dst_req_idx
-            for offset_pos, count_pos in ((1, 2), (3, 4)):
-                count = int(src_indices[count_pos])
-                if count == 0:
-                    continue
-                src_off = int(src_indices[offset_pos]) * slot_bytes
-                dst_off = int(dst_indices[offset_pos]) * slot_bytes
-                length = count * slot_bytes
+            for src_offset, dst_offset, count in logical_segments:
+                src_off = src_offset * src_slot_bytes
+                dst_off = dst_offset * dst_slot_bytes
+                length = count * src_slot_bytes
                 transfer_blocks.append(
                     (src_row_base + src_off, dst_row_base + dst_off, length)
                 )
