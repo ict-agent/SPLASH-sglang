@@ -1279,12 +1279,16 @@ class MooncakeKVManager(CommonKVManager):
                     or rc
                 )
             elif st == StateType.NSA_TAIL:
+                if target_rank_registration_info is None:
+                    logger.error("NSA tail transfer requires decode registration info")
+                    return -1
                 rc = (
                     self._send_slot_state(
                         req,
                         src_data_ptrs,
                         src_item_lens,
                         dst_data_ptrs,
+                        dst_item_lens,
                         indices,
                         dst_indices,
                         st.value,
@@ -1322,43 +1326,90 @@ class MooncakeKVManager(CommonKVManager):
         src_ptrs: list[int],
         src_item_lens: list[int],
         dst_ptrs: list[int],
+        dst_item_lens: list[int],
         src_indices: list[int],
         dst_indices: list[int],
         label: str,
     ):
-        """Transfer one state component using a per-request ring-slot index."""
+        """Transfer live segments of a per-request dense ring state."""
 
         if not src_indices and not dst_indices:
             return 0
         if not src_indices or not dst_indices:
             logger.error(
-                f"{label} slot index missing: src={src_indices}, dst={dst_indices}"
+                "%s slot indices missing: src=%s, dst=%s",
+                label,
+                src_indices,
+                dst_indices,
             )
             return -1
         if len(src_indices) != 6 or len(dst_indices) != 6:
             logger.error(
-                f"{label} slot indices must be a 6-tuple "
-                f"(got src={src_indices}, dst={dst_indices}); "
-                f"PD nodes must run matching versions."
+                "%s slot indices must be 6-tuples; src=%s, dst=%s",
+                label,
+                src_indices,
+                dst_indices,
             )
             return -1
 
-        src_idx = int(src_indices[0])
-        dst_idx = int(dst_indices[0])
-        tail_size = int(src_indices[5])
+        src_req_idx, dst_req_idx = int(src_indices[0]), int(dst_indices[0])
+        tail_size, dst_tail_size = int(src_indices[5]), int(dst_indices[5])
+        if tail_size <= 0 or tail_size != dst_tail_size:
+            logger.error(
+                "%s tail size mismatch: src=%s, dst=%s",
+                label,
+                tail_size,
+                dst_tail_size,
+            )
+            return -1
+        if not (
+            len(src_ptrs)
+            == len(src_item_lens)
+            == len(dst_ptrs)
+            == len(dst_item_lens)
+        ):
+            logger.error(
+                "%s state layout count mismatch: src_ptrs=%s src_lens=%s "
+                "dst_ptrs=%s dst_lens=%s",
+                label,
+                len(src_ptrs),
+                len(src_item_lens),
+                len(dst_ptrs),
+                len(dst_item_lens),
+            )
+            return -1
+        if src_indices[2] != dst_indices[2] or src_indices[4] != dst_indices[4]:
+            logger.error(
+                "%s live-ring span mismatch: src=%s, dst=%s",
+                label,
+                src_indices,
+                dst_indices,
+            )
+            return -1
+
         transfer_blocks = []
-        for j, dst_ptr in enumerate(dst_ptrs):
-            row_bytes = src_item_lens[j]
-            slot_bytes = row_bytes // tail_size
-            src_row_base = src_ptrs[j] + row_bytes * src_idx
-            dst_row_base = dst_ptr + row_bytes * dst_idx
-            for seg in (1, 2):
-                n = int(src_indices[seg * 2])
-                if n == 0:
+        for src_ptr, src_row_bytes, dst_ptr, dst_row_bytes in zip(
+            src_ptrs, src_item_lens, dst_ptrs, dst_item_lens
+        ):
+            if src_row_bytes != dst_row_bytes or src_row_bytes % tail_size:
+                logger.error(
+                    "%s row layout mismatch: src_bytes=%s, dst_bytes=%s, tail=%s",
+                    label,
+                    src_row_bytes,
+                    dst_row_bytes,
+                    tail_size,
+                )
+                return -1
+            slot_bytes = src_row_bytes // tail_size
+            src_row_base = src_ptr + src_row_bytes * src_req_idx
+            dst_row_base = dst_ptr + dst_row_bytes * dst_req_idx
+            for offset_pos, count_pos in ((1, 2), (3, 4)):
+                count = int(src_indices[count_pos])
+                if count == 0:
                     continue
-                src_off = int(src_indices[seg * 2 - 1]) * slot_bytes
-                dst_off = int(dst_indices[seg * 2 - 1]) * slot_bytes
-                length = n * slot_bytes
+                src_off = int(src_indices[offset_pos]) * slot_bytes
+                dst_off = int(dst_indices[offset_pos]) * slot_bytes
+                length = count * slot_bytes
                 transfer_blocks.append(
                     (src_row_base + src_off, dst_row_base + dst_off, length)
                 )
