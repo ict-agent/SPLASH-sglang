@@ -1,76 +1,109 @@
 import logging
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.glm4v.configuration_glm4v import Glm4vVisionConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
 logger = logging.getLogger(__name__)
 
 
+class Glm5NextVisionConfig(Glm4vVisionConfig):
+    model_type = "glm5next_vision"
+
+
 class Glm5NextConfig(PretrainedConfig):
+    r"""Config for GLM-5 Next; flat for text-only, nested (text_config + vision_config) for VLM."""
+
     model_type = "glm5_next"
+    sub_configs = {"vision_config": Glm5NextVisionConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
+
+    # Wrapper-owned / identity fields that must not be promoted from text_config.
+    _NO_PROMOTE = frozenset(
+        {
+            "model_type",
+            "architectures",
+            "text_config",
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "image_start_token_id",
+            "image_end_token_id",
+            "video_start_token_id",
+            "video_end_token_id",
+        }
+    )
 
     def __init__(
         self,
-        model_type="glm5_next",
-        vocab_size=154880,
-        hidden_size=4096,
-        head_dim=None,
-        intermediate_size=12288,
-        num_hidden_layers=45,
-        num_attention_heads=64,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        rms_norm_eps=1e-05,
-        pad_token_id=151329,
-        bos_token_id=None,
-        eos_token_id=None,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        max_position_embeddings=4196,
-        tie_word_embeddings=False,
+        model_type: str | None = "glm5_next",
+        vocab_size: int | None = 154880,
+        hidden_size: int | None = 4096,
+        head_dim: int | None = None,
+        intermediate_size: int | None = 12288,
+        num_hidden_layers: int | None = 45,
+        num_attention_heads: int | None = 64,
+        num_key_value_heads: int | None = None,
+        hidden_act: str | None = "silu",
+        rms_norm_eps: float | None = 1e-05,
+        pad_token_id: int | None = 151329,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
+        rope_theta: float | None = 10000.0,
+        rope_scaling: dict | None = None,
+        max_position_embeddings: int | None = 4196,
+        tie_word_embeddings: bool | None = False,
         moe_intermediate_size: int | None = None,
-        moe_renormalize: bool = True,
-        scoring_func: str = "sigmoid",
+        moe_renormalize: bool | None = True,
+        scoring_func: str | None = "sigmoid",
         n_routed_experts: int | None = None,
         num_experts_per_tok: int | None = None,
-        n_shared_experts: int = 1,
-        routed_scaling_factor: float = 2.5,
-        first_k_dense_replace: int = 0,
-        moe_layer_freq: int = 1,
-        use_grouped_topk: bool = True,
-        n_group: int = 1,
-        topk_group: int = 1,
-        norm_topk_prob: bool = True,
-        mla: bool = True,
+        n_shared_experts: int | None = 1,
+        routed_scaling_factor: float | None = 2.5,
+        first_k_dense_replace: int | None = 0,
+        moe_layer_freq: int | None = 1,
+        use_grouped_topk: bool | None = True,
+        n_group: int | None = 1,
+        topk_group: int | None = 1,
+        norm_topk_prob: bool | None = True,
+        mla: bool | None = True,
         q_lora_rank: int | None = None,
         kv_lora_rank: int | None = None,
         qk_nope_head_dim: int | None = None,
         qk_rope_head_dim: int | None = None,
         v_head_dim: int | None = None,
         mla_nope: bool | None = True,
-        num_nextn_predict_layers: int = 0,
+        num_nextn_predict_layers: int | None = 0,
         linear_attn_config: dict | None = None,
         index_head_dim: int | None = None,
         index_topk: int | None = None,
         index_n_heads: int | None = None,
-        index_dsa_use_layernorm: bool = True,
-        index_kpool: int = 1,
-        index_kpool_compress: bool = False,
-        index_kpool_always_select_tail: bool = False,
-        linear_conv_kernel_dim: int = 4,
+        index_dsa_use_layernorm: bool | None = True,
+        index_kpool: int | None = 1,
+        index_kpool_compress: bool | None = False,
+        index_kpool_always_select_tail: bool | None = False,
+        linear_conv_kernel_dim: int | None = 4,
         linear_num_key_heads: int | None = None,
         linear_num_value_heads: int | None = None,
         linear_key_head_dim: int | None = None,
         linear_value_head_dim: int | None = None,
         linear_allow_neg_eigval: bool | None = False,
         mhc: bool | None = False,
-        hc_mult: int = 4,
+        hc_mult: int | None = 4,
         hc_eps: float | None = 1e-06,
         hc_sinkhorn_iters: int | None = 20,
         hc_post_mult_value: float | None = 2.0,
         swiglu_limit: float | None = None,
+        # Vision-language wrapper fields (present only for VLM checkpoints).
+        text_config: dict | None = None,
+        vision_config: dict | None = None,
+        image_token_id: int | None = 151363,
+        video_token_id: int | None = 151364,
+        image_start_token_id: int | None = 151339,
+        image_end_token_id: int | None = 151340,
+        video_start_token_id: int | None = 151341,
+        video_end_token_id: int | None = 151342,
         **kwargs,
     ):
         self.model_type = model_type
@@ -157,6 +190,49 @@ class Glm5NextConfig(PretrainedConfig):
 
         self.swiglu_limit = swiglu_limit
 
+        # Only VLM checkpoints carry text_config/vision_config/token ids; text-only stays flat for multimodal detection.
+        is_vlm = text_config is not None or vision_config is not None
+        if is_vlm:
+            # Promote nested text_config fields onto self for flat attribute access.
+            if text_config is not None:
+                text_conf_cls = self.sub_configs["text_config"]
+                if isinstance(text_config, text_conf_cls):
+                    self.text_config = text_config
+                elif isinstance(text_config, PretrainedConfig):
+                    self.text_config = text_conf_cls(**text_config.to_dict())
+                else:
+                    self.text_config = text_conf_cls(**text_config)
+                for k, v in self.text_config.__dict__.items():
+                    if k.startswith("_") or k in self._NO_PROMOTE:
+                        continue
+                    setattr(self, k, v)
+
+                # For VLM the real token ids live in text_config, but the
+                # top-level args usually stay at their defaults. Pull them from
+                # text_config so super().__init__ below doesn't clobber the
+                # promoted values with those defaults.
+                pad_token_id = getattr(self.text_config, "pad_token_id", pad_token_id)
+                bos_token_id = getattr(self.text_config, "bos_token_id", bos_token_id)
+                eos_token_id = getattr(self.text_config, "eos_token_id", eos_token_id)
+                tie_word_embeddings = getattr(
+                    self.text_config, "tie_word_embeddings", tie_word_embeddings
+                )
+
+            if isinstance(vision_config, dict):
+                self.vision_config = self.sub_configs["vision_config"](**vision_config)
+            else:
+                self.vision_config = vision_config
+
+            # Multimodal token ids.
+            self.image_token_id = image_token_id
+            self.video_token_id = video_token_id
+            self.video_start_token_id = video_start_token_id
+            self.video_end_token_id = video_end_token_id
+            self.image_start_token_id = image_start_token_id
+            self.image_end_token_id = image_end_token_id
+
+        logger.warning("glm5_next config unused kwargs keys: %s", list(kwargs.keys()))
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -213,9 +289,7 @@ class Glm5NextConfig(PretrainedConfig):
             get_attention_tp_size,
         )
 
-        # KDA shards heads along the CP group under NSA prefill CP, so the
-        # mamba state must shard with the same factor; otherwise the cache
-        # is replicated across CP ranks and consumes attn_cp_size× memory.
+        # Shard mamba state by the same factor KDA shards heads (CP under NSA prefill CP, else TP).
         head_shard_size = (
             get_attention_cp_size()
             if is_nsa_enable_prefill_cp()
@@ -230,3 +304,12 @@ class Glm5NextConfig(PretrainedConfig):
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+class Glm5NextTextConfig(Glm5NextConfig):
+    model_type = "glm5next_text"
+
+
+# Registered after definition: Glm5NextTextConfig subclasses Glm5NextConfig, so it can't be referenced inside the class body above.
+Glm5NextConfig.sub_configs["text_config"] = Glm5NextTextConfig
+

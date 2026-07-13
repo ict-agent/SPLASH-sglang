@@ -256,6 +256,9 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved_glm=rope_scaling.get(
+                        "mrope_interleaved_glm", False
+                    ),
                     **extra_kwargs,
                 )
             else:

@@ -4,6 +4,8 @@ import logging
 
 import numpy as np
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -25,8 +27,7 @@ def _try_cuda_backend() -> bool:
     try:
         from torchcodec.decoders import set_cuda_backend
 
-        set_cuda_backend("beta")
-        _cuda_backend_enabled = True
+        _cuda_backend_enabled = set_cuda_backend is not None
     except Exception:
         _cuda_backend_enabled = False
     return _cuda_backend_enabled
@@ -43,12 +44,17 @@ class VideoDecoderWrapper:
         device: "cpu" or "cuda". GPU decoding only supported with torchcodec.
         """
         self._tmp_path = None
+        self._source = source
+        self._device = device
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
+            from torchcodec.decoders import set_cuda_backend
             try:
-                self._decoder = VideoDecoder(source, **kwargs)
+                # set_cuda_backend is a no-op unless kwargs sets device="cuda".
+                with set_cuda_backend(envs.SGLANG_VIDEO_CUDA_BACKEND.get()):
+                    self._decoder = VideoDecoder(source, **kwargs)
             except RuntimeError:
                 if "device" in kwargs:
                     logger.warning("CUDA video decoding failed, falling back to CPU.")
@@ -77,9 +83,11 @@ class VideoDecoderWrapper:
         return len(self._decoder)
 
     def __getitem__(self, idx):
-        """Return single frame as numpy NHWC uint8."""
+        """Return single frame as NHWC uint8. numpy on CPU, torch tensor on CUDA."""
         if _BACKEND == "torchcodec":
-            return self._decoder[idx].numpy()
+            frame = self._decoder[idx]
+            data = frame.data if hasattr(frame, "data") else frame
+            return data if data.is_cuda else data.numpy()
         else:
             frame = self._decoder[idx]
             return frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
@@ -91,27 +99,48 @@ class VideoDecoderWrapper:
         else:
             return self._decoder.get_avg_fps()
 
-    def get_frames_at(self, indices: list) -> np.ndarray:
-        """Return frames at given indices as numpy array with shape (N, H, W, C)."""
+    @property
+    def frame_shape(self) -> tuple:
+        """(height, width) of decoded frames, from container metadata (no
+        decode); falls back to decoding frame 0 if metadata lacks dimensions."""
         if _BACKEND == "torchcodec":
-            batch = self._decoder.get_frames_at(indices)
-            return batch.data.numpy()
+            md = self._decoder.metadata
+            h = getattr(md, "height", None)
+            w = getattr(md, "width", None)
+            if h and w:
+                return int(h), int(w)
+        shape = self[0].shape  # HWC
+        return int(shape[-3]), int(shape[-2])
+
+    def get_frames_at(self, indices: list):
+        """Return frames at given indices, shape (N, H, W, C), uint8.
+
+        Returns a numpy array when decoding on CPU (preserves the existing
+        contract for CPU callers), or a torch CUDA tensor when decoding on GPU
+        (so the whole video pipeline can stay on-device, zero-copy to ViT)."""
+        if _BACKEND == "torchcodec":
+            data = self._decoder.get_frames_at(indices).data
+            return data if data.is_cuda else data.numpy()
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
     def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+        """Return frames at given indices as a torch tensor (NHWC, uint8).
+
+        On CPU the tensor is pinned for faster H2D; on CUDA it is returned
+        as-is (already on device; pin_memory() is invalid for CUDA tensors)."""
         import torch
 
         if _BACKEND == "torchcodec":
-            batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            data = self._decoder.get_frames_at(indices).data
+            return data if data.is_cuda else data.pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
             return torch.from_numpy(arr).pin_memory()
 
     def close(self):
-        """Explicitly clean up temporary files."""
+        """Explicitly release the decoder and clean up temporary files."""
+        self._decoder = None
         if self._tmp_path is not None:
             import os
 

@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.linear.kda_qkvo_utils import (
     get_kda_qkvo_tp_size,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -32,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as GLM4MoESparseMoeBlock
+from sglang.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.load_ckpt import (
     WrappedStorageReader,
@@ -48,6 +50,339 @@ logger = logging.getLogger(__name__)
 def is_ep_moe_enabled():
     server_args = get_global_server_args()
     return server_args.ep_size == server_args.tp_size
+
+
+def vit_interleaved_to_non_interleaved(weight, num_heads, head_dim, hidden_size):
+    """Convert ViT QKV weight from interleaved [num_heads, 3*head_dim, hidden] to [Q|K|V]."""
+    weight = weight.view(num_heads, 3 * head_dim, hidden_size)
+    q = weight[:, :head_dim, :].reshape(-1, hidden_size)
+    k = weight[:, head_dim : 2 * head_dim, :].reshape(-1, hidden_size)
+    v = weight[:, 2 * head_dim :, :].reshape(-1, hidden_size)
+    return torch.cat([q, k, v], dim=0)
+
+
+def vit_interleaved_to_non_interleaved_bias(bias, num_heads, head_dim):
+    """Convert ViT QKV bias from interleaved [num_heads, 3*head_dim] to [Q|K|V]."""
+    bias = bias.view(num_heads, 3 * head_dim)
+    q = bias[:, :head_dim].reshape(-1)
+    k = bias[:, head_dim : 2 * head_dim].reshape(-1)
+    v = bias[:, 2 * head_dim :].reshape(-1)
+    return torch.cat([q, k, v])
+
+
+@torch.no_grad()
+def _load_vision_weights(
+    init_model,
+    mgt_sd,
+    target_tp,
+    tp,
+    device,
+    params_dict,
+):
+    """Load vision encoder weights from Megatron distcp checkpoint into the visual module.
+
+    Handles weight mapping from Megatron vision_model.* / vision_projection.* keys
+    to SGLang visual.* parameters, including interleave conversion, dummy head padding,
+    and TP slicing.
+    """
+    config = init_model.config
+    vis_config = config.vision_config
+    num_heads = vis_config.num_heads
+    head_dim = vis_config.hidden_size // num_heads
+    hidden_size = vis_config.hidden_size
+    depth = vis_config.depth
+
+    # DP encoder: vision uses TP=1
+    if getattr(init_model, "use_data_parallel", False):
+        vis_tp_size = 1
+        vis_tp_rank = 0
+    else:
+        vis_tp_size = target_tp
+        vis_tp_rank = tp
+
+    # In distcp format, vision keys are in mgt_sd[0][0]["model"] after postprocess
+    vis_sd = mgt_sd[0][0]["model"]
+
+    # Handle merged vision weights (shape [depth, ...]) - split by layer
+    # Check if vision weights are merged (no layer index in keys)
+    _vision_merged_weights = {}
+    for key, value in list(vis_sd.items()):
+        if "vision_model.transformer.layers." in key:
+            # Check if this is a merged weight (no layer index like .layers.0.)
+            # Merged keys are like "vision_model.transformer.layers.self_attention.linear_qkv.weight"
+            # Split keys are like "vision_model.transformer.layers.0.self_attention.linear_qkv.weight"
+            has_layer_index = any(f".layers.{i}." in key for i in range(depth))
+            if not has_layer_index and len(value.shape) >= 2 and value.shape[0] == depth:
+                # This is a merged weight, split by layer
+                for layer_idx in range(depth):
+                    # Replace "transformer.layers." with "transformer.layers.{layer_idx}."
+                    new_key = key.replace("transformer.layers.", f"transformer.layers.{layer_idx}.")
+                    _vision_merged_weights[new_key] = value[layer_idx]
+                # Note: we keep the original key for compatibility, but add split keys
+
+    # Add split weights to vis_sd
+    vis_sd.update(_vision_merged_weights)
+
+    def _get_vis(key):
+        """Retrieve tensor from vision state dict by key."""
+        return vis_sd[key]
+
+    def _has_vis(key):
+        return key in vis_sd
+
+    def _copy_param(param_name, tensor):
+        """Copy tensor to parameter, moving to device."""
+        if param_name not in params_dict:
+            logger.warning(
+                f"Vision param {param_name} not found in params_dict, skipping."
+            )
+            return
+        param = params_dict[param_name]
+        param.data.copy_(tensor.to(device))
+
+    def _weight_loader_param(param_name, tensor, shard_id=None):
+        """Use param's weight_loader to load tensor (handles TP slicing)."""
+        if param_name not in params_dict:
+            logger.warning(
+                f"Vision param {param_name} not found in params_dict, skipping."
+            )
+            return
+        param = params_dict[param_name]
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        if shard_id is not None:
+            weight_loader(param, tensor.to(device), shard_id)
+        else:
+            weight_loader(param, tensor.to(device))
+
+    def _tp_row_slice(tensor, dim=1):
+        """Manually slice tensor along dim for RowParallelLinear."""
+        if vis_tp_size <= 1:
+            return tensor
+        return tensor.chunk(vis_tp_size, dim=dim)[vis_tp_rank].clone()
+
+    if torch.distributed.get_rank() == 0:
+        logger.info("Loading vision encoder weights from Megatron checkpoint...")
+        # Debug: print all vision-related keys in checkpoint
+        vision_keys = [k for k in vis_sd.keys() if "vision" in k.lower()]
+        logger.debug(f"Checkpoint vision keys ({len(vision_keys)}):")
+        for k in vision_keys:
+            logger.debug(f"  {k}")
+
+    # === 1. Patch embedding ===
+    if _has_vis("vision_model.conv3d.weight"):
+        _copy_param(
+            "visual.patch_embed.proj.weight", _get_vis("vision_model.conv3d.weight")
+        )
+    if _has_vis("vision_model.conv3d.bias"):
+        _copy_param(
+            "visual.patch_embed.proj.bias", _get_vis("vision_model.conv3d.bias")
+        )
+
+    # === 2. Post-conv layernorm (conditional) ===
+    post_conv_ln = getattr(vis_config, "post_conv_ln", True)
+    if post_conv_ln and _has_vis("vision_model.post_conv_layernorm.weight"):
+        _copy_param(
+            "visual.post_conv_layernorm.weight",
+            _get_vis("vision_model.post_conv_layernorm.weight"),
+        )
+
+    # === 3. Position embedding (conditional) ===
+    adapt_position = getattr(vis_config, "adapt_position", True)
+    if adapt_position and _has_vis("vision_model.position_embeddings.weight"):
+        _copy_param(
+            "visual.embeddings.position_embedding.weight",
+            _get_vis("vision_model.position_embeddings.weight"),
+        )
+
+    # === 4. Transformer blocks ===
+    for i in range(depth):
+        prefix_mgt = f"vision_model.transformer.layers.{i}"
+        prefix_sgl = f"visual.blocks.{i}"
+
+        # --- 4.1 Input layernorm (norm1) ---
+        # distcp may have standalone input_layernorm or fused layer_norm_weight
+        norm1_key = f"{prefix_mgt}.input_layernorm.weight"
+        if not _has_vis(norm1_key):
+            norm1_key = f"{prefix_mgt}.self_attention.linear_qkv.layer_norm_weight"
+        if _has_vis(norm1_key):
+            _copy_param(f"{prefix_sgl}.norm1.weight", _get_vis(norm1_key))
+
+        # --- 4.2 QKV projection ---
+        qkv_w_key = f"{prefix_mgt}.self_attention.linear_qkv.weight"
+        if _has_vis(qkv_w_key):
+            qkv_w = _get_vis(qkv_w_key)
+            # Convert interleaved to non-interleaved [Q|K|V]
+            # ViT has no GQA: each head has [q_head_dim, k_head_dim, v_head_dim]
+            if getattr(config, "interleaved_qkv", True):
+                qkv_w = vit_interleaved_to_non_interleaved(
+                    qkv_w, num_heads, head_dim, hidden_size
+                )
+            # Apply dummy head padding
+            qkv_w = vision_utils.pad_vit_attn_dummy_heads(
+                config, f"{prefix_sgl}.attn.qkv_proj.weight", qkv_w
+            )
+            # Use weight_loader for TP slicing (QKVParallelLinear)
+            _weight_loader_param(f"{prefix_sgl}.attn.qkv_proj.weight", qkv_w)
+
+        # --- 4.3 QKV bias ---
+        qkv_b_key = f"{prefix_mgt}.self_attention.linear_qkv.bias"
+        if _has_vis(qkv_b_key):
+            qkv_b = _get_vis(qkv_b_key)
+            if getattr(config, "interleaved_qkv", True):
+                qkv_b = vit_interleaved_to_non_interleaved_bias(
+                    qkv_b, num_heads, head_dim
+                )
+            qkv_b = vision_utils.pad_vit_attn_dummy_heads(
+                config, f"{prefix_sgl}.attn.qkv_proj.bias", qkv_b
+            )
+            _weight_loader_param(f"{prefix_sgl}.attn.qkv_proj.bias", qkv_b)
+
+        # --- 4.4 Q/K layernorm ---
+        q_ln_key = f"{prefix_mgt}.self_attention.q_layernorm.weight"
+        if _has_vis(q_ln_key):
+            q_ln = _get_vis(q_ln_key)
+            q_ln = vision_utils.pad_vit_attn_dummy_heads(
+                config, f"{prefix_sgl}.attn.q_norm.weight", q_ln
+            )
+            _copy_param(f"{prefix_sgl}.attn.q_norm.weight", q_ln)
+
+        k_ln_key = f"{prefix_mgt}.self_attention.k_layernorm.weight"
+        if _has_vis(k_ln_key):
+            k_ln = _get_vis(k_ln_key)
+            k_ln = vision_utils.pad_vit_attn_dummy_heads(
+                config, f"{prefix_sgl}.attn.k_norm.weight", k_ln
+            )
+            _copy_param(f"{prefix_sgl}.attn.k_norm.weight", k_ln)
+
+        # --- 4.5 Projection (RowParallelLinear) ---
+        proj_w_key = f"{prefix_mgt}.self_attention.linear_proj.weight"
+        if _has_vis(proj_w_key):
+            proj_w = _get_vis(proj_w_key)
+            proj_w = vision_utils.pad_vit_attn_dummy_heads(
+                config, f"{prefix_sgl}.attn.proj.weight", proj_w
+            )
+            # RowParallelLinear: TP slice along dim=1
+            proj_w = _tp_row_slice(proj_w, dim=1)
+            _copy_param(f"{prefix_sgl}.attn.proj.weight", proj_w)
+
+        proj_b_key = f"{prefix_mgt}.self_attention.linear_proj.bias"
+        if _has_vis(proj_b_key):
+            _copy_param(f"{prefix_sgl}.attn.proj.bias", _get_vis(proj_b_key))
+
+        # --- 4.6 Pre-MLP layernorm (norm2) ---
+        norm2_key = f"{prefix_mgt}.pre_mlp_layernorm.weight"
+        if not _has_vis(norm2_key):
+            norm2_key = f"{prefix_mgt}.mlp.linear_fc1.layer_norm_weight"
+        if _has_vis(norm2_key):
+            _copy_param(f"{prefix_sgl}.norm2.weight", _get_vis(norm2_key))
+
+        # --- 4.7 MLP gate_up_proj (MergedColumnParallelLinear with SwiGLU) ---
+        fc1_w_key = f"{prefix_mgt}.mlp.linear_fc1.weight"
+        if _has_vis(fc1_w_key):
+            fc1_w = _get_vis(fc1_w_key)
+            # Megatron SwiGLU: fc1 = [gate | up] concatenated along dim=0
+            gate_w, up_w = fc1_w.chunk(2, dim=0)
+            # weight_loader with shard_id: 0=gate, 1=up (handles TP internally)
+            _weight_loader_param(
+                f"{prefix_sgl}.mlp.gate_up_proj.weight", gate_w, shard_id=0
+            )
+            _weight_loader_param(
+                f"{prefix_sgl}.mlp.gate_up_proj.weight", up_w, shard_id=1
+            )
+
+        fc1_b_key = f"{prefix_mgt}.mlp.linear_fc1.bias"
+        if _has_vis(fc1_b_key):
+            fc1_b = _get_vis(fc1_b_key)
+            gate_b, up_b = fc1_b.chunk(2, dim=0)
+            _weight_loader_param(
+                f"{prefix_sgl}.mlp.gate_up_proj.bias", gate_b, shard_id=0
+            )
+            _weight_loader_param(
+                f"{prefix_sgl}.mlp.gate_up_proj.bias", up_b, shard_id=1
+            )
+
+        # --- 4.8 MLP down_proj (RowParallelLinear) ---
+        fc2_w_key = f"{prefix_mgt}.mlp.linear_fc2.weight"
+        if _has_vis(fc2_w_key):
+            fc2_w = _get_vis(fc2_w_key)
+            fc2_w = _tp_row_slice(fc2_w, dim=1)
+            _copy_param(f"{prefix_sgl}.mlp.down_proj.weight", fc2_w)
+
+        fc2_b_key = f"{prefix_mgt}.mlp.linear_fc2.bias"
+        if _has_vis(fc2_b_key):
+            _copy_param(f"{prefix_sgl}.mlp.down_proj.bias", _get_vis(fc2_b_key))
+
+    # === 5. Post layernorm ===
+    if _has_vis("vision_model.post_layernorm.weight"):
+        _copy_param(
+            "visual.post_layernorm.weight",
+            _get_vis("vision_model.post_layernorm.weight"),
+        )
+
+    # === 6. Downsample conv ===
+    if _has_vis("vision_model.downsample.weight"):
+        _copy_param(
+            "visual.downsample.weight", _get_vis("vision_model.downsample.weight")
+        )
+    if _has_vis("vision_model.downsample.bias"):
+        _copy_param("visual.downsample.bias", _get_vis("vision_model.downsample.bias"))
+
+    # === 7. Vision projection (merger) ===
+    # merger.proj — ReplicatedLinear, no TP split
+    # Support both "vision_projection.linear_fc_extra.weight" and "vision_projection.encoder.linear_fc_extra.weight"
+    if _has_vis("vision_projection.linear_fc_extra.weight"):
+        _copy_param(
+            "visual.merger.proj.weight",
+            _get_vis("vision_projection.linear_fc_extra.weight"),
+        )
+    elif _has_vis("vision_projection.encoder.linear_fc_extra.weight"):
+        _copy_param(
+            "visual.merger.proj.weight",
+            _get_vis("vision_projection.encoder.linear_fc_extra.weight"),
+        )
+
+    # merger.post_projection_norm — LayerNorm
+    # Support both "vision_projection.layer_norm.*" and "vision_projection.encoder.layer_norm.*"
+    if _has_vis("vision_projection.layer_norm.weight"):
+        _copy_param(
+            "visual.merger.post_projection_norm.weight",
+            _get_vis("vision_projection.layer_norm.weight"),
+        )
+    elif _has_vis("vision_projection.encoder.layer_norm.weight"):
+        _copy_param(
+            "visual.merger.post_projection_norm.weight",
+            _get_vis("vision_projection.encoder.layer_norm.weight"),
+        )
+
+    if _has_vis("vision_projection.layer_norm.bias"):
+        _copy_param(
+            "visual.merger.post_projection_norm.bias",
+            _get_vis("vision_projection.layer_norm.bias"),
+        )
+    elif _has_vis("vision_projection.encoder.layer_norm.bias"):
+        _copy_param(
+            "visual.merger.post_projection_norm.bias",
+            _get_vis("vision_projection.encoder.layer_norm.bias"),
+        )
+
+    # merger.gate_up_proj — MergedColumnParallelLinear with SwiGLU
+    if _has_vis("vision_projection.encoder.linear_fc1.weight"):
+        fc1_w = _get_vis("vision_projection.encoder.linear_fc1.weight")
+        gate_w, up_w = fc1_w.chunk(2, dim=0)
+        _weight_loader_param("visual.merger.gate_up_proj.weight", gate_w, shard_id=0)
+        _weight_loader_param("visual.merger.gate_up_proj.weight", up_w, shard_id=1)
+
+    # merger.down_proj — RowParallelLinear, TP dim=1
+    if _has_vis("vision_projection.encoder.linear_fc2.weight"):
+        fc2_w = _get_vis("vision_projection.encoder.linear_fc2.weight")
+        fc2_w = _tp_row_slice(fc2_w, dim=1)
+        _copy_param("visual.merger.down_proj.weight", fc2_w)
+
+    # Move visual module to device
+    init_model.visual = init_model.visual.to(device)
+
+    if torch.distributed.get_rank() == 0:
+        logger.info("Vision encoder weights loaded successfully.")
 
 
 class _ConfigView:
@@ -557,6 +892,9 @@ def _load_embedding(
 ):
     """Copy ``word_embeddings`` from any PP rank that carries it. Raises
     ``KeyError`` if no PP rank had the key."""
+    # encoder-only mode: no language model to load an embedding into.
+    if init_model.model is None:
+        return
     for pp in range(original_pp):
         try:
             init_model.model.embed_tokens = init_model.model.embed_tokens.to(device)
@@ -1341,7 +1679,7 @@ def _build_moe_mlp_sd(ctx, layer_sd):
             slice_dim=1,
         )
 
-    if not isinstance(layer.mlp, GLM4MoESparseMoeBlock):
+    if not isinstance(layer.mlp, (GLM4MoESparseMoeBlock, Glm4MoeSparseMoeBlock)):
         raise ValueError(f"Unsupported expert type: {type(layer.mlp)}")
 
     assert original_tp <= target_tp
@@ -1638,6 +1976,21 @@ def load_megatron_weights(
         mgt_sd = _read_torch_dist_ckpt(
             checkpoint_path, metadata, ifmtp, cfg, target_tp, tp, st_time
         )
+        # Load vision weights if the model has a vision encoder.
+        # In language_only mode, config has vision_config but visual module is None.
+        if (
+            hasattr(init_model.config, "vision_config")
+            and hasattr(init_model, "visual")
+            and init_model.visual is not None
+        ):
+            _load_vision_weights(
+                init_model,
+                mgt_sd,
+                target_tp,
+                tp,
+                device,
+                params_dict,
+            )
     else:
         mgt_sd = _read_torch_legacy_ckpt(
             ckpt_dir, original_tp, original_pp, original_pp_enabled, target_tp, tp, cnt
@@ -1676,6 +2029,13 @@ def load_megatron_weights(
         device,
         original_pp,
     )
+
+    # encoder-only mode: vision weights (if any) are already loaded above and
+    # there is no language model — skip layer / lm_head / final_layernorm loading.
+    if init_model.model is None:
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"total loading time: {time.time() - st_time}")
+        return
 
     layer_offset = _iterate_layers(
         init_model,

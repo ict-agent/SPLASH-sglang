@@ -176,16 +176,29 @@ def process_content_for_template_format(
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
-                        video_data.append(chunk["video_url"]["url"])
+                    # Per-video frame-sampling overrides (GLM-4V).
+                    sampling = {
+                        k: video_obj[k]
+                        for k in (
+                            "fps",
+                            "max_frames",
+                            "max_tokens_per_frame",
+                        )
+                        if video_obj.get(k) is not None
+                    }
+                    if mdp is None and not sampling:
+                        if isinstance(
+                            (video_frame_url := chunk.get("video_frame_url")), list
+                        ):
+                            video_data.append(video_frame_url)
+                        else:
+                            video_data.append(chunk["video_url"]["url"])
                     else:
                         # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        structured = {"url": video_obj["url"], **sampling}
+                        if mdp is not None:
+                            structured["max_dynamic_patch"] = mdp
+                        video_data.append(structured)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

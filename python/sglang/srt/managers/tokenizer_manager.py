@@ -411,6 +411,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                is_decode_role=(
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                ),
             )
 
     def init_metric_collector_watchdog(self):
@@ -745,6 +748,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
+                    if self.server_args.language_only:
+                        # language_only has no local vision tower: the encoder
+                        # failed, timed out, or never ran. Fail loudly instead
+                        # of falling back to local processing (which would
+                        # forward unexpanded image placeholders into the
+                        # language model). Check --encoder-urls / adaptive
+                        # dispatch settings.
+                        raise ValueError(
+                            "language_only mode received a multimodal request "
+                            "that was not served by an encoder (no precomputed "
+                            "embeddings)."
+                        )
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,

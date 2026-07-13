@@ -420,8 +420,13 @@ class VisionFlash3Attention(nn.Module):
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            # Prefer a caller-provided max_seqlen to avoid a per-call
+            # `seq_lens.max().item()` DtoH sync. Callers that iterate many blocks
+            # over the same cu_seqlens (e.g. GLM-4V ViT) compute it once upstream.
+            max_seqlen = kwargs.get("max_seqlen", None)
+            if max_seqlen is None:
+                seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                max_seqlen = seq_lens.max().item()
 
             output = flash_attn_func(
                 q,

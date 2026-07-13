@@ -208,9 +208,11 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "lora_path",
+                    "image_url",
+                    "url",
                     "sampling_params",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "output_ids", "embedding", "url", "image_url"}
             elif self.log_requests_level == 1:
                 max_length = 1 << 30
                 skip_names = {
@@ -220,12 +222,30 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "lora_path",
+                    "image_url",
+                    "url",
                 }
-                out_skip_names = {"text", "output_ids", "embedding"}
+                out_skip_names = {"text", "output_ids", "embedding", "url", "image_url"}
             elif self.log_requests_level == 2:
                 max_length = 2048
+                skip_names = {
+                    "image_data",
+                    "audio_data",
+                    "input_embeds",
+                    "image_url",
+                    "url",
+                }
+                out_skip_names = {"output_ids", "embedding", "url", "image_url"}
             elif self.log_requests_level == 3:
                 max_length = 1 << 30
+                skip_names = {
+                    "image_data",
+                    "audio_data",
+                    "input_embeds",
+                    "image_url",
+                    "url",
+                }
+                out_skip_names = {"output_ids", "embedding", "url", "image_url"}
             else:
                 raise ValueError(
                     f"Invalid --log-requests-level: {self.log_requests_level=}"
@@ -256,16 +276,18 @@ def _dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
-        else:
-            return str(data)
+        return (
+            "["
+            + ", ".join(
+                [_dataclass_to_string_truncated(k, max_length, skip_names) for k in data]
+            )
+            + "]"
+        )
     elif isinstance(data, dict):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {_dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {_dataclass_to_string_truncated(v, max_length, skip_names)}"
                 for k, v in data.items()
                 if k not in skip_names
             )
@@ -276,7 +298,7 @@ def _dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                f"{f.name}={_dataclass_to_string_truncated(getattr(data, f.name), max_length, skip_names)}"
                 for f in fields
                 if f.name not in skip_names
             )

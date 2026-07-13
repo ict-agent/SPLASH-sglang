@@ -4,9 +4,11 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -42,13 +44,18 @@ TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
+# Page-locked (pinned) host staging buffer. Features are gathered into a
+# contiguous slice on the CPU, then flushed to the GPU in a single H2D DMA.
+# Pinning the source lets `non_blocking=True` run truly async at full PCIe
+# bandwidth (pageable memory would fall back to a synchronous half-BW copy).
+_PINNED_STAGING_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
 
 
 def init_feature_buffer(device):
-    global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
+    global _GPU_FEATURE_BUFFER, _PINNED_STAGING_BUFFER, _BUFFER_OFFSET
     if (
         device == "cpu"
         or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
@@ -61,9 +68,19 @@ def init_feature_buffer(device):
         _GPU_FEATURE_BUFFER = torch.empty(
             num_elements, dtype=torch.float32, device=device
         )
+        # Pinned host staging buffer of matching capacity. Allocated once and
+        # reused; pin_memory failures (memory pressure) degrade gracefully to
+        # the per-tensor pageable path in try_add_to_buffer.
+        try:
+            _PINNED_STAGING_BUFFER = torch.empty(
+                num_elements, dtype=torch.float32, pin_memory=True
+            )
+        except RuntimeError:
+            _PINNED_STAGING_BUFFER = None
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
     except RuntimeError as e:
         _GPU_FEATURE_BUFFER = None
+        _PINNED_STAGING_BUFFER = None
 
 
 def reset_buffer_offset():
@@ -94,6 +111,119 @@ def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         return result
     else:
         return tensor
+
+
+def add_features_to_buffer_batched(items) -> list:
+    """Stage every item's feature into the pinned host buffer, then flush the
+    whole batch to the GPU buffer in a SINGLE host->device DMA.
+
+    Versus per-item ``try_add_to_buffer``, this pins the H2D source (full PCIe
+    bandwidth, no pageable bounce) and merges N copies into one (no per-tensor
+    launch/sync). Features are normalized to float32 to match legacy behavior;
+    items that don't fit (or when the pinned buffer is unavailable) fall back to
+    the per-item path unchanged.
+
+    Returns:
+        ``staged``: a list of ``(item, start_offset, shape)`` for every feature
+        that was placed in the pinned/GPU buffer. ``restore_features_to_cpu``
+        uses this to copy each feature back from the (still-valid, same-request)
+        pinned staging buffer instead of doing a slower device->host transfer.
+        Empty list when the fallback/per-item path was taken.
+    """
+    global _BUFFER_OFFSET
+
+    if _GPU_FEATURE_BUFFER is None or _PINNED_STAGING_BUFFER is None:
+        # No pinned staging available: preserve old per-item behavior.
+        for item in items:
+            if item.feature is not None and isinstance(item.feature, torch.Tensor):
+                item.feature = try_add_to_buffer(item.feature)
+        return []
+
+    capacity = _GPU_FEATURE_BUFFER.numel()
+    staged = []  # (item, start_offset, shape)
+
+    for item in items:
+        feat = item.feature
+        if feat is None or not isinstance(feat, torch.Tensor):
+            continue
+        n = feat.numel()
+        start = _BUFFER_OFFSET
+        if start + n > capacity:
+            # Out of room: leave this (and remaining) feature on CPU, matching
+            # try_add_to_buffer's "return tensor unchanged" fallback.
+            continue
+        # CPU->CPU stage into pinned memory (dtype-normalized to float32).
+        _PINNED_STAGING_BUFFER[start : start + n].copy_(feat.flatten())
+        staged.append((item, start, feat.shape))
+        _BUFFER_OFFSET += n
+
+    if not staged:
+        return staged
+
+    end = _BUFFER_OFFSET
+    start0 = staged[0][1]
+    # Single H2D for the whole staged region. Source is pinned, so this runs at
+    # full PCIe bandwidth regardless of non_blocking. We use a BLOCKING copy
+    # (non_blocking=False) on purpose: the very next step (set_pad_value ->
+    # gpu_tensor_hash) reads this GPU data immediately, so there is no
+    # independent work to overlap with -- an async copy would buy nothing here
+    # and would risk the hash kernel racing an unfinished transfer if it ever
+    # runs on a different CUDA stream. Blocking keeps correctness independent of
+    # stream assumptions while retaining the two real wins: full bandwidth + a
+    # single merged transfer. (Revisit if a stream-pipelined path is added.)
+    _GPU_FEATURE_BUFFER[start0:end].copy_(
+        _PINNED_STAGING_BUFFER[start0:end], non_blocking=False
+    )
+
+    # Hand each item a float32 GPU view into its slice of the buffer.
+    for item, start, shape in staged:
+        n = int(torch.Size(shape).numel())
+        item.feature = _GPU_FEATURE_BUFFER[start : start + n].view(shape)
+
+    return staged
+
+
+def restore_features_to_cpu(items, staged) -> None:
+    """Move features off the (reused) GPU buffer back to per-item CPU memory.
+
+    Must be called after the GPU hash is computed and before the next request
+    reuses the shared buffers. Two paths:
+
+      * For features that went through the pinned staging buffer (``staged``),
+        copy them back from that pinned host buffer with a CPU->CPU clone. The
+        data there is bit-identical to the GPU buffer (it's the H2D source) and
+        is still valid within this single, synchronous request, so we avoid a
+        device->host transfer over PCIe entirely. The clone detaches the item
+        from the reusable staging buffer so the next request can overwrite it.
+
+      * For any feature NOT in ``staged`` (pinned buffer unavailable, or the
+        feature didn't fit and was left on CPU / on GPU via try_add_to_buffer),
+        fall back to the original ``.to("cpu")`` device->host copy.
+
+    dtype note: the staging buffer is float32, exactly matching what the old
+    ``item.feature.to("cpu")`` produced (the GPU buffer is float32 too), so the
+    downstream ``get_*_feature`` path -- which re-casts via ``.type(visual.dtype)``
+    -- is unaffected.
+    """
+    staged_items = {id(item) for item, _start, _shape in staged}
+
+    # Fast path: features staged in pinned memory -> CPU->CPU clone.
+    if _PINNED_STAGING_BUFFER is not None:
+        for item, start, shape in staged:
+            n = int(torch.Size(shape).numel())
+            # .clone() detaches from the reusable staging buffer (next request
+            # overwrites that region); .view(shape) restores the original shape.
+            item.feature = (
+                _PINNED_STAGING_BUFFER[start : start + n].view(shape).clone()
+            )
+
+    # Fallback path: anything not staged still lives on GPU/CPU as before.
+    for item in items:
+        if id(item) in staged_items:
+            continue
+        feat = item.feature
+        if isinstance(feat, torch.Tensor) and feat.is_cuda:
+            item.feature = feat.to("cpu", non_blocking=True)
 
 
 class TransportProxyTensor(torch.Tensor):
@@ -488,11 +618,14 @@ def _get_chunked_embedding_full(
     if embedding_per_req is None:
         _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
-        embedding_per_req = (
-            EmbeddingResult(embedding=embedding)
-            if isinstance(embedding, torch.Tensor)
-            else embedding
-        )
+        if isinstance(embedding, torch.Tensor):
+            # Plain tensor: may be offloaded to CPU per SGLANG_VLM_CACHE_ON_CPU.
+            embedding_per_req = EmbeddingResult(
+                embedding=_store_embedding_for_cache(embedding)
+            )
+        else:
+            # EVS results carry placeholder-redistribution state; keep as-is.
+            embedding_per_req = embedding
         embedding_cache.set(embedding_items_hash, embedding_per_req)
 
     if isinstance(embedding_per_req, EVSEmbeddingResult):
@@ -513,7 +646,44 @@ def _get_chunked_embedding_full(
         extend_seq_len=extend_seq_len,
         items_offset=items_offset,
     )
+    # Slicing happens on whatever device the cache holds; ensure the chunk is on
+    # the compute device so it can concat with by-item chunks downstream.
+    if embedding_per_req_chunk is not None:
+        embedding_per_req_chunk = _load_embedding_from_cache(
+            embedding_per_req_chunk, device
+        )
     return embedding_per_req_chunk, input_ids
+
+
+def _store_embedding_for_cache(embedding: torch.Tensor) -> torch.Tensor:
+    """
+    Prepare an embedding for insertion into the server-level mm cache.
+
+    By default the embedding stays on its current (GPU) device, so cache hits
+    are zero-copy. When SGLANG_VLM_CACHE_ON_CPU is set, it is moved to pinned
+    CPU memory instead: this frees inference VRAM and lets the cache hold far
+    more entries, at the cost of one H2D copy per later hit.
+    """
+    if not envs.SGLANG_VLM_CACHE_ON_CPU.get():
+        return embedding
+    # pin_memory() requires a contiguous CPU tensor; split() yields views.
+    cpu_embedding = embedding.detach().contiguous().to("cpu")
+    if torch.cuda.is_available():
+        cpu_embedding = cpu_embedding.pin_memory()
+    return cpu_embedding
+
+
+def _load_embedding_from_cache(
+    embedding: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Move a cached embedding onto the target device for assembly.
+
+    No-op when the cache already holds GPU tensors (default path); a single
+    non-blocking H2D copy when SGLANG_VLM_CACHE_ON_CPU stored it on CPU.
+    """
+    if embedding.device != device:
+        return embedding.to(device, non_blocking=True)
+    return embedding
 
 
 def _get_chunked_embedding_by_item(
@@ -547,12 +717,14 @@ def _get_chunked_embedding_by_item(
         return None
 
     # 2. Check per-image cache for each overlapping item
-    cached_embeddings = {}  # idx -> tensor
+    cached_embeddings = {}  # idx -> tensor (on `device`)
     miss_items = []  # (idx, item, start, end)
     for idx, item, start, end in overlapping:
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
-            cached_embeddings[idx] = cached.embedding
+            cached_embeddings[idx] = _load_embedding_from_cache(
+                cached.embedding, device
+            )
         else:
             miss_items.append((idx, item, start, end))
 
@@ -570,8 +742,10 @@ def _get_chunked_embedding_by_item(
         split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
         for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
+            # Keep the freshly-encoded GPU tensor for this chunk's assembly,
+            # but store a (possibly CPU-resident) copy in the cache.
             cached_embeddings[idx] = emb
-            emb_result = EmbeddingResult(embedding=emb)
+            emb_result = EmbeddingResult(embedding=_store_embedding_for_cache(emb))
             embedding_cache.set(item.hash, emb_result)
 
     # 4. Assemble chunk: for each overlapping item, extract the overlap slice
@@ -1649,3 +1823,68 @@ def unwrap_shm_features(obj):
             if isinstance(item.feature, ShmPointerMMData):
                 item.feature = item.feature.materialize()
     return obj
+
+
+# Reusable pool for parallel shm materialize. materialize() spends ~100% of its
+# time in aten::copy_ (memcpy out of shm) and SharedMemory.close()/shm_unlink
+# (syscalls); both release the GIL, so a thread pool gives real parallelism.
+_shm_unwrap_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_shm_unwrap_pool() -> ThreadPoolExecutor:
+    global _shm_unwrap_pool
+    if _shm_unwrap_pool is None:
+        # memcpy is memory-bandwidth bound, so beyond a handful of threads we
+        # only contend for bandwidth; cap at 8.
+        max_workers = min(8, (os.cpu_count() or 4))
+        _shm_unwrap_pool = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="shm_unwrap"
+        )
+    return _shm_unwrap_pool
+
+
+def unwrap_shm_features_batch(recv_reqs):
+    """
+    Restore ShmPointerMMData wrappers across a batch of requests, materializing
+    them in parallel.
+
+    materialize() is dominated by aten::copy_ (memcpy from shared memory) and
+    SharedMemory.close()/shm_unlink (syscalls), both of which release the GIL.
+    Each ShmPointerMMData is independent (own shm segment / handle / unlink), so
+    they can be materialized concurrently. Replaces the serial double loop in
+    unwrap_shm_features().
+
+    Must be called AFTER the cross-rank broadcast/barrier so that materialize()
+    (which unlinks the shm segment) does not race other ranks' shm_open.
+    """
+    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+        return recv_reqs
+
+    # Flatten: collect every item whose feature is still a shm pointer.
+    pending = []
+
+    def _collect(obj):
+        if hasattr(obj, "batch"):
+            for sub_obj in obj.batch:
+                _collect(sub_obj)
+        elif hasattr(obj, "mm_inputs") and obj.mm_inputs:
+            for item in obj.mm_inputs.mm_items:
+                if isinstance(item.feature, ShmPointerMMData):
+                    pending.append(item)
+
+    for req in recv_reqs:
+        _collect(req)
+
+    if not pending:
+        return recv_reqs
+
+    # A single materialize isn't worth the thread dispatch overhead.
+    if len(pending) == 1:
+        pending[0].feature = pending[0].feature.materialize()
+        return recv_reqs
+
+    pool = _get_shm_unwrap_pool()
+    materialized = list(pool.map(lambda item: item.feature.materialize(), pending))
+    for item, tensor in zip(pending, materialized):
+        item.feature = tensor
+    return recv_reqs

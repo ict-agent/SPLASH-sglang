@@ -39,6 +39,31 @@ def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor
     return x_t
 
 
+def apply_axis_map_rope(x: torch.Tensor, axis_map: torch.Tensor) -> torch.Tensor:
+    """GLM-style round-robin MRoPE axis assignment.
+
+    For each frequency-pair index k in [0, num_pairs), pick the axis in {T, H, W}
+    indicated by ``axis_map[k]`` and read that axis's cos/sin component.
+
+    Args:
+        x: shape ``[3, ..., num_pairs]`` cos or sin per axis.
+        axis_map: int64 tensor of shape ``[num_pairs]`` with values in {0, 1, 2}.
+    Returns:
+        Tensor of shape ``[..., num_pairs]``.
+    """
+    assert x.shape[0] == 3, f"axis-map MRoPE expects leading axis dim = 3, got {x.shape}"
+    num_pairs = x.shape[-1]
+    assert axis_map.shape[-1] == num_pairs, (
+        f"axis_map length {axis_map.shape[-1]} != num_pairs {num_pairs}"
+    )
+    # Broadcast axis_map to x.shape minus the leading axis dim, then gather along dim 0.
+    expand_shape = (1,) + tuple(x.shape[1:])
+    idx = axis_map.to(device=x.device).view(
+        (1,) * (x.ndim - 1) + (num_pairs,)
+    ).expand(expand_shape)
+    return x.gather(0, idx).squeeze(0)
+
+
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -133,6 +158,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         if self.mrope_interleaved:
             cos = apply_interleaved_rope(cos, self.mrope_section)
             sin = apply_interleaved_rope(sin, self.mrope_section)
+        elif self.mrope_interleaved_glm:
+            cos = apply_axis_map_rope(cos, self.axis_map)
+            sin = apply_axis_map_rope(sin, self.axis_map)
         else:
             cos = torch.cat(
                 [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
@@ -151,6 +179,8 @@ class MRotaryEmbedding(RotaryEmbedding):
             or self.cos_sin_cache.dtype != query.dtype
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+        if self.axis_map is not None and self.axis_map.device != query.device:
+            self.axis_map = self.axis_map.to(query.device)
 
     def forward_native(
         self,
@@ -171,6 +201,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             if self.mrope_interleaved:
                 cos = apply_interleaved_rope(cos, self.mrope_section)
                 sin = apply_interleaved_rope(sin, self.mrope_section)
+            elif self.mrope_interleaved_glm:
+                cos = apply_axis_map_rope(cos, self.axis_map)
+                sin = apply_axis_map_rope(sin, self.axis_map)
             else:
                 cos = torch.cat(
                     [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
@@ -205,7 +238,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available and not self.mrope_interleaved_glm:
             return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                 positions,
                 query,
@@ -238,6 +271,16 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.mrope_section
         self._match_cos_sin_cache_dtype(query)
+
+        # Triton kernel expects 2D [num_tokens, num_heads * head_size]; MLA paths
+        # may pass 3D [num_tokens, num_heads, head_size]. Flatten to 2D, run the
+        # in-place kernel, then restore the original shape.
+        q_shape, k_shape = query.shape, key.shape
+        if query.ndim > 2:
+            query = query.contiguous().view(q_shape[0], -1)
+        if key.ndim > 2:
+            key = key.contiguous().view(k_shape[0], -1)
+
         triton_mrope_fused(
             query,
             key,
@@ -251,7 +294,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.is_neox_style,
             self.axis_map,
         )
-        return query, key
+        return query.view(q_shape), key.view(k_shape)
 
     def forward_npu(
         self,
@@ -263,7 +306,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if query.shape[1] > 4096:
+        if self.mrope_interleaved_glm or query.shape[1] > 4096:
+            # NPU's npu_mrope op does not understand axis_map; use native fallback
+            # for the GLM round-robin layout.
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
         mrope_section = [0, 0, 0]
@@ -383,6 +428,7 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         *,
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
+        mrope_interleaved_glm: bool = False,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
         beta_fast: int = 32,
@@ -405,6 +451,7 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
             dtype,
             mrope_section=mrope_section,
             mrope_interleaved=mrope_interleaved,
+            mrope_interleaved_glm=mrope_interleaved_glm,
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:

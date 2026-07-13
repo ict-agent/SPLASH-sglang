@@ -1565,6 +1565,7 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             # Set attention backend for DeepSeek
             if is_nsa_model:  # DeepSeek 3.2/GLM 5
@@ -1833,7 +1834,10 @@ class ServerArgs:
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
 
-            if model_arch == "Glm5NextForCausalLM":
+            if model_arch in (
+                "Glm5NextForCausalLM",
+                "Glm5NextForConditionalGeneration",
+            ):
                 self._handle_mamba_radix_cache(
                     model_arch=model_arch,
                     support_mamba_cache=True,
@@ -3510,7 +3514,6 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-        # Validate model type: only support Qwen models for now
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if (self.encoder_only or self.language_only) and model_arch not in [
@@ -3521,9 +3524,10 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "Glm5NextForConditionalGeneration",
         ]:
             raise ValueError(
-                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen and GLM models are supported for now."
             )
 
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:

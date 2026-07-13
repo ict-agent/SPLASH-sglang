@@ -462,12 +462,40 @@ class Envs:
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
+    # Store cached mm embeddings in (pinned) CPU memory instead of GPU.
+    # Trades a per-hit H2D copy for freeing inference GPU memory; lets the
+    # embedding cache grow far larger than VRAM would allow.
+    SGLANG_VLM_CACHE_ON_CPU = EnvBool(False)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # ViT chunking to cap peak activation memory on long videos / many images
+    # (mirror upstream Qwen3-VL PR #14907). 0 = unlimited.
+    SGLANG_VLM_MAX_PATCHES_PER_VIT = EnvInt(0)
+    SGLANG_VLM_MAX_IMAGES_PER_VIT = EnvInt(0)
+
+    # GLM-4V video frame-sampling defaults (mirror the HF GLM-4.6V processor).
+    # Dynamic-fps table: fps used per duration bucket (<=30s / <=300s / longer).
+    SGLANG_GLM_VIDEO_FPS_SHORT = EnvFloat(3.0)
+    SGLANG_GLM_VIDEO_FPS_MEDIUM = EnvFloat(1.0)
+    SGLANG_GLM_VIDEO_FPS_LONG = EnvFloat(0.5)
+    SGLANG_GLM_VIDEO_MAX_FRAMES = EnvInt(640)
+    SGLANG_GLM_VIDEO_MAX_DURATION = EnvInt(2400)
+    SGLANG_GLM_VIDEO_TEMPORAL_PATCH_SIZE = EnvInt(2)
+    # Vision patch geometry: token pixel coverage and resize granularity are
+    # derived from these (pixels-per-token = (patch*merge)^2, resize factor =
+    # patch*merge*expand). Keep them consistent with the ViT/patch embed config.
+    SGLANG_GLM_VIDEO_PATCH_SIZE = EnvInt(14)
+    SGLANG_GLM_VIDEO_MERGE_SIZE = EnvInt(2)
+    SGLANG_GLM_VIDEO_PATCH_EXPAND_FACTOR = EnvInt(4)
+
+    # torchcodec video-decode CUDA backend: "ffmpeg" (default, stable) or "beta"
+    # (NVDEC, faster but can fail at frame-fetch on some pixel formats, e.g.
+    # "Failed to convert NV12 frame.").
+    SGLANG_VIDEO_CUDA_BACKEND = EnvStr("ffmpeg")
 
 
     # VLM Item CUDA IPC Transport
@@ -540,7 +568,26 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_EMBEDDING_TTL = EnvFloat(0.0)
+    SGLANG_ENCODER_EMBEDDING_SWEEP_INTERVAL = EnvFloat(0.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+    # Cross-request batching for the encoder server (image-only here).
+    SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)  # max requests fused per batch
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)  # per-request wait bound for batched /encode
+    # Cap concurrent in-flight video encodes on rank 0 to bound resident decoded
+    # frames (decode is offloaded/parallel but ViT is serial, so results pile up).
+    # 0 = unlimited (previous behavior).
+    SGLANG_ENCODER_MAX_CONCURRENT_VIDEO = EnvInt(0)
+
+    # Mooncake RDMA registered-buffer pool (encoder transfer path). Both must
+    # be > 0 to ENABLE the pool: the receiver then reuses registered-once
+    # buffers and the sender registers the embedding in place (refcounted),
+    # avoiding the per-transfer register/deregister churn and its remote/local
+    # access errors. Either == 0 (the default) DISABLES the pool -> original
+    # per-request register + deregister. They also cap the pool: total
+    # registered MiB, and total buffer count.
+    SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
+    SGLANG_MC_RDMA_POOL_MAX_BUFFERS = EnvInt(0)
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)

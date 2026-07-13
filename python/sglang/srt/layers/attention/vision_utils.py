@@ -5,9 +5,18 @@ import torch
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 
-def update_vit_attn_dummy_heads_config(config):
-    """Update HF config to ensure vision attention num_attention_heads is divisible by tp_size"""
-    tp_size = get_attention_tp_size()
+def update_vit_attn_dummy_heads_config(config, use_data_parallel=False):
+    """Update HF config to ensure vision attention num_attention_heads is divisible by tp_size
+
+    Args:
+        config: Model config
+        use_data_parallel: If True, vision encoder uses DP (TP=1), so no dummy heads needed
+    """
+    # DP encoder: vision uses TP=1, no dummy heads needed
+    if use_data_parallel:
+        tp_size = 1
+    else:
+        tp_size = get_attention_tp_size()
     num_heads = getattr(
         config.vision_config,
         "num_heads",

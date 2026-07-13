@@ -138,6 +138,9 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
+    def mamba_pool_has_space_for_reqs(self, num_reqs: int = 1):
+        return True
+
     def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).

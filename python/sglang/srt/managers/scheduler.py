@@ -147,7 +147,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
     init_mm_embedding_cache,
-    unwrap_shm_features,
+    unwrap_shm_features_batch,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -1647,8 +1647,7 @@ class Scheduler(
                 and has_shm_features(recv_reqs)
             ):
                 barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
+            unwrap_shm_features_batch(recv_reqs)
 
         return recv_reqs
 

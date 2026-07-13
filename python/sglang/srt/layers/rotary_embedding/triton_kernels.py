@@ -47,16 +47,15 @@ def _triton_mrope_forward_fused(
     h_sin = h_cos + half_rd
     w_sin = w_cos + half_rd
     cos_offsets = tl.arange(0, pad_hd // 2)
-    if is_interleaved:
-        if is_interleaved_glm:
-            axes = tl.load(axis_map_ptr + cos_offsets, mask=cos_offsets < (pad_hd // 2))
-            t_mask = axes == 0
-            h_mask = axes == 1
-            w_mask = axes == 2
-        else:
-            h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 * mrope_section_h)
-            w_mask = ((cos_offsets % 3) == 2) & (cos_offsets <= 3 * mrope_section_w)
-            t_mask = ~(h_mask | w_mask)
+    if is_interleaved_glm:
+        axes = tl.load(axis_map_ptr + cos_offsets, mask=cos_offsets < (pad_hd // 2))
+        t_mask = axes == 0
+        h_mask = axes == 1
+        w_mask = axes == 2
+    elif is_interleaved:
+        h_mask = ((cos_offsets % 3) == 1) & (cos_offsets <= 3 * mrope_section_h)
+        w_mask = ((cos_offsets % 3) == 2) & (cos_offsets <= 3 * mrope_section_w)
+        t_mask = ~(h_mask | w_mask)
     else:
         t_end = mrope_section_t
         h_end = t_end + mrope_section_h

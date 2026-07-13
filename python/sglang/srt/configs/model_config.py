@@ -75,6 +75,7 @@ def is_deepseek_nsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]
         and index_topk is not None
     )
@@ -329,7 +330,10 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm5NextForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ):
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
             self.hf_config.linear_attn_config = None
@@ -466,6 +470,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "Glm5NextForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
@@ -1333,6 +1338,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",

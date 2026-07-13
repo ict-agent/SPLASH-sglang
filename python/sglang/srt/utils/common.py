@@ -87,7 +87,7 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+from torchvision.io import ImageReadMode, decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -797,7 +797,9 @@ def _load_image(
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             logger.warning(
@@ -896,11 +898,38 @@ def _normalize_video_input(
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)
+    elif isinstance(video_file, list):
+        # GLM NOTE: video input support frames
+        for frame in video_file:
+            url = frame.get("url")
+            if url and url.startswith("data:"):
+                frame_file = url.split(",")[1]
+                frame["frame_image"] = Image.open(
+                    BytesIO(pybase64.b64decode(frame_file, validate=True))
+                )
+                # don't need image url anymore
+                frame["url"] = ""
+            else:
+                raise ValueError(f"Invalid frame url: {url}")
+        return video_file
     else:
         return None
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    # GLM NOTE: a list of frame dicts (each carrying a data-URL) must be
+    # normalized so every frame is decoded into a `frame_image`. This has to
+    # run before the fast-return below, which is only valid for already-decoded
+    # frames (tensors/ndarrays/PIL lists).
+    if (
+        isinstance(video_file, list)
+        and video_file
+        and isinstance(video_file[0], dict)
+        and "url" in video_file[0]
+        and "timestamp" in video_file[0]
+    ):
+        return _normalize_video_input(video_file)
+
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
 

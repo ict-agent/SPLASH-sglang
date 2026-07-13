@@ -37,6 +37,29 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+
+def _rdma_pool_max_bytes() -> int:
+    return envs.SGLANG_MC_RDMA_POOL_MAX_MB.get() * 1024 * 1024
+
+
+def _rdma_pool_max_buffers() -> int:
+    return envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.get()
+
+
+def rdma_pool_enabled() -> bool:
+    """Whether to use the mooncake RDMA registered-buffer pool / refcount.
+
+    Controlled by the same two caps that size the pool:
+      * SGLANG_MC_RDMA_POOL_MAX_MB      (default 0)
+      * SGLANG_MC_RDMA_POOL_MAX_BUFFERS (default 0)
+    Both must be > 0 to ENABLE the pool: the receiver uses RdmaBufferPool and
+    the sender RdmaRegRefcount. Either == 0 (the default) DISABLES it -- the
+    receiver and sender fall back to the original per-request register +
+    deregister logic.
+    """
+    return _rdma_pool_max_bytes() > 0 and _rdma_pool_max_buffers() > 0
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -125,6 +148,220 @@ def _grpc_send_request(target, request_json):
         channel.close()
 
 
+class RdmaBufferPool:
+    """Pool of RDMA-registered CPU buffers for the mooncake RDMA-write target
+    (receiver side).
+
+    Each buffer is registered with the transfer engine exactly once and is
+    NEVER deregistered while the process lives, so its rkey stays stable. This
+    is the fix for the register/deregister-per-transfer race that corrupts
+    concurrent transfers when the transfer engine is shared across tp ranks:
+    a deregister tearing down an MR still in use by another in-flight write
+    (local access violation), or a peer writing with a stale rkey after an
+    address is reused (remote access error).
+
+    Reuse is by SIZE CLASS: a request is rounded up to the next power-of-two
+    (>= floor) and served from that class's free list; if that class has no
+    free buffer, the smallest larger free buffer is reused (best-fit) before
+    allocating a new one. This matches buffer size to request size (a small
+    request gets a small buffer, not a max-size one), while keeping the number
+    of distinct sizes small (~log2 classes) instead of one-per-exact-size.
+    Intra-class waste is <2x. Steady-state
+    memory ~= peak-concurrent-transfers x their size class (the irreducible
+    in-flight working set), which grows with concurrency by nature.
+
+    Memory is bounded by two caps (both must be > 0 to enable the pool at all;
+    see rdma_pool_enabled):
+      * SGLANG_MC_RDMA_POOL_MAX_MB      total registered MiB (default 0 = off)
+      * SGLANG_MC_RDMA_POOL_MAX_BUFFERS total buffer count   (default 0 = off)
+    Caps are a safety ceiling, not an active constraint: sized above the
+    working set they never fire (so rkeys stay stable and no churn happens).
+    Only when a cap is exceeded does release() actually deregister+drop the
+    returned buffer to shrink back down -- which reintroduces register/
+    deregister churn (and its remote/local access errors). So if a cap is hit
+    under normal load, RAISE it rather than run into the churn.
+    """
+
+    def __init__(self, engine):
+        # engine: a MooncakeTransferEngine wrapper whose .register(ptr, nbytes)
+        # returns 0 on success and .deregister(ptr) frees the MR.
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._free = {}  # size_class_bytes -> list[torch.Tensor]
+        self._floor = 1 * 1024 * 1024  # 1 MiB minimum size class
+        self._max_total_bytes = _rdma_pool_max_bytes()
+        self._max_buffers = _rdma_pool_max_buffers()
+        self._total_bytes = 0  # sum over all registered buffers (in-use + free)
+        self._total_count = 0
+        self._warned_over = False
+
+    def _size_class(self, nbytes: int) -> int:
+        n = max(int(nbytes), self._floor)
+        # next power of two >= n
+        return 1 << (n - 1).bit_length()
+
+    def acquire(self, nbytes: int) -> "torch.Tensor":
+        """Return a registered uint8 CPU buffer with capacity >= nbytes."""
+        class_bytes = self._size_class(nbytes)
+        with self._lock:
+            free = self._free.get(class_bytes)
+            if free:
+                return free.pop()
+            # No exact-class buffer free: reuse the smallest free buffer that
+            # is still big enough (best-fit), rather than allocating a new one.
+            # Only a prefix is used; on release it goes back to its own class.
+            best_key = None
+            for k, lst in self._free.items():
+                if k > class_bytes and lst and (best_key is None or k < best_key):
+                    best_key = k
+            if best_key is not None:
+                return self._free[best_key].pop()
+        # Allocate + register outside the lock (registration broadcasts
+        # metadata and can be slow); concurrent misses just create distinct
+        # buffers of the same class, which is fine.
+        buf = torch.empty(class_bytes, dtype=torch.uint8)
+        ret = self._engine.register(buf.data_ptr(), buf.nbytes)
+        if ret != 0:
+            raise RuntimeError(
+                f"mooncake register_memory failed (ret={ret}, bytes={class_bytes})"
+            )
+        with self._lock:
+            self._total_bytes += class_bytes
+            self._total_count += 1
+            if (
+                self._total_bytes > self._max_total_bytes
+                or self._total_count > self._max_buffers
+            ) and not self._warned_over:
+                self._warned_over = True
+                logger.warning(
+                    "mooncake RDMA buffer pool over budget "
+                    "(bytes=%d/%d, count=%d/%d); released buffers will be "
+                    "deregistered to shrink, which reintroduces churn. Raise "
+                    "SGLANG_MC_RDMA_POOL_MAX_MB / SGLANG_MC_RDMA_POOL_MAX_BUFFERS.",
+                    self._total_bytes,
+                    self._max_total_bytes,
+                    self._total_count,
+                    self._max_buffers,
+                )
+        return buf
+
+    def release(self, buf: "torch.Tensor") -> None:
+        """Return a buffer to the pool for reuse, unless a cap is exceeded, in
+        which case deregister+drop it to shrink back under budget."""
+        if buf is None:
+            return
+        with self._lock:
+            over = (
+                self._total_bytes > self._max_total_bytes
+                or self._total_count > self._max_buffers
+            )
+            if not over:
+                self._free.setdefault(buf.numel(), []).append(buf)
+                return
+            # Over budget: drop this buffer instead of retaining it idle.
+            self._total_bytes -= buf.numel()
+            self._total_count -= 1
+        # Deregister outside the lock. Safe: a released buffer's transfer has
+        # completed, so no in-flight write references its MR.
+        try:
+            self._engine.deregister(buf.data_ptr())
+        except Exception:
+            logger.exception("mooncake: failed to deregister pooled buffer")
+
+    def discard(self, buf: "torch.Tensor") -> None:
+        """Deregister and drop a buffer WITHOUT returning it for reuse.
+
+        Used on the abort/timeout path (an in-flight or late write may still
+        target this buffer): deregistering invalidates the rkey so any such
+        write is rejected instead of silently landing in a buffer that reuse
+        would hand to another request. Do NOT use on the normal completion
+        path -- there the write is confirmed done and release() reuses it.
+        """
+        if buf is None:
+            return
+        nbytes = buf.numel()
+        with self._lock:
+            self._total_bytes -= nbytes
+            self._total_count -= 1
+            remaining_bytes = self._total_bytes
+            remaining_count = self._total_count
+        logger.warning(
+            "mooncake RDMA pool: discarding buffer (bytes=%d) on abort/timeout "
+            "path -- deregistered (late writes will be rejected), not reused. "
+            "pool now bytes=%d count=%d",
+            nbytes,
+            remaining_bytes,
+            remaining_count,
+        )
+        try:
+            self._engine.deregister(buf.data_ptr())
+        except Exception:
+            logger.exception("mooncake: failed to deregister discarded buffer")
+
+
+class RdmaRegRefcount:
+    """Zero-copy, reference-counted registration for the mooncake RDMA-write
+    SOURCE (sender side).
+
+    Instead of copying the embedding into a pooled buffer, the embedding tensor
+    itself is registered in place. Registration is reference counted per source
+    address: the MR is created on first use and deregistered only when the last
+    concurrent user of that address releases it, so no in-flight transfer's MR
+    is ever torn down (fixes the sender-side teardown race / local access
+    violation) -- without holding any extra buffer memory.
+
+    The tensor is pinned (kept alive) while registered so the allocator cannot
+    hand the same address to a different tensor underneath an in-flight write.
+    Note: unlike the never-deregister pool, this still registers each new source
+    address (and thus broadcasts segment metadata) per new embedding -- that
+    register churn is the price of using zero extra memory on the sender. It is
+    safe because the sender's lkey is resolved locally and synchronously at
+    submit time (no cross-node cache-staleness like the receiver rkey).
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._rc = {}  # addr -> refcount
+        self._pin = {}  # addr -> torch.Tensor (kept alive while registered)
+
+    def acquire(self, tensor: "torch.Tensor") -> int:
+        """Register (refcounted) the tensor's memory; return its address.
+
+        The tensor must be contiguous so [data_ptr, data_ptr+nbytes) covers the
+        data. Register/deregister are done under the lock to avoid a
+        double-register / register-vs-deregister race on the same address.
+        """
+        addr = tensor.data_ptr()
+        with self._lock:
+            c = self._rc.get(addr, 0)
+            if c == 0:
+                ret = self._engine.register(addr, tensor.nbytes)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"mooncake register_memory failed (ret={ret}, "
+                        f"bytes={tensor.nbytes})"
+                    )
+                self._pin[addr] = tensor
+            self._rc[addr] = c + 1
+        return addr
+
+    def release(self, addr: int) -> None:
+        with self._lock:
+            c = self._rc.get(addr, 0)
+            if c <= 1:
+                self._rc.pop(addr, None)
+                self._pin.pop(addr, None)
+                try:
+                    self._engine.deregister(addr)
+                except Exception:
+                    logger.exception(
+                        "mooncake: failed to deregister source buffer"
+                    )
+            else:
+                self._rc[addr] = c - 1
+
+
 class EmbeddingData:
     def __init__(
         self,
@@ -146,6 +383,7 @@ class EmbeddingData:
         self.modality = modality
         self.embedding = embedding
         self.send_time = None
+        self.created_at = time.perf_counter()
         self.dtype = embedding.dtype if embedding is not None else None
         if embedding_shape is not None:
             self.shape = embedding_shape
@@ -299,7 +537,7 @@ class MultiModalEmbeddingData(EmbeddingData):
                 if e is not None:
                     groups[self.modality_list[i]].append(e.cuda())
             return {
-                mod: torch.concat(tensors).to("cpu", non_blocking=True)
+                mod: torch.concat(tensors).to("cpu")
                 for mod, tensors in groups.items()
             }
         return self.embedding_list
@@ -604,11 +842,20 @@ class MMReceiverBase(ABC):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)
+        # EPD decode instances run the language model in PREBUILT forward mode and
+        # never consume the multimodal embedding values (KV is transferred from the
+        # prefill side). When this receiver belongs to a decode instance, ask the
+        # encoder to send metadata only (grid_thw / shape / timestamps) and skip the
+        # embedding tensor entirely. Only well-defined for the mooncake backend over
+        # HTTP today; every other backend keeps the full-embedding behavior.
+        self.is_decode_role = is_decode_role
+        self.meta_only = is_decode_role and self.encoder_transfer_backend == "mooncake"
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -625,6 +872,12 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
+            self._use_rdma_pool = rdma_pool_enabled()
+            self._rdma_pool = (
+                RdmaBufferPool(self.embeddings_engine)
+                if self._use_rdma_pool
+                else None
+            )
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
@@ -701,7 +954,7 @@ class MMReceiverBase(ABC):
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=20,
+                timeout=envs.SGLANG_ENCODER_RECV_TIMEOUT.get(),
             )
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
@@ -718,10 +971,19 @@ class MMReceiverBase(ABC):
         if embeddings is None:
             return
         try:
-            self.embeddings_engine.deregister(embeddings.data_ptr())
+            if self._use_rdma_pool:
+                # Abort/timeout path: an in-flight or late write may still
+                # target this buffer, so DISCARD (deregister + drop) rather
+                # than release() it for reuse -- deregistering makes the late
+                # write get rejected instead of silently landing in a buffer
+                # a new request would then be handed.
+                self._rdma_pool.discard(embeddings)
+            else:
+                self.embeddings_engine.deregister(embeddings.data_ptr())
         except Exception:
             logger.exception(
-                "mooncake: failed to deregister buffer for req_id=%s", req_id
+                "mooncake: failed to discard/deregister buffer for req_id=%s",
+                req_id,
             )
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
@@ -774,14 +1036,17 @@ class MMReceiverBase(ABC):
                 else:
                     recv_embedding_data.add(recv_obj)
 
-            if self.encoder_transfer_backend == "mooncake":
+            if self.encoder_transfer_backend == "mooncake" and not self.meta_only:
                 if req_id not in self.embeddings_buffer:
                     logger.error(
                         "mooncake: embeddings_buffer missing req_id=%s", req_id
                     )
                     return None
                 raw_buffer = self.embeddings_buffer.pop(req_id)
-                self.embeddings_engine.deregister(raw_buffer.data_ptr())
+                if not self._use_rdma_pool:
+                    # Fallback: deregister here (original logic). The views
+                    # below keep raw_buffer alive, so no copy is needed.
+                    self.embeddings_engine.deregister(raw_buffer.data_ptr())
                 byte_offset = 0
                 for i in range(recv_embedding_data.num_parts):
                     shape = recv_embedding_data.embedding_shape_list[i]
@@ -792,12 +1057,22 @@ class MMReceiverBase(ABC):
                         * shape[1]
                         * torch.tensor([], dtype=self.dtype).element_size()
                     )
-                    recv_embedding_data.embedding_list[i] = (
+                    part = (
                         raw_buffer[byte_offset : byte_offset + part_bytes]
                         .view(self.dtype)
                         .reshape(shape)
                     )
+                    # Pool path: .clone() copies the data OUT of the pooled
+                    # buffer before it is returned for reuse below; otherwise
+                    # a view would alias memory a concurrent request may reuse.
+                    recv_embedding_data.embedding_list[i] = (
+                        part.clone() if self._use_rdma_pool else part
+                    )
                     byte_offset += part_bytes
+                if self._use_rdma_pool:
+                    # Data has been copied out; return the buffer to the pool
+                    # (registered-once, never deregistered).
+                    self._rdma_pool.release(raw_buffer)
 
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
@@ -966,11 +1241,29 @@ class MMReceiverBase(ABC):
         return req
 
     async def allocate_embedding_buffer(self, req_id, total_bytes):
-        embeddings = torch.empty(total_bytes, dtype=torch.uint8)
-        self.embeddings_engine.register(
-            embeddings.data_ptr(),
-            embeddings.nbytes,
-        )
+        # Pool path (default): a registered-once pooled buffer whose rkey is
+        # stable for the process lifetime -- prevents the encoder writing with
+        # a stale rkey (remote access error) and prevents a concurrent cleanup
+        # from tearing down an MR still targeted by an in-flight write (local
+        # access violation). Capacity may exceed total_bytes; the encoder
+        # writes only the [base, base+total_bytes) prefix, within the MR.
+        # Fallback path (pool off): original per-request
+        # torch.empty + register.
+        if self._use_rdma_pool:
+            embeddings = self._rdma_pool.acquire(total_bytes)
+        else:
+            embeddings = torch.empty(total_bytes, dtype=torch.uint8)
+            ret = self.embeddings_engine.register(
+                embeddings.data_ptr(), embeddings.nbytes
+            )
+            if ret != 0:
+                logger.error(
+                    "mooncake: receiver register failed for req_id=%s "
+                    "(ret=%s, bytes=%d)",
+                    req_id,
+                    ret,
+                    total_bytes,
+                )
         self.embeddings_buffer[req_id] = embeddings
         return embeddings.data_ptr()
 
@@ -1055,6 +1348,7 @@ class MMReceiverHTTP(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         super().__init__(
             server_args,
@@ -1064,6 +1358,7 @@ class MMReceiverHTTP(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            is_decode_role=is_decode_role,
         )
 
     # For zmq_to_scheduler
@@ -1127,6 +1422,10 @@ class MMReceiverHTTP(MMReceiverBase):
                         "modality": modality.name,  # convert enum to string for json serialization
                         "prefill_host": self.host,
                         "embedding_port": embedding_port,
+                        # Decode instances never consume embedding values; ask the
+                        # encoder to send metadata only. Harmless for non-mooncake
+                        # backends (meta_only is False there) and read with .get().
+                        "role": "decode" if self.meta_only else "prefill",
                     }
                 )
                 cum_idx += 1
@@ -1138,12 +1437,13 @@ class MMReceiverHTTP(MMReceiverBase):
                 total=1800
             )  # Add timeout for request reliability
         ) as session:
-            # Send encode requests
-
+            # Send encode requests. Request-Id enables LB session affinity so
+            # a part's /encode and /send land on the same encoder replica.
             tasks = [
                 session.post(
                     f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
+                    headers={"Request-Id": encode_request["req_id"]},
                 )
                 for encode_request in encode_requests
             ]
@@ -1162,6 +1462,13 @@ class MMReceiverHTTP(MMReceiverBase):
             response_json_list_unsort = [
                 await response.json() for response in responses
             ]
+
+            # Decode role (mooncake): the encoder pushed a meta-only ZMQ frame
+            # synchronously inside /encode (response content is None), so there is
+            # nothing to bootstrap here -- no RDMA buffer, no /send handshake.
+            # _recv_mm_data assembles input_ids from the metadata frame alone.
+            if self.meta_only:
+                return
 
             # zmq backend: return is None
             if None in response_json_list_unsort:
@@ -1198,6 +1505,7 @@ class MMReceiverHTTP(MMReceiverBase):
                     session.post(
                         f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
+                        headers={"Request-Id": response_json["req_id"]},
                     )
                 )
                 offset += embedding_size_list_sort[idx]
@@ -1214,6 +1522,7 @@ class MMReceiverGrpc(MMReceiverBase):
         tp_rank: Optional[int] = None,
         tp_group: Optional[GroupCoordinator] = None,
         scheduler: Optional["Scheduler"] = None,
+        is_decode_role: bool = False,
     ):
         super().__init__(
             server_args,
@@ -1223,6 +1532,7 @@ class MMReceiverGrpc(MMReceiverBase):
             tp_rank=tp_rank,
             tp_group=tp_group,
             scheduler=scheduler,
+            is_decode_role=is_decode_role,
         )
 
     def build_and_send_encode_request(self, image_urls, rid):
@@ -1394,6 +1704,7 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
     transport_mode: Optional[str] = None,
+    is_decode_role: bool = False,
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
@@ -1413,4 +1724,5 @@ def create_mm_receiver(
         tp_rank=tp_rank,
         tp_group=tp_group,
         scheduler=scheduler,
+        is_decode_role=is_decode_role,
     )

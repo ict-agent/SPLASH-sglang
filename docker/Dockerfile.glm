@@ -1,5 +1,14 @@
 ARG BUSYBOX=busybox:1.37.0-musl
 ARG CUDA_BASE=nvcr.io/nvidia/cuda:13.0.2-base-ubuntu24.04
+# Global so both deepep-source (git checkout) and deepep-builder (build cache
+# id) see the same value, and so --build-arg DEEPEP_COMMIT overrides both.
+ARG DEEPEP_COMMIT=29d31c095796f3c8ece47ee9cdcc167051bbeed9
+# Global single source of truth for the apache-tvm-ffi version. Used both to
+# install it in the image AND to rewrite the pin baked into the locally-built
+# sgl_deep_gemm wheel, so sglang's apache-tvm-ffi==<ver> pin, sgl-deep-gemm's
+# declared dep, and the runtime install all agree (avoids the resolver
+# conflict that leaves sglang uninstalled). Override with --build-arg.
+ARG APACHE_TVM_FFI_VERSION=0.1.11
 
 
 FROM ${BUSYBOX} AS busybox
@@ -47,10 +56,12 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.10.0
 ARG VISION_VERSION=0.25.0
 ARG XFORMERS_VERSION=0.0.34
+ARG CODEC_VERSION=0.10.0
 COPY --link <<-EOF requirements.txt
 ${TORCH_INDEX}/torch-${TORCH_VERSION}%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
 ${TORCH_INDEX}/torchaudio-${TORCH_VERSION}%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
 ${TORCH_INDEX}/torchvision-${VISION_VERSION}%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
+${TORCH_INDEX}/torchcodec-${CODEC_VERSION}%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl
 ${TORCH_INDEX}/xformers-${XFORMERS_VERSION}-cp39-abi3-manylinux_2_28_x86_64.whl
 EOF
 
@@ -72,7 +83,7 @@ RUN \
     --mount=type=bind,target=/bin/sh,from=busybox,source=/bin/sh \
     --mount=type=bind,target=/bin/grep,from=busybox,source=/bin/grep \
     --mount=type=bind,target=sglang/pyproject.toml,source=python/pyproject.toml,readwrite=true \
-    grep -v "sglang-kernel" sglang/pyproject.toml > pyproject.toml
+    grep -vE "sglang-kernel|sgl-deep-gemm" sglang/pyproject.toml > pyproject.toml
 
 
 FROM scratch AS site-symlink
@@ -179,7 +190,7 @@ RUN \
 
 
 FROM scratch AS deepep-source
-ARG DEEPEP_COMMIT=29d31c095796f3c8ece47ee9cdcc167051bbeed9
+ARG DEEPEP_COMMIT
 ADD https://github.com/deepseek-ai/DeepEP.git#${DEEPEP_COMMIT} /
 
 
@@ -299,6 +310,7 @@ ENV PATH=${CUDA_HOME}/bin:$PATH
 
 
 FROM pytorch AS deepep-builder
+ARG DEEPEP_COMMIT
 
 RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
@@ -309,7 +321,7 @@ RUN \
 RUN \
     --mount=type=bind,target=deepep,from=deepep-source,readwrite=true \
     --mount=type=bind,target=deepep/timeout.patch,source=timeout.patch,from=deepep-patch \
-    --mount=type=cache,target=deepep/build,sharing=locked \
+    --mount=type=cache,target=deepep/build,sharing=locked,id=deepep-${DEEPEP_COMMIT} \
     --mount=type=cache,target=/root/.cache/sccache,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
     <<-EOF
@@ -374,12 +386,13 @@ EOF
 
 
 FROM pytorch AS deepgemm-builder
+ARG APACHE_TVM_FFI_VERSION
 
 RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
-    pip install build ninja apache-tvm-ffi==0.1.10
+    pip install build ninja apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}
 
 # Build the ``sgl-deep-gemm`` distribution (the one sglang pyproject pins as
 # ``sgl-deep-gemm==0.0.1``), NOT the legacy ``deep_gemm`` distribution. They
@@ -401,6 +414,7 @@ export TORCH_CUDA_ARCH_LIST="9.0;10.0+PTX"
 export TVM_FFI_CUDA_ARCH_LIST="9.0;10.0+PTX"
 cd deepgemm
 sed -i '/git submodule update/d' build_sgl_deep_gemm.sh
+grep -RIl --exclude-dir=third-party 'apache-tvm-ffi==' . | xargs -r sed -i "s/apache-tvm-ffi==[0-9.]*/apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}/g"
 bash build_sgl_deep_gemm.sh
 mkdir -p /dist
 cp dist/sgl_deep_gemm-*.whl /dist/
@@ -425,6 +439,7 @@ RUN \
 
 
 FROM pytorch AS base
+ARG APACHE_TVM_FFI_VERSION
 
 RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
@@ -445,7 +460,7 @@ RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
-    pip install tilelang==0.1.9 apache-tvm-ffi==0.1.10
+    pip install tilelang==0.1.9 apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}
 
 RUN \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
@@ -463,7 +478,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     libcurl4t64 \
-    curl htop
+    curl htop ffmpeg
 EOF
 
 RUN \
@@ -492,15 +507,15 @@ RUN \
     --mount=type=bind,target=/dist,source=/dist,from=sglang-builder \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     --mount=type=tmpfs,target=/tmp \
-    find /dist -name "*.whl" -exec pip install "sglang @ file://{}" \;
+    find /dist -name "*.whl" -exec pip install --no-deps "sglang @ file://{}" \;
 
-# Install our gitlab sgl-deep-gemm LAST so it overrides the PyPI
-# ``sgl-deep-gemm==0.0.1`` that sglang pulls in transitively (see
-# python/pyproject.toml). Local VERSION=0.1.0 doesn't satisfy the ==0.0.1
-# pin, so ``--force-reinstall`` is required. ``--no-deps`` keeps the
-# already-installed apache-tvm-ffi==0.1.10 (sgl_deep_gemm/pyproject.toml
-# pins ==0.1.9 which would otherwise downgrade and break the _C.so ABI
-# baked into the wheel at build time).
+# Install the GitLab-built sgl-deep-gemm wheel explicitly. The dependency
+# preinstall stage filters out the PyPI sgl-deep-gemm copy, and the sglang
+# wheel is installed with --no-deps above, so pip never resolves the PyPI
+# sgl-deep-gemm==0.1.0 (which pins apache-tvm-ffi==0.1.9) against sglang's
+# apache-tvm-ffi==${APACHE_TVM_FFI_VERSION} pin. The local wheel's tvm-ffi
+# pin was rewritten to the same version in deepgemm-builder, and its _C.so
+# is compiled against it. --force-reinstall --no-deps installs it as-is.
 RUN \
     --mount=type=bind,target=/root/.config/pip/pip.conf,source=pip.conf,from=pip-conf \
     --mount=type=bind,target=/dist,source=/dist,from=deepgemm-builder \

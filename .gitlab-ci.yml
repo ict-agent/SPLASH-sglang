@@ -47,6 +47,7 @@ build:inference-image:
       --opt build-arg:HTTP_PROXY=$CI_PROXY
       --opt build-arg:HTTPS_PROXY=$CI_PROXY
       --opt build-arg:CI_JOB_TOKEN=$CI_JOB_TOKEN
+      --opt no-cache-filter=deepep-source,deepep-builder
       --opt filename=docker/Dockerfile.glm
       --output type=image,name=$GLM_SGL_IMAGE:$IMAGE_TAG,oci-mediatypes=true,compression=zstd,push=true
       --output type=image,name=$GLM_PLATFORM_SGLANG_IMAGE:$IMAGE_TAG,oci-mediatypes=true,compression=zstd,push=true

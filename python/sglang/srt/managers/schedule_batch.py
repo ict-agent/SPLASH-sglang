@@ -292,8 +292,16 @@ class MultimodalDataItem:
         if self.hash is None:
             if self.feature is not None:
                 hashed_feature = self.feature
-            else:
+            elif self.precomputed_embeddings is not None:
                 hashed_feature = self.precomputed_embeddings
+            else:
+                # EPD decode-role item: metadata only, no feature and no embedding
+                # to hash (the LM runs in PREBUILT mode and never reads pad_value).
+                # Use a stable sentinel so set_pad_value() doesn't crash on
+                # hash_feature(None).
+                self.hash = 0
+                self.pad_value = _compute_pad_value(self.hash)
+                return
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
@@ -453,33 +461,36 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
+        staged_features = []
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
             # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
             # for faster hash computation, while avoiding OOM issues.
             from sglang.srt.managers.mm_utils import (
+                add_features_to_buffer_batched,
                 init_feature_buffer,
                 is_feature_buffer_initialized,
                 reset_buffer_offset,
-                try_add_to_buffer,
             )
 
             device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
-                if item.feature is not None:
-                    if isinstance(item.feature, torch.Tensor):
-                        item.feature = try_add_to_buffer(item.feature)
+            # Stage all features into a pinned host buffer, then flush to the GPU
+            # buffer in a single async DMA (instead of a per-item pageable H2D).
+            staged_features = add_features_to_buffer_batched(ret.mm_items)
 
         for item in ret.mm_items:
             item.set_pad_value()
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
-                if item.feature is not None:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
+            from sglang.srt.managers.mm_utils import restore_features_to_cpu
+
+            # Move features off the reused GPU buffer before the next request
+            # overwrites it. Staged features are cloned back from the pinned host
+            # buffer (CPU->CPU, no PCIe), avoiding a device->host transfer.
+            restore_features_to_cpu(ret.mm_items, staged_features)
 
         optional_args = [
             "mrope_positions",

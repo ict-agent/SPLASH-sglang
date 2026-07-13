@@ -29,6 +29,20 @@ from huggingface_hub import snapshot_download
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
+# Compat shim: transformers 5.x removed ``DefaultFastImageProcessorKwargs``
+# (kwargs base class is now ``ImagesKwargs``). Some remote model code
+# (e.g. GLM-4.6v's image_processing_glmv.py) still imports the old name.
+# Inject an alias so dynamic-module loading via AutoProcessor keeps working.
+try:
+    from transformers.image_processing_utils_fast import (  # noqa: F401
+        DefaultFastImageProcessorKwargs,
+    )
+except ImportError:
+    from transformers import image_processing_utils_fast as _ipuf_compat
+    from transformers.processing_utils import ImagesKwargs as _ImagesKwargs_compat
+
+    _ipuf_compat.DefaultFastImageProcessorKwargs = _ImagesKwargs_compat
+
 # Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
 # that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
 # (``flash_attn_func``, etc.).  HuggingFace remote model code (e.g. Kimi-VL)
@@ -74,6 +88,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     FalconH1Config,
     Glm5NextConfig,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -127,6 +142,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     KimiK25Config,
     Step3p5Config,
     Glm5NextConfig,
+    Glm5NextTextConfig,
 ]
 
 _CONFIG_REGISTRY = {

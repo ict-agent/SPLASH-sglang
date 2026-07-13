@@ -431,6 +431,17 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    # Per-video frame-sampling overrides (GLM-4V). None -> model default.
+    # `fps`: target frames sampled per second (matches qwen_vl naming).
+    # `max_frames`: cap on sampled frame count (matches qwen_vl naming).
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+
+class ChatCompletionMessageContentVideoFrameURL(BaseModel):
+    url: str
+    timestamp: str
+    detail: Optional[str] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -445,7 +456,8 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
-    video_url: ChatCompletionMessageContentVideoURL
+    video_url: Optional[ChatCompletionMessageContentVideoURL] = None
+    video_frame_url: Optional[List[ChatCompletionMessageContentVideoFrameURL]] = None
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):

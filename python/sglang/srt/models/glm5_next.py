@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.configs.glm5_next import Glm5NextConfig
+from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextVisionConfig
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -33,6 +33,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -90,6 +91,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -110,6 +116,8 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as Glm5NextMLAAttention
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoe
+from sglang.srt.models.glm4v import Glm4vVisionModel
+from sglang.srt.multimodal.glm_visual import GlmVisualEncoderMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -1259,19 +1267,50 @@ class Glm5NextModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm5NextForCausalLM(nn.Module):
+class Glm5NextForCausalLMBase(nn.Module):
+    """Shared weight loading and utilities for the Glm5Next model family.
+
+    Everything identical between the text-only ``Glm5NextForCausalLM`` and the
+    multimodal ``Glm5NextForConditionalGeneration`` lives here; each subclass
+    keeps only its own ``__init__`` and ``forward``. The multimodal-only branches
+    in ``load_weights`` / ``post_load_weights`` / ``load_from_megatron`` (prefix
+    stripping, vision padding, EPD encoder/language-only handling) are inert for
+    the text-only model, so they live here too.
+    """
+
     fall_back_to_pt_during_load = False
+
+    # Fused → unfused shards for is_layer_skipped (HF FP8 configs list only
+    # unfused names in modules_to_not_convert). Class-level so the loader
+    # captures the final mapping before quant_config is built. fused_qkv_a_proj_with_mqa
+    # is listed unconditionally: is_layer_skipped only matches against real layer
+    # names, so the extra key is inert when q_lora_rank is None.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+        "fused_bfg_a_proj": ["b_proj", "f_a_proj", "g_a_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     _STACKED_PARAMS_MAPPING = [
-        # Fused KDA "a" projections (used when do_fuse_qkvbfg=True).
-        # Listed first so .q_proj on a KDA layer routes to fused_qkvbfg_a_proj;
-        # the loader falls through to qkv_proj when the fused param is absent.
+        # Fused KDA "a" projections (do_fuse_qkvbfg=True); listed first so KDA .q_proj routes here, else falls through to qkv_proj.
         ("fused_qkvbfg_a_proj", "q_proj", 0),
         ("fused_qkvbfg_a_proj", "k_proj", 1),
         ("fused_qkvbfg_a_proj", "v_proj", 2),
         ("fused_qkvbfg_a_proj", "b_proj", 3),
         ("fused_qkvbfg_a_proj", "f_a_proj", 4),
         ("fused_qkvbfg_a_proj", "g_a_proj", 5),
-        # Fused KDA "b" projections (used when do_fuse_qkvbfg=True).
+        # Fused KDA "b" projections (do_fuse_qkvbfg=True).
         ("fused_fg_b_proj", "f_b_proj", 0),
         ("fused_fg_b_proj", "g_b_proj", 1),
         # Sub-fused KDA "a" projections (used under enable_glm_kda_qkvo_proj_tp_shard).
@@ -1291,25 +1330,6 @@ class Glm5NextForCausalLM(nn.Module):
         ("gate_up_proj", "up_proj", 1),
     ]
 
-    # Fused → unfused shards for is_layer_skipped (HF FP8 configs list only
-    # unfused names in modules_to_not_convert). Class-level so the loader
-    # captures the final mapping before quant_config is built.
-    packed_modules_mapping = {
-        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
-        "fused_qkvbfg_a_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "b_proj",
-            "f_a_proj",
-            "g_a_proj",
-        ],
-        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
-        "fused_bfg_a_proj": ["b_proj", "f_a_proj", "g_a_proj"],
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
     _NEXTN_SPEC_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
     _EAGLE_IGNORE_NAMES = ("eagle_draft_tokens_map", "eagle_lm_head.weight")
     _SHARED_EXPERTS_PATTERN = re.compile(
@@ -1317,98 +1337,8 @@ class Glm5NextForCausalLM(nn.Module):
     )
     _AWQ_LIKE_QUANT_METHOD = {"awq", "awq_marlin", "moe_wna16"}
 
-    def __init__(
-        self,
-        config: Glm5NextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-
-        self.fuse_qkv_a_proj = config.q_lora_rank is not None
-
-        self.pp_group = get_pp_group()
-        self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
-        self.use_nsa = is_deepseek_nsa(config)
-        self.model = Glm5NextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config)
-
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Glm5NextMoe)
-            }
-        )
-        self.capture_aux_hidden_states = False
-
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_cp_rank()
-            self.cp_size = get_attention_cp_size()
-        else:
-            self.cp_rank = self.cp_size = None
-
-        get_attn_tp_context().init_context(config.q_lora_rank, self.use_nsa, config.mhc)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    @property
-    def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
-        if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                )
-
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
-            )
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
-        else:
-            return hidden_states
 
     @property
     def start_layer(self):
@@ -1512,6 +1442,13 @@ class Glm5NextForCausalLM(nn.Module):
         weight_names = []
 
         for name, loaded_weight in weights:
+            # Multimodal checkpoints prefix language weights with "language_model."
+            # and vision weights with "model.visual."; normalize to canonical names.
+            # Inert for the text-only model whose weight names never match.
+            if "language_model." in name:
+                name = name.replace("language_model.", "")
+            if "model.visual." in name:
+                name = name.replace("model.visual.", "visual.")
             weight_names.append(name)
 
             if is_nextn or is_eagle:
@@ -1569,6 +1506,10 @@ class Glm5NextForCausalLM(nn.Module):
                 continue
 
             # ---- for other params ----
+            # Rename fused vision qkv (attn.qkv -> attn.qkv_proj) before the .bias skip, else qkv.bias is dropped.
+            if "visual" in name:
+                name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+
             if name.endswith(".bias") and name not in params_dict:
                 continue
             if is_eagle and name in self._EAGLE_IGNORE_NAMES:
@@ -1605,17 +1546,33 @@ class Glm5NextForCausalLM(nn.Module):
                 name = name.replace("_proj", "attn_mqa")
 
             if name not in params_dict:
-                logger.warning(f"Parameter {name} not found in params_dict")
+                # EPD encoder_only/language_only: silently skip weights for modules
+                # this rank doesn't build. Inert for the text-only model.
+                if not (
+                    getattr(config, "encoder_only", False)
+                    or getattr(config, "language_only", False)
+                ):
+                    logger.warning(f"Parameter {name} not found in params_dict")
                 continue
 
             param = params_dict[name]
             loader = getattr(param, "weight_loader", default_weight_loader)
+
+            # Vision weights need dummy-head padding; inert for the text-only model.
+            if "visual" in name:
+                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                    self.config, name, loaded_weight
+                )
+
             loader(param, loaded_weight)
 
         if getattr(config, "mla", False):
             self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
+        # encoder_only mode has no language model; nothing to post-process.
+        if self.model is None:
+            return
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
@@ -1639,14 +1596,6 @@ class Glm5NextForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.n_routed_experts,
-            num_groups=config.n_group,
-        )
-
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
@@ -1658,6 +1607,14 @@ class Glm5NextForCausalLM(nn.Module):
         else:
             self.capture_aux_hidden_states = True
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.n_routed_experts,
+            num_groups=config.n_group,
+        )
 
     def load_from_megatron(
         self,
@@ -1675,6 +1632,10 @@ class Glm5NextForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+        if getattr(self.config, "encoder_only", False):
+            # encoder_only: no language model, nothing more to post-process.
+            return
+
         if self.model.consumed_train_tokens is not None:
             self.consumed_train_tokens = self.model.consumed_train_tokens
         if self.model.consumed_train_samples is not None:
@@ -1685,4 +1646,226 @@ class Glm5NextForCausalLM(nn.Module):
             self.post_load_weights(is_nextn=False)
 
 
-EntryClass = [Glm5NextForCausalLM]
+class Glm5NextForCausalLM(Glm5NextForCausalLMBase):
+    def __init__(
+        self,
+        config: Glm5NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.fuse_qkv_a_proj = config.q_lora_rank is not None
+
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+        self.determine_num_fused_shared_experts()
+        self.use_nsa = is_deepseek_nsa(config)
+        self.model = Glm5NextModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
+        else:
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Glm5NextMoe)
+            }
+        )
+        self.capture_aux_hidden_states = False
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
+        else:
+            self.cp_rank = self.cp_size = None
+
+        get_attn_tp_context().init_context(config.q_lora_rank, self.use_nsa, config.mhc)
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = self.model(
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
+
+
+class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, Glm5NextForCausalLMBase):
+    def __init__(
+        self,
+        config: Glm5NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.fuse_qkv_a_proj = config.q_lora_rank is not None
+        self.use_nsa = is_deepseek_nsa(config)
+
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        vision_utils.update_vit_attn_dummy_heads_config(self.config, self.use_data_parallel)
+        self.quant_config = quant_config
+        self.num_fused_shared_experts = 0
+
+        # EPD: encoder_only builds only the vision tower; language_only gets
+        # vision weights from the encoder server.
+        self.config.encoder_only = getattr(config, "encoder_only", False)
+        self.config.language_only = getattr(config, "language_only", False)
+
+        vision_config = getattr(config, "vision_config", None)
+        if (
+            not self.config.language_only
+            and vision_config is not None
+            and isinstance(vision_config, Glm5NextVisionConfig)
+        ):
+            self.visual = Glm4vVisionModel(
+                vision_config,
+                text_config=getattr(config, "text_config", None),
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+        else:
+            # language_only mode, or no vision config: no vision tower.
+            self.visual = None
+
+        if not self.config.encoder_only:
+            self.determine_num_fused_shared_experts()
+
+            self.model = Glm5NextModel(
+                config, quant_config, prefix=add_prefix("model", prefix)
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        config.vocab_size,
+                        config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, no lm_head needed
+            self.model = None
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config)
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
+        else:
+            self.cp_rank = self.cp_size = None
+
+        get_attn_tp_context().init_context(config.q_lora_rank, self.use_nsa, config.mhc)
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        if self.nsa_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
+
+
+EntryClass = [Glm5NextForCausalLM, Glm5NextForConditionalGeneration]

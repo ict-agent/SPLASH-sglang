@@ -1896,6 +1896,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def glm5_next_config(self):
         config = self.model_config.hf_config
+        # Both text-only and vision-language checkpoints use Glm5NextConfig;
+        # the VLM form promotes the linear-attn / mamba fields to the top level
+        # so the same object answers the mambaish queries directly.
         if isinstance(config, Glm5NextConfig):
             return config
         return None

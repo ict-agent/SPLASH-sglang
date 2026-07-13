@@ -409,9 +409,12 @@ class Conversation:
         """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str):
-        """Append a new video."""
-        self.video_data.append(video)
+    def append_video(self, video: str, sampling: Optional[dict] = None):
+        """Append a new video, optionally with per-video sampling overrides."""
+        if sampling:
+            self.video_data.append({"url": video, **sampling})
+        else:
+            self.video_data.append(video)
 
     def append_audio(self, audio: str):
         """Append a new audio."""
@@ -661,7 +664,16 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        sampling = {
+                            k: getattr(content.video_url, k, None)
+                            for k in (
+                                "fps",
+                                "max_frames",
+                                "max_tokens_per_frame",
+                            )
+                            if getattr(content.video_url, k, None) is not None
+                        }
+                        conv.append_video(content.video_url.url, sampling)
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)

@@ -52,11 +52,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.glm_visual import GlmVisualEncoderMixin
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -129,6 +129,10 @@ class Glm4vVisionBlock(nn.Module):
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
         use_data_parallel: bool = False,
+        proj_bias: bool = False,
+        qk_normalization: bool = False,
+        qk_normalization_by_head_size: bool = False,
+        mlp_linear_bias: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
@@ -139,8 +143,17 @@ class Glm4vVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=False,
+            proj_bias=proj_bias,
             qkv_bias=attn_qkv_bias,
+            qk_normalization=qk_normalization,
+            qk_normalization_by_head_size=qk_normalization_by_head_size,
+            # GLM-4.7V uses qk_norm_by_head_size=True; both q_norm and k_norm
+            # are RMSNorm(head_size). They MUST use the same eps as norm1/norm2
+            # to match training's `--vit-layernorm-epsilon` exactly. The
+            # VisionAttention default is 1e-6 which silently disagrees with
+            # the model config's rms_norm_eps (1e-5 for GLM-4.7V), creating an
+            # LSB-level mismatch with megatron's q_layernorm/k_layernorm.
+            layer_norm_eps=rms_norm_eps,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -150,6 +163,7 @@ class Glm4vVisionBlock(nn.Module):
         self.mlp = Glm4vVisionMLP(
             dim,
             intermediate_dim,
+            bias=mlp_linear_bias,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
             use_data_parallel=use_data_parallel,
@@ -161,6 +175,7 @@ class Glm4vVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -174,6 +189,7 @@ class Glm4vVisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            max_seqlen=max_seqlen,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -182,7 +198,6 @@ class Glm4vVisionBlock(nn.Module):
         x_norm_2d, x_after_add_2d = self.norm2(x2d, residual=attn2d)
         x_norm = x_norm_2d.reshape(S, B, H)
         x_after_add = x_after_add_2d.reshape(S, B, H)
-
         # MLP and final residual
         mlp_out = self.mlp(x_norm)
         x = x_after_add + mlp_out
@@ -210,6 +225,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=True,
+            disable_linear=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -234,6 +250,7 @@ class Glm4vPatchMerger(nn.Module):
         bias: bool = False,
         prefix: str = "",
         use_data_parallel: bool = False,
+        layer_norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
@@ -246,7 +263,10 @@ class Glm4vPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
-        self.post_projection_norm = LayerNorm(self.hidden_size)
+        # Default LayerNorm eps in sglang is 1e-6 — must match training's
+        # `--vit-layernorm-epsilon` (1e-5 for GLM-4.7V) to align bf16 LSB
+        # with megatron's projector layer_norm.
+        self.post_projection_norm = LayerNorm(self.hidden_size, eps=layer_norm_eps)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,
@@ -375,6 +395,7 @@ class Glm4vVisionModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        text_config=None,
     ) -> None:
         super().__init__()
 
@@ -388,6 +409,7 @@ class Glm4vVisionModel(nn.Module):
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
+        self.intermediate_dim = vision_config.intermediate_size
         self.use_data_parallel = use_data_parallel
 
         self.patch_embed = Glm4vVisionPatchEmbed(
@@ -410,7 +432,7 @@ class Glm4vVisionModel(nn.Module):
             [
                 Glm4vVisionBlock(
                     dim=self.hidden_size,
-                    intermediate_dim=self.out_hidden_size,
+                    intermediate_dim=self.intermediate_dim,
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
@@ -418,25 +440,51 @@ class Glm4vVisionModel(nn.Module):
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
+                    proj_bias=getattr(vision_config, "proj_bias", False),
+                    qk_normalization=getattr(
+                        vision_config, "qk_normalization", False
+                    ),
+                    qk_normalization_by_head_size=getattr(
+                        vision_config, "qk_norm_by_head_size", False
+                    ),
+                    mlp_linear_bias=getattr(
+                        vision_config, "mlp_linear_bias", False
+                    ),
                 )
                 for layer_idx in range(depth)
             ]
         )
 
+        # GLM NOTE: merger context_dim must be the LLM's intermediate_size, not
+        # the vision_config's. Falls back to vision_config.intermediate_size for
+        # the legacy / text-config-less path.
+        merger_context_dim = getattr(vision_config, "projection_intermediate_size", None)
+        if merger_context_dim is None:
+            merger_context_dim = (
+                text_config.intermediate_size
+                if text_config is not None
+                else vision_config.intermediate_size
+            )
+
         self.merger = Glm4vPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=vision_config.intermediate_size,
+            context_dim=merger_context_dim,
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            layer_norm_eps=vision_config.rms_norm_eps,
         )
 
-        self.embeddings = Glm4vVisionEmbeddings(vision_config)
+        self.adapt_position = getattr(vision_config, "adapt_position", True)
+        if self.adapt_position:
+            self.embeddings = Glm4vVisionEmbeddings(vision_config)
 
-        self.post_conv_layernorm = Glm4vRMSNorm(
-            vision_config.hidden_size, eps=vision_config.rms_norm_eps
-        )
+        self.use_post_conv_ln = getattr(vision_config, "post_conv_ln", True)
+        if self.use_post_conv_ln:
+            self.post_conv_layernorm = Glm4vRMSNorm(
+                vision_config.hidden_size, eps=vision_config.rms_norm_eps
+            )
         self.downsample = nn.Conv2d(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
@@ -494,15 +542,16 @@ class Glm4vVisionModel(nn.Module):
         return cos_combined, sin_combined, pos_ids
 
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        x = self.post_conv_layernorm(x)
+        if self.use_post_conv_ln:
+            x = self.post_conv_layernorm(x)
 
         # compute position embedding
         rotary_pos_emb_cos, rotary_pos_emb_sin, image_type_ids = self.rot_pos_emb(
             grid_thw
         )
+
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -510,9 +559,10 @@ class Glm4vVisionModel(nn.Module):
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        x = self.embeddings(
-            x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
-        )
+        if self.adapt_position:
+            x = self.embeddings(
+                x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
+            )
 
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
@@ -524,12 +574,20 @@ class Glm4vVisionModel(nn.Module):
         # x.shape: (s, b, d) where b=1 for vision processing
         # transformers
         x = x.unsqueeze(1)
+
+        # max_seqlen is constant across all blocks. Derive it once here from the
+        # already-materialized `seqlens` CPU list (no extra device sync) and pass
+        # it down, so each block's attention skips its own
+        # `seq_lens.max().item()` DtoH readback (24 syncs/forward -> 0).
+        max_seqlen = max(seqlens)
+
         for blk in self.blocks:
             x = blk(
                 x,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
             )
 
         # adapter
@@ -542,7 +600,7 @@ class Glm4vVisionModel(nn.Module):
         return x
 
 
-class Glm4vForConditionalGeneration(nn.Module):
+class Glm4vForConditionalGeneration(GlmVisualEncoderMixin, nn.Module):
     def __init__(
         self,
         config: Glm4vConfig,
@@ -554,33 +612,48 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
-        vision_utils.update_vit_attn_dummy_heads_config(self.config)
-        self.visual = Glm4vVisionModel(
-            config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        vision_utils.update_vit_attn_dummy_heads_config(self.config, self.use_data_parallel)
 
-        self.model = Glm4Model(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("model", prefix),
-        )
+        # EPD: in encoder_only mode we only need the vision tower; in
+        # language_only mode the vision weights come from the encoder server.
+        self.config.encoder_only = getattr(config, "encoder_only", False)
+        self.config.language_only = getattr(config, "language_only", False)
 
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+        if not self.config.language_only:
+            self.visual = Glm4vVisionModel(
+                config.vision_config,
+                text_config=getattr(config, "text_config", None),
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
         else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+            self.visual = None
+
+        if not self.config.encoder_only:
+            self.model = Glm4Model(
+                config,
+                quant_config=quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # encoder_only mode: no language model, so no lm_head needed
+            self.model = None
+            self.lm_head = None
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -593,51 +666,6 @@ class Glm4vForConditionalGeneration(nn.Module):
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in GLM-V, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
-            )
-        else:
-            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        return image_embeds
-
-    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in GLM-V, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-
-        # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
-        temp_frames_hw = []
-        for t, h, w in video_grid_thw:
-            repeated_row = (
-                torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
-            )
-            temp_frames_hw.append(repeated_row)
-        flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
-
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual,
-                pixel_values,
-                flattened_video_grid_thw.tolist(),
-                rope_type="rope_3d",
-            )
-        else:
-            video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
-        return video_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -815,6 +843,27 @@ class Glm4vForConditionalGeneration(nn.Module):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def load_from_megatron(self, model_config):
+        import gc
+
+        from sglang.srt.utils.load_mgt import load_megatron_weights
+
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        load_megatron_weights(self, model_config.model_path, params_dict, ifmtp=False)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        if self.config.encoder_only:
+            # encoder_only: no language model, nothing more to post-process.
+            return
+
+        if self.model.consumed_train_tokens is not None:
+            self.consumed_train_tokens = self.model.consumed_train_tokens
+        if self.model.consumed_train_samples is not None:
+            self.consumed_train_samples = self.model.consumed_train_samples
 
 
 EntryClass = [Glm4vForConditionalGeneration]
