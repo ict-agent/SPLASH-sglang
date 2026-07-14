@@ -770,7 +770,12 @@ class ModelRunnerKVCacheMixin:
                             ),
                             nsa_index_kpool=self.model_config.nsa_index_kpool,
                             tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
-                            max_running_requests=self.max_running_requests,
+                            # Decode preallocation uses request slots beyond
+                            # max_running_requests. The dense kpool tail is
+                            # indexed by req_pool_idx, so it must cover every
+                            # allocatable request-pool row.
+                            max_running_requests=self.req_to_token_pool._alloc_size
+                            - 1,
                             layer_shard_rank=nsa_cp_layer_shard_rank,
                             layer_shard_size=nsa_cp_layer_shard_size,
                             mla_kv_prefetch_ring_size=self.server_args.mla_kv_prefetch_ring_size,
