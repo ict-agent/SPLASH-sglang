@@ -768,7 +768,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # NSA MTP index share: per-req seed topk_indices captured on prefill's
     # draft-extend (or decode's draft-extend-after-decode) for reuse as the
-    # first-step topk_indices in the next draft. Shape: (b, index_topk).
+    # first-step topk_indices in the next draft. Shape is (b, index_topk) for
+    # regular NSA and (b, index_topk + index_kpool - 1) for KPool.
     # Only populated when index_share_for_mtp_iteration is enabled.
     mtp_topk_indices: Optional[torch.Tensor] = None
 
@@ -787,8 +788,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
     num_accept_tokens: Optional[torch.Tensor] = None
-
-    use_sglang_create_extend_after_decode_spec_info = get_bool_env_var("SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO", default="true")
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -934,6 +933,10 @@ class EagleDraftExtendInput(SpecInput):
     the next iter's draft.
     """
 
+    use_sglang_create_extend_after_decode_spec_info = get_bool_env_var(
+        "SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO", default="true"
+    )
+
     # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
     # by accept_index; consumed by the draft-extend forward. None when the spec
     # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
@@ -1056,19 +1059,17 @@ class EagleDraftExtendInput(SpecInput):
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
         if self.use_sglang_create_extend_after_decode_spec_info:
             dcu_create_extend_after_decode_spec_info(
-                verified_id = batch.input_ids,
-                seq_lens = batch.seq_lens,
-                accept_lens = self.accept_length,
-                positions = self.positions,
-                new_verified_id = self.verified_id,
-                # bs = max(speculative_num_steps + 1, len(batch.seq_lens)),
-                bs =len(batch.seq_lens),
+                verified_id=batch.input_ids,
+                seq_lens=batch.seq_lens,
+                accept_lens=self.num_accept_tokens,
+                positions=self.positions,
+                new_verified_id=self.bonus_tokens,
+                bs=len(batch.seq_lens),
             )
         else:
-            self.bonus_tokens = torch.empty_like(self.num_accept_tokens, dtype=torch.int32)
             create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
                 batch.input_ids,
                 batch.seq_lens,

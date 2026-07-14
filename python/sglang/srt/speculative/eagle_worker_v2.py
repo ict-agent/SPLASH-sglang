@@ -849,7 +849,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
-            
+
+            # Deferred Mamba init ops are one-shot operations consumed by the
+            # target prefill. Do not let the draft prefill clear/COW the same
+            # shared Mamba slots again when this batch object is reused.
+            model_worker_batch.mamba_cow_src_indices = None
+            model_worker_batch.mamba_cow_dst_indices = None
+            model_worker_batch.mamba_clear_indices = None
+
             # Draft prefill
             draft_capture_mode = (
                 CaptureHiddenMode.NULL

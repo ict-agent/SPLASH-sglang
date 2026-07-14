@@ -1467,6 +1467,66 @@ class NixlKVManager(CommonKVManager):
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
 
+    def _send_slot_state(
+        self,
+        peer_name: str,
+        src_state_data_ptrs: list[int],
+        src_state_item_lens: list[int],
+        dst_state_data_ptrs: list[int],
+        src_indices: list[int],
+        dst_indices: list[int],
+        dst_gpu_id: int,
+        notif: str,
+    ):
+        """Transfer the live segments of one request-indexed KPool tail."""
+        if not src_indices and not dst_indices:
+            return 0
+        if not src_indices or not dst_indices:
+            logger.error(
+                f"NSA_TAIL slot index missing: src={src_indices}, dst={dst_indices}"
+            )
+            return -1
+        assert len(src_indices) == 6 and len(dst_indices) == 6, (
+            f"NSA_TAIL indices must be a 6-tuple; got src={src_indices}, "
+            f"dst={dst_indices}. PD nodes must run matching versions."
+        )
+
+        src_idx = int(src_indices[0])
+        dst_idx = int(dst_indices[0])
+        tail_size = int(src_indices[5])
+        assert tail_size == int(dst_indices[5])
+        src_addrs = []
+        dst_addrs = []
+        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+            row_bytes = src_state_item_lens[i]
+            assert row_bytes % tail_size == 0
+            slot_bytes = row_bytes // tail_size
+            src_row_base = src_state_data_ptrs[i] + row_bytes * src_idx
+            dst_row_base = dst_state_ptr + row_bytes * dst_idx
+            for segment in (1, 2):
+                count = int(src_indices[segment * 2])
+                if count == 0:
+                    continue
+                assert count == int(dst_indices[segment * 2])
+                src_offset = int(src_indices[segment * 2 - 1]) * slot_bytes
+                dst_offset = int(dst_indices[segment * 2 - 1]) * slot_bytes
+                length = count * slot_bytes
+                src_addrs.append(
+                    (src_row_base + src_offset, length, self.kv_args.gpu_id)
+                )
+                dst_addrs.append((dst_row_base + dst_offset, length, dst_gpu_id))
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not handle:
+            raise RuntimeError("Failed to create NSA-tail state transfer")
+        if self.agent.transfer(handle) == "ERR":
+            raise RuntimeError("Failed to post NSA-tail state transfer")
+        return handle
+
     def maybe_send_extra(
         self,
         peer_name: str,
@@ -1557,6 +1617,17 @@ class NixlKVManager(CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                )
+            elif st == StateType.NSA_TAIL:
+                h = self._send_slot_state(
+                    peer_name,
+                    src_ptrs,
+                    src_lens,
+                    dst_ptrs,
+                    src_indices,
+                    dst_indices,
+                    dst_gpu_id,
+                    comp_notif,
                 )
             else:
                 raise RuntimeError(

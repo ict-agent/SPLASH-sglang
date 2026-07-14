@@ -166,11 +166,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     index_cache_num_layers = max(
                         1, owned_layers_upper_bound + 1
                     )
-            kv_cache_dim = (
-                mr.calculate_mla_kv_cache_dim()
-                if is_nsa
-                else model_config.kv_lora_rank + model_config.qk_rope_head_dim
-            )
+            kv_cache_dim = mr.calculate_mla_kv_cache_dim()
             cell_size = kv_cache_dim * kv_cache_num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer

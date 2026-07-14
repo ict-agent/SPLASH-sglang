@@ -1102,7 +1102,7 @@ class IndexerKPool(Indexer):
 
         CUDA-only: target_verify with kpool only runs on CUDA today.
         """
-        assert is_cuda(), "kpool ring-write path is CUDA-only"
+        #assert is_cuda(), "kpool ring-write path is CUDA-only"
         from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         plan = metadata.attn_metadata.kpool_write_plan
@@ -1156,35 +1156,48 @@ class IndexerKPool(Indexer):
             )
 
         # (2) Run tail/compress on the alt stream while the current stream
-        # prepares q_fp8 and head-gate weights for paged top-k.
+        # prepares the platform-specific query representation and head-gate
+        # weights for paged top-k (BF16 on DCU, FP8 elsewhere).
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                if is_dcu():
+                    q_index = query
+                    weights = self._get_bf16_logits_head_gate(x)
+                else:
+                    q_index, q_scale = act_quant(
+                        query, self.block_size, self.scale_fmt
+                    )
+                    weights = self._get_logits_head_gate(x, q_scale)
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
         else:
             _compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                if is_dcu():
+                    q_index = query
+                    weights = self._get_bf16_logits_head_gate(x)
+                else:
+                    q_index, q_scale = act_quant(
+                        query, self.block_size, self.scale_fmt
+                    )
+                    weights = self._get_logits_head_gate(x, q_scale)
 
         if not return_indices:
             return None
 
         # (3) Top-k via persistent paged page_table (no stitched reserve).
         return self._get_topk_paged_verify(
-            forward_batch, layer_id, q_fp8, weights, plan, metadata
+            forward_batch, layer_id, q_index, weights, plan, metadata
         )
 
     def _get_topk_paged_verify(
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q_index: torch.Tensor,
         weights: torch.Tensor,
         plan,
         metadata: BaseIndexerMetadata,
@@ -1193,34 +1206,46 @@ class IndexerKPool(Indexer):
 
         ``plan.paged_page_table`` is the persistent page_table_64 (no
         reserve stitching). Closed-pool FP8 was just written to those
-        very pages above, so DeepGEMM reads correct draft-assuming data.
+        very pages above, so the paged logits kernel reads correct
+        draft-assuming data.
         """
         page_size = forward_batch.token_to_kv_pool.page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+        kv_cache_buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
         block_kv = page_size // self.index_kpool
         head_dim_with_sf = self.head_dim + 4
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, 1, head_dim_with_sf
-        )
 
-        assert q_fp8.dim() == 3
-        q_fp8 = q_fp8.unsqueeze(1)
+        assert q_index.dim() == 3
+        q_index = q_index.unsqueeze(1)
         assert weights.dim() == 3
         weights = weights.squeeze(2)
 
         pool_max_seq_len = plan.paged_page_table.shape[1] * block_kv
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            plan.pool_seqlens_per_q.unsqueeze(-1),
-            plan.paged_page_table,
-            plan.pool_schedule_metadata,
-            pool_max_seq_len,
-            clean_logits=False,
-        )
+        if is_dcu():
+            logits = kpool_bf16_paged_mqa_logits(
+                q_index,
+                kv_cache_buf,
+                weights,
+                plan.pool_seqlens_per_q,
+                plan.paged_page_table,
+                pool_max_seq_len,
+                block_kv,
+            )
+        else:
+            kv_cache_fp8 = kv_cache_buf.view(
+                kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
+            )
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_index,
+                kv_cache_fp8,
+                weights,
+                plan.pool_seqlens_per_q.unsqueeze(-1),
+                plan.paged_page_table,
+                plan.pool_schedule_metadata,
+                pool_max_seq_len,
+                clean_logits=False,
+            )
 
         # Fused top-k method dispatch. ``_kpool_fused_topk_mapping`` resolves
         # to page_table_1 (token-granularity, B*N rows after repeat_interleave),

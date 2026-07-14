@@ -153,7 +153,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
-        if not forward_batch.forward_mode.is_extend():
+        if not forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             return
         if (
             forward_batch.mamba_clear_indices is not None

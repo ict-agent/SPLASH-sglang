@@ -778,20 +778,32 @@ class Indexer(MultiPlatformOp):
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if self._use_dcu_bf16_index_cache(forward_batch):
             kv_cache = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id=layer_id)
-            # BF16 decode follows the vLLM ROCm pattern:
-            # keep the indexer K cache in paged BF16 layout and pass it directly
-            # to the paged kernel, instead of packing an fp8+scale buffer first.
-            logits = gemmopt.paged_mqa_logits(
-                q[:q_offset].unsqueeze(1),
-                kv_cache,
-                # The BF16 path expects dense per-head weights in fp32.
-                weights[:q_offset].to(torch.float32),
-                seqlens_32,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=True,
-            )
+            if envs.SGLANG_NSA_DCU_USE_TRITON_PAGED_MQA.get():
+                from sglang.srt.layers.attention.nsa.kpool.kernels import (
+                    bf16_paged_mqa_logits,
+                )
+
+                # Opt-in fallback for LightOp builds that reject this indexer
+                # head size. Keep the native paged BF16 cache layout.
+                logits = bf16_paged_mqa_logits(
+                    q[:q_offset].unsqueeze(1),
+                    kv_cache,
+                    weights[:q_offset].to(torch.float32),
+                    seqlens_32,
+                    block_tables,
+                    max_seq_len,
+                )
+            else:
+                logits = gemmopt.paged_mqa_logits(
+                    q[:q_offset].unsqueeze(1),
+                    kv_cache,
+                    weights[:q_offset].to(torch.float32),
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=True,
+                )
         else:
             kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id

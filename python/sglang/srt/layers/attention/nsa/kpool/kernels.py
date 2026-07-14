@@ -164,6 +164,133 @@ def kpool_bf16_paged_mqa_logits(
     return logits
 
 
+def bf16_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Triton fallback for the dense BF16 NSA index cache on DCU."""
+    assert q.ndim == 4 and q.shape[1] == 1
+    assert kv_cache.ndim == 4 and kv_cache.shape[2] == 1
+    assert q.shape[-1] == kv_cache.shape[-1]
+    assert weights.shape == (q.shape[0], q.shape[2])
+
+    q = q.squeeze(1).to(torch.bfloat16).contiguous()
+    kv_cache = kv_cache.contiguous()
+    weights = weights.to(torch.float32).contiguous()
+    seqlens = seqlens.reshape(-1).to(torch.int32).contiguous()
+    page_table = page_table.to(torch.int32).contiguous()
+    logits = torch.empty(
+        (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
+    )
+    if max_seq_len == 0 or q.shape[0] == 0:
+        return logits
+
+    page_size = kv_cache.shape[1]
+    head_dim = kv_cache.shape[-1]
+    _bf16_paged_mqa_logits_kernel[(q.shape[0], triton.cdiv(max_seq_len, 4))](
+        q,
+        kv_cache,
+        weights,
+        seqlens,
+        page_table,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(3),
+        weights.stride(0),
+        weights.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        max_seq_len,
+        NUM_HEADS=q.shape[1],
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        BLOCK_K=4,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_warps=4,
+    )
+    return logits
+
+
+@triton.jit
+def _bf16_paged_mqa_logits_kernel(
+    q_ptr,
+    kv_ptr,
+    weights_ptr,
+    seqlens_ptr,
+    page_table_ptr,
+    logits_ptr,
+    q_stride_0,
+    q_stride_1,
+    kv_stride_0,
+    kv_stride_1,
+    kv_stride_3,
+    weights_stride_0,
+    weights_stride_1,
+    page_table_stride_0,
+    page_table_stride_1,
+    logits_stride_0,
+    max_seq_len,
+    NUM_HEADS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    token_offsets = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    valid_output = token_offsets < max_seq_len
+    seqlen = tl.load(seqlens_ptr + batch_idx).to(tl.int32)
+    valid_token = valid_output & (token_offsets < seqlen)
+    logical_page = token_offsets // PAGE_SIZE
+    slot = token_offsets % PAGE_SIZE
+    physical_page = tl.load(
+        page_table_ptr
+        + batch_idx * page_table_stride_0
+        + logical_page * page_table_stride_1,
+        mask=valid_token,
+        other=0,
+    ).to(tl.int32)
+    physical_page = tl.maximum(physical_page, 0)
+
+    dims = tl.arange(0, BLOCK_D)
+    scores = tl.zeros([BLOCK_K], dtype=tl.float32)
+    for head_idx in tl.static_range(0, NUM_HEADS):
+        q = tl.load(
+            q_ptr + batch_idx * q_stride_0 + head_idx * q_stride_1 + dims,
+            mask=dims < HEAD_DIM,
+            other=0.0,
+        ).to(tl.bfloat16)
+        k_offsets = (
+            physical_page[:, None] * kv_stride_0
+            + slot[:, None] * kv_stride_1
+            + dims[None, :] * kv_stride_3
+        )
+        k = tl.load(
+            kv_ptr + k_offsets,
+            mask=valid_token[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        ).to(tl.bfloat16)
+        dot = tl.sum((k * q[None, :]).to(tl.float32), axis=1)
+        weight = tl.load(
+            weights_ptr + batch_idx * weights_stride_0 + head_idx * weights_stride_1
+        ).to(tl.float32)
+        scores += tl.maximum(dot, 0.0) * weight
+
+    tl.store(
+        logits_ptr + batch_idx * logits_stride_0 + token_offsets,
+        scores,
+        mask=valid_output,
+    )
+
+
 @triton.jit
 def _decode_e4m3fn(raw):
     """Decode raw E4M3FN bytes without Triton's FP8 load conversion.
@@ -259,11 +386,11 @@ def _kpool_bf16_paged_mqa_logits_kernel(
         )
         k = _decode_e4m3fn(raw_k)
         k = (k * scales[:, None]).to(tl.bfloat16)
-        # Match the BF16 MQA reference: round the elementwise product to BF16
-        # before accumulating it in FP32.
-        dot = tl.sum(
-            (k * q[None, :]).to(tl.bfloat16).to(tl.float32), axis=1
-        )
+        # Match _bf16_paged_mqa_logits_kernel (line 281): accumulate the
+        # BF16 elementwise product directly in FP32 without an extra
+        # bf16 round on (k*q), which would drop mantissa bits and
+        # systematically flatten the head-dim reduction.
+        dot = tl.sum((k * q[None, :]).to(tl.float32), axis=1)
         weight = tl.load(
             weights_ptr + batch_idx * weights_stride_0 + head_idx * weights_stride_1
         ).to(tl.float32)

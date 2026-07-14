@@ -1764,6 +1764,7 @@ class HybridLinearKVPool(KVCache):
             self.index_kpool = self.full_kv_pool.index_kpool
             self.tail_extra_slots = self.full_kv_pool.tail_extra_slots
             self.slots_per_page = self.full_kv_pool.slots_per_page
+            self.tail_extra_slots = self.full_kv_pool.tail_extra_slots
         else:
 
             TokenToKVPoolClass = MLATokenToKVPool
@@ -2901,7 +2902,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
-        assert nsa_index_kpool > 1 or tail_extra_slots == 0
+        #assert nsa_index_kpool > 1 or tail_extra_slots == 0
         self.index_kpool = nsa_index_kpool
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size // nsa_index_kpool

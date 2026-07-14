@@ -547,10 +547,18 @@ class NativeSparseAttnBackend(
                     forward_batch.seq_lens - self.speculative_num_draft_tokens
                 ).to(torch.int32)
                 spec_info = forward_batch.spec_info
+                # Reference project reads `spec_info.accept_length` which in
+                # v2 already includes the bonus token. This project renamed it
+                # per speculative-naming.md Rule 3: `num_accept_tokens` is the
+                # bonus-inclusive count (= reference's accept_length in v2).
+                # Missing this rename left accept_length=None every step, so
+                # `plan.effective_n_per_batch` stayed at 0 and the fused
+                # write-then-compress kernel never crossed a pool boundary,
+                # leaving v2's compressed K out of the FP8 cache entirely.
                 accept_length = (
-                    spec_info.accept_length
+                    spec_info.num_accept_tokens
                     if spec_info is not None
-                    and getattr(spec_info, "accept_length", None) is not None
+                    and getattr(spec_info, "num_accept_tokens", None) is not None
                     else None
                 )
             return _init_kpool_write_plan_impl(
@@ -1386,9 +1394,15 @@ class NativeSparseAttnBackend(
                     write_start = write_start - 1
                 elif is_v2:
                     write_start = write_start - self.speculative_num_draft_tokens
+                # See nsa_backend.py:548 note: reference reads
+                # `spec_info.accept_length` (bonus-inclusive in v2); this
+                # project renamed it to `num_accept_tokens`. Without this
+                # rename, replay leaves effective_n_per_batch at 0 and the
+                # fused write-then-compress kernel never crosses a pool
+                # boundary under CUDA graph.
                 accept_length = (
-                    spec_info.accept_length[:bs]
-                    if is_v2 and spec_info is not None and getattr(spec_info, "accept_length", None) is not None
+                    spec_info.num_accept_tokens[:bs]
+                    if is_v2 and spec_info is not None and getattr(spec_info, "num_accept_tokens", None) is not None
                     else None
                 )
                 _update_kpool_write_plan_impl(
@@ -1615,7 +1629,45 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 pass
 
+        # The fused metadata-copy kernels only copy the ordinary NSA fields.
+        # Pooled MQA metadata and the KPool write plan are backend-local graph
+        # buffers and must be refreshed from the runtime sequence lengths.
+        self._update_pooled_paged_mqa_metadata(
+            metadata=metadata,
+            seqlens_32=metadata.cache_seqlens_int32,
+            forward_mode=forward_mode,
+        )
+        self._update_kpool_write_plan_from_precomputed(
+            metadata=metadata,
+            precomputed=precomputed,
+        )
         self.forward_metadata = metadata
+
+    def _update_kpool_write_plan_from_precomputed(
+        self,
+        *,
+        metadata: NSAMetadata,
+        precomputed: PrecomputedMetadata,
+    ) -> None:
+        """Refresh the backend-local decode write plan on fast MTP replay."""
+        if not (
+            self.nsa_index_kpool > 1 and precomputed.req_pool_indices is not None
+        ):
+            return
+
+        bs = precomputed.req_pool_indices.shape[0]
+        write_start = (precomputed.cache_seqlens[:bs] - 1).to(torch.int32)
+        _update_kpool_write_plan_impl(
+            metadata,
+            write_start=write_start,
+            req_pool_indices=precomputed.req_pool_indices,
+            real_page_table=metadata.real_page_table,
+            pool_size=self.nsa_index_kpool,
+            real_page_size=self.real_page_size,
+            num_draft_tokens=1,
+            forward_mode=ForwardMode.DECODE,
+            accept_length=None,
+        )
 
     def forward_extend(
         self,
@@ -2948,6 +3000,23 @@ class NativeSparseAttnMultiStepBackend:
                         precomputed.max_len,
                         precomputed.seqlens_expanded_size,
                     )
+
+                    # The multi-copy kernel only handles dense NSA fields.
+                    # Refresh backend-local KPool state for the three fused
+                    # destinations just like the single-backend replay path.
+                    for i in range(3):
+                        backend = self.attn_backends[i]
+                        backend_metadata = backend.decode_cuda_graph_metadata[bs]
+                        backend._update_pooled_paged_mqa_metadata(
+                            metadata=backend_metadata,
+                            seqlens_32=backend_metadata.cache_seqlens_int32,
+                            forward_mode=ForwardMode.DECODE,
+                        )
+                        backend._update_kpool_write_plan_from_precomputed(
+                            metadata=backend_metadata,
+                            precomputed=precomputed,
+                        )
+                        backend.forward_metadata = backend_metadata
 
                     # Copy remaining backends one by one (if > 3 backends)
                     for i in range(3, self.speculative_num_steps - 1):

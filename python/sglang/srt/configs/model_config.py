@@ -165,7 +165,7 @@ def is_mtp_index_share_enabled(hf_config) -> bool:
 def get_mtp_index_share_topk(hf_config) -> int:
     if not is_mtp_index_share_enabled(hf_config):
         return 0
-    return get_nsa_index_topk(hf_config)
+    return get_nsa_index_topk(hf_config) + get_nsa_index_kpool(hf_config) - 1
 
 
 class ModelConfig:

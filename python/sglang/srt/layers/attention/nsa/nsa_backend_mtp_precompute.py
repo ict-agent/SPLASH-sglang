@@ -49,6 +49,11 @@ class PrecomputedMetadata:
     # FlashMLA (optional)
     flashmla_metadata: Optional[torch.Tensor] = None
 
+    # KPool write plans are backend-local CUDA-graph buffers.  Keep the
+    # shared input so every backend can rebuild its own plan after metadata
+    # has been copied from this precomputed object.
+    req_pool_indices: Optional[torch.Tensor] = None
+
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     """Compute cumulative sequence lengths with padding."""
@@ -131,7 +136,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(
-            cache_seqlens, nsa_index_topk=self.nsa_index_topk
+            cache_seqlens,
+            nsa_index_topk=self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
@@ -165,6 +172,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=max_len,
             max_seqlen_k=max_len,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )
 
     def _precompute_target_verify_mode(
@@ -212,7 +220,11 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        nsa_cache_seqlens = compute_nsa_seqlens(
+            seqlens_expanded,
+            self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
+        )
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum
@@ -244,6 +256,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )
 
     def _precompute_draft_extend_mode(
@@ -290,7 +303,11 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        nsa_cache_seqlens = compute_nsa_seqlens(
+            seqlens_expanded,
+            self.nsa_index_topk,
+            index_kpool=self.nsa_index_kpool,
+        )
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum
@@ -322,4 +339,5 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             max_len=max_seqlen_k,
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
+            req_pool_indices=req_pool_indices,
         )

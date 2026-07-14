@@ -39,7 +39,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_dcu
 
 # Forward-persistent ragged compress scratch (uint8 K + fp32 scale). Lazy-grown
 # to the largest seen ``total_k_rows`` and sliced per forward, so prefill no
@@ -983,7 +983,9 @@ def update_kpool_write_plan(
     the full N drafts (safe because rejected draft K in the tail ring gets
     overwritten by the next round's V2 write before any reader needs it).
     """
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not (
+        is_cuda() or is_dcu()
+    ):
         return
     is_verify = forward_mode.is_target_verify()
     is_decode = forward_mode.is_decode_or_idle()
