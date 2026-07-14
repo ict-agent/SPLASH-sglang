@@ -265,7 +265,12 @@ class SchedulerDPAttnMixin:
             need_sync: If specified, overrides self.require_mlp_sync for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.require_mlp_sync:
-            batch = self.prepare_mlp_sync_batch(batch)
+            if batch is not None and batch.is_spec_v2_full_overlap:
+                with self.mlp_sync_stream_ctx:
+                    batch = self.prepare_mlp_sync_batch(batch)
+                self.schedule_stream.wait_stream(self.mlp_sync_stream)
+            else:
+                batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
     def get_idle_batch(self: Scheduler) -> ScheduleBatch:

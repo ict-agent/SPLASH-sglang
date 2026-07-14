@@ -69,16 +69,27 @@ class ScheduleBatchDisaggregationDecodeMixin:
         extend_input_logprob_token_ids = None
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
+        pin_memory = torch.device(self.device).type == "cuda"
+        input_ids_cpu = torch.tensor(
+            sum(input_ids, []), dtype=torch.int32, pin_memory=pin_memory
         )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+        req_pool_indices_cpu = torch.tensor(
+            req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
+        seq_lens_cpu = torch.tensor(
+            seq_lens, dtype=torch.int64, pin_memory=pin_memory
+        )
+        orig_seq_lens_cpu = torch.tensor(
+            seq_lens, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.input_ids = input_ids_cpu.to(device=self.device, non_blocking=True)
+        self.req_pool_indices = req_pool_indices_cpu.to(
+            device=self.device, non_blocking=True
+        )
+        self.seq_lens = seq_lens_cpu.to(device=self.device, non_blocking=True)
+        self.seq_lens_cpu = seq_lens_cpu
+        self.orig_seq_lens = orig_seq_lens_cpu.to(
+            device=self.device, non_blocking=True
         )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
@@ -129,7 +140,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        pin_memory = torch.device(self.device).type == "cuda"
+        output_ids_cpu = torch.tensor(self.output_ids, pin_memory=pin_memory)
+        self.output_ids = output_ids_cpu.to(device=self.device, non_blocking=True)
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -140,27 +153,42 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 [
                     torch.as_tensor(
                         req.output_topk_p[:num_states],
-                        device=self.device,
                         dtype=torch.float32,
                     )
                     for req in self.reqs
                 ],
                 dim=0,
             )
+            if topk_p.device.type == "cpu" and pin_memory and not topk_p.is_pinned():
+                topk_p = topk_p.pin_memory()
+            topk_p = topk_p.to(device=self.device, non_blocking=True)
             topk_index = torch.stack(
                 [
                     torch.as_tensor(
                         req.output_topk_index[:num_states],
-                        device=self.device,
                         dtype=torch.int64,
                     )
                     for req in self.reqs
                 ],
                 dim=0,
             )
+            if (
+                topk_index.device.type == "cpu"
+                and pin_memory
+                and not topk_index.is_pinned()
+            ):
+                topk_index = topk_index.pin_memory()
+            topk_index = topk_index.to(device=self.device, non_blocking=True)
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
-            hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
+            hidden_states = torch.stack(hidden_states_list, dim=0)
+            if (
+                hidden_states.device.type == "cpu"
+                and pin_memory
+                and not hidden_states.is_pinned()
+            ):
+                hidden_states = hidden_states.pin_memory()
+            hidden_states = hidden_states.to(device=self.device, non_blocking=True)
 
             # GLM NOTE: NSA index_share_for_mtp_iteration: rebuild per-request seed
             # indices from prefill. We require ALL reqs in the batch to have
@@ -173,8 +201,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 for req in self.reqs
             ]
             if mtp_indices_list and all(t is not None for t in mtp_indices_list):
-                mtp_topk_indices = torch.stack(mtp_indices_list, dim=0).to(
-                    self.device
+                mtp_topk_indices = torch.stack(mtp_indices_list, dim=0)
+                if (
+                    mtp_topk_indices.device.type == "cpu"
+                    and pin_memory
+                    and not mtp_topk_indices.is_pinned()
+                ):
+                    mtp_topk_indices = mtp_topk_indices.pin_memory()
+                mtp_topk_indices = mtp_topk_indices.to(
+                    device=self.device, non_blocking=True
                 )
 
             # local import to avoid circular import

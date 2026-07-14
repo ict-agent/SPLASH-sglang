@@ -1,6 +1,6 @@
 import logging
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -69,21 +69,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     topk: int
     draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
-    seq_lens_sum: int
-    seq_lens_cpu: torch.Tensor
+    seq_lens_sum: Optional[int]
+    seq_lens_cpu: Optional[torch.Tensor]
     grammar: BaseGrammarObject = None
+    is_spec_v2_full_overlap: bool = False
+    # CPU-side max kv_allocated_len, avoids GPU to CPU sync for page table slicing.
+    max_kv_len: Optional[int] = None
+    spec_info: InitVar[Optional[SpecInput]] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1
+    raw_bs: Optional[int] = None
 
-    def __post_init__(self):
+    def __post_init__(self, spec_info: Optional[SpecInput]):
         super().__init__(SpecInputType.EAGLE_VERIFY)
+        if spec_info is not None:
+            self.is_spec_v2_full_overlap = spec_info.is_spec_v2_full_overlap
+            self.max_kv_len = spec_info.max_kv_len
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(
+        cls,
+        topk: int,
+        spec_steps: int,
+        num_verify_tokens: int,
+        spec_info: Optional[SpecInput] = None,
+    ):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
             custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
@@ -104,6 +118,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=0,
             seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+            spec_info=spec_info,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
@@ -670,6 +685,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # Shape info for padding
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
+    raw_bs: Optional[int] = None
 
     # Inputs for draft extend
     # shape: (b,)
@@ -681,6 +697,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
+    # CPU-side KV allocation bound, used to avoid replay-time GPU->CPU sync.
+    max_kv_len: Optional[int] = None
+    # CPU-side KV length sum bound, used to avoid tree-mask allocation sync.
+    sum_kv_len: Optional[int] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -791,6 +811,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.future_indices.mtp_topk_indices is not None:
+                self.future_indices.mtp_topk_indices = (
+                    self.future_indices.mtp_topk_indices[new_indices]
+                )
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -822,10 +846,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            mtp_topk_indices = None
+            if (
+                self.future_indices.mtp_topk_indices is not None
+                and spec_info.future_indices.mtp_topk_indices is not None
+            ):
+                mtp_topk_indices = torch.cat(
+                    [
+                        self.future_indices.mtp_topk_indices,
+                        spec_info.future_indices.mtp_topk_indices,
+                    ],
+                    axis=0,
+                )
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+                ),
+                mtp_topk_indices_available=mtp_topk_indices is not None,
+                mtp_topk_indices=mtp_topk_indices,
             )
             return
 
@@ -844,12 +882,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        if self.mtp_topk_indices is None:
-            self.mtp_topk_indices = spec_info.mtp_topk_indices
-        elif spec_info.mtp_topk_indices is not None:
+        if self.mtp_topk_indices is not None and spec_info.mtp_topk_indices is not None:
             self.mtp_topk_indices = torch.cat(
-                [self.mtp_topk_indices, spec_info.mtp_topk_indices]
+                [self.mtp_topk_indices, spec_info.mtp_topk_indices], axis=0
             )
+        else:
+            self.mtp_topk_indices = None
 
 
 @dataclass

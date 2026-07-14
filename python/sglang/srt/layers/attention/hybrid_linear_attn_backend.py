@@ -497,7 +497,7 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
@@ -532,37 +532,51 @@ class MambaAttnBackendBase(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        raw_bs = getattr(spec_info, "raw_bs", None) if spec_info is not None else None
+        if raw_bs is None:
+            if seq_lens_cpu is not None:
+                num_padding = int(
+                    torch.count_nonzero(
+                        seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                    ).item()
+                )
+            else:
+                num_padding = 0
+            raw_bs = bs - num_padding
+        assert 0 <= raw_bs <= bs
+
         # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
+        req_pool_indices[raw_bs:] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = -1
+        mamba_indices[raw_bs:] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
-            if num_padding == 0:
+            if raw_bs == bs:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][:raw_bs].copy_(
+                    self.cached_cuda_graph_decode_query_start_loc[:raw_bs]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    bs - num_padding
-                )
-        elif forward_mode.is_target_verify():
-            if num_padding == 0:
+                self.query_start_loc_list[bs - 1][raw_bs:].fill_(raw_bs)
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            if raw_bs == bs:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                assert spec_info is not None
+                if forward_mode.is_target_verify():
+                    graph_tokens_per_req = spec_info.draft_token_num
+                else:
+                    graph_tokens_per_req = spec_info.num_tokens_per_req
+                assert graph_tokens_per_req > 0
+                self.query_start_loc_list[bs - 1][:raw_bs].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[:raw_bs]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
+                self.query_start_loc_list[bs - 1][raw_bs:].fill_(
+                    raw_bs * graph_tokens_per_req
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -686,11 +700,19 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        if forward_mode.is_target_verify():
+            assert spec_info is not None
+            draft_token_num = spec_info.draft_token_num
+        elif forward_mode.is_draft_extend_v2():
+            draft_token_num = num_tokens // bs
+        else:
+            draft_token_num = 1
+        assert draft_token_num > 0
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata,
             seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
+            is_target_verify=forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2(),
             draft_token_num=draft_token_num,
         )
 
@@ -708,11 +730,20 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        if forward_mode.is_target_verify():
+            assert spec_info is not None
+            draft_token_num = spec_info.draft_token_num
+        elif forward_mode.is_draft_extend_v2():
+            assert spec_info is not None
+            draft_token_num = spec_info.num_tokens_per_req
+        else:
+            draft_token_num = 1
+        assert draft_token_num > 0
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata,
             seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
+            is_target_verify=forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2(),
             draft_token_num=draft_token_num,
         )
 
@@ -833,7 +864,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
+        seq_lens_sum: Optional[int],
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
@@ -850,6 +881,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info,
                 seq_lens_cpu,
             )
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        try:
+            self.full_attn_backend.update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs
+            )
+        except NotImplementedError:
+            pass
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()

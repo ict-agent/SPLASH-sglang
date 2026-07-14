@@ -1036,6 +1036,7 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
+            model_config = self.model_config
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
@@ -1177,6 +1178,10 @@ class Scheduler(
         self.copy_stream: CudaStream = self.device_module.Stream()
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
+        )
+        self.mlp_sync_stream: CudaStream = self.device_module.Stream()
+        self.mlp_sync_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.mlp_sync_stream
         )
 
         if not self.enable_overlap:
@@ -1393,6 +1398,7 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        self.full_overlap_pending_release_reqs: List[Req] = []
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1465,12 +1471,13 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # Naive specv2 do not support overlap + spec + grammar yet,
+        # so overlap should be turn offed for this batch.
+        # But full overlap specv2 supports overlap + spec + grammar.
         need_grammar_sync = (
             batch
             and batch.is_spec_v2
+            and not batch.is_spec_v2_full_overlap
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
@@ -2850,6 +2857,12 @@ class Scheduler(
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
+                if (
+                    batch.is_spec_v2_full_overlap
+                    and batch.has_grammar
+                    and self.result_queue
+                ):
+                    raise ValueError("spec v2 full overlap with grammar is not supported now ")
 
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)

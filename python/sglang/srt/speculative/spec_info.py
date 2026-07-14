@@ -116,6 +116,8 @@ class SpecInputType(IntEnum):
 class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
+        self.is_spec_v2_full_overlap = False
+        self.max_kv_len = None
 
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
@@ -141,3 +143,16 @@ class SpecInput(ABC):
             x * c2 for x in forward_batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+
+def get_spec_v2_full_overlap_max_kv_len(
+    spec_info: Optional[SpecInput],
+) -> Optional[int]:
+    if spec_info is None or not spec_info.is_spec_v2_full_overlap:
+        return None
+    if spec_info.max_kv_len is None:
+        raise RuntimeError(
+            "SpecV2 full-overlap requires spec_info.max_kv_len for "
+            "backend metadata initialization."
+        )
+    return spec_info.max_kv_len

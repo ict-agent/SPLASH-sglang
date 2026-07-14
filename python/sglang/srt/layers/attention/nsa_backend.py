@@ -64,6 +64,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.spec_info import get_spec_v2_full_overlap_max_kv_len
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -358,7 +359,9 @@ class NativeSparseAttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
-        self.forward_metadata: NSAMetadata
+        # None until init_forward_metadata runs; idle forwards (e.g. DP-attention
+        # pad ranks in spec-v2 draft) may reach the indexer before any init.
+        self.forward_metadata: Optional[NSAMetadata] = None
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
@@ -641,7 +644,7 @@ class NativeSparseAttnBackend(
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True),
                 cache_seqlens_int32,
                 self.speculative_num_draft_tokens * batch_size,
                 self.speculative_num_draft_tokens,
@@ -843,7 +846,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -853,7 +856,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
+                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
@@ -1088,9 +1091,16 @@ class NativeSparseAttnBackend(
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
             include_v2=True
         ):
-            cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
+            is_v2 = forward_mode.is_draft_extend_v2()
+            if is_v2:
+                # V2 pre-fills all draft KV before this forward, so seq_lens is
+                # already the cache length. Target verify still receives the
+                # committed length and must add the fixed draft window here.
+                cache_seqlens_int32 = seq_lens.to(torch.int32)
+            else:
+                cache_seqlens_int32 = (
+                    seq_lens + self.speculative_num_draft_tokens
+                ).to(torch.int32)
             cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
             max_seqlen_q = 1
             page_table_1 = self.decode_cuda_graph_metadata["page_table"][
@@ -1108,10 +1118,7 @@ class NativeSparseAttnBackend(
 
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens.tolist()
-            ]
+            seqlens_int32_cpu = cache_seqlens_int32.tolist()
             seqlens_expanded = torch.cat(
                 [
                     torch.arange(
@@ -1156,7 +1163,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -1165,7 +1172,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
@@ -1250,28 +1257,40 @@ class NativeSparseAttnBackend(
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
+        seq_lens_sum: Optional[int],
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
-        assert seq_lens_cpu is not None
+        """Initialize forward metadata for replaying CUDA graph.
+
+        seq_lens_cpu may be None in SpecV2 full-overlap replay. NSA only needs
+        it for page-table bounds, so use scheduler-side KV allocation metadata
+        or the captured table width instead of synchronizing seq_lens.
+        """
 
         self.set_nsa_prefill_impl(forward_batch=None)
 
-        seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
-        req_pool_indices = req_pool_indices[:bs]
-
-        # Normal Decode
         metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
+        seq_lens = seq_lens[:bs]
+        max_kv_len = get_spec_v2_full_overlap_max_kv_len(spec_info)
+        if max_kv_len is not None:
+            pt_width = metadata.page_table_1.shape[1]
+            max_kv_len = min(max_kv_len, pt_width)
+        else:
+            assert seq_lens_cpu is not None
+            seq_lens_cpu = seq_lens_cpu[:bs]
+            max_kv_len = int(seq_lens_cpu.max().item())
+            if forward_mode.is_target_verify():
+                max_kv_len += self.speculative_num_draft_tokens
+        req_pool_indices = req_pool_indices[:bs]
         page_tables_already_updated = False
+
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = int(seq_lens_cpu.max().item())
+            max_len = max_kv_len
 
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1317,14 +1336,12 @@ class NativeSparseAttnBackend(
             is_v2 = forward_mode.is_draft_extend_v2()
             if is_v2:
                 cache_seqlens = seq_lens.to(torch.int32)
-                max_seqlen_k = int(seq_lens_cpu.max().item())
+                max_seqlen_k = max_kv_len
             else:
                 cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                     torch.int32
                 )
-                max_seqlen_k = int(
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-                )
+                max_seqlen_k = max_kv_len
 
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
@@ -1335,12 +1352,14 @@ class NativeSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
+                extend_seq_lens,
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
@@ -1353,7 +1372,7 @@ class NativeSparseAttnBackend(
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend():
-            max_seqlen_k = int(seq_lens_cpu.max().item())
+            max_seqlen_k = max_kv_len
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
@@ -1393,7 +1412,7 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -1402,7 +1421,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else metadata.cache_seqlens_int32
                 )
@@ -2635,7 +2654,12 @@ class NativeSparseAttnBackend(
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
-    ) -> NSAIndexerMetadata:
+    ) -> Optional[NSAIndexerMetadata]:
+        if self.forward_metadata is None:
+            # No metadata (idle forward on a backend that never ran
+            # init_forward_metadata, or explicitly dropped by forward_idle).
+            # None tells the indexer to skip this batch.
+            return None
         force_unfused = (
             forward_batch.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()

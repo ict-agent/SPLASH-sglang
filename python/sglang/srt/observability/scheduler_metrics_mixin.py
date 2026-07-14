@@ -297,7 +297,10 @@ class SchedulerMetricsMixin:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        total_context = float(batch.seq_lens_cpu.sum().item())
+        if batch.is_spec_v2_full_overlap:
+            total_context = float(sum(req.seqlen for req in batch.reqs) - tokens)
+        else:
+            total_context = float(batch.seq_lens_cpu.sum().item())
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * total_context
@@ -726,7 +729,10 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            if batch.is_spec_v2_full_overlap:
+                self.stats.decode_sum_seq_lens = sum(req.seqlen for req in batch.reqs)
+            else:
+                self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled

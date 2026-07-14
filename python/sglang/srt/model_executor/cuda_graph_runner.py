@@ -352,6 +352,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+        else:
+            self.seq_lens_cpu.fill_(seq_len_fill_value)
+            self.seq_lens_cpu[:raw_bs].zero_()
 
 
 # Detect whether the current forward pass is in capture mode
@@ -1119,15 +1122,23 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if forward_batch.spec_info is not None and forward_batch.spec_info.is_spec_v2_full_overlap:
+            seq_lens_cpu = None
+        else:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+            seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+        if forward_batch.spec_info is not None:
+            forward_batch.spec_info.raw_bs = raw_bs
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_sum,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            seq_lens_cpu=seq_lens_cpu,
         )
 
         # Store fields

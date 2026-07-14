@@ -1947,7 +1947,11 @@ class ServerArgs:
                 logger.info(
                     "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
                 )
-                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if envs.SGLANG_SPEC_V2_FULL_OVERLAP.get():
+                    raise ValueError(
+                        "Spec v2 Full Overlap is not supported for MiMoV2FlashForCausalLM."
+                    )
+                elif not envs.SGLANG_ENABLE_SPEC_V2.get():
                     envs.SGLANG_ENABLE_SPEC_V2.set(True)
                     logger.warning(
                         "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
@@ -1968,7 +1972,11 @@ class ServerArgs:
                 logger.info(
                     "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
                 )
-                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                if envs.SGLANG_SPEC_V2_FULL_OVERLAP.get():
+                    raise ValueError(
+                        "Spec v2 Full Overlap is not supported for Step3p5ForCausalLM."
+                    )
+                elif not envs.SGLANG_ENABLE_SPEC_V2.get():
                     envs.SGLANG_ENABLE_SPEC_V2.set(True)
                     logger.warning(
                         "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
@@ -3218,9 +3226,27 @@ class ServerArgs:
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
-                logger.warning(
-                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
-                )
+                if envs.SGLANG_SPEC_V2_FULL_OVERLAP.get():
+                    if self.disaggregation_mode == "prefill":
+                        raise ValueError(
+                            "Spec v2 Full Overlap is not supported on a disaggregated prefill server."
+                        )
+                    if self.enable_multi_layer_eagle:
+                        raise ValueError(
+                            "Spec v2 Full Overlap is not supported with multi-layer EAGLE."
+                        )
+                    if self.attention_backend != "nsa":
+                        raise ValueError(
+                            "Spec v2 Full Overlap is only supported with --attention-backend nsa, "
+                            f"but got attention_backend={self.attention_backend!r}."
+                        )
+                    logger.warning(
+                        "Spec v2 Full Overlap is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
+                    )
+                else:
+                    logger.warning(
+                        "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
+                    )
                 if (
                     self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1
@@ -3229,6 +3255,11 @@ class ServerArgs:
                         "Spec v2 currently only supports topk = 1 for speculative decoding."
                     )
             else:
+                if envs.SGLANG_SPEC_V2_FULL_OVERLAP.get():
+                    raise ValueError(
+                        "Spec v2 Full Overlap is not supported when SGLANG_ENABLE_SPEC_V2 is False "
+                        "or when using an unsupported speculative algorithm."
+                    )
                 self.disable_overlap_schedule = True
                 logger.warning(
                     "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "

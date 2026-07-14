@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -38,7 +39,13 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_pin_memory_available,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -57,6 +64,34 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+
+def sync_seq_lens_for_eager_forward(
+    batch: ModelWorkerBatch, forward_batch: ForwardBatch
+):
+    if not forward_batch.spec_info.is_spec_v2_full_overlap:
+        return
+    if forward_batch.seq_lens_cpu is None:
+        seq_lens_cpu = forward_batch.seq_lens.cpu()
+        seq_lens_sum = seq_lens_cpu.sum().item()
+        forward_batch.seq_lens_cpu = seq_lens_cpu
+        forward_batch.seq_lens_sum = seq_lens_sum
+        batch.seq_lens_cpu = seq_lens_cpu[: len(batch.seq_lens)]
+        batch.seq_lens_sum = seq_lens_sum
+
+    if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        if forward_batch.extend_seq_lens_cpu is None:
+            if isinstance(batch.extend_seq_lens, torch.Tensor):
+                forward_batch.extend_seq_lens_cpu = batch.extend_seq_lens.cpu().tolist()
+            else:
+                forward_batch.extend_seq_lens_cpu = batch.extend_seq_lens
+        if forward_batch.extend_prefix_lens_cpu is None:
+            if isinstance(batch.extend_prefix_lens, torch.Tensor):
+                forward_batch.extend_prefix_lens_cpu = (
+                    batch.extend_prefix_lens.cpu().tolist()
+                )
+            else:
+                forward_batch.extend_prefix_lens_cpu = batch.extend_prefix_lens
 
 
 @triton.jit
@@ -95,7 +130,8 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
+        # Now seq_lens is correct. In full-overlap mode this only inserts a
+        # stream dependency, making sure the kernel order and dependency.
         batch.maybe_wait_verify_done()
 
         page_size = batch.token_to_kv_pool_allocator.page_size
@@ -112,8 +148,15 @@ class EagleDraftInputV2Mixin:
             r.kv_allocated_len += x
             r.decode_batch_idx += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
+        self.max_kv_len = max(nxt_kv_lens_cpu)
+        self.sum_kv_len = sum(cur_kv_lens_cpu)
+
+        cur_kv_lens_cpu = torch.tensor(
+            cur_kv_lens_cpu, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        nxt_kv_lens_cpu = torch.tensor(
+            nxt_kv_lens_cpu, dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
         # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
         # barrier has chained to the prev forward -> host stalls a full forward.
@@ -146,9 +189,12 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        if self.is_spec_v2_full_overlap:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
@@ -196,16 +242,28 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
-        seq_lens_cpu_ = batch.seq_lens_cpu
-        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
+        bs = len(batch.seq_lens)
+        extend_num_tokens = bs * num_draft_tokens
 
         batch.spec_info = self
         batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.extend_prefix_lens = seq_lens_cpu_.tolist()
+        if self.is_spec_v2_full_overlap:
+            extend_prefix_lens = batch.seq_lens.to(torch.int32)
+            batch.seq_lens = batch.seq_lens + num_draft_tokens
+            batch.extend_seq_lens = torch.full(
+                (bs,),
+                num_draft_tokens,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
+            )
+            batch.extend_prefix_lens = extend_prefix_lens
+        else:
+            seq_lens_cpu_ = batch.seq_lens_cpu
+            batch.seq_lens = batch.seq_lens + num_draft_tokens
+            batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+            batch.seq_lens_sum += extend_num_tokens
+            batch.extend_seq_lens = [num_draft_tokens for _ in range(bs)]
+            batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = (
@@ -216,6 +274,7 @@ class EagleDraftInputV2Mixin:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
+            sync_seq_lens_for_eager_forward(batch, forward_batch)
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
             # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch;
@@ -271,6 +330,13 @@ class EagleVerifyInputV2Mixin:
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
             verify_forward_batch.mark_forward_metadata_ready()
+        else:
+            if not batch.forward_mode.is_idle():
+                sync_seq_lens_for_eager_forward(batch, verify_forward_batch)
+                target_worker.model_runner.attn_backend.init_forward_metadata(
+                    verify_forward_batch
+                )
+                verify_forward_batch.mark_forward_metadata_ready()
 
         return verify_forward_batch, can_run_cuda_graph
 

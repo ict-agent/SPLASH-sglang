@@ -40,6 +40,10 @@ else:
 class FutureIndices:
     indices: torch.Tensor
     interval: Optional[slice] = None
+    mtp_topk_indices_available: bool = False
+    # GLM5-next MTP indices are wide, so keep them per future batch instead
+    # of allocating a dense future_buffer_len-sized GPU buffer.
+    mtp_topk_indices: Optional[torch.Tensor] = None
 
 
 class FutureMap:
@@ -117,7 +121,6 @@ class FutureMap:
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
-
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -148,6 +151,18 @@ class FutureMap:
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+            mtp_topk_indices = draft_input.future_indices.mtp_topk_indices
+            if (
+                draft_input.future_indices.mtp_topk_indices_available
+                and mtp_topk_indices is not None
+            ):
+                if mtp_topk_indices.device.type == torch.device(self.device).type:
+                    mtp_topk_indices.record_stream(
+                        torch.get_device_module(self.device).current_stream()
+                    )
+                draft_input.mtp_topk_indices = mtp_topk_indices
+            else:
+                draft_input.mtp_topk_indices = None
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
@@ -183,5 +198,11 @@ class FutureMap:
         self.topk_index_buf[intv] = draft_input.topk_index
         self.verified_id_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        mtp_topk_indices = getattr(draft_input, "mtp_topk_indices", None)
+        future_indices.mtp_topk_indices_available = mtp_topk_indices is not None
+        if mtp_topk_indices is not None:
+            future_indices.mtp_topk_indices = mtp_topk_indices.clone()
+        else:
+            future_indices.mtp_topk_indices = None
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states

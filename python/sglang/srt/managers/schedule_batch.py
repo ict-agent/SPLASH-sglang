@@ -1200,7 +1200,9 @@ class Req(ReqDllmMixin):
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        new_accepted_tokens = (
+            self.output_ids[-new_accepted_len:] if new_accepted_len > 0 else []
+        )
 
         if self._check_token_based_finish(new_accepted_tokens):
             return
@@ -1400,7 +1402,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
-    seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    seq_lens_cpu: Optional[torch.Tensor] = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
@@ -1418,7 +1420,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     multimodal_inputs: Optional[List] = None
 
     # The sum of all sequence lengths
-    seq_lens_sum: int = None
+    seq_lens_sum: Optional[int] = None
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
@@ -2167,6 +2169,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    @property
+    def is_spec_v2_full_overlap(self):
+        # FIXME: finally deprecate is_spec_v2_full_overlap
+        return self.is_spec_v2 and envs.SGLANG_SPEC_V2_FULL_OVERLAP.get()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2184,6 +2191,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
+            self.spec_info.is_spec_v2_full_overlap = self.is_spec_v2_full_overlap
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -2261,17 +2269,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 set_mamba_track_indices_from_reqs(self)
 
             # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
-            )
+            if self.is_spec_v2_full_overlap:
+                self.mamba_track_mask = (
+                    self.seq_lens % get_global_server_args().mamba_track_interval == 0
+                )
+            else:
+                self.mamba_track_mask = (
+                    (
+                        self.seq_lens_cpu
+                        % get_global_server_args().mamba_track_interval
+                        == 0
+                    )
+                    .pin_memory()
+                    .to(device=self.device, non_blocking=True)
+                )
 
     def maybe_wait_verify_done(self):
+        """Wait for verify before preparing the next draft.
+
+        Full-overlap keeps this as a stream dependency so CPU mirrors can stay
+        deferred on the decode hot path.
+        """
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+                if draft_input.is_spec_v2_full_overlap:
+                    torch.cuda.current_stream().wait_event(draft_input.verify_done)
+                else:
+                    draft_input.verify_done.synchronize()
 
     def filter_batch(
         self,
@@ -2320,10 +2345,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+        if self.is_spec_v2_full_overlap:
+            self.seq_lens_cpu = None
+            self.seq_lens_sum = None
+        else:
+            self.seq_lens_cpu = self.seq_lens.cpu()
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2378,10 +2406,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        if (not self.is_spec_v2_full_overlap) and (not other.is_spec_v2_full_overlap):
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+            self.seq_lens_sum += other.seq_lens_sum
+        else:
+            self.seq_lens_cpu = None
+            self.seq_lens_sum = None
+
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
@@ -2428,6 +2461,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
+        if self.spec_info is not None:
+            self.spec_info.is_spec_v2_full_overlap = self.is_spec_v2_full_overlap
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2464,6 +2499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            is_spec_v2_full_overlap=self.is_spec_v2_full_overlap,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2595,7 +2631,7 @@ class ModelWorkerBatch:
     out_cache_loc: torch.Tensor
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
-    seq_lens_sum: int
+    seq_lens_sum: Optional[int]
 
     # For logprob
     return_logprob: bool
@@ -2613,8 +2649,8 @@ class ModelWorkerBatch:
 
     # For extend
     extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[List[int]]
-    extend_prefix_lens: Optional[List[int]]
+    extend_seq_lens: Optional[Union[List[int], torch.Tensor]]
+    extend_prefix_lens: Optional[Union[List[int], torch.Tensor]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 
@@ -2649,6 +2685,7 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+    is_spec_v2_full_overlap: bool = False
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None

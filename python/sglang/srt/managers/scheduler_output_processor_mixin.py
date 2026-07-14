@@ -433,6 +433,12 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        release_reqs = []
+        if batch.is_spec_v2_full_overlap:
+            if self.full_overlap_pending_release_reqs:
+                release_reqs.extend(self.full_overlap_pending_release_reqs)
+                self.full_overlap_pending_release_reqs.clear()
+
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
@@ -475,14 +481,21 @@ class SchedulerOutputProcessorMixin:
                     req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
-                        self.decode_offload_manager.finalize_release_on_finish(req)
+                if batch.is_spec_v2_full_overlap and self.result_queue:
+                    # Keep KV, req-pool, and linear-state resources until the
+                    # already queued next result is synchronized and processed.
+                    self.full_overlap_pending_release_reqs.append(req)
                 else:
-                    if self.enable_hisparse:
-                        self.hisparse_coordinator.request_finished(req)
-                    release_kv_cache(req, self.tree_cache)
+                    release_reqs.append(req)
+
+                # if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                #     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                #     if not self.decode_offload_manager.offload_kv_cache(req):
+                #         self.decode_offload_manager.finalize_release_on_finish(req)
+                # else:
+                #     if self.enable_hisparse:
+                #         self.hisparse_coordinator.request_finished(req)
+                #     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
 
@@ -545,6 +558,16 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+        
+        for req in release_reqs:
+            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                # release_kv_cache runs after the asynchronous Device-to-Host copy.
+                if not self.decode_offload_manager.offload_kv_cache(req):
+                    self.decode_offload_manager.finalize_release_on_finish(req)
+            else:
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
+                release_kv_cache(req, self.tree_cache)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

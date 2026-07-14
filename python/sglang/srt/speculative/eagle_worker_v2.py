@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -12,6 +13,10 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
+from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -42,8 +47,12 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
+    sync_seq_lens_for_eager_forward,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -79,6 +88,17 @@ def _get_plan_stream(
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
+
+
+def _get_grammar_copy_stream(
+    device: str,
+) -> Tuple[any, contextlib.AbstractContextManager]:
+    if _is_cuda:
+        copy_stream = torch.get_device_module(device).Stream()
+        copy_stream_ctx = torch.get_device_module(device).stream(copy_stream)
+        return copy_stream, copy_stream_ctx
     else:
         return None, contextlib.nullcontext()
 
@@ -154,6 +174,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self.enable_mtp_index_share = is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config
+        )
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -179,6 +202,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        
 
     def init_token_map(self):
         # Load hot token ids
@@ -293,15 +317,24 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = _is_cuda and (
-            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
-            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+        supports_cuda_draft_extend_graph = (
+            _is_cuda
+            and self.draft_extend_attn_backend is not None
+            and isinstance(self.draft_extend_attn_backend, (TritonAttnBackend, TRTLLMMLABackend, NativeSparseAttnBackend, HybridLinearAttnBackend, FlashAttentionBackend, FlashInferAttnBackend))
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
             or supports_cuda_draft_extend_graph
+            or (
+                _is_cuda
+                and isinstance(
+                    self.draft_extend_attn_backend,
+                    NativeSparseAttnBackend,
+                )
+                and self.server_args.disaggregation_mode != "prefill"
+            )
             or supports_hip_aiter_draft_extend_graph
         ):
             tic = time.perf_counter()
@@ -340,17 +373,28 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 # Skip attention backend init for 1-step draft,
                 # `draft_forward` only does sample in this case.
+                sync_seq_lens_for_eager_forward(model_worker_batch, forward_batch)
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.mark_forward_metadata_ready()
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
-
+        if (
+            model_worker_batch.seq_lens_cpu is None
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            model_worker_batch.seq_lens_cpu = forward_batch.seq_lens_cpu[
+                : len(model_worker_batch.seq_lens)
+            ]
+            model_worker_batch.seq_lens_sum = (
+                model_worker_batch.seq_lens_cpu.sum().item()
+            )
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
+                spec_info=draft_input,
             )
 
         # Build tree mask
@@ -358,6 +402,21 @@ class EagleDraftWorker(BaseDraftWorker):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+
+        if draft_input.is_spec_v2_full_overlap:
+            if tree_mask_buf is None:
+                if draft_input.sum_kv_len is None:
+                    raise RuntimeError(
+                        "SpecV2 full-overlap requires spec_info.sum_kv_len to avoid "
+                        "synchronizing seq_lens_sum from GPU."
+                    )
+                model_worker_batch.seq_lens_sum = draft_input.sum_kv_len
+            tree_seq_lens_sum = model_worker_batch.seq_lens_sum or 0
+        else:
+            model_worker_batch.seq_lens_sum = (
+                model_worker_batch.seq_lens_cpu.sum().item()
+            )
+            tree_seq_lens_sum = model_worker_batch.seq_lens_sum
 
         (
             tree_mask,
@@ -372,7 +431,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
+            tree_seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -395,6 +454,7 @@ class EagleDraftWorker(BaseDraftWorker):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+            spec_info=draft_input,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -426,6 +486,14 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        if self.enable_mtp_index_share:
+            forward_batch.reuse_mtp_topk_indices = True
+            if spec_info.mtp_topk_indices is not None and self.topk > 1:
+                # Expand the per-seq (bs, k) seed to per-branch (bs * topk, k)
+                # to match draft-step token rows.
+                spec_info.mtp_topk_indices = (
+                    spec_info.mtp_topk_indices.repeat_interleave(self.topk, dim=0)
+                )
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -459,6 +527,11 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+
+        if self.enable_mtp_index_share:
+            spec_info.mtp_topk_indices = None
+            forward_batch.topk_indices = None
+            forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -530,6 +603,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        if self.enable_mtp_index_share:
+            forward_batch.capture_mtp_topk_indices = True
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
@@ -541,17 +616,26 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        self.maybe_store_draft_seed_mtp_topk_indices(
+            next_draft_input,
+            forward_batch,
+            mtp_topk_indices=getattr(logits_output, "mtp_topk_indices", None),
+            cuda_graph=False,
+        )
         return next_draft_input
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        verify_input: EagleVerifyInput = batch.spec_info
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
+        draft_input.is_spec_v2_full_overlap = verify_input.is_spec_v2_full_overlap
+        draft_input.max_kv_len = verify_input.max_kv_len
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
             * self.speculative_num_draft_tokens
@@ -560,6 +644,10 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Prepare for draft extend in a separate stream
+        if self.plan_stream and batch.is_spec_v2_full_overlap:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
                 batch,
@@ -576,6 +664,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if forward_batch.spec_info.accept_length is None:
             forward_batch.spec_info.accept_length = batch_result.accept_lens
+        if self.enable_mtp_index_share:
+            forward_batch.capture_mtp_topk_indices = True
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -595,6 +685,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Reorganize the spec info for the next batch
+        mtp_topk_indices = getattr(draft_logits_output, "mtp_topk_indices", None)
+        if mtp_topk_indices is None and self.enable_mtp_index_share:
+            mtp_topk_indices = forward_batch.topk_indices
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
@@ -615,6 +708,65 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_p,
             ret_topk_index,
             ret_hidden_states,
+        )
+        if self.enable_mtp_index_share:
+            next_draft_input.mtp_topk_indices = None
+            if mtp_topk_indices is not None:
+                next_draft_input.mtp_topk_indices = mtp_topk_indices[
+                    select_index
+                ].clone()
+
+    def extract_draft_seed_mtp_topk_indices(
+        self,
+        forward_batch: ForwardBatch,
+        mtp_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self.enable_mtp_index_share:
+            return None
+
+        mtp_topk_indices = (
+            forward_batch.topk_indices
+            if mtp_topk_indices is None
+            else mtp_topk_indices
+        )
+        if mtp_topk_indices is None or forward_batch.extend_seq_lens is None:
+            return None
+
+        last_token_indices = torch.cumsum(
+            forward_batch.extend_seq_lens.to(torch.int64), dim=0
+        ) - 1
+        return mtp_topk_indices.index_select(0, last_token_indices)
+
+    def maybe_store_draft_seed_mtp_topk_indices(
+        self,
+        draft_input: EagleDraftInput,
+        forward_batch: Optional[ForwardBatch],
+        mtp_topk_indices: Optional[torch.Tensor] = None,
+        cuda_graph: bool = False,
+    ) -> None:
+        if not self.enable_mtp_index_share:
+            return
+
+        draft_input.mtp_topk_indices = None
+        if forward_batch is None:
+            return
+
+        draft_seed_mtp_topk_indices = self.extract_draft_seed_mtp_topk_indices(
+            forward_batch, mtp_topk_indices=mtp_topk_indices
+        )
+        if draft_seed_mtp_topk_indices is None:
+            if not forward_batch.forward_mode.is_idle():
+                logger.debug(
+                    "Draft MTP index share enabled but draft_extend produced no "
+                    f"reusable topk_indices (cuda_graph={cuda_graph})",
+                )
+            return
+
+        draft_input.mtp_topk_indices = draft_seed_mtp_topk_indices.clone()
+        logger.debug(
+            "Captured draft_extend topk_indices for draft reuse "
+            f"(cuda_graph={cuda_graph}, "
+            f"shape={tuple(draft_input.mtp_topk_indices.shape)})",
         )
 
 
@@ -671,6 +823,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.grammar_copy_stream, self.grammar_copy_stream_ctx = (
+            _get_grammar_copy_stream(self.device)
+        )
 
     @property
     def target_worker(self):
@@ -711,6 +866,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
+                assert model_worker_batch.forward_mode.is_idle()
+                # Idle ranks have no request-side KV allocation bound. Keep them
+                # on the original metadata path, which uses CUDA graph padding
+                # metadata and does not require spec_info.max_kv_len.
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=self.target_worker.model_config.hidden_size,
@@ -745,11 +904,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
+        if getattr(verify_input, "max_kv_len", None) is None:
+            verify_input.max_kv_len = getattr(batch, "_saved_max_kv_len", None)
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # Prepare for target verify in a separate stream.
+        # Making sure the order of kernel for spec v2 full overlap.
+        if self.plan_stream and batch.is_spec_v2_full_overlap:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
@@ -779,11 +945,39 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
-            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
-            draft_tokens_cpu = verify_input.draft_token.view(
+            retrieve_next_token_gpu = verify_input.retrive_next_token
+            retrieve_next_sibling_gpu = verify_input.retrive_next_sibling
+            draft_tokens_gpu = verify_input.draft_token.view(
                 verify_input.retrive_next_token.shape
-            ).cpu()
+            )
+
+            if (
+                batch.spec_info.is_spec_v2_full_overlap
+                and self.grammar_copy_stream is not None
+            ):
+                device_module = torch.get_device_module(self.device)
+                current_stream = device_module.current_stream()
+                self.grammar_copy_stream.wait_stream(current_stream)
+                with self.grammar_copy_stream_ctx:
+                    retrieve_next_token_cpu = torch.empty_like(
+                        retrieve_next_token_gpu, device="cpu", pin_memory=True
+                    ).copy_(retrieve_next_token_gpu, non_blocking=True)
+                    retrieve_next_sibling_cpu = torch.empty_like(
+                        retrieve_next_sibling_gpu, device="cpu", pin_memory=True
+                    ).copy_(retrieve_next_sibling_gpu, non_blocking=True)
+                    draft_tokens_cpu = torch.empty_like(
+                        draft_tokens_gpu, device="cpu", pin_memory=True
+                    ).copy_(draft_tokens_gpu, non_blocking=True)
+                    grammar_copy_done = device_module.Event()
+                    grammar_copy_done.record(self.grammar_copy_stream)
+
+                retrieve_next_token_gpu.record_stream(self.grammar_copy_stream)
+                retrieve_next_sibling_gpu.record_stream(self.grammar_copy_stream)
+                draft_tokens_gpu.record_stream(self.grammar_copy_stream)
+            else:
+                retrieve_next_token_cpu = retrieve_next_token_gpu.cpu()
+                retrieve_next_sibling_cpu = retrieve_next_sibling_gpu.cpu()
+                draft_tokens_cpu = draft_tokens_gpu.cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
         # Metadata init is skipped iff cuda-graph already ran replay_prepare —
@@ -800,6 +994,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
+            if batch.spec_info.is_spec_v2_full_overlap:
+                raise ValueError("spec v2 full overlap with grammar is not supported now ")
+
+            if grammar_copy_done is not None:
+                grammar_copy_done.synchronize()
+
             # Generate the logit mask for structured output.
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
@@ -812,7 +1012,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                if batch.spec_info.is_spec_v2_full_overlap:
+                    vocab_mask = vocab_mask.to(
+                        verify_input.retrive_next_token.device, non_blocking=True
+                    )
+                else:
+                    vocab_mask = vocab_mask.to(
+                        verify_input.retrive_next_token.device
+                    )
                 # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -857,6 +1064,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
+        )
+        next_draft_input.is_spec_v2_full_overlap = (
+            batch.spec_info.is_spec_v2_full_overlap
         )
 
         return GenerationBatchResult(

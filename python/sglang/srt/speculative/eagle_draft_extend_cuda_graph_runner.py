@@ -502,6 +502,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+        else:
+            buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].zero_()
 
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
@@ -515,21 +518,28 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.extend_seq_lens_cpu[:bs]
         )
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
+        forward_batch.spec_info.raw_bs = raw_bs
+        forward_batch.spec_info.num_tokens_per_req = self.num_tokens_per_bs
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.accept_length = buffers.accept_length[:bs]
 
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if not forward_batch.spec_info.is_spec_v2_full_overlap:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+            seq_lens_cpu = buffers.seq_lens_cpu
+        else:
+            seq_lens_cpu = None
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum
-            + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_sum=seq_lens_sum,
             encoder_lens=None,
             forward_mode=self.forward_mode,
             spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
         # Replay
@@ -549,10 +559,16 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if unpadding_bs is not None:
             out_copy = out
+            mtp_topk_indices = out_copy.mtp_topk_indices
+            if (
+                mtp_topk_indices is not None
+                and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+            ):
+                mtp_topk_indices = mtp_topk_indices[:unpadding_bs]
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
-                mtp_topk_indices=out_copy.mtp_topk_indices,
+                mtp_topk_indices=mtp_topk_indices,
             )
             out.topk_p = out_copy.topk_p[:unpadding_bs]
             out.topk_index = out_copy.topk_index[:unpadding_bs]

@@ -898,12 +898,15 @@ class DecodePreallocQueue:
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64, pin_memory=True)
+            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64, pin_memory=True)
+            last_loc_cpu = torch.tensor([-1], dtype=torch.int64, pin_memory=True)
             kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                prefix_lens=prefix_lens_cpu.to(device=device, non_blocking=True),
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
+                seq_lens_cpu=seq_lens_cpu,
+                last_loc=last_loc_cpu.to(device=device, non_blocking=True),
                 extend_num_tokens=fill_len,
             )
             # Allocate host indices for the RDMA transfer target
@@ -919,12 +922,15 @@ class DecodePreallocQueue:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64, pin_memory=True)
+            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64, pin_memory=True)
+            last_loc_cpu = torch.tensor([-1], dtype=torch.int64, pin_memory=True)
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                prefix_lens=prefix_lens_cpu.to(device=device, non_blocking=True),
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens_cpu.to(device=device, non_blocking=True),
+                seq_lens_cpu=seq_lens_cpu,
+                last_loc=last_loc_cpu.to(device=device, non_blocking=True),
                 extend_num_tokens=fill_len,
             )
 
@@ -1293,22 +1299,35 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
+        self.full_overlap_pending_release_reqs: List[Req] = []
         self.last_batch: Optional[ScheduleBatch] = None
+
+        def pop_and_process():
+            if not self.result_queue:
+                return
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            self.schedule_stream.wait_stream(self.forward_stream)
-
             # polling and allocating kv cache
             self.process_decode_queue()
+
+            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = (
+                self.is_disable_overlap_for_disagg_decode_batch(batch)
+            )
+
+            if disable_overlap_for_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -1319,8 +1338,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.self_check_during_idle()
 
@@ -1330,6 +1349,13 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def is_disable_overlap_for_disagg_decode_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        if batch is not None and batch.is_spec_v2_full_overlap:
+            return False
+        return self.is_disable_overlap_for_batch(batch)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

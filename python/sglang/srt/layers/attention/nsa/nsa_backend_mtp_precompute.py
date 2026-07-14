@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import compute_nsa_seqlens
+from sglang.srt.layers.attention.utils import seqlens_expand_triton
+from sglang.srt.speculative.spec_info import (
+    get_spec_v2_full_overlap_max_kv_len,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -76,11 +81,15 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
         spec_info: Optional["SpecInput"],
     ) -> PrecomputedMetadata:
         """Precompute all shared metadata for multi-step backends.
+
+        seq_lens_cpu may be None in SpecV2 full-overlap replay. In that case
+        spec_info.max_kv_len, or the captured page-table width as a fallback,
+        provides a safe page-table upper bound.
 
         This function extracts and computes all operations that are
         identical across different backend instances in multi-step
@@ -99,21 +108,33 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         """
         # Slice inputs to batch size
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        max_kv_len = get_spec_v2_full_overlap_max_kv_len(spec_info)
+        if max_kv_len is not None:
+            pt_width = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+            max_kv_len = min(max_kv_len, pt_width)
+        else:
+            assert seq_lens_cpu is not None
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
             return self._precompute_decode_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
+                bs, req_pool_indices, seq_lens, seq_lens_cpu, max_kv_len
             )
         elif forward_mode.is_target_verify():
             return self._precompute_target_verify_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu
+                bs, req_pool_indices, seq_lens, seq_lens_cpu, max_kv_len
             )
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             return self._precompute_draft_extend_mode(
-                bs, req_pool_indices, seq_lens, seq_lens_cpu, spec_info
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu,
+                spec_info,
+                max_kv_len,
+                is_draft_extend_v2=forward_mode.is_draft_extend_v2(),
             )
         else:
             raise ValueError(f"Unsupported forward mode: {forward_mode}")
@@ -123,10 +144,13 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        max_kv_len: Optional[int] = None,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
-        max_len = int(seq_lens_cpu.max().item())
+        max_len = (
+            max_kv_len if max_kv_len is not None else int(seq_lens_cpu.max().item())
+        )
 
         # Convert to int32 and compute cumsum
         cache_seqlens = seq_lens.to(torch.int32)
@@ -181,11 +205,14 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        max_kv_len: Optional[int] = None,
     ) -> PrecomputedMetadata:
         """Precompute metadata for target verify mode."""
-        max_seqlen_k = int(
-            seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+        max_seqlen_k = (
+            max_kv_len
+            if max_kv_len is not None
+            else int(seq_lens_cpu.max().item() + self.speculative_num_draft_tokens)
         )
 
         # Cache seqlens with draft tokens
@@ -199,25 +226,17 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         ).contiguous()
 
         # Generate expanded seqlens
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-        seqlens_int32_cpu = [
-            self.speculative_num_draft_tokens + kv_len
-            for kv_len in seq_lens_cpu.tolist()
-        ]
-        seqlens_expanded = torch.cat(
-            [
-                torch.arange(
-                    kv_len - qo_len + 1,
-                    kv_len + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for qo_len, kv_len in zip(
-                    extend_seq_lens_cpu,
-                    seqlens_int32_cpu,
-                    strict=True,
-                )
-            ]
+        extend_seq_lens = torch.full(
+            (bs,),
+            self.speculative_num_draft_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        seqlens_expanded = seqlens_expand_triton(
+            extend_seq_lens,
+            cache_seqlens,
+            self.speculative_num_draft_tokens * bs,
+            self.speculative_num_draft_tokens,
         )
 
         # Compute NSA seqlens
@@ -265,19 +284,34 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
         spec_info: "SpecInput",
+        max_kv_len: Optional[int] = None,
+        is_draft_extend_v2: bool = False,
     ) -> PrecomputedMetadata:
         """Precompute metadata for draft extend mode."""
-        max_seqlen_k = int(seq_lens_cpu.max().item())
+        max_seqlen_k = (
+            max_kv_len if max_kv_len is not None else int(seq_lens_cpu.max().item())
+        )
 
         # Cache seqlens
         cache_seqlens = seq_lens.to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
-        # Extend seqlens from spec_info
-        extend_seq_lens = spec_info.accept_length[:bs]
-        extend_seq_lens_cpu = extend_seq_lens.tolist()
+        # Extend seqlens from spec_info. V2 uses the explicit q_len tensor
+        # prepared by draft-extend replay; V1 uses accepted-token lengths.
+        if is_draft_extend_v2:
+            extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs]
+            extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
+            if extend_seq_lens_cpu is None:
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            else:
+                extend_seq_lens_cpu = extend_seq_lens_cpu[:bs]
+            extend_sum = sum(extend_seq_lens_cpu)
+        else:
+            extend_seq_lens = spec_info.accept_length[:bs]
+            extend_seq_lens_cpu = extend_seq_lens.tolist()
+            extend_sum = sum(extend_seq_lens_cpu)
 
         # Page indices (repeated per accept length)
         page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
@@ -285,22 +319,33 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             page_indices, repeats=extend_seq_lens, dim=0
         ).contiguous()
 
-        # Generate expanded seqlens
-        seqlens_expanded = torch.cat(
-            [
-                torch.arange(
-                    kv_len - qo_len + 1,
-                    kv_len + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for qo_len, kv_len in zip(
-                    extend_seq_lens_cpu,
-                    seq_lens_cpu.tolist(),
-                    strict=True,
-                )
-            ]
-        )
+        # Generate expanded seqlens. The V2 full-overlap path keeps seq_lens_cpu
+        # deferred, so use the device-side expansion. V1 still requires the true
+        # CPU mirror because its q_len is variable.
+        if is_draft_extend_v2:
+            seqlens_expanded = seqlens_expand_triton(
+                extend_seq_lens,
+                cache_seqlens,
+                extend_sum,
+                self.speculative_num_draft_tokens,
+            )
+        else:
+            assert seq_lens_cpu is not None
+            seqlens_expanded = torch.cat(
+                [
+                    torch.arange(
+                        kv_len - qo_len + 1,
+                        kv_len + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    for qo_len, kv_len in zip(
+                        extend_seq_lens_cpu,
+                        seq_lens_cpu.tolist(),
+                        strict=True,
+                    )
+                ]
+            )
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(
