@@ -1,0 +1,301 @@
+# =============================================================================
+# HCU Nightly Wheels - GitLab CI
+# 参考 .github/workflows/release-pypi-nightly-hcu.yml 的 compile job 翻译而来
+# =============================================================================
+
+stages:
+  - compile
+  - build_image
+  - test
+
+variables:
+  # ---- 构建参数 ----
+  TORCH_VERSION: "2.10.0"
+  # sglang-router 不编译，改用 pip 源 (见 docker/shca17.Dockerfile)；true=compile 跳过 gateway
+  SKIP_GATEWAY: "true"
+  # ---- 内部源 / 资源服务器 ----
+  PIP_INDEX_URL: "http://42.228.13.241:666/nightly/dtk2604/+simple/"
+  PIP_TRUSTED_HOST: "42.228.13.241"
+  RESOURCE_SERVER: "http://42.228.13.241:18000/"
+  # ---- 递归拉取子模块 (对应 checkout submodules: recursive) ----
+  GIT_SUBMODULE_STRATEGY: recursive
+  # ---- 镜像 (build_image / test 阶段) ----
+  # 只含驱动 / 编译器 (DTK/UCX/OpenMPI/RCCL/shca17)、未装 whl 的基础镜像;
+  # 所有 whl (依赖栈 + 本仓库编译产物) 在 build_image 阶段现装 (见 docker/shca17.Dockerfile)
+  BASE_IMAGE: "42.228.13.241:5000/jenkins/base_env/shca17:ubuntu22.04-dtk2604-py3.10-dtk2604"
+  HARBOR_REGISTRY: "42.228.13.241:5000"
+  IMAGE_REPO: "jenkins/model_test_env"
+  HARBOR_USER: "sugon"
+  # HARBOR_PWD_B64 在 GitLab: Settings > CI/CD > Variables 中配置 (masked)
+  # HARBOR_PWD_B64 = 密码的 base64 (原始密码含 #/& 等特殊字符无法直接掩码, 故存 base64)
+  # 精度测试开关: RUN_PRECISION_TEST=true 时跑 glm-evals-dcu 精度评测, 否则只做 smoke test
+  RUN_PRECISION_TEST: "true"
+
+# =============================================================================
+# 编译: sgl-kernel + sglang wheel (docker executor, 设备在 runner config.toml)
+# =============================================================================
+compile:
+  stage: compile
+  tags:
+    - 811-docker-runner
+  image: harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304
+  timeout: 24h
+  interruptible: true
+  rules:
+    # 定时触发 (在 GitLab UI: CI/CD > Schedules 中配置 cron "0 22 * * *")
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # 手动触发 (Web UI Run pipeline)
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  script:
+    - |
+      set -e
+
+      # =========================================================================
+      # 环境准备
+      # =========================================================================
+      export WHEEL_COMMIT_SHA="$(git rev-parse HEAD)"
+      echo "Building HCU wheels for ${WHEEL_COMMIT_SHA}"
+
+      # ---- 安装构建依赖 (maturin<1.7: 避开 v1.7 起 readme 路径越界的严格校验) ----
+      pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.7" ciupload
+      wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
+      unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
+      chmod +x /usr/local/bin/protoc
+      ln -sf /usr/local/bin/protoc /usr/bin/protoc
+      wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/rustup-init.sh
+      export RUSTUP_DIST_SERVER=https://rsproxy.cn
+      export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+      bash rustup-init.sh -y
+      rm -rf ${HOME}/.cargo/config
+      mkdir -p ${HOME}/.cargo
+      cat > ${HOME}/.cargo/config << 'EOF'
+      [source.crates-io]
+      replace-with = 'rsproxy-sparse'
+
+      [source.tuna-sparse]
+      registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+      [source.rsproxy-sparse]
+      registry = "sparse+https://rsproxy.cn/index/"
+
+      [net]
+      retry = 5
+      git-fetch-with-cli = true
+
+      [http]
+      low-speed-limit = 1
+      EOF
+
+      # ---- 安装 DTK ----
+      DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+      cd /opt
+      wget -q $DTK_PKG_URL
+      tar -xzf $(basename $DTK_PKG_URL)
+      mv dtk-* dtk
+      cd "${CI_PROJECT_DIR}"
+
+      # =========================================================================
+      # 编译阶段
+      # =========================================================================
+
+      # ---- sgl-kernel (HIP) ----
+      source /opt/dtk/env.sh
+      cd sgl-kernel && python setup_hip.py bdist_wheel
+      echo "=== sgl-kernel wheel ==="
+      ls -lh dist/*.whl
+      cd "${CI_PROJECT_DIR}"
+
+      # ---- sglang python package ----
+      source /opt/dtk/env.sh
+      source $HOME/.cargo/env
+      cd python
+      export SETUPTOOLS_SCM_PRETEND_VERSION="0.5.12"
+      python -m build --wheel --no-isolation -Cfeatures=all_hip
+      echo "=== sglang wheel ==="
+      ls -lh dist/*.whl
+      cd "${CI_PROJECT_DIR}"
+
+      # ---- sgl-model-gateway (可通过 SKIP_GATEWAY=true 跳过) ----
+      if [ "${SKIP_GATEWAY}" != "true" ]; then
+        source /opt/dtk/env.sh
+        source $HOME/.cargo/env
+        export RUSTUP_DIST_SERVER=https://rsproxy.cn
+        export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+        cd sgl-model-gateway && cargo build --release
+        cd bindings/python && maturin build --release --skip-auditwheel
+        echo "=== sgl-model-gateway wheel ==="
+        ls -lh target/wheels/*.whl
+        cd "${CI_PROJECT_DIR}"
+      else
+        echo "SKIP_GATEWAY=true, 跳过 sgl-model-gateway 编译"
+      fi
+
+      # ---- 用 CIUpload 给 whl 打 DAS local version (改包名), 产物落到 output/ ----
+      source /opt/dtk/env.sh
+      DTK_PKG_URL=${RESOURCE_SERVER}/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz
+      DTK_VER=$(echo $DTK_PKG_URL | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+      TORCH_VER=$(echo $TORCH_VERSION | tr -d '.')
+      LOCAL_VER="das.dtk${DTK_VER}.torch${TORCH_VER}.$(date +%y%m%d%H%M).g$(printf '%s' "${WHEEL_COMMIT_SHA}" | cut -c1-12)"
+      echo "Local version: ${LOCAL_VER}"
+      mkdir -p output
+      for whl in sgl-kernel/dist/*.whl python/dist/*.whl sgl-model-gateway/bindings/python/target/wheels/*.whl; do
+        [ -f "$whl" ] || continue
+        CIUpload --repair --torch_version $TORCH_VERSION --set_local_version $LOCAL_VER --outputdir output -f "$whl"
+      done
+      echo "=== Repaired wheels ==="
+      ls -lh output/
+  artifacts:
+    name: "hcu-wheels-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - output/*.whl
+    expire_in: 30 mins
+    when: on_success
+
+# =============================================================================
+# 构建镜像: 在已含 shca17 环境的 BASE_IMAGE 上装入 compile 阶段编译出的 wheel,
+#           推送到 harbor (对应 Jenkinsfile 的「构建环境镜像」stage)
+# =============================================================================
+build_image:
+  stage: build_image
+  tags:
+    - 811-shell-runner
+  timeout: 24h
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  needs:
+    - job: compile
+      artifacts: true
+  script:
+    - |
+      set -e
+
+      SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+      BUILD_TIME="$(date +%Y%m%d-%H%M)"
+      IMAGE_TAG="sglang:0.5.12-shca17-zhiyuan-py3.10-${BUILD_TIME}-g${SHORT_SHA}"
+      FULL_IMAGE="${HARBOR_REGISTRY}/${IMAGE_REPO}/${IMAGE_TAG}"
+      echo "FULL_IMAGE=${FULL_IMAGE}" | tee image.env
+
+      # ---- 收集 wheel 到构建上下文 (compile 阶段 repair 后的产物在 output/) ----
+      mkdir -p wheelhouse
+      cp output/*.whl wheelhouse/ 2>/dev/null || true
+      echo "=== wheels to install ===" && ls -lh wheelhouse/
+
+      # ---- 构建镜像 (Dockerfile 现装依赖栈 + 本仓库 whl) ----
+      source image.env
+      docker build --network=host --build-arg BASE_IMAGE="${BASE_IMAGE}" --build-arg TORCH_VERSION="${TORCH_VERSION}" -t "${FULL_IMAGE}" -f docker/shca17.Dockerfile .
+
+      # ---- 起带设备的容器执行 vllm-hcu-apply-patches, 再 commit 回镜像 (补丁烘进镜像) ----
+      #      docker build 无设备访问, apply-patches 需要 /dev/kfd, 故用 run+exec+commit
+      CID=$(docker run -d \
+        -v /opt/hyhal/:/opt/hyhal/:ro \
+        --network host --shm-size=80G \
+        --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+        --device=/dev/kfd --device=/dev/dri/ --group-add video --privileged \
+        "${FULL_IMAGE}" sleep infinity)
+      trap 'docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
+      docker exec "${CID}" bash -lc 'source /opt/dtk/env.sh && vllm-hcu-apply-patches'
+      docker commit "${CID}" "${FULL_IMAGE}"
+      docker rm -f "${CID}"
+      trap - EXIT
+
+      # ---- 只存本地, 不推 harbor ----
+      echo "镜像构建完成, 保存于本地: ${FULL_IMAGE}"
+  artifacts:
+    reports:
+      dotenv: image.env
+
+# =============================================================================
+# 测试: 拉起镜像做 smoke test (import); RUN_PRECISION_TEST=true 时用 glm-evals-dcu
+#       跑精度评测: 容器内先起 sglang server (GLM-5-N-0707-INT8), 再用 evaluate.py
+#       打到 http://127.0.0.1:30000。shell runner: 启动参数写在 yaml。
+# =============================================================================
+test:
+  stage: test
+  tags:
+    - 811-shell-runner
+  timeout: 24h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  needs:
+    - job: build_image
+      artifacts: true
+  variables:
+    # 只挂本次测试需要的模型 + 测试工具代码 (glm-evals-dcu, 数据集在其仓库内);
+    # 不挂 broad /models:ro，否则往其内部嵌套挂载会因只读父目录无法创建挂载点而失败
+    DOCKER_RUN_ARGS: >-
+      -v /opt/hyhal/:/opt/hyhal/:ro
+      -v /rogon_admin/models/GLM-5-N-0707-INT8:/models/GLM-5-N-0707-INT8:ro
+      -v /rogon_admin/models/glm-evals:/glm-evals:ro
+      --network host --init --shm-size=80G
+      --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      --device=/dev/kfd --device=/dev/dri/ --group-add video --privileged
+  script:
+    - |
+      set -e
+
+      # ---- build_image 在同一台 runner 上本地构建, 镜像已在本地 docker 中 ----
+      echo "Testing image ${FULL_IMAGE}"
+      docker image inspect "${FULL_IMAGE}" >/dev/null || { echo "镜像未找到: ${FULL_IMAGE}"; exit 1; }
+
+      # ---- smoke test: 验证编译出的 wheel 能正常 import ----
+      docker run --rm ${DOCKER_RUN_ARGS} --user root "${FULL_IMAGE}" \
+        bash -lc 'source /opt/dtk/env.sh; python -c "import sgl_kernel; import sglang; import sglang_router; print(\"sglang\", sglang.__version__)"'
+
+      # ---- 精度测试 (RUN_PRECISION_TEST=true 时跑; glm-evals-dcu 评测) ----
+      #   1) 容器内起 sglang server (GLM-5-N-0707-INT8, port 30000)
+      #   2) 拷贝 /glm-evals 测试代码 (数据集在其仓库内), checkout wangrui, 装依赖
+      #   3) evaluate.py 打到本地 server, 先跑快的两个 task (simpleqa / chinese_simpleqa)
+      if [ "${RUN_PRECISION_TEST}" != "true" ]; then
+        echo "RUN_PRECISION_TEST!=true, 跳过精度测试 (仅 smoke test)"
+        exit 0
+      fi
+
+      CID=$(docker run -d ${DOCKER_RUN_ARGS} --user root "${FULL_IMAGE}" sleep infinity)
+      trap 'docker rm -f "${CID}" || true' EXIT
+      docker exec "${CID}" mkdir -p /workspace
+
+      # ---- server 启动脚本 (env + sglang serve) 单独维护, cp 进容器 ----
+      docker cp "${CI_PROJECT_DIR}/scripts/start_sglang_server.sh" "${CID}:/workspace/start_sglang_server.sh"
+
+      # ---- 评测流程脚本: cp 进容器再 exec (避免 yaml 内嵌 shell 的引号转义) ----
+      cat > "${CI_PROJECT_DIR}/run_eval.sh" <<'EOF'
+      #!/bin/bash
+      set -e
+      source /opt/dtk/env.sh
+
+      # ---- glm-evals-dcu 测试工具 (数据集在仓库内) ----
+      cp -r /glm-evals /workspace/glm-evals-dcu
+      cd /workspace/glm-evals-dcu
+      git checkout wangrui || true
+      pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+      pip install --force-reinstall --no-deps "dataclass_wizard>=0.23,<1.0"
+      python -c "from dataclass_wizard import YAMLWizard; print('dataclass_wizard OK:', YAMLWizard.__name__)"
+
+      # ---- 启动 sglang server (脚本内部阻塞等待 ready 后返回) ----
+      bash /workspace/start_sglang_server.sh
+
+      # ---- 精度评测 (--load 与 0707 一致; 数据集在仓库 data/ 下) ----
+      python evaluate.py \
+        --mode inference \
+        --data-path data \
+        --model-config configs/sglang/glm5_next_tp8_155k.json \
+        --load /models/GLM-5-N-0707-INT8/int8_ffn_mla_kda \
+        --task tasks/english/simpleqa/simpleqa.yaml \
+               tasks/english/simpleqa/chinese_simpleqa.yaml \
+        --sglang --memory-fraction 0.7 \
+        --save-dir results/full \
+        --sglang-no-launch-server --sglang-url http://127.0.0.1:30000 || true
+
+      kill "$(cat /workspace/sglang_server.pid 2>/dev/null)" 2>/dev/null || true
+      EOF
+
+      docker cp "${CI_PROJECT_DIR}/run_eval.sh" "${CID}:/workspace/run_eval.sh"
+      docker exec "${CID}" bash /workspace/run_eval.sh || true
+      docker exec "${CID}" bash -lc 'cd /workspace/glm-evals-dcu && zip -r /workspace/precision_test_result.zip results/full 2>/dev/null || true; zip -j /workspace/precision_test_result.zip /workspace/sglang_server.log || true'
+      docker cp "${CID}:/workspace/precision_test_result.zip" "${CI_PROJECT_DIR}/" || true
+  artifacts:
+    # ---- 精度测试结果不归档 (保密) ----
+    expire_in: 30 mins

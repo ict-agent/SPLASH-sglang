@@ -1,0 +1,72 @@
+GLM-5-N-0707-INT8_sglang:
+  type: "precision"
+
+  server: "sglang"
+
+  model: "GLM-5-N-0707-INT8/int8_ffn_mla_kda"
+
+  env:
+    NCCL_MIN_NCHANNELS: 16
+    NCCL_MAX_NCHANNELS: 16
+    SGLANG_ENABLE_SPEC_V2: 1
+    HSA_ENABLE_COREDUMP: 1
+    USE_DCU_CUSTOM_ALLREDUCE: 0
+    SGLANG_USE_AITER_AR: 0
+    SGLANG_CUSTOM_ALLREDUCE_INPUT_FENCE: "thread0"
+    ALLREDUCE_STREAM_WITH_COMPUTE: 1
+    HIP_KERNEL_EVENT_SYSTENFENCE: 1
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD: 0
+    GLIBC_TUNABLES: "glibc.rtld.optional_static_tls=0x40000"
+    HIP_KERNEL_BATCH_CEILING: 100
+    GPU_FORCE_BLIT_COPY_SIZE: 16
+    HSA_KERNARG_POOL_SIZE: 8388608
+    ROC_AQL_QUEUE_SIZE: 131072
+    SGLANG_USE_LIGHTOP: 1
+    SGLANG_ROCM_USE_AITER_MOE: 0
+    SGLANG_KVALLOC_KERNEL: 1
+    SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO: 1
+    SGLANG_ASSIGN_EXTEND_CACHE_LOCS: 1
+    SGLANG_ASSIGN_REQ_TO_TOKEN_POOL: 1
+    SGLANG_GET_LAST_LOC: 1
+    SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON: 1
+    SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES: 1
+    HIP_GRAPH_ACCUMULATE_DISPATCH: 1
+    HIP_GRAPH_USE_CMD_CACHE: 0
+    SGLANG_ROCM_USE_AITER_TILELANG_MHC: 1
+    SGLANG_OPT_USE_TILELANG_MHC_PRE: 1
+    SGLANG_OPT_USE_TILELANG_MHC_POST: 1
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM: 0
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION: 0
+
+  server_args:
+    trust-remote-code: true
+    tp-size: 8
+    attention-backend: dcu_mla
+    linear-attn-backend: triton
+    json-model-override-args: '{"disable_nsa": true}'
+    quantization: w8a8_int8
+    moe-runner-backend: aiter
+    dtype: bfloat16
+    dist-timeout: 10000
+    watchdog-timeout: 3600
+    page-size: 64
+    kv-cache-dtype: bf16
+    mem-fraction-static: 0.9
+    chunked-prefill-size: 8192
+    cuda-graph-max-bs: 32
+
+  dataset:
+    - "from opencompass.configs.datasets.humaneval.humaneval_gen import humaneval_datasets"
+    - "from opencompass.configs.datasets.gsm8k.gsm8k_gen_17d0dc import gsm8k_datasets"
+    - "from opencompass.configs.datasets.math.math_500_gen import math_datasets"
+
+  models_config:
+    key: "EMPTY"
+    temperature: 0.0
+    query_per_second: 128
+    max_out_len: 8192
+    max_seq_len: 8192
+    batch_size: 64
+    meta_template: "api_meta_template"
+    pred_postprocessor:
+      type: "opencompass.utils.text_postprocessors.extract_non_reasoning_content"
