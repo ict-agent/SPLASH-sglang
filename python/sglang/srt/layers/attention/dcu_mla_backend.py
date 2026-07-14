@@ -8,7 +8,11 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashmla_kv_indices_triton,
+    get_dcu_mla_fp8_kv_cache_dim,
+    should_pad_dcu_mla_fp8_kv_cache,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_kernel.flash_mla import dcu_create_flashmla_kv_indices
@@ -90,7 +94,7 @@ def is_bmz_fp8(kv_cache: torch.Tensor) -> bool:
 def _pad_last_dim(x: torch.Tensor, target_dim: int) -> torch.Tensor:
     if x.shape[-1] >= target_dim:
         return x
-    out = x.new_zeros((*x.shape[:-1], target_dim))
+    out = x.new_zeros(*x.shape[:-1], target_dim)
     out[..., : x.shape[-1]] = x
     return out
 
@@ -157,10 +161,15 @@ class DCUMLABackend(AttentionBackend):
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
-        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
 
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.kv_cache_dim = get_dcu_mla_fp8_kv_cache_dim(
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.qk_rope_head_dim,
+            self.data_type,
+            uses_dcu_mla=True,
+        )
 
         self.device = model_runner.device
         # self.k_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
@@ -663,6 +672,9 @@ class DCUMLABackend(AttentionBackend):
             )
         else:
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+            if _is_dcu and self.qk_rope_head_dim == 0 and reshape_q.shape[-1] == 512:
+                reshape_q = _pad_last_dim(reshape_q, 576)
+                k_cache_reshaped = _pad_last_dim(k_cache_reshaped, 576)
             flashmla_metadata, num_splits = _dense_flashmla_sched_meta(
                 self.forward_metadata.flashmla_metadata,
                 self.forward_metadata.num_splits,
@@ -713,18 +725,13 @@ class DCUMLABackend(AttentionBackend):
             )
         else:
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-            kernel_head_dim_v = self.kv_lora_rank
-            trim_output_dim = None
-            target_head_dim = k_cache_reshaped.shape[-1]
-            if (
-                _is_dcu
-                and target_head_dim > self.kv_lora_rank
-                and reshape_q.shape[-1] <= target_head_dim
+            if should_pad_dcu_mla_fp8_kv_cache(
+                reshape_q.shape[-1],
+                self.qk_rope_head_dim,
+                self.data_type,
+                uses_dcu_mla=True,
             ):
-                kernel_head_dim_v = target_head_dim
-                reshape_q = _pad_last_dim(reshape_q, target_head_dim)
-                trim_output_dim = self.kv_lora_rank
-
+                reshape_q = _pad_last_dim(reshape_q, self.kv_cache_dim)
             if is_fp8 and not is_bmz_fp8(k_cache):
                 reshape_q = reshape_q.to(k_cache_reshaped.dtype)
                 o, _ = flash_mla_with_kvcache_fp8(
@@ -732,7 +739,7 @@ class DCUMLABackend(AttentionBackend):
                     k_cache=k_cache_reshaped,
                     block_table=block_table,
                     cache_seqlens=cache_seqlens,
-                    head_dim_v=kernel_head_dim_v,
+                    head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                     num_splits=self.forward_metadata.num_splits,
                     softmax_scale=scaling,
@@ -746,7 +753,7 @@ class DCUMLABackend(AttentionBackend):
                     k_cache=k_cache_reshaped,
                     block_table=block_table,
                     cache_seqlens=cache_seqlens,
-                    head_dim_v=kernel_head_dim_v,
+                    head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                     num_splits=self.forward_metadata.num_splits,
                     softmax_scale=scaling,
@@ -754,8 +761,6 @@ class DCUMLABackend(AttentionBackend):
                     k_scale=k_scale,
                     kv_cache_dtype=kv_cache_dtype,
                 )
-            if trim_output_dim is not None and o.shape[-1] > trim_output_dim:
-                o = o[..., :trim_output_dim]
         return o
 
     def forward_decode(

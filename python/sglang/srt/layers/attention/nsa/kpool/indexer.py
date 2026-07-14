@@ -1217,18 +1217,31 @@ class IndexerKPool(Indexer):
         head_dim_with_sf = self.head_dim + 4
 
         assert q_index.dim() == 3
+        num_q_padded = q_index.shape[0]
+        n_real = min(
+            num_q_padded,
+            plan.pool_seqlens_per_q.shape[0],
+            plan.seqlens_per_q.shape[0],
+            plan.paged_page_table.shape[0],
+        )
+        if n_real < num_q_padded:
+            q_index = q_index[:n_real]
+            weights = weights[:n_real]
         q_index = q_index.unsqueeze(1)
         assert weights.dim() == 3
         weights = weights.squeeze(2)
+        pool_seqlens_per_q = plan.pool_seqlens_per_q[:n_real]
+        seqlens_per_q = plan.seqlens_per_q[:n_real]
+        paged_page_table = plan.paged_page_table[:n_real]
 
-        pool_max_seq_len = plan.paged_page_table.shape[1] * block_kv
+        pool_max_seq_len = paged_page_table.shape[1] * block_kv
         if is_dcu():
             logits = kpool_bf16_paged_mqa_logits(
                 q_index,
                 kv_cache_buf,
                 weights,
-                plan.pool_seqlens_per_q,
-                plan.paged_page_table,
+                pool_seqlens_per_q,
+                paged_page_table,
                 pool_max_seq_len,
                 block_kv,
             )
@@ -1240,8 +1253,8 @@ class IndexerKPool(Indexer):
                 q_index,
                 kv_cache_fp8,
                 weights,
-                plan.pool_seqlens_per_q.unsqueeze(-1),
-                plan.paged_page_table,
+                pool_seqlens_per_q.unsqueeze(-1),
+                paged_page_table,
                 plan.pool_schedule_metadata,
                 pool_max_seq_len,
                 clean_logits=False,
@@ -1255,10 +1268,11 @@ class IndexerKPool(Indexer):
 
         return self._topk_from_kpool_logits(
             logits=logits,
-            pool_lens=plan.pool_seqlens_per_q,
-            seq_lens=plan.seqlens_per_q,
+            pool_lens=pool_seqlens_per_q,
+            seq_lens=seqlens_per_q,
             page_table=page_table_for_topk,
             topk_offsets=None,
+            out_rows=num_q_padded if num_q_padded != n_real else None,
         )
 
     def forward_cuda(

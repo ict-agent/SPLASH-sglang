@@ -457,6 +457,10 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
 
+    # Temporary DCU fallback for BF16 NSA index cache head sizes unsupported
+    # by LightOp paged_mqa_logits.
+    SGLANG_NSA_DCU_USE_TRITON_PAGED_MQA = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 

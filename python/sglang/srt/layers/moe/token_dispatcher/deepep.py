@@ -66,33 +66,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
-_use_int8_deep_ll_quant = get_bool_env_var(
-    "SGLANG_INT8_DEEP_LL_QUANT", default="true"
-)
 
 use_groupgemm = get_bool_env_var(
     "SGLANG_GROUPGEMM", default="true"
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _per_token_quant_int8_for_deepep_ll(
-    hidden_states: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if hidden_states.shape[0] == 0:
-        return (
-            torch.empty_like(hidden_states, dtype=torch.int8),
-            torch.empty(
-                (*hidden_states.shape[:-1], 1),
-                device=hidden_states.device,
-                dtype=torch.float32,
-            ),
-        )
-    hidden_states_q, hidden_states_scales = per_token_quant_int8(hidden_states)
-    if hidden_states_scales.dim() == 1:
-        hidden_states_scales = hidden_states_scales.reshape(-1, 1)
-    return hidden_states_q, hidden_states_scales
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -776,16 +755,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     )
                 )
             else:
-                dispatch_hidden_states = hidden_states
-                dispatch_hidden_states_scales = None
-                if not _use_int8_deep_ll_quant:
-                    (
-                        dispatch_hidden_states,
-                        dispatch_hidden_states_scales,
-                    ) = _per_token_quant_int8_for_deepep_ll(hidden_states)
                 packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
                     buffer.low_latency_dispatch(
-                        dispatch_hidden_states,
+                        hidden_states,
                         topk_ids,
                         topk_weights,
                         self.num_max_dispatch_tokens_per_rank,
@@ -794,7 +766,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                         fp8_round_scale=False,
                         async_finish=not self.return_recv_hook,
                         return_recv_hook=self.return_recv_hook,
-                        x_scales=dispatch_hidden_states_scales,
                     )
                 )
         else:
