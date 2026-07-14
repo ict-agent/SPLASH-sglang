@@ -6,7 +6,7 @@ import triton.language as tl
 
 
 @triton.jit(do_not_specialize=["T"])
-def fused_sigmoid_gating_delta_rule_update_kernel(
+def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     A_log,
     a,
     dt_bias,
@@ -75,6 +75,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
 
     p_q = q + bos * stride_q + i_h * K + o_k
     p_k = k + bos * stride_k + i_h * K + o_k
@@ -82,18 +85,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_b = b + bos * stride_b + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
-    # Gating computation pointers
-    p_A_log = A_log + i_hv
     if IS_KDA:
         p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
         p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
-
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -108,18 +105,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    # Preload tree attention data if needed
-    if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-        token_indices = tl.arange(0, NP2_T)
-        mask_retrieve = token_indices < T
-        retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + (i_n * stride_retrieve_parent_token_seq)
-            + token_indices * stride_retrieve_parent_token_token
-        )
-        parent_idx_tokens = tl.load(
-            retrieve_parent_token_base, mask=mask_retrieve, other=0
-        )
+    b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
+    if IS_KDA:
+        b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0.0).to(tl.float32)
+    else:
+        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
@@ -132,40 +122,39 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+                parent_step_idx = tl.load(
+                    retrieve_parent_token_ptr
+                    + i_n * stride_retrieve_parent_token_seq
+                    + step_idx * stride_retrieve_parent_token_token
                 )
-                step_offset = parent_step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_v[None, :] * K
-                    + o_k[:, None]
-                )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+                if parent_step_idx != step_idx - 1:
+                    step_offset = parent_step_idx * HV * K * V
+                    cache_ptr = (
+                        intermediate_states_buffer
+                        + cache_idx * cache_steps * HV * K * V
+                        + step_offset
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
         # Load inputs
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_b = tl.load(p_b).to(tl.float32)
 
         # Compute sigmoid gating
         # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
         if IS_KDA:
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
         else:
             b_a = tl.load(p_a).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias), or the KDA safe gate.
         x = b_a + b_dt_bias
         if IS_KDA and USE_LOWER_BOUND:
-            b_g = lower_bound * tl.sigmoid(tl.exp(b_A_log) * x)
+            b_g = lower_bound * tl.sigmoid(b_A * x)
         else:
             beta_x = softplus_beta * x
             # Apply softplus with numerical stability
@@ -174,17 +163,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
                 x,
             )
-            b_g = -tl.exp(b_A_log) * softplus_x
+            b_g = -b_A * softplus_x
 
         # Compute beta = sigmoid(b)
         b_beta = beta_scale * (1.0 / (1.0 + tl.exp(-b_b)))
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
-
-        b_q = b_q * scale
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
 
         # Apply gating to hidden state: h *= exp(g)
         if IS_KDA:
@@ -202,6 +188,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_h += b_k[:, None] * b_v[None, :]
 
         # Compute output: o = sum(h * q, dim=0)
+        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_q = b_q * scale
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
@@ -315,7 +305,7 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
-    fused_sigmoid_gating_delta_rule_update_kernel[grid](
+    fused_sigmoid_gating_delta_rule_update_kernel_opt[grid](
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,

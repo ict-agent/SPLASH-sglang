@@ -20,6 +20,64 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+DECODE_OPT_T = 3072
+DECODE_OPT_D = 128
+DECODE_OPT_BT = 8
+
+
+@triton.jit
+def layer_norm_gated_fwd_kernel_decode_3072_128(
+    x,
+    g,
+    y,
+    w,
+    rstd,
+    eps,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, D)
+    offsets = o_t[:, None] * D + o_d[None, :]
+
+    b_x = tl.load(x + offsets).to(tl.float32)
+    b_rstd = tl.rsqrt(tl.sum(b_x * b_x, axis=1) * (1.0 / D) + eps)
+    tl.store(rstd + o_t, b_rstd)
+
+    b_w = tl.load(w + o_d).to(tl.float32)
+    b_g = tl.load(g + offsets).to(tl.float32)
+    b_y = b_x * b_rstd[:, None] * b_w[None, :] * tl.sigmoid(b_g)
+    tl.store(y + offsets, b_y)
+
+
+def _can_use_decode_3072_128_opt(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    y: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    activation: str,
+    is_rms_norm: bool,
+    residual_out: torch.Tensor,
+) -> bool:
+    return (
+        x.shape == (DECODE_OPT_T, DECODE_OPT_D)
+        and g.shape == (DECODE_OPT_T, DECODE_OPT_D)
+        and y.shape == (DECODE_OPT_T, DECODE_OPT_D)
+        and weight is not None
+        and weight.shape == (DECODE_OPT_D,)
+        and bias is None
+        and residual is None
+        and residual_out is None
+        and activation == "sigmoid"
+        and is_rms_norm
+        and x.stride() == (DECODE_OPT_D, 1)
+        and g.stride() == (DECODE_OPT_D, 1)
+        and y.stride() == (DECODE_OPT_D, 1)
+        and weight.stride() == (1,)
+    )
 
 
 @triton.jit
@@ -205,6 +263,33 @@ def layer_norm_gated_fwd(
         else None
     )
     rstd = torch.empty((T,), dtype=torch.float, device=x.device)
+    if _can_use_decode_3072_128_opt(
+        x=x,
+        g=g,
+        y=y,
+        weight=weight,
+        bias=bias,
+        residual=residual,
+        activation=activation,
+        is_rms_norm=is_rms_norm,
+        residual_out=residual_out,
+    ):
+        layer_norm_gated_fwd_kernel_decode_3072_128[
+            (cdiv(DECODE_OPT_T, DECODE_OPT_BT),)
+        ](
+            x=x,
+            g=g,
+            y=y,
+            w=weight,
+            rstd=rstd,
+            eps=eps,
+            D=DECODE_OPT_D,
+            BT=DECODE_OPT_BT,
+            num_warps=4,
+            num_stages=1,
+        )
+        return y, mean, rstd, residual_out if residual_out is not None else x
+
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
