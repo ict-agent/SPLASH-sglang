@@ -231,8 +231,6 @@ class Glm5NextConfig(PretrainedConfig):
             self.image_start_token_id = image_start_token_id
             self.image_end_token_id = image_end_token_id
 
-        logger.warning("glm5_next config unused kwargs keys: %s", list(kwargs.keys()))
-
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -312,4 +310,3 @@ class Glm5NextTextConfig(Glm5NextConfig):
 
 # Registered after definition: Glm5NextTextConfig subclasses Glm5NextConfig, so it can't be referenced inside the class body above.
 Glm5NextConfig.sub_configs["text_config"] = Glm5NextTextConfig
-
