@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.nsa.kpool.kernels import (
     all_gather_and_scatter_pool_slots,
     gather_index_k_scale_prefix_into,
     kpool_bf16_paged_mqa_logits,
+    kpool_dequantize_fp8_paged_kv_cache,
     kpool_assemble_softmax_rotate_write_cache,
     kpool_write_tail_and_maybe_compress,
     scatter_kpool_tail_updates,
@@ -721,14 +722,19 @@ class IndexerKPool(Indexer):
         )
         pool_max_seq_len = pool_block_tables.shape[1] * block_kv
         if is_dcu():
-            logits = kpool_bf16_paged_mqa_logits(
+            from lightop import gemmopt
+            kv_cache_fp8 = kv_cache_buf.view(
+                kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
+            kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
+            logits = gemmopt.paged_mqa_logits(
                 q_fp8,
-                kv_cache_buf,
-                weights,
+                kv_cache_bf16,
+                weights.float(),
                 pool_seqlens,
                 pool_block_tables,
+                None,
                 pool_max_seq_len,
-                block_kv,
             )
         else:
             kv_cache_fp8 = kv_cache_buf.view(
@@ -1236,14 +1242,19 @@ class IndexerKPool(Indexer):
 
         pool_max_seq_len = paged_page_table.shape[1] * block_kv
         if is_dcu():
-            logits = kpool_bf16_paged_mqa_logits(
+            from lightop import gemmopt
+            kv_cache_fp8 = kv_cache_buf.view(
+                kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
+            )
+            kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
+            logits = gemmopt.paged_mqa_logits(
                 q_index,
-                kv_cache_buf,
-                weights,
+                kv_cache_bf16,
+                weights.float(),
                 pool_seqlens_per_q,
                 paged_page_table,
+                None,
                 pool_max_seq_len,
-                block_kv,
             )
         else:
             kv_cache_fp8 = kv_cache_buf.view(

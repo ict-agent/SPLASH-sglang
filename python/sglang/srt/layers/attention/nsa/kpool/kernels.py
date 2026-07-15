@@ -219,6 +219,51 @@ def bf16_paged_mqa_logits(
     return logits
 
 
+def kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8: torch.Tensor) -> torch.Tensor:
+    """Dequantize a kpool FP8 paged cache view into BF16 K cache.
+
+    ``kv_cache_fp8`` is the 4D view used by paged MQA kernels:
+    ``[num_pages, slots_per_page, 1, INDEX_HEAD_DIM + 4]``. The underlying
+    kpool page layout is still ``[all K bytes][all FP32 scales]`` rather than
+    interleaved per slot, so this kernel reads K rows and scales using the
+    physical page layout and writes compact BF16 K rows:
+    ``[num_pages, slots_per_page, 1, INDEX_HEAD_DIM]``.
+    """
+
+    assert kv_cache_fp8.dtype == torch.uint8
+    assert kv_cache_fp8.ndim == 4 and kv_cache_fp8.shape[2] == 1
+    assert kv_cache_fp8.shape[-1] == INDEX_HEAD_DIM + 4
+    assert kv_cache_fp8.is_contiguous()
+
+    num_pages = kv_cache_fp8.shape[0]
+    slots_per_page = kv_cache_fp8.shape[1]
+    k_out = torch.empty(
+        (num_pages, slots_per_page, 1, INDEX_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=kv_cache_fp8.device,
+    )
+    if num_pages == 0 or slots_per_page == 0:
+        return k_out
+
+    _kpool_dequantize_fp8_paged_kv_cache_kernel[
+        (num_pages, triton.cdiv(slots_per_page, 4))
+    ](
+        kv_cache_fp8,
+        kv_cache_fp8.view(torch.float32),
+        k_out,
+        kv_cache_fp8.stride(0),
+        k_out.stride(0),
+        k_out.stride(1),
+        k_out.stride(3),
+        SLOTS_PER_PAGE=slots_per_page,
+        HEAD_DIM=INDEX_HEAD_DIM,
+        BLOCK_SLOTS=4,
+        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        num_warps=4,
+    )
+    return k_out
+
+
 @triton.jit
 def _bf16_paged_mqa_logits_kernel(
     q_ptr,
@@ -314,6 +359,58 @@ def _decode_e4m3fn(raw):
     # zero so it cannot poison a sparse score row.
     value = tl.where((exponent == 15) & (mantissa == 7), 0.0, value)
     return sign * value
+
+
+@triton.jit
+def _kpool_dequantize_fp8_paged_kv_cache_kernel(
+    kv_u8_ptr,
+    kv_fp32_ptr,
+    k_out_ptr,
+    kv_page_stride,
+    out_page_stride,
+    out_slot_stride,
+    out_dim_stride,
+    SLOTS_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    page_idx = tl.program_id(0)
+    slot = tl.program_id(1) * BLOCK_SLOTS + tl.arange(0, BLOCK_SLOTS)
+    valid_slot = slot < SLOTS_PER_PAGE
+    dims = tl.arange(0, BLOCK_D)
+    valid_dim = dims < HEAD_DIM
+
+    k_offsets = (
+        page_idx * kv_page_stride
+        + slot[:, None] * HEAD_DIM
+        + dims[None, :]
+    )
+    raw_k = tl.load(
+        kv_u8_ptr + k_offsets,
+        mask=valid_slot[:, None] & valid_dim[None, :],
+        other=0.0,
+    )
+
+    scale_byte_offsets = (
+        page_idx * kv_page_stride + SLOTS_PER_PAGE * HEAD_DIM + slot * 4
+    )
+    scale_offsets = scale_byte_offsets // 4
+    scales = tl.load(kv_fp32_ptr + scale_offsets, mask=valid_slot, other=0.0).to(
+        tl.float32
+    )
+
+    k = (_decode_e4m3fn(raw_k) * scales[:, None]).to(tl.bfloat16)
+    out_offsets = (
+        page_idx * out_page_stride
+        + slot[:, None] * out_slot_stride
+        + dims[None, :] * out_dim_stride
+    )
+    tl.store(
+        k_out_ptr + out_offsets,
+        k,
+        mask=valid_slot[:, None] & valid_dim[None, :],
+    )
 
 
 @triton.jit
