@@ -172,6 +172,9 @@ class W8A8Int8Config(QuantizationConfig):
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
+    # Linear wrappers use this capability instead of assuming that every
+    # quantization method accepts an already quantized activation.
+    supports_prequantized_input = True
 
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
@@ -227,8 +230,13 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        input_quant_args=None,
     ):
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
+            if input_quant_args is not None:
+                raise NotImplementedError(
+                    "Prequantized W8A8 input is only supported by the GPU path"
+                )
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -237,7 +245,33 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
+        if input_quant_args is None:
+            x_q, x_scale = per_token_quant_int8(x)
+        else:
+            if (
+                not isinstance(input_quant_args, (tuple, list))
+                or len(input_quant_args) != 2
+            ):
+                raise ValueError("input_quant_args must be a (q_int8, scale_fp32) pair")
+            x_q, x_scale = input_quant_args
+            expected_scale_shape = (*x.shape[:-1], 1)
+            if x_q.shape != x.shape or x_q.dtype != torch.int8:
+                raise ValueError(
+                    f"Expected INT8 activation with shape {tuple(x.shape)}, got "
+                    f"shape={tuple(x_q.shape)}, dtype={x_q.dtype}"
+                )
+            if (
+                x_scale.shape != expected_scale_shape
+                or x_scale.dtype != torch.float32
+            ):
+                raise ValueError(
+                    f"Expected FP32 scale with shape {expected_scale_shape}, got "
+                    f"shape={tuple(x_scale.shape)}, dtype={x_scale.dtype}"
+                )
+            if x_q.device != x.device or x_scale.device != x.device:
+                raise ValueError("Prequantized activation and scale must be on x.device")
+            if not x_q.is_contiguous() or not x_scale.is_contiguous():
+                raise ValueError("Prequantized activation and scale must be contiguous")
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])

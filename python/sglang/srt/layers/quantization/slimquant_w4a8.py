@@ -21,7 +21,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 
 import os
 from sglang.srt.utils import get_bool_env_var
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):

@@ -54,16 +54,17 @@ _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+# Implicitly delaying RMSNorm into a Linear is the legacy protocol.  The GLM5
+# KDA path passes an explicit (q, scale) pair and does not depend on this flag.
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
 _use_fused_bailing_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_SILU_MUL_FP8_QUANT")
 _use_fused_dpskv4_silu_mul_fp8_quant = get_bool_env_var("SGLANG_USE_FUSED_DPSKV4_SILU_MUL_FP8_QUANT")
 
 if _use_fused_rms_quant:
-    try:
-        from lmslim.quantize.quant_ops import lm_faster_rmsquant
-    except Exception as e:
-        print(f"Error: Import fused rmsquant error: {e}")
+    from sglang.srt.layers.fused_rms_quant import (
+        fused_rms_norm_per_token_quant as lm_faster_rmsquant,
+    )
 if _use_fused_silu_mul_quant:
     try:
         from lmslim.quantize.quant_ops import lm_fuse_silu_mul_quant
@@ -296,34 +297,46 @@ class ReplicatedLinear(LinearBase):
         ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
-    def forward(self,
-                x: torch.Tensor,
-                rms_weight: Optional[torch.Tensor] = None,
-                residual: Optional[torch.Tensor] = None,
-                quant_args: Optional[list] = None,
-                update_hd: Optional[bool] = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if _use_fused_rms_quant and rms_weight is not None:
-            i_q, _scales = lm_faster_rmsquant(input=x,
-                                              rms_weight=rms_weight,
-                                              epsilon=1e-6,
-                                              quant_dtype=torch.int8,
-                                              residual=residual,
-                                              update_input=update_hd,
-                                            )
+    def forward(
+        self,
+        x: torch.Tensor,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        quant_args: Optional[list] = None,
+        update_hd: Optional[bool] = True,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        rms_norm_eps: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+        if input_quant_args is not None:
+            if not getattr(self.quant_method, "supports_prequantized_input", False):
+                raise TypeError(
+                    f"{type(self.quant_method).__name__} does not support prequantized input"
+                )
+            output = self.quant_method.apply(
+                self, x, bias, input_quant_args=input_quant_args
+            )
+        elif _use_fused_rms_quant and rms_weight is not None:
+            if rms_norm_eps is None:
+                raise ValueError("rms_norm_eps must be provided for fused RMS+quant")
+            i_q, _scales = lm_faster_rmsquant(
+                input=x,
+                rms_weight=rms_weight,
+                epsilon=rms_norm_eps,
+                quant_dtype=torch.int8,
+                residual=residual,
+                update_input=update_hd,
+            )
 
-            input_quant_args = [i_q, _scales]
-
-            bias = self.bias if not self.skip_bias_add else None
-            assert self.quant_method is not None
-            output = self.quant_method.apply(self, x, bias, input_quant_args)
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
+            input_quant_args = (i_q, _scales)
+            output = self.quant_method.apply(
+                self, x, bias, input_quant_args=input_quant_args
+            )
         else:
-            bias = self.bias if not self.skip_bias_add else None
-            assert self.quant_method is not None
             output = self.quant_method.apply(self, x, bias)
-            output_bias = self.bias if self.skip_bias_add else None
-            return output, output_bias
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -508,26 +521,38 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_,
-                rms_weight: Optional[torch.Tensor] = None,
-                residual: Optional[torch.Tensor] = None,
-                update_hd: Optional[bool] = True,
-                input_quant_args = None,
-            ):
-        if _use_fused_rms_quant and (rms_weight is not None or input_quant_args is not None):
+    def forward(
+        self,
+        input_,
+        rms_weight: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        update_hd: Optional[bool] = True,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
+        if input_quant_args is not None or (
+            _use_fused_rms_quant and rms_weight is not None
+        ):
             if input_quant_args is None:
-                i_q, _scales = lm_faster_rmsquant(input=input_,
-                                            rms_weight=rms_weight,
-                                            epsilon=self.eps,
-                                            quant_dtype=torch.int8,
-                                            residual=residual,
-                                            update_input=update_hd)
+                i_q, _scales = lm_faster_rmsquant(
+                    input=input_,
+                    rms_weight=rms_weight,
+                    epsilon=self.eps,
+                    quant_dtype=torch.int8,
+                    residual=residual,
+                    update_input=update_hd,
+                )
 
-                input_quant_args = [i_q, _scales]
+                input_quant_args = (i_q, _scales)
 
             bias = self.bias if not self.skip_bias_add else None
             assert self.quant_method is not None
-            output_parallel = self.quant_method.apply(self, input_, bias, input_quant_args)
+            if not getattr(self.quant_method, "supports_prequantized_input", False):
+                raise TypeError(
+                    f"{type(self.quant_method).__name__} does not support prequantized input"
+                )
+            output_parallel = self.quant_method.apply(
+                self, input_, bias, input_quant_args=input_quant_args
+            )
 
             if self.gather_output:
                 # All-gather across the partitions.

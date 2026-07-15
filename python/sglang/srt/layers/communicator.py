@@ -102,7 +102,10 @@ if _use_aiter:
         )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+# The historical delayed-RMS protocol is incomplete for MLA/MoE (some BF16
+# consumers can observe an unnormalized tensor).  Keep it opt-in separately;
+# SGLANG_USE_FUSED_RMS_QUANT now selects the audited GLM5 KDA integration.
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
 _use_fused_bailing_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_BAILING_RMS_QUANT")
 if _use_fused_bailing_rms_quant:
     from lightop import rms_norm_per_token_fp8_quant
@@ -448,6 +451,7 @@ class LayerCommunicator:
         self.layer_id = layer_id
 
         self._context = CommunicateContext.init_new()
+        self._attn_input_quant_args = None
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -510,7 +514,10 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        fuse_rms_quant: bool = False,
     ):
+        del fuse_rms_quant
+        self._attn_input_quant_args = None
         layer_id = self.layer_id if self.layer_id >= 0 else _get_comm_layer_id(self.qkv_latent_func)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -679,6 +686,11 @@ class LayerCommunicator:
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
+
+    def take_attn_input_quant_args(self):
+        input_quant_args = self._attn_input_quant_args
+        self._attn_input_quant_args = None
+        return input_quant_args
 
     def _tp_reduce_scatter(
         self,

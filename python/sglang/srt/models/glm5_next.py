@@ -64,6 +64,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.fused_rms_quant import (
+    is_lightop_sglang_rms_quant_available,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -146,6 +149,16 @@ logger = logging.getLogger(__name__)
 KDA_SAFE_GATE_LOWER_BOUND = -5.0
 KDA_NEG_EIGVAL_BETA_SCALE = 2.0
 KDA_DEFAULT_BETA_SCALE = 1.0
+
+
+def _linear_supports_prequantized_input(linear: nn.Module) -> bool:
+    return bool(
+        getattr(
+            getattr(linear, "quant_method", None),
+            "supports_prequantized_input",
+            False,
+        )
+    )
 
 
 def _get_config_dtype(config: ModelNextConfig):
@@ -385,7 +398,12 @@ class ModelNextLinearAttention(nn.Module):
 
         self._cp_fuse_symm_mem = envs.SGLANG_NSA_CP_FUSE_SYMM_MEM.get()
 
-    def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def forward_qkvbfg(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_quant_args=None,
+    ):
         cp_prefill = nsa_use_prefill_cp(forward_batch)
         if cp_prefill and self._cp_fuse_symm_mem:
             from torch.distributed._symmetric_memory import (
@@ -412,10 +430,42 @@ class ModelNextLinearAttention(nn.Module):
                 hidden_states = cp_plain_all_gather(
                     hidden_states, get_attention_cp_size(), forward_batch
                 )
-            qkv = self.qkv_proj(hidden_states)[0]
-            beta = self.b_proj(hidden_states)[0]
-            fa_out = self.f_a_proj(hidden_states)[0]
-            ga_out = self.g_a_proj(hidden_states)[0]
+                # The gathered tensor has a different row layout from the
+                # local prequantized input.  This mode is excluded by the
+                # caller, but retain a safe fallback if that changes.
+                input_quant_args = None
+            qkv = self.qkv_proj(
+                hidden_states,
+                input_quant_args=(
+                    input_quant_args
+                    if _linear_supports_prequantized_input(self.qkv_proj)
+                    else None
+                ),
+            )[0]
+            beta = self.b_proj(
+                hidden_states,
+                input_quant_args=(
+                    input_quant_args
+                    if _linear_supports_prequantized_input(self.b_proj)
+                    else None
+                ),
+            )[0]
+            fa_out = self.f_a_proj(
+                hidden_states,
+                input_quant_args=(
+                    input_quant_args
+                    if _linear_supports_prequantized_input(self.f_a_proj)
+                    else None
+                ),
+            )[0]
+            ga_out = self.g_a_proj(
+                hidden_states,
+                input_quant_args=(
+                    input_quant_args
+                    if _linear_supports_prequantized_input(self.g_a_proj)
+                    else None
+                ),
+            )[0]
 
         forget_gate = self.f_b_proj(fa_out)[0]
         g_proj_states = self.g_b_proj(ga_out)[0]
@@ -467,7 +517,9 @@ class ModelNextLinearAttention(nn.Module):
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
-                hidden_states, forward_batch
+                hidden_states,
+                forward_batch,
+                input_quant_args=kwargs.get("input_quant_args"),
             )
 
         # For prefill, chunk_kda expects raw gate as [B, T, H, K], while beta is
@@ -696,6 +748,22 @@ class ModelNextDecoderLayer(nn.Module):
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
+        self._can_fuse_attn_rms_quant = (
+            self.is_linear_attn
+            and envs.SGLANG_USE_FUSED_RMS_QUANT.get()
+            and is_lightop_sglang_rms_quant_available()
+            and not self.self_attn.do_fuse_qkvbfg
+            and any(
+                _linear_supports_prequantized_input(linear)
+                for linear in (
+                    self.self_attn.qkv_proj,
+                    self.self_attn.b_proj,
+                    self.self_attn.f_a_proj,
+                    self.self_attn.g_a_proj,
+                )
+            )
+        )
+
     def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
         """mHC pre-stage for the attention sub-layer (reads hc_attn_* params)."""
         assert self.config.mhc, "hc_attn_pre is only valid when config.mhc=True"
@@ -793,6 +861,13 @@ class ModelNextDecoderLayer(nn.Module):
             residual,
             forward_batch,
             quant_format,
+            fuse_rms_quant=(
+                self._can_fuse_attn_rms_quant
+                and not nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            ),
+        )
+        attn_input_quant_args = (
+            self.layer_communicator.take_attn_input_quant_args()
         )
 
         # MLA's CP attention consumes the scattered (round-robin/zigzag)
@@ -813,6 +888,11 @@ class ModelNextDecoderLayer(nn.Module):
             if ctx.attn_inputs_ is not None:
                 ctx.attn_inputs_.hidden_states_local = hidden_states
 
+        attn_quant_kwargs = (
+            {"input_quant_args": attn_input_quant_args}
+            if self.is_linear_attn and attn_input_quant_args is not None
+            else {}
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -820,6 +900,7 @@ class ModelNextDecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             layer_scatter_modes=self.layer_scatter_modes,
             prev_topk_indices=prev_topk_indices,
+            **attn_quant_kwargs,
         )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
@@ -888,6 +969,18 @@ class ModelNextModel(nn.Module):
         super().__init__()
 
         self.config = config
+        if envs.SGLANG_USE_FUSED_RMS_QUANT.get():
+            if is_lightop_sglang_rms_quant_available():
+                log_info_on_rank0(
+                    logger,
+                    "LightOp RMSNorm+INT8 quant fusion enabled for eligible GLM5 KDA layers.",
+                )
+            else:
+                log_info_on_rank0(
+                    logger,
+                    "SGLANG_USE_FUSED_RMS_QUANT was requested, but the rebuilt "
+                    "LightOp SGLang entry point is unavailable; using native RMSNorm.",
+                )
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace

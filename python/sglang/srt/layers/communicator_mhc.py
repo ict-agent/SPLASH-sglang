@@ -23,6 +23,10 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer,
     get_local_dp_buffer,
 )
+from sglang.srt.layers.fused_rms_quant import (
+    fused_rms_norm_per_token_quant,
+    supports_fused_rms_quant_input,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -76,8 +80,10 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        fuse_rms_quant: bool = False,
     ):
         del residual, quant_format, post_residual_addition
+        self._attn_input_quant_args = None
         assert self.hc_attn_pre is not None
 
         if (
@@ -93,7 +99,33 @@ class MHCLayerCommunicator(LayerCommunicator):
             self.input_layernorm.variance_epsilon,
         )
         if not norm_fused and hidden_states.shape[0] != 0:
-            hidden_states = self.input_layernorm(hidden_states)
+            # The original mHC state is the cross-layer residual.  Only update
+            # hc_pre's newly produced buffer in place; if an implementation
+            # ever aliases it to residual, retain the native out-of-place path.
+            hidden_storage_ptr = hidden_states.untyped_storage().data_ptr()
+            aliases_mhc_state = any(
+                state is not None
+                and state.untyped_storage().data_ptr() == hidden_storage_ptr
+                for state in (residual, self._h_res, self._h_post)
+            )
+            can_fuse = (
+                fuse_rms_quant
+                and not aliases_mhc_state
+                and supports_fused_rms_quant_input(
+                    hidden_states, self.input_layernorm.weight
+                )
+            )
+            if can_fuse:
+                self._attn_input_quant_args = fused_rms_norm_per_token_quant(
+                    input=hidden_states,
+                    rms_weight=self.input_layernorm.weight,
+                    epsilon=self.input_layernorm.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=None,
+                    update_input=True,
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
         if self.qkv_latent_func is not None:
             get_attn_tp_context().set_attn_inputs(

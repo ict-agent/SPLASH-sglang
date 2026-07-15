@@ -224,7 +224,10 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_opt_cat_decode = get_bool_env_var("SGLANG_USE_OPT_CAT")
 _use_fused_mla_cat = get_bool_env_var("SGLANG_USE_FUSED_MLA_CAT")
 _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
+# This legacy delayed-RMS path is not safe for MLA's q_lora/indexer and has an
+# incomplete MoE return-value contract.  Keep it isolated from the audited
+# GLM5 KDA path selected by SGLANG_USE_FUSED_RMS_QUANT.
+_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
 _rms_quant_path = get_int_env_var('SGLANG_USE_RMS_QUANT_PATH')
 if _use_fused_rmsnorm_rope:
     from lightop import fused_rms_norm_rope_contiguous
@@ -2004,6 +2007,7 @@ class DeepseekV2AttentionMLA(
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
                             hidden_states, 
                             rms_weight=self.input_layernorm.weight.data,
+                            rms_norm_eps=self.input_layernorm.variance_epsilon,
                             residual=None,
                             update_hd=False)
                         forward_batch.residual_rms_per_quant_int8 = hidden_states
@@ -2011,6 +2015,7 @@ class DeepseekV2AttentionMLA(
                         qkv_latent, _ = self.fused_qkv_a_proj_with_mqa(
                             hidden_states, 
                             rms_weight=self.input_layernorm.weight.data,
+                            rms_norm_eps=self.input_layernorm.variance_epsilon,
                             residual=forward_batch.residual_rms_per_quant_int8,
                             update_hd=False)
                 else:
