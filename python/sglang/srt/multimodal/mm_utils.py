@@ -573,6 +573,19 @@ def run_dp_sharded_mrope_vision_model(
     max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
+    # An empty rank (0 assigned images) skips the ViT, so its embedding buffer
+    # must be placed on the ViT's OWN cuda device/dtype — NOT pixel_values',
+    # which is the (CPU) HF-processor output and only gets moved to cuda inside
+    # the ViT forward. Otherwise an empty rank feeds a CPU tensor into the
+    # NCCL-only all_gather below and the whole collective fails with
+    # "No backend type associated with device type cpu".
+    try:
+        model_device = vision_model.device
+        model_dtype = vision_model.dtype
+    except AttributeError:
+        _p = next(vision_model.parameters())
+        model_device, model_dtype = _p.device, _p.dtype
+
     # Run the vision model on the local pixel_values_local
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
@@ -585,8 +598,8 @@ def run_dp_sharded_mrope_vision_model(
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
                 (0, embed_dim_reduction_factor, out_dim),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                device=model_device,
+                dtype=model_dtype,
             )
     else:
         if pixel_values_local.shape[0] > 0:
@@ -598,8 +611,8 @@ def run_dp_sharded_mrope_vision_model(
             # Handle empty case
             image_embeds_local = torch.empty(
                 (0, vision_model.out_hidden_size),
-                device=pixel_values.device,
-                dtype=pixel_values.dtype,
+                device=model_device,
+                dtype=model_dtype,
             )
 
     # Pad the output based on max_len_per_rank
