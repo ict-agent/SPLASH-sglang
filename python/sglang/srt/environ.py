@@ -580,6 +580,8 @@ class Envs:
     # frames (decode is offloaded/parallel but ViT is serial, so results pile up).
     # 0 = unlimited (previous behavior).
     SGLANG_ENCODER_MAX_CONCURRENT_VIDEO = EnvInt(0)
+    # Min sampled-frame count to trigger DP-sharded single-video decode.
+    SGLANG_DP_DECODE_MIN_FRAMES = EnvInt(320)
 
     # Mooncake RDMA registered-buffer pool (encoder transfer path). Both must
     # be > 0 to ENABLE the pool: the receiver then reuses registered-once

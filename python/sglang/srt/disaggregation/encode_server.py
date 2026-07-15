@@ -53,6 +53,7 @@ from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.glm4v import (
     _split_video_items as glm_split_video_items,
     glm_sample_and_decode_sync,
+    glm_decode_frames_at,
     glm_sample_frame_indices,
     preprocess_video_frames_sync as glm_preprocess_video_frames_sync,
 )
@@ -167,6 +168,11 @@ _mm_feature_attrs = {
 
 
 def _get_mm_grid_dim(mm_inputs, modality):
+    # DP-sharded decode: use global grid override if present. Scoped to VIDEO
+    # so a mixed image+video request doesn't hand the video grid to the image
+    # modality lookup.
+    if modality == Modality.VIDEO and "_video_grid_thw_global" in mm_inputs:
+        return mm_inputs["_video_grid_thw_global"]
     for attr in _mm_grid_attrs[modality]:
         if attr in mm_inputs:
             return mm_inputs[attr]
@@ -605,6 +611,132 @@ class MMEncoder:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
 
+    async def _dp_sharded_decode_single_video(
+        self, vr, video_config, num_decode_workers, *, tp_rank, tp_size,
+        video_processor_kwargs, precomputed_indices=None,
+    ):
+        """DP-sharded decode: each TP rank decodes only its assigned temporal
+        units from a single video, so no rank holds all frames at once.
+
+        Returns ``(videos, video_processor_kwargs)`` like ``_flatten_and_load_videos``.
+        ``video_processor_kwargs`` carries an extra ``_dp_meta`` dict for
+        ``_process_mm_items`` to build global metadata from.
+        """
+        video_config = video_config or {}
+        video_fps = vr.avg_fps
+        total_num_frames = len(vr)
+        duration = total_num_frames / video_fps if video_fps else 0
+
+        # Global sampling: deterministic, identical on all ranks.
+        if precomputed_indices is not None:
+            global_indices = precomputed_indices
+        else:
+            global_indices = glm_sample_frame_indices(
+                total_num_frames,
+                video_fps,
+                duration,
+                target_fps=video_config.get("fps"),
+                max_frame_count=video_config.get("max_frames"),
+            )
+        n_units = len(global_indices) // 2  # temporal_patch_size=2
+
+        # Contiguous split: rank r owns a contiguous block of temporal units
+        # (remainder to the low ranks), so the ViT all_gather reassembles in
+        # global order without any permutation.
+        base, rem = divmod(n_units, tp_size)
+        gpu_sample_counts = [base + (1 if r < rem else 0) for r in range(tp_size)]
+        start = sum(gpu_sample_counts[:tp_rank])
+        count = gpu_sample_counts[tp_rank]
+
+        # Unit u -> frame pair (2u, 2u+1); a contiguous unit block is a
+        # contiguous frame slice.
+        local_frame_indices = list(global_indices[2 * start : 2 * (start + count)])
+
+        # Rank-local admission + decode. Any failure here (admission rejection,
+        # decode error) must NOT unwind this rank alone: every rank enters this
+        # function symmetrically and peers go on to the ViT all_gather, so a lone
+        # bail-out would deadlock them. Capture the error, agree on a global
+        # outcome below, then all ranks proceed or all abort together.
+        loop = asyncio.get_running_loop()
+        frames = None
+        reserved = 0
+        local_err = None
+        try:
+            # Byte-based admission on this rank's share.
+            if local_frame_indices:
+                try:
+                    h, w = vr.frame_shape
+                    est_bytes = len(local_frame_indices) * h * w * 3
+                except Exception:
+                    est_bytes = 0
+                admit_err, reserved = await self.await_gpu_bytes(est_bytes)
+                if admit_err is not None:
+                    logger.warning(f"[video-admit-dp] rejected: {admit_err}")
+                    raise MMError(admit_err, code=HTTPStatus.SERVICE_UNAVAILABLE)
+
+                # Decode only local frames.
+                frames = await loop.run_in_executor(
+                    self.io_executor,
+                    glm_decode_frames_at,
+                    vr,
+                    local_frame_indices,
+                    num_decode_workers,
+                    video_config,
+                )
+        except Exception as e:
+            local_err = e
+            frames = None
+        finally:
+            self._release_admit_bytes(reserved)
+
+        # Cross-rank agreement: MIN all-reduce of the per-rank success flag over
+        # the attention-TP group. Any single failure (flag 0) aborts every rank,
+        # so no peer is ever left waiting on the downstream ViT all_gather.
+        from sglang.srt.layers.dp_attention import get_attention_tp_group
+
+        local_ok = 0 if local_err is not None else 1
+        if tp_size > 1:
+            flag = torch.tensor([local_ok], dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_attention_tp_group().cpu_group,
+            )
+            global_ok = int(flag.item())
+        else:
+            global_ok = local_ok
+
+        if global_ok == 0:
+            if local_err is not None:
+                # Re-raise this rank's own error, preserving its code (MMError
+                # 503, TimeoutError, ...) which _encode already maps correctly.
+                raise local_err
+            # A peer failed; abort symmetrically. Retryable 503, no deadlock.
+            raise MMError(
+                "peer TP rank failed during DP-sharded video decode; "
+                "aborting to keep ranks in sync",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+
+        if frames is not None:
+            videos = [frames]
+        else:
+            # Empty rank: HF processor still needs a placeholder.
+            import numpy as np
+            h, w = vr.frame_shape
+            videos = [np.zeros((0, h, w, 3), dtype=np.uint8)]
+
+        video_processor_kwargs["do_sample_frames"] = False
+        video_processor_kwargs["return_metadata"] = True
+        # Global metadata for _process_mm_items to rebuild timestamps/grid.
+        video_processor_kwargs["_dp_meta"] = {
+            "global_indices": global_indices,
+            "fps": video_fps,
+            "n_units": n_units,
+            "gpu_sample_counts": gpu_sample_counts,
+        }
+        return videos, video_processor_kwargs
+
     def _estimate_video_decode_bytes(self, video_items, video_configs) -> int:
         """Estimate a request's raw GPU decode footprint (bytes): per video
         sampled_frames * H * W * 3 (native-resolution NHWC uint8)."""
@@ -735,6 +867,44 @@ class MMEncoder:
                 return videos, video_processor_kwargs
 
             # Decoded-video fast path: sampled + K-way parallel decode.
+            num_decode_workers = int(
+                os.environ.get("SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS", "4")
+            )
+
+            # DP-sharded decode: each TP rank decodes only its temporal units,
+            # then the ViT path all_gathers to rebuild the full embedding —
+            # avoids every rank holding all frames (large-video OOM). GPU-decode
+            # only, since that is where the per-rank VRAM pressure exists.
+            from sglang.srt.layers.dp_attention import (
+                get_attention_tp_rank,
+                get_attention_tp_size,
+            )
+
+            tp_size = get_attention_tp_size()
+            _DP_DECODE_MIN_FRAMES = envs.SGLANG_DP_DECODE_MIN_FRAMES.get()
+            if (
+                self.use_image_processor_gpu
+                and self.server_args.mm_enable_dp_encoder
+                and tp_size > 1
+                and len(video_items) == 1
+            ):
+                vr = video_items[0]
+                cfg = video_configs[0] if video_configs else {}
+                sampled = glm_sample_frame_indices(
+                    len(vr), vr.avg_fps,
+                    len(vr) / vr.avg_fps if vr.avg_fps else 0,
+                    target_fps=cfg.get("fps"),
+                    max_frame_count=cfg.get("max_frames"),
+                )
+                if len(sampled) >= _DP_DECODE_MIN_FRAMES:
+                    return await self._dp_sharded_decode_single_video(
+                        vr, cfg, num_decode_workers,
+                        tp_rank=get_attention_tp_rank(),
+                        tp_size=tp_size,
+                        video_processor_kwargs=video_processor_kwargs,
+                        precomputed_indices=sampled,
+                    )
+
             # Byte-based admission: wait for GPU headroom before decoding.
             est_bytes = self._estimate_video_decode_bytes(video_items, video_configs)
             admit_err, reserved = await self.await_gpu_bytes(est_bytes)
@@ -742,9 +912,6 @@ class MMEncoder:
                 logger.warning(f"[video-admit] rejected: {admit_err}")
                 raise MMError(admit_err, code=HTTPStatus.SERVICE_UNAVAILABLE)
 
-            num_decode_workers = int(
-                os.environ.get("SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS", "4")
-            )
             tasks = [
                 loop.run_in_executor(
                     self.io_executor,
@@ -1117,6 +1284,8 @@ class MMEncoder:
             videos, video_processor_kwargs = await self._flatten_and_load_videos(
                 mm_items
             )
+            # Pop DP metadata before passing to HF processor (it's not an HF kwarg)
+            dp_meta = video_processor_kwargs.pop("_dp_meta", None)
             processor_input = self.video_processor(
                 videos=videos, **video_processor_kwargs
             )
@@ -1144,25 +1313,45 @@ class MMEncoder:
                     video_timestamps.append(timestamps)
                 processor_input["video_timestamps"] = video_timestamps
             elif "glm" in self.model_type:
-                # GLM4V: the HF video processor sampled frames internally and
-                # returned the sampled metadata. Reproduce HF's per-frame
-                # timestamps (metadata.timestamps[::2]) so the language side can
-                # rebuild the same interleaved frame/timestamp token layout.
-                video_metadata = processor_input.get("video_metadata", None)
-                video_timestamps = []
-                if video_metadata is not None:
-                    for metadata in video_metadata:
-                        ts = getattr(metadata, "timestamps", None)
-                        if ts is None and isinstance(metadata, dict):
-                            ts = metadata.get("timestamps", None)
-                        if ts is None:
-                            raise InternalError(
-                                f"GLM4V video metadata missing timestamps: {metadata}"
-                            )
-                        video_timestamps.append(list(ts)[::2])
-                processor_input["video_timestamps"] = video_timestamps
-                # video_metadata is not transferable / needed downstream.
-                processor_input.pop("video_metadata", None)
+                if dp_meta is not None:
+                    # DP-sharded: build GLOBAL timestamps from global indices;
+                    # local processor metadata only has this rank's subset.
+                    gidx = dp_meta["global_indices"]
+                    gfps = dp_meta["fps"]
+                    global_ts = [i / gfps for i in gidx][::2]
+                    processor_input["video_timestamps"] = [global_ts]
+                    processor_input.pop("video_metadata", None)
+                    # DP sharding info for get_video_feature / ViT path.
+                    processor_input["dp_decode_sharded"] = True
+                    processor_input["dp_meta"] = dp_meta
+                    # Override grid_thw with the global grid, not the subset.
+                    local_grid = processor_input.get("video_grid_thw")
+                    if local_grid is not None and len(local_grid) > 0:
+                        h_val = int(local_grid[0][1])
+                        w_val = int(local_grid[0][2])
+                        processor_input["_video_grid_thw_global"] = torch.tensor(
+                            [[dp_meta["n_units"], h_val, w_val]]
+                        )
+                else:
+                    # GLM4V: the HF video processor sampled frames internally and
+                    # returned the sampled metadata. Reproduce HF's per-frame
+                    # timestamps (metadata.timestamps[::2]) so the language side can
+                    # rebuild the same interleaved frame/timestamp token layout.
+                    video_metadata = processor_input.get("video_metadata", None)
+                    video_timestamps = []
+                    if video_metadata is not None:
+                        for metadata in video_metadata:
+                            ts = getattr(metadata, "timestamps", None)
+                            if ts is None and isinstance(metadata, dict):
+                                ts = metadata.get("timestamps", None)
+                            if ts is None:
+                                raise InternalError(
+                                    f"GLM4V video metadata missing timestamps: {metadata}"
+                                )
+                            video_timestamps.append(list(ts)[::2])
+                    processor_input["video_timestamps"] = video_timestamps
+                    # video_metadata is not transferable / needed downstream.
+                    processor_input.pop("video_metadata", None)
             elif (
                 self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
                 and processor_input.get("video_grid_thw", None) is not None
@@ -1243,12 +1432,22 @@ class MMEncoder:
                     "feature": _convert(_get_mm_feature(mm_inputs, modality)),
                 }
             )
+            # Keys internal to DP sharding — don't convert with _convert
+            _dp_internal_keys = {"dp_decode_sharded", "dp_meta", "_video_grid_thw_global"}
+            is_dp_sharded = mm_inputs.get("dp_decode_sharded", False)
             for k, v in mm_inputs.items():
                 if k in _mm_feature_attrs[modality]:
                     continue
+                if k in _dp_internal_keys:
+                    continue
                 mm_item.set(k, _convert(v))
 
-            if self.server_args.enable_prefix_mm_cache:
+            # Thread DP sharding info onto mm_item so get_video_feature can see it
+            if is_dp_sharded:
+                mm_item.set("dp_decode_sharded", True)
+                mm_item.set("dp_meta", mm_inputs["dp_meta"])
+
+            if self.server_args.enable_prefix_mm_cache and not is_dp_sharded:
                 mm_item.set_pad_value()
                 mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
                 async with self.mm_cache_lock:
@@ -1263,7 +1462,7 @@ class MMEncoder:
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
-            if self.server_args.enable_prefix_mm_cache:
+            if self.server_args.enable_prefix_mm_cache and not is_dp_sharded:
                 async with self.mm_cache_lock:
                     self.mm_cache.set(mm_hash, EmbeddingResult(embedding=mm_embedding))
             if self.profiler is not None:

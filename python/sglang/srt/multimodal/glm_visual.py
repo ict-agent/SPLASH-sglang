@@ -17,7 +17,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    run_dp_presharded_mrope_vision_model,
+    run_dp_sharded_mrope_vision_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +112,27 @@ class GlmVisualEncoderMixin:
             self.visual.dtype
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+
+        # DP-sharded decode: pixel_values are already this rank's subset.
+        # dp_meta (set together with the shard) drives the presharded ViT path,
+        # which all_gathers the per-rank embeddings back to global order.
+        dp_meta = next(
+            (item.dp_meta for item in items if getattr(item, "dp_meta", None)), None
+        )
+        if dp_meta is not None and self.use_data_parallel:
+            # All temporal units share the same spatial dims. Local grid = this
+            # rank's frames; global grid = all n_units frames.
+            h_val = int(video_grid_thw[0][1])
+            w_val = int(video_grid_thw[0][2])
+            local_grid = [[1, h_val, w_val]] * int(video_grid_thw[:, 0].sum())
+            global_grid = [[1, h_val, w_val]] * dp_meta["n_units"]
+            return run_dp_presharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                local_grid,
+                global_grid,
+                dp_meta["gpu_sample_counts"],
+            )
 
         # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
         temp_frames_hw = []

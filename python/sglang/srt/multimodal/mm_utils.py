@@ -668,3 +668,90 @@ def run_dp_sharded_mrope_vision_model(
             current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings
+
+
+def run_dp_presharded_mrope_vision_model(
+    vision_model: torch.nn.Module,
+    pixel_values_local: torch.Tensor,
+    local_grid_thw_list: list,
+    global_grid_thw_list: list,
+    gpu_sample_counts: list,
+):
+    """Run a vision model whose input is ALREADY DP-sharded at the decode stage.
+
+    Units are split into contiguous per-rank blocks (rank ``r`` owns
+    ``global_grid_thw_list`` units ``[start_r, start_r + gpu_sample_counts[r])``).
+    ``gpu_sample_counts`` is the decode-stage assignment, threaded through
+    ``dp_meta`` — reused here as the single source of truth rather than
+    recomputed. Because the blocks are contiguous, an all_gather in rank order
+    already yields the global unit order, so the padded per-rank slices just
+    concatenate — no permutation.
+    """
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_group,
+        get_attention_tp_size,
+    )
+
+    tp_size = get_attention_tp_size()
+
+    # Per-rank total patch count over each rank's contiguous unit block.
+    patches_per_image = [math.prod(g) for g in global_grid_thw_list]
+    grouped_pixel_values_len = []
+    _idx = 0
+    for rank in range(tp_size):
+        cnt = gpu_sample_counts[rank]
+        grouped_pixel_values_len.append(sum(patches_per_image[_idx : _idx + cnt]))
+        _idx += cnt
+
+    embed_dim_reduction_factor = (
+        vision_model.spatial_merge_size * vision_model.spatial_merge_size
+    )
+    max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
+
+    # Empty-rank buffer must sit on the ViT's cuda device, not the CPU
+    # placeholder pixel_values, or the NCCL all_gather below fails.
+    try:
+        model_device = vision_model.device
+        model_dtype = vision_model.dtype
+    except AttributeError:
+        _p = next(vision_model.parameters())
+        model_device, model_dtype = _p.device, _p.dtype
+
+    if pixel_values_local.shape[0] > 0:
+        image_embeds_local = vision_model(
+            pixel_values_local, torch.tensor(local_grid_thw_list)
+        )
+    else:
+        image_embeds_local = torch.empty(
+            (0, vision_model.out_hidden_size),
+            device=model_device,
+            dtype=model_dtype,
+        )
+
+    # Pad for all_gather
+    current_len = image_embeds_local.shape[0]
+    if current_len < max_len_per_rank:
+        padding = torch.empty(
+            (max_len_per_rank - current_len, image_embeds_local.shape[1]),
+            dtype=image_embeds_local.dtype,
+            device=image_embeds_local.device,
+        )
+        image_embeds_local_padded = torch.cat([image_embeds_local, padding], dim=0)
+    else:
+        image_embeds_local_padded = image_embeds_local
+
+    # All-gather across TP group
+    gathered_embeds = get_attention_tp_group().all_gather(
+        image_embeds_local_padded, dim=0
+    )
+
+    # Contiguous blocks: strip each rank's padding and concat in rank order,
+    # which already reproduces the global unit order.
+    original_order_embeddings = []
+    for rank in range(tp_size):
+        start_idx = rank * max_len_per_rank
+        end_idx = start_idx + (
+            grouped_pixel_values_len[rank] // embed_dim_reduction_factor
+        )
+        original_order_embeddings.append(gathered_embeds[start_idx:end_idx])
+    return torch.cat(original_order_embeddings, dim=0)

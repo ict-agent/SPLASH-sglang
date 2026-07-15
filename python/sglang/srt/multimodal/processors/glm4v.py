@@ -769,6 +769,35 @@ def glm_sample_and_decode_sync(vr, num_decode_workers=4, video_config=None):
     return frames, metadata
 
 
+def glm_decode_frames_at(vr, indices, num_decode_workers=4, video_config=None):
+    """Decode ONLY the explicitly-given ``indices`` (already sampled).
+
+    Used by the DP-sharded decode path: the caller (encoder) samples the full
+    frame set once, assigns temporal units to TP ranks, and calls this per rank
+    with just that rank's frame indices. Returns frames only (metadata is built
+    globally by the caller from the full sampled indices).
+
+    ``indices`` must already be the concrete per-rank frame indices. Empty input
+    returns ``None`` (rank owns no temporal units).
+    """
+    indices = list(indices)
+    if len(indices) == 0:
+        return None
+    video_config = video_config or {}
+    if num_decode_workers and num_decode_workers > 1 and len(indices) > 1:
+        frames = _decode_indices_parallel(
+            vr._source, device=vr._device, indices=indices,
+            num_workers=num_decode_workers,
+        )
+    else:
+        frames = vr.get_frames_at(indices)
+
+    max_tokens_per_frame = video_config.get("max_tokens_per_frame")
+    if max_tokens_per_frame is not None:
+        frames = _resize_frames_to_max_tokens(frames, max_tokens_per_frame)
+    return frames
+
+
 def preprocess_video_sync(vr):
     """Synchronous core of :func:`preprocess_video` (blocking frame decode)."""
     video_fps = vr.avg_fps
