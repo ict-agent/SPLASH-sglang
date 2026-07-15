@@ -493,15 +493,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
         (``[1, n, H, D]`` / ``[1, n, H]``) that fed the main kernel; the short
         recurrence replays the identical computation over the ``m``-token tail.
         """
-        if (
-            forward_batch.mamba_track_mask is None
-            or not forward_batch.mamba_track_mask.any()
-        ):
+        if forward_batch.mamba_track_mask is None:
             return
 
         cp_group = get_attention_cp_group()
         cp_rank = cp_group.rank_in_group
+        # Populate the cached host-side track_mask first, then test emptiness on
+        # the Python list. `mamba_track_mask.any()` on the GPU tensor forces an
+        # implicit `.item()` D2H sync on *every* KDA layer; `any(list)` is a pure
+        # host check, and the `.cpu().tolist()` inside _ensure_* still runs once.
         self._ensure_kda_cp_cpu_meta(forward_batch, metadata)
+        if metadata.cpu_track_mask is None or not any(metadata.cpu_track_mask):
+            return
         req_starts = metadata.cpu_req_starts
         track_mask_cpu = metadata.cpu_track_mask
         track_seqlens_cpu = metadata.cpu_track_seqlens
@@ -616,9 +619,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
                 owned.append((i, conv_win, ssm_state))
 
-        dst_idx = track_indices[
-            torch.tensor(dst_req_idx, device=track_indices.device, dtype=torch.long)
-        ].to(device=persistent_conv_states.device, dtype=torch.long)
+        # Pinned host tensor + async H2D copy so the CPU doesn't block on the
+        # transfer; the gather + device/dtype cast stay on-stream, so dst_idx is
+        # ready by the time _coalesced_cp_state_writeback consumes it.
+        dst_req_idx_t = torch.tensor(
+            dst_req_idx, dtype=torch.long, pin_memory=True
+        ).to(track_indices.device, non_blocking=True)
+        dst_idx = track_indices[dst_req_idx_t].to(
+            device=persistent_conv_states.device, dtype=torch.long, non_blocking=True
+        )
         self._coalesced_cp_state_writeback(
             dst_idx,
             owned,
@@ -682,9 +691,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # Batch this rank's owned states once (this rank owns ~n / cp_size items).
         num_owned = len(owned)
         if num_owned:
+            # Build the index tensor on the host in pinned memory and kick off an
+            # async H2D copy so the CPU doesn't block on the transfer; it can keep
+            # queuing the stacks/index_copy_ below while the copy is in flight.
             owned_rows = torch.tensor(
-                [i for (i, _, _) in owned], device=device, dtype=torch.long
-            )
+                [i for (i, _, _) in owned],
+                dtype=torch.long,
+                pin_memory=True,
+            ).to(device, non_blocking=True)
             conv_stack = torch.stack([c for (_, c, _) in owned]).to(torch.float32)
             ssm_stack = torch.stack([s for (_, _, s) in owned]).to(torch.float32)
 
@@ -799,11 +813,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     )
                 )
 
-        dst_idx = persistent_cache_indices[
-            torch.tensor(
-                dst_req_idx, device=persistent_cache_indices.device, dtype=torch.long
-            )
-        ].to(device=persistent_conv_states.device, dtype=torch.long)
+        # Build the request-index tensor on the host in pinned memory and issue an
+        # async H2D copy (mirrors the owned_rows path in _coalesced_cp_state_writeback)
+        # so the CPU doesn't block on the transfer. The gather + device/dtype cast
+        # stay on-stream, so dst_idx is ready by the time the writeback consumes it.
+        dst_req_idx_t = torch.tensor(
+            dst_req_idx, dtype=torch.long, pin_memory=True
+        ).to(persistent_cache_indices.device, non_blocking=True)
+        dst_idx = persistent_cache_indices[dst_req_idx_t].to(
+            device=persistent_conv_states.device, dtype=torch.long, non_blocking=True
+        )
         self._coalesced_cp_state_writeback(
             dst_idx,
             owned,

@@ -1061,8 +1061,12 @@ def chunk_kda_cp(
         state_v_first=True,
     )
     if merged is not None and continuation_index is not None:
-        slot = int(initial_state_indices[continuation_index].item())
-        initial_state[slot].copy_(merged.to(initial_state.dtype))
+        # Scatter the merged prefix state into its slot with a GPU-side
+        # index_copy_ instead of `int(...item())`: the .item() forces a D2H sync
+        # that drains the stream and bubbles the GPU. Keeping the slot index on
+        # device lets the copy stay enqueued behind the pre-process kernels.
+        slot = initial_state_indices[continuation_index].view(1).long()
+        initial_state.index_copy_(0, slot, merged.to(initial_state.dtype).unsqueeze(0))
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
