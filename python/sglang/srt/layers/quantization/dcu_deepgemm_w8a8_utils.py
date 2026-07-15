@@ -53,12 +53,11 @@ def _pack_w8a8_int8_asm_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = _check_int8_weight(weight)
     if n % 16 != 0 or k % 16 != 0:
         raise ValueError(f"N={n}, K={k} must satisfy N%16==0 and K%16==0")
-    return (
-        weight.contiguous()
-        .reshape(experts, n // 16, 16, k // 16, 16)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .view(experts, n // 16, k * 16)
+    from deepgemm import marlin_i8_contiguous_weight
+    return marlin_i8_contiguous_weight(
+        weight,
+        shuffle_unique=0,
+        low_memory=True,
     )
 
 
@@ -66,13 +65,13 @@ def _pack_w8a8_int8_asm_masked_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = _check_int8_weight(weight)
     if n % 16 != 0 or k % 64 != 0:
         raise ValueError(f"N={n}, K={k} must satisfy N%16==0 and K%64==0")
-    return (
-        weight.contiguous()
-        .reshape(experts, n // 16, 16, k // 64, 4, 16)
-        .permute(0, 3, 1, 4, 2, 5)
-        .contiguous()
-        .view(experts, n // 16, k * 16)
+    from deepgemm import marlin_i8_masked_weight
+    return marlin_i8_masked_weight(
+        weight,
+        shuffle_unique=0,
+        low_memory=True,
     )
+
 
 
 def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
