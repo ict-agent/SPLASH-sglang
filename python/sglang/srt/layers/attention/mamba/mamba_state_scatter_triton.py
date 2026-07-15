@@ -38,11 +38,15 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     3. If valid, performing the scatter:
        dst[l, dst_indices_raw[pid_req], :] = src[l, pid_req, step_indices_raw[pid_req], :]
 
-    Grid: (total_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
+    Grid: (ceil(elem_per_entry / BLOCK_SIZE), total_requests, num_layers).
+
+    Keep the contiguous state-chunk dimension first. Triton linearizes that
+    dimension first, so neighboring programs copy neighboring chunks from the
+    same request/layer row instead of jumping between large state rows.
     """
-    pid_req = tl.program_id(0)
-    pid_layer = tl.program_id(1).to(tl.int64)
-    pid_block = tl.program_id(2).to(tl.int64)
+    pid_block = tl.program_id(0).to(tl.int64)
+    pid_req = tl.program_id(1)
+    pid_layer = tl.program_id(2).to(tl.int64)
 
     # Load step index to check validity (step >= 0 means valid)
     step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
@@ -75,12 +79,9 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     )
     dst_offset = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
 
-    # Compute element range for this block
-    start = pid_block * BLOCK_SIZE
-    offsets = start + tl.arange(0, BLOCK_SIZE)
+    # Load from source and store to destination.
+    offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < elem_per_entry
-
-    # Load from source and store to destination
     data = tl.load(src_ptr + src_offset + offsets, mask=mask)
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
@@ -166,8 +167,10 @@ def fused_mamba_state_scatter_with_mask(
     # Block size for copying elements
     BLOCK_SIZE = 1024
 
-    # Grid over all requests - invalid ones will early-exit in the kernel
-    grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    # Put contiguous state chunks on grid axis 0 so adjacent programs access
+    # adjacent memory. The previous (request, layer, chunk) order made adjacent
+    # programs jump across multi-megabyte state rows on large Mamba states.
+    grid = (triton.cdiv(elem_per_entry, BLOCK_SIZE), total_requests, num_layers)
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
