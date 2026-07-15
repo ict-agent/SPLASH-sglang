@@ -685,6 +685,39 @@ def is_pin_memory_available(device=None) -> bool:
     return True
 
 
+def copy_cpu_values_to_device(
+    values,
+    device: torch.device,
+    *,
+    dtype: Optional[torch.dtype] = None,
+    dst: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Copy CPU values to a device tensor without forcing a sync when possible."""
+    device = torch.device(device)
+    if dst is not None:
+        if dtype is None:
+            dtype = dst.dtype
+        elif dst.dtype != dtype:
+            raise ValueError(f"dst dtype {dst.dtype} does not match dtype {dtype}.")
+
+    src = torch.as_tensor(values, dtype=dtype)
+    if src.device.type != "cpu":
+        src = src.cpu()
+
+    if dst is None:
+        dst = torch.empty(src.shape, dtype=src.dtype, device=device)
+    elif dst.shape != src.shape:
+        raise ValueError(
+            f"dst shape {dst.shape} does not match source shape {src.shape}."
+        )
+
+    use_pinned = is_pin_memory_available(device)
+    cpu_values = torch.empty(src.shape, dtype=src.dtype, pin_memory=use_pinned)
+    cpu_values.copy_(src)
+    dst.copy_(cpu_values, non_blocking=use_pinned)
+    return dst
+
+
 class LayerFn(Protocol):
 
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...

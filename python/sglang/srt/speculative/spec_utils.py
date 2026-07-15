@@ -494,7 +494,9 @@ def _select_top_k_tokens_first(
 ):
     input_ids = topk_index.flatten()
     if hidden_states is not None:
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        hidden_states = hidden_states.repeat_interleave(
+            topk, dim=0, output_size=hidden_states.shape[0] * topk
+        )
 
     tree_info = (
         topk_p.unsqueeze(1),  # (b, 1, topk)
@@ -532,7 +534,9 @@ def _select_top_k_tokens_later(
         batch_offsets = torch.arange(
             0, hidden_states.shape[0], step=topk, device=flat_cs.device
         )
-        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(
+            topk, output_size=flat_cs.shape[0]
+        )
         hidden_states = hidden_states[selected_input_index]
 
     tree_info = (

@@ -68,6 +68,7 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
+    is_dcu,
     is_hip,
     is_musa,
     is_npu,
@@ -78,10 +79,29 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_dcu = is_dcu()
 _is_musa = is_musa()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _is_nsa_attn_backend(attn_backend) -> bool:
+    if attn_backend is None:
+        return False
+
+    try:
+        from sglang.srt.layers.attention.nsa_backend import (
+            NativeSparseAttnBackend,
+            NativeSparseAttnMultiStepBackend,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+    return isinstance(
+        attn_backend,
+        (NativeSparseAttnBackend, NativeSparseAttnMultiStepBackend),
+    )
 
 
 def _get_plan_stream(
@@ -258,6 +278,28 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_extend_attn_backend = (
             draft_backend_factory.create_draft_extend_backend()
         )
+        actual_draft_attn_backend = self.draft_runner.attn_backend
+        if _is_nsa_attn_backend(
+            actual_draft_attn_backend
+        ) and not _is_nsa_attn_backend(self.draft_extend_attn_backend):
+            log_info_on_rank0(
+                logger,
+                "Using the draft model's NSA attention backend for draft extend "
+                "CUDA graph capture/replay "
+                f"(factory_backend={type(self.draft_extend_attn_backend).__name__}).",
+            )
+            self.draft_extend_attn_backend = actual_draft_attn_backend
+
+        if _is_nsa_attn_backend(self.draft_extend_attn_backend):
+            token_pool = getattr(self.draft_runner, "token_to_kv_pool", None)
+            log_info_on_rank0(
+                logger,
+                "Draft NSA kpool config: "
+                f"model_config.nsa_index_kpool={self.draft_runner.model_config.nsa_index_kpool}, "
+                f"draft_extend_backend.nsa_index_kpool={getattr(self.draft_extend_attn_backend, 'nsa_index_kpool', None)}, "
+                f"draft_decode_backend.nsa_index_kpool={getattr(self.draft_attn_backend, 'nsa_index_kpool', None)}, "
+                f"token_pool.index_kpool={getattr(token_pool, 'index_kpool', None)}.",
+            )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
@@ -276,6 +318,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "dcu": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
@@ -298,6 +341,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2ExtendCudaGraphRunner = {
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
+            "dcu": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
         supports_hip_aiter_draft_extend_graph = False
@@ -311,9 +355,20 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
+        is_cuda_draft_extend_device = self.target_worker.device in (
+            "cuda",
+            "dcu",
+            "musa",
+        ) or self.device in ("cuda", "dcu", "musa")
+        is_nsa_draft_extend_backend = _is_nsa_attn_backend(
+            self.draft_extend_attn_backend
+        )
+        supports_cuda_draft_extend_graph = (
+            _is_cuda or _is_dcu or _is_musa or is_cuda_draft_extend_device
+        ) and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+            or is_nsa_draft_extend_backend
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -335,6 +390,17 @@ class EagleDraftWorker(BaseDraftWorker):
             log_info_on_rank0(
                 logger,
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
+            )
+        elif self.draft_extend_attn_backend:
+            log_info_on_rank0(
+                logger,
+                "Skip draft extend cuda graph capture because the attention backend "
+                f"is not supported yet: {type(self.draft_extend_attn_backend).__name__}. "
+                f"device={self.device}, target_device={self.target_worker.device}, "
+                f"is_cuda={_is_cuda}, is_dcu={_is_dcu}, is_musa={_is_musa}, is_npu={_is_npu}, "
+                f"is_hip={_is_hip}, is_cuda_draft_extend_device={is_cuda_draft_extend_device}, "
+                f"is_nsa_draft_extend_backend={is_nsa_draft_extend_backend}, "
+                f"speculative_attention_mode={self.server_args.speculative_attention_mode}.",
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
@@ -453,7 +519,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 expected_rows = forward_batch.batch_size * self.topk
                 if spec_info.mtp_topk_indices.shape[0] == forward_batch.batch_size:
                     spec_info.mtp_topk_indices = (
-                        spec_info.mtp_topk_indices.repeat_interleave(self.topk, dim=0)
+                        spec_info.mtp_topk_indices.repeat_interleave(
+                            self.topk, dim=0, output_size=expected_rows
+                        )
                     )
                 elif spec_info.mtp_topk_indices.shape[0] != expected_rows:
                     logger.debug(
@@ -577,14 +645,14 @@ class EagleDraftWorker(BaseDraftWorker):
                 device=topk_indices.device, dtype=torch.int64
             )
 
-        if select_index.numel() == 0 or int(select_index.max().item()) >= len(
-            topk_indices
-        ):
-            logger.debug(
-                "EAGLE v2 MTP index-share output is shorter than its selection "
-                "indices; falling back to local indexer compute"
-            )
+        if select_index.numel() == 0:
             return
+
+        # Keep this path fully asynchronous.  ``select_index`` is a CUDA tensor
+        # in decode-v2, so checking ``select_index.max().item()`` would force a
+        # device-to-host sync on every iteration.  The source tensor is produced
+        # by the same draft-extend forward as logits/hidden states and therefore
+        # must follow the same row contract for the index_select below.
         next_draft_input.mtp_topk_indices = topk_indices.index_select(
             0, select_index
         ).clone()

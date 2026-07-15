@@ -145,14 +145,18 @@ class EagleDraftInputV2Mixin:
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+        cur_kv_lens_cpu = torch.tensor(
+            cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        nxt_kv_lens_cpu = torch.tensor(
+            nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
@@ -171,8 +175,8 @@ class EagleDraftInputV2Mixin:
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
+            cur_kv_lens,
+            nxt_kv_lens,
             out_cache_loc,
             bs,
         )
@@ -219,7 +223,9 @@ class EagleDraftInputV2Mixin:
             else CaptureHiddenMode.LAST
         )
         batch.capture_hidden_mode = capture_mode
-        self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+        self.positions = batch.seq_lens.repeat_interleave(
+            topk, dim=0, output_size=len(batch.seq_lens_cpu) * topk
+        )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
@@ -388,20 +394,29 @@ class EagleVerifyInputV2Mixin:
         if sampling_info.acc_additive_penalties is not None:
             next_token_logits.add_(
                 torch.repeat_interleave(
-                    sampling_info.acc_additive_penalties, self.draft_token_num, dim=0
+                    sampling_info.acc_additive_penalties,
+                    self.draft_token_num,
+                    dim=0,
+                    output_size=bs * self.draft_token_num,
                 )
             )
         if sampling_info.acc_scaling_penalties is not None:
             apply_scaling_penalties(
                 next_token_logits,
                 torch.repeat_interleave(
-                    sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
+                    sampling_info.acc_scaling_penalties,
+                    self.draft_token_num,
+                    dim=0,
+                    output_size=bs * self.draft_token_num,
                 ),
             )
         if sampling_info.logit_bias is not None:
             next_token_logits.add_(
                 torch.repeat_interleave(
-                    sampling_info.logit_bias, self.draft_token_num, dim=0
+                    sampling_info.logit_bias,
+                    self.draft_token_num,
+                    dim=0,
+                    output_size=bs * self.draft_token_num,
                 )
             )
 
@@ -437,7 +452,10 @@ class EagleVerifyInputV2Mixin:
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
+                sampling_info.temperatures,
+                self.draft_token_num,
+                dim=0,
+                output_size=bs * self.draft_token_num,
             )  # (bs * num_draft_tokens, 1)
 
             target_probs = F.softmax(
@@ -446,13 +464,19 @@ class EagleVerifyInputV2Mixin:
             target_probs = top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
+                    sampling_info.top_ks,
+                    self.draft_token_num,
+                    dim=0,
+                    output_size=bs * self.draft_token_num,
                 ),
             )  # (bs * num_draft_tokens, vocab_size)
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
+                    sampling_info.top_ps,
+                    self.draft_token_num,
+                    dim=0,
+                    output_size=bs * self.draft_token_num,
                 ),
             )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
@@ -527,7 +551,9 @@ def select_top_k_tokens_tmp(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        hidden_states = hidden_states.repeat_interleave(
+            topk, dim=0, output_size=hidden_states.shape[0] * topk
+        )
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
@@ -552,7 +578,7 @@ def select_top_k_tokens_tmp(
 
         selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
             0, hidden_states.shape[0], step=topk, device=hidden_states.device
-        ).repeat_interleave(topk)
+        ).repeat_interleave(topk, output_size=topk_cs_index.numel())
         hidden_states = hidden_states[selected_input_index, :]
 
         tree_info = (

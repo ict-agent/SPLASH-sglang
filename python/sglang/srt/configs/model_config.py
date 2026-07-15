@@ -824,7 +824,7 @@ class ModelConfig:
     @property
     def nsa_index_kpool(self) -> int:
         """Effective NSA pool_size; ``> 1`` means kpool enabled."""
-        return get_nsa_index_kpool(self.hf_text_config)
+        return get_nsa_index_kpool(self.hf_config)
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:

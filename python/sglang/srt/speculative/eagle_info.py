@@ -986,6 +986,19 @@ class EagleDraftExtendInput(SpecInput):
         (e.g., STANDALONE)."""
         if worker.speculative_algorithm.is_standalone():
             return None
+
+        draft_runner = _draft_runner_of(worker)
+        draft_inner_model = getattr(draft_runner.model, "model", None)
+        if draft_inner_model is not None and hasattr(draft_inner_model, "hnorm"):
+            # NextN/MTP draft models (DeepSeek nextn, Step3.5 MTP, etc.) feed
+            # spec_info.hidden_states through their own hnorm, so the buffer
+            # must match the draft model width rather than the target model
+            # spec_hidden_size. DeepSeek-V4 nextn consumes hc_mult hidden
+            # states per token.
+            draft_hidden_size = draft_runner.model_config.hidden_size
+            hc_mult = getattr(draft_inner_model, "hc_mult", 1)
+            return draft_hidden_size * hc_mult
+
         target_cfg = worker.target_worker.model_runner.model_config
         if not (
             worker.speculative_algorithm.is_eagle3()
