@@ -7,8 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
-import logging
-logger = logging.getLogger(__name__)
 
 from sglang.srt.configs.model_config import get_nsa_index_kpool
 from sglang.srt.environ import envs
@@ -43,7 +41,6 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_dcu, is_npu
-from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
 
 if is_dcu():
     import deepgemm
@@ -724,28 +721,15 @@ class IndexerKPool(Indexer):
         )
         pool_max_seq_len = pool_block_tables.shape[1] * block_kv
         if is_dcu():
-            from lightop import gemmopt
-            kv_cache_fp8 = kv_cache_buf.view(
-                kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-            )
-            logits = gemmopt.paged_mqa_logits(
+            logits = kpool_bf16_paged_mqa_logits(
                 q_fp8,
-                kv_cache_fp8.to(torch.bfloat16),
-                weights.float(),
+                kv_cache_buf,
+                weights,
                 pool_seqlens,
                 pool_block_tables,
-                None,
                 pool_max_seq_len,
+                block_kv,
             )
-            # logits = kpool_bf16_paged_mqa_logits(
-            #     q_fp8,
-            #     kv_cache_buf,
-            #     weights,
-            #     pool_seqlens,
-            #     pool_block_tables,
-            #     pool_max_seq_len,
-            #     block_kv,
-            # )
         else:
             kv_cache_fp8 = kv_cache_buf.view(
                 kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
@@ -1252,29 +1236,15 @@ class IndexerKPool(Indexer):
 
         pool_max_seq_len = paged_page_table.shape[1] * block_kv
         if is_dcu():
-            from lightop import gemmopt
-            kv_cache_fp8 = kv_cache_buf.view(
-                kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
-            )
-            logits = gemmopt.paged_mqa_logits(
+            logits = kpool_bf16_paged_mqa_logits(
                 q_index,
-                kv_cache_fp8.to(torch.bfloat16),
-                weights.float(),
+                kv_cache_buf,
+                weights,
                 pool_seqlens_per_q,
                 paged_page_table,
-                None,
                 pool_max_seq_len,
+                block_kv,
             )
-            
-            # logits = kpool_bf16_paged_mqa_logits(
-            #     q_index,
-            #     kv_cache_buf,
-            #     weights,
-            #     pool_seqlens_per_q,
-            #     paged_page_table,
-            #     pool_max_seq_len,
-            #     block_kv,
-            # )
         else:
             kv_cache_fp8 = kv_cache_buf.view(
                 kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
