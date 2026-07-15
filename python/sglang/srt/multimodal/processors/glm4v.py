@@ -123,6 +123,66 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    def assign_mm_offsets(self, all_collected_items, input_ids, mm_tokens):
+        """Assign GLM4V image/video offsets structurally from the token stream.
+
+        GLM4V images and video frames both collapse to ``IM_TOKEN_ID`` after
+        tokenization, so the base token-id offset logic cannot tell them apart.
+        Given a correct ``input_ids`` (image bodies inside
+        ``<|begin_of_image|>..<|end_of_image|>`` and video frames inside
+        ``<|begin_of_video|>..<|end_of_video|>``), we split the maximal
+        ``IM_TOKEN_ID`` runs by whether they fall inside a video span: runs
+        outside a span are image bodies (one ``(start, end)`` per image), runs
+        inside a span are video frames (one per frame). This is exactly what
+        ``get_new_expanded_mm_items`` expects and needs no grids. Non-visual
+        modalities (e.g. audio) defer to the base token-id offsets.
+        """
+        ids = (
+            input_ids.tolist()
+            if isinstance(input_ids, torch.Tensor)
+            else list(input_ids)
+        )
+        im_token_id = self.IM_TOKEN_ID
+        video_start_id = self.VIDEO_START_TOKEN_ID
+        video_end_id = self.VIDEO_END_TOKEN_ID
+
+        # Split maximal IM-token runs, tagging each by video-span membership.
+        image_runs, video_runs = [], []
+        in_video = False
+        run_start = None
+        for i, t in enumerate(ids):
+            if t == im_token_id:
+                if run_start is None:
+                    run_start = i
+                run_end = i
+                continue
+            if run_start is not None:
+                (video_runs if in_video else image_runs).append((run_start, run_end))
+                run_start = None
+            if t == video_start_id:
+                in_video = True
+            elif t == video_end_id:
+                in_video = False
+        if run_start is not None:
+            (video_runs if in_video else image_runs).append((run_start, run_end))
+
+        for mm_item in all_collected_items:
+            if mm_item.is_image():
+                mm_item.offsets = image_runs
+            elif mm_item.is_video():
+                mm_item.offsets = video_runs
+            else:
+                # Non-visual modality (e.g. audio): fall back to token-id offsets.
+                mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is None:
+                    raise ValueError(
+                        f"No token id found for modality: {mm_item.modality}"
+                    )
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=mm_token_id,
+                )
+
     def build_input_ids_with_timestamps(
         self,
         prompt: Union[str, List[int]],
@@ -201,7 +261,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                     # HF Glm4vProcessor.replace_frame_token_id appends int seconds.
                     timestamp_sec = curr_timestamps[frame_idx]
                     timestamp_tokens = self._tokenizer.encode(
-                        f"{int(timestamp_sec)}", add_special_tokens=False
+                        f"{float(timestamp_sec):.1f} seconds", add_special_tokens=False
                     )
                     input_ids.extend(timestamp_tokens)
                 video_idx += 1
@@ -213,6 +273,34 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             input_ids.extend(prompt[cur_idx:])
 
         return input_ids, offsets, modality_list
+
+    @staticmethod
+    def _group_offsets_by_modality(offsets, modality_list, video_grid_thw):
+        """Split the flat ``build_input_ids_with_timestamps`` offsets by modality.
+
+        ``build_input_ids_with_timestamps`` returns one offset per image and one
+        offset per video *frame*, while ``modality_list`` has a single entry per
+        image and per video. This regroups the flat offsets into:
+          - ``image_runs``: one ``(start, end)`` per image
+          - ``video_frame_runs``: one ``(start, end)`` per frame, all videos
+            concatenated
+        matching the bundled-item contract ``get_new_expanded_mm_items`` expects
+        (image offsets len == #images; video offsets len == total frames).
+        """
+        image_runs = []
+        video_frame_runs = []
+        off_idx = 0
+        video_idx = 0
+        for modality in modality_list:
+            if modality == Modality.IMAGE:
+                image_runs.append(offsets[off_idx])
+                off_idx += 1
+            elif modality == Modality.VIDEO:
+                num_frames = int(video_grid_thw[video_idx][0])
+                video_frame_runs.extend(offsets[off_idx : off_idx + num_frames])
+                off_idx += num_frames
+                video_idx += 1
+        return image_runs, video_frame_runs
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         """EPD language side: rebuild mm_inputs from precomputed embeddings.
@@ -316,6 +404,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
+        # With the remote-code Glm4vProcessor emitting a correct token stream
+        # (image bodies inside <|begin_of_image|>..<|end_of_image|>, video frames
+        # inside <|begin_of_video|>..<|end_of_video|>), the base pipeline is enough:
+        # our assign_mm_offsets override splits the shared IM_TOKEN runs into image
+        # vs video by video-span membership, so no id rebuild is needed here.
         if video_metadata is not None:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,

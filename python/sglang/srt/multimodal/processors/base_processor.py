@@ -1053,6 +1053,28 @@ class BaseMultimodalProcessor(ABC):
 
         return collected_items, input_ids, ret
 
+    def assign_mm_offsets(
+        self,
+        all_collected_items: List[MultimodalDataItem],
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+    ) -> None:
+        """Assign each mm_item the (start, end) offsets of its placeholder runs.
+
+        Default: each item's runs are located by its modality's placeholder token
+        id. Processors whose modalities share a placeholder token id (e.g. GLM4V
+        images and video frames both collapse to the image token after
+        tokenization) override this to disambiguate runs by position.
+        """
+        for mm_item in all_collected_items:
+            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+            if mm_token_id is None:
+                raise ValueError(f"No token id found for modality: {mm_item.modality}")
+            mm_item.offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=mm_token_id,
+            )
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1133,14 +1155,7 @@ class BaseMultimodalProcessor(ABC):
             ).input_ids.flatten()
 
         # Add offsets to all items
-        for mm_item in all_collected_items:
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=mm_token_id,
-            )
+        self.assign_mm_offsets(all_collected_items, input_ids, mm_tokens)
 
         # Split bundled items into per-image/video items for better cache granularity
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
