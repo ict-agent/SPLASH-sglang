@@ -301,6 +301,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         *,
         shard_dim: int,
         expected_dim: int,
+        components: Optional[list] = None,
     ) -> torch.Tensor:
         selected = state[cache_indices].contiguous()
         if selected.shape[shard_dim] == expected_dim:
@@ -311,7 +312,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cp_group.world_size > 1
             and selected.shape[shard_dim] * cp_group.world_size == expected_dim
         ):
-            return cp_group.all_gather(selected, dim=shard_dim)
+            gathered = cp_group.all_gather(selected, dim=shard_dim)
+            if components is not None:
+                # per-rank pool slices are [q_r|k_r|v_r]; the all_gather is
+                # rank-major, but the CP conv1d consumes component-major
+                # [q_full|k_full|v_full] -> un-permute.
+                gathered = self._conv_rank_to_comp_major(
+                    gathered, components, cp_group.world_size
+                ).contiguous()
+            return gathered
 
         raise RuntimeError(
             "KDA-CP expected Prefix Cache state to be either full-head or "
@@ -344,6 +353,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices,
             shard_dim=1,
             expected_dim=mixed_qkv.shape[-1],
+            components=[layer.q_dim, layer.k_dim, layer.v_dim],
         )
         full_ssm_by_req = self._gather_full_kda_state(
             ssm_states,
@@ -636,7 +646,47 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_full_shape,
             persistent_conv_states,
             persistent_ssm_states,
+            conv_components=[layer.q_dim, layer.k_dim, layer.v_dim],
         )
+
+    @staticmethod
+    def _conv_comp_to_rank_major(
+        conv_state: torch.Tensor, components: list, cp_size: int
+    ) -> torch.Tensor:
+        """[..., D_full, W] component-major ([q_full|k_full|v_full]) ->
+        rank-major (concat over ranks of [q_r|k_r|v_r]).
+
+        The persistent conv pool packs PER-RANK slices of every component
+        ([q_r|k_r|v_r], matching the non-CP writer and the PD per-component
+        slice transfer), so a full-head component-major state must be
+        re-permuted before it is split into cp_size contiguous rank blocks.
+        A plain contiguous split would hand rank r a slice that crosses
+        component boundaries (e.g. pure q rows from other ranks' head shards).
+        """
+        seq_size = conv_state.shape[:-2]
+        W = conv_state.shape[-1]
+        parts = torch.split(conv_state, components, dim=-2)
+        blocks = [
+            prt.reshape(*seq_size, cp_size, prt.shape[-2] // cp_size, W)
+            for prt in parts
+        ]
+        stacked = torch.cat(blocks, dim=-2)  # [..., cp, sum(comp/cp), W]
+        return stacked.reshape(*seq_size, -1, W)
+
+    @staticmethod
+    def _conv_rank_to_comp_major(
+        conv_state: torch.Tensor, components: list, cp_size: int
+    ) -> torch.Tensor:
+        """Inverse of _conv_comp_to_rank_major: rank-major (all_gather of
+        per-rank [q_r|k_r|v_r] pool slices) -> component-major
+        ([q_full|k_full|v_full]) as consumed by the CP conv1d / kernels."""
+        seq_size = conv_state.shape[:-2]
+        W = conv_state.shape[-1]
+        local_qkv_size = [c // cp_size for c in components]
+        conv_state = conv_state.reshape(*seq_size, cp_size, sum(local_qkv_size), W)
+        parts = torch.split(conv_state, local_qkv_size, dim=-2)
+        parts = [prt.reshape(*seq_size, -1, W) for prt in parts]
+        return torch.cat(parts, dim=-2)
 
     def _coalesced_cp_state_writeback(
         self,
@@ -647,6 +697,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ssm_full_shape: tuple,
         persistent_conv_states: torch.Tensor,
         persistent_ssm_states: torch.Tensor,
+        conv_components: Optional[list] = None,
     ) -> None:
         """Coalesce per-request conv+ssm state exchange into a single collective.
 
@@ -713,6 +764,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # Per owned item, split its full state into cp_size contiguous
                 # blocks (block d -> rank d, matching _local_state_shard), then
                 # lay out by destination: src[d, j, :] = item j's block d.
+                if conv_components is not None:
+                    # pool layout is per-rank [q_r|k_r|v_r]; permute the
+                    # component-major full state before the rank-block split.
+                    conv_stack = self._conv_comp_to_rank_major(
+                        conv_stack, conv_components, cp_size
+                    ).contiguous()
                 conv_blocks = conv_stack.reshape(num_owned, cp_size, conv_shard_numel)
                 ssm_blocks = ssm_stack.reshape(num_owned, cp_size, ssm_shard_numel)
                 src = torch.cat(
@@ -745,11 +802,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             conv_full = buf[:, :conv_numel].reshape(n, conv_full_dim, conv_state_len)
             ssm_full = buf[:, conv_numel:].reshape(n, ssm_full_shape[0], *ssm_tail)
-            conv_out = (
-                conv_full.narrow(1, cp_rank * conv_local_dim, conv_local_dim)
-                if conv_sharded
-                else conv_full
-            )
+            if conv_sharded and conv_components is not None:
+                conv_out = self._conv_comp_to_rank_major(
+                    conv_full, conv_components, cp_size
+                ).reshape(n, cp_size, conv_local_dim, conv_state_len)[:, cp_rank]
+            elif conv_sharded:
+                conv_out = conv_full.narrow(
+                    1, cp_rank * conv_local_dim, conv_local_dim
+                )
+            else:
+                conv_out = conv_full
             ssm_out = (
                 ssm_full.narrow(1, cp_rank * ssm_local_dim, ssm_local_dim)
                 if ssm_sharded
@@ -831,6 +893,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_full_shape,
             persistent_conv_states,
             persistent_ssm_states,
+            conv_components=[layer.q_dim, layer.k_dim, layer.v_dim],
         )
 
     def _scatter_kda_cp_runtime_states_to_persistent(
@@ -1066,6 +1129,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     cache_indices,
                     shard_dim=1,
                     expected_dim=mixed_qkv.shape[-1],
+                    components=[layer.q_dim, layer.k_dim, layer.v_dim],
                 )
                 ssm_states = self._gather_full_kda_state(
                     persistent_ssm_states,
