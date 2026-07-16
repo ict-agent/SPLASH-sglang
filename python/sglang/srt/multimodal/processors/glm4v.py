@@ -47,6 +47,7 @@ def preprocess_video_frames_sync(frame_list: List[dict]):
     metadata = _video_metadata(total_num_frames, fps, duration, indices)
     return images, metadata
 
+
 async def preprocess_video_frames(frame_list: List[dict]):
     """Async wrapper around :func:`preprocess_video_frames_sync`.
 
@@ -306,27 +307,19 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         """EPD language side: rebuild mm_inputs from precomputed embeddings.
 
         ``embeddings`` is ``{Modality: tensor}`` (assembled by the encoder
-        receiver). GLM4V currently sends a single modality per request, so the
-        reconstructed embeddings are sliced per multimodal item and attached as
-        ``precomputed_embeddings``.
+        receiver). A request may mix images and videos: each modality is sent /
+        received as its own embedding tensor, so we emit one multimodal item per
+        modality present, each carrying that modality's offsets and embedding
+        (``mm_utils`` slices the tensor back out via the offsets in
+        ``get_embedding_chunk``).
         """
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         video_timestamps = kwargs.get("video_timestamps", None)
-
         input_ids, offsets, modality_list = self.build_input_ids_with_timestamps(
             prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
-        # GLM4V EPD currently sends a single modality per request. A video maps
-        # to many per-frame offsets but a single modality entry, so we attach all
-        # offsets and the full modality embedding to one item (mm_utils slices it
-        # back out via the offsets in get_embedding_chunk).
-        assert len(set(modality_list)) == 1, (
-            f"GLM4V EPD only supports a single modality per request, "
-            f"got {set(modality_list)}"
-        )
-        modality = modality_list[0]
 
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
@@ -338,10 +331,18 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
+        # Split the flat per-image / per-frame offsets by modality so each
+        # modality's precomputed embedding is sliced independently. A video maps
+        # to many per-frame offsets but a single modality entry; images map to one
+        # offset each. Emitting one item per modality supports mixed image+video
+        # requests (previously the EPD language side asserted a single modality).
+        image_runs, video_frame_runs = self._group_offsets_by_modality(
+            offsets, modality_list, video_grid_thw
+        )
         mm_items = [
             MultimodalDataItem(
                 modality=modality,
-                offsets=offsets,
+                offsets=runs,
                 # Decode instances receive metadata only (empty embeddings dict):
                 # they run the LM in PREBUILT mode and never consume the embedding
                 # values, so leave precomputed_embeddings as None. Prefill instances
@@ -350,7 +351,15 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                     embeddings.get(modality) if embeddings else None
                 ),
             )
+            for modality, runs in (
+                (Modality.IMAGE, image_runs),
+                (Modality.VIDEO, video_frame_runs),
+            )
+            if runs
         ]
+        # Preserve prompt order (first placeholder position) so downstream
+        # consumers that iterate mm_items in sequence stay aligned.
+        mm_items.sort(key=lambda it: it.offsets[0][0])
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,
