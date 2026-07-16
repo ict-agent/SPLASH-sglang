@@ -98,6 +98,7 @@ _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_int8_deepgemm_asm = get_bool_env_var("SGLANG_INT8_DEEPGEMM_ASM")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
+_use_torch_bf16_grouped_mm = get_bool_env_var("SGLANG_USE_TORCH_BF16_GROUPED_MM")
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -1167,35 +1168,46 @@ class DeepEPMoE(FusedMoE):
             m_indices,
             output_index,
         )
-
-        gateup_output = torch.zeros(
-            (all_tokens, N),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
-
-        m_grouped_bf16_gemm_nt_contiguous(
-            input_tensor,
-            self.w13_weight,
-            gateup_output,
-            m_indices,
-        )
+        grouped_mm_offsets = None
+        if _use_torch_bf16_grouped_mm:
+            grouped_mm_offsets = torch.cumsum(
+                num_recv_tokens_per_expert_gpu, dim=0, dtype=torch.int32
+            )
+            gateup_output = torch._grouped_mm(
+                input_tensor, self.w13_weight.transpose(1, 2), grouped_mm_offsets
+            )
+        else:
+            gateup_output = torch.zeros(
+                (all_tokens, N),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_bf16_gemm_nt_contiguous(
+                input_tensor,
+                self.w13_weight,
+                gateup_output,
+                m_indices,
+            )
         q_a2_all = torch.empty((all_tokens, N // 2), device=hidden_states.device, dtype=torch.bfloat16)
         fuse_silu_and_mul(input=gateup_output, output=q_a2_all)
         del gateup_output
 
-        down_output = torch.empty(
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
-
-        m_grouped_bf16_gemm_nt_contiguous(
-            q_a2_all,
-            self.w2_weight,
-            down_output,
-            m_indices,
-        )
+        if _use_torch_bf16_grouped_mm:
+            down_output = torch._grouped_mm(
+                q_a2_all, self.w2_weight.transpose(1, 2), grouped_mm_offsets
+            )
+        else:
+            down_output = torch.empty(
+                (all_tokens, K),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+            m_grouped_bf16_gemm_nt_contiguous(
+                q_a2_all,
+                self.w2_weight,
+                down_output,
+                m_indices,
+            )
 
         gather_out = torch.empty(
             hidden_states_shape,
