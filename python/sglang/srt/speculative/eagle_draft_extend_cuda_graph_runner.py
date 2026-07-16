@@ -130,6 +130,14 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+        if kpool_on and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+            # V2 derives the committed write position as seq_lens - N. Keep
+            # capture placeholders non-negative so KPool cannot index before
+            # the tail ring during the two uncaptured warmup forwards.
+            self.seq_len_fill_value = max(
+                self.seq_len_fill_value, self.num_tokens_per_bs
+                + self.eagle_worker.draft_extend_attn_backend.nsa_index_kpool,
+            )
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
@@ -160,6 +168,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
+            if kpool_on and self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+                self.seq_len_fill_value = max(
+                    self.seq_len_fill_value, self.num_tokens_per_bs
+                    + self.eagle_worker.draft_extend_attn_backend.nsa_index_kpool,
+                )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
