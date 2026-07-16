@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import logging
+
 from typing import Optional, Tuple
 
 import torch
@@ -22,8 +24,18 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 
 from sglang.srt.utils import get_bool_env_var, is_dcu
+
+logger = logging.getLogger(__name__)
+
 _is_dcu = is_dcu()
 _use_prefill_aiter_linear_attn = get_bool_env_var("SGLANG_USE_AITER_LINEAR_ATTN")
+_use_aiter_chunk_gated_delta_h_hip = get_bool_env_var(
+    "SGLANG_USE_AITER_CHUNK_GATED_DELTA_H_HIP"
+)
+
+
+def _should_use_aiter_chunk_gated_delta_h_hip(K: int, V: int, BT: int) -> bool:
+    return _is_dcu and _use_aiter_chunk_gated_delta_h_hip and K == 128 and V == 128 and BT == CHUNK_SIZE
 
 @triton.autotune(
     # Single hardcoded config. The kernel writes ht (final state) back into
@@ -312,13 +324,41 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
+    if _should_use_aiter_chunk_gated_delta_h_hip(K, V, BT):
+        try:
+            import aiter
+
+            return aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64(
+                k=k,
+                w=w,
+                u=u,
+                g=g,
+                gk=gk,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                output_final_state=True,
+                chunk_size=BT,
+                save_new_value=save_new_value,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                use_exp2=False,
+                transpose_state_layout=True,
+            )
+        except (ImportError, AttributeError, RuntimeError) as exc:
+            logger.warning(
+                "Falling back from aiter.chunk_gated_delta_rule_fwd_sglang_hip_blockdim64 "
+                "to Triton path: %s",
+                exc,
+            )
+
     h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
-    
+
     if not _use_prefill_aiter_linear_attn:
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
             k=k,
