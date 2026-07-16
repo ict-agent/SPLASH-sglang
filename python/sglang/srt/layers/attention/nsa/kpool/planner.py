@@ -23,16 +23,24 @@ Class index (which dataclass lives where):
 from __future__ import annotations
 
 import dataclasses
+import logging
+import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.jit_kernel.kpool_write_plan import (
+    kpool_write_plan_cuda,
+    kpool_write_plan_multi_decode_cuda,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
     INDEX_HEAD_DIM,
     kpool_build_ragged_layout,
     update_kpool_write_plan_cuda_graph,
+    update_kpool_write_plan_cuda_graph_multi_decode,
 )
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
@@ -41,11 +49,39 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.utils import is_cuda, is_dcu
 
+
+@lru_cache(maxsize=1)
+def _get_deep_gemm():
+    try:
+        import deep_gemm
+
+        return deep_gemm
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _get_aot_kpool_write_plan():
+    try:
+        from sgl_kernel import kpool_write_plan
+
+        return kpool_write_plan
+    except Exception:
+        return None
+
+
 # Forward-persistent ragged compress scratch (uint8 K + fp32 scale). Lazy-grown
 # to the largest seen ``total_k_rows`` and sliced per forward, so prefill no
 # longer pays two cudaMallocs per call.
 _RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
 _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
+logger = logging.getLogger(__name__)
+_KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED = False
+_KPOOL_WRITE_PLAN_JIT_WARNED = False
+
+
+def _disable_jit_kpool_write_plan() -> bool:
+    return os.getenv("SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN", "0") == "1"
 
 
 def _get_ragged_scratch(
@@ -766,7 +802,7 @@ def init_pooled_paged_mqa_metadata(
     """
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
-        or not is_cuda()
+        or not (is_cuda() or is_dcu())
         or not forward_mode.is_decode_or_idle()
     ):
         return metadata
@@ -774,16 +810,15 @@ def init_pooled_paged_mqa_metadata(
     pooled_cache_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
         torch.int32
     )
-    try:
-        import deep_gemm
-
+    deep_gemm = _get_deep_gemm()
+    if deep_gemm is not None:
         slots_per_page = real_page_size // pool_size
         pooled_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             pooled_cache_seqlens.unsqueeze(-1),
             slots_per_page,
             deep_gemm.get_num_sms(),
         )
-    except (ImportError, ModuleNotFoundError):
+    else:
         pooled_schedule = None
 
     return dataclasses.replace(
@@ -813,26 +848,36 @@ def update_pooled_paged_mqa_metadata(
     """
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
-        or not is_cuda()
+        or not (is_cuda() or is_dcu())
         or not forward_mode.is_decode_or_idle()
+        or metadata.pooled_cache_seqlens_int32 is None
+        or metadata.pooled_index_kpool != pool_size
     ):
         return
 
-    pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-        torch.int32
+    pool_seqlens = metadata.pooled_cache_seqlens_int32[: seqlens_32.shape[0]]
+    torch.div(
+        seqlens_32,
+        pool_size,
+        rounding_mode="floor",
+        out=pool_seqlens,
     )
-    metadata.pooled_cache_seqlens_int32[: pool_seqlens.shape[0]].copy_(pool_seqlens)
 
+    deep_gemm = _get_deep_gemm()
+    if deep_gemm is None:
+        return
+    if metadata.pooled_paged_mqa_schedule_metadata is None:
+        return
     try:
-        import deep_gemm
-
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             pool_seqlens.unsqueeze(-1),
             real_page_size // pool_size,
             deep_gemm.get_num_sms(),
         )
-        metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
-    except (ImportError, ModuleNotFoundError):
+        metadata.pooled_paged_mqa_schedule_metadata.copy_(
+            new_schedule, non_blocking=True
+        )
+    except Exception:
         # capture saw deep_gemm absent -> schedule buffer is None already
         pass
 
@@ -884,17 +929,18 @@ def _compute_pool_schedule_metadata(
     slots_per_page: int,
 ) -> Optional[torch.Tensor]:
     """Per-pool DeepGEMM schedule metadata; None if deep_gemm absent."""
-    if not is_cuda():
+    if not (is_cuda() or is_dcu()):
+        return None
+    deep_gemm = _get_deep_gemm()
+    if deep_gemm is None:
         return None
     try:
-        import deep_gemm
-
         return deep_gemm.get_paged_mqa_logits_metadata(
             pool_seqlens_per_q.unsqueeze(-1),
             slots_per_page,
             deep_gemm.get_num_sms(),
         )
-    except (ImportError, ModuleNotFoundError):
+    except Exception:
         return None
 
 
@@ -998,7 +1044,7 @@ def update_kpool_write_plan(
         "see init_kpool_write_plan_capture"
     )
     slots_per_page = real_page_size // pool_size
-    update_kpool_write_plan_cuda_graph(
+    kernel_kwargs = dict(
         write_start=write_start,
         req_pool_indices=req_pool_indices,
         real_page_table=real_page_table,
@@ -1012,6 +1058,36 @@ def update_kpool_write_plan(
         num_draft_tokens=num_draft_tokens,
         slots_per_page=slots_per_page,
     )
+    aot_kpool_write_plan = _get_aot_kpool_write_plan()
+    try:
+        if aot_kpool_write_plan is not None:
+            aot_kpool_write_plan(**kernel_kwargs)
+        else:
+            if _disable_jit_kpool_write_plan():
+                raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
+            kpool_write_plan_cuda(**kernel_kwargs)
+    except Exception as e:
+        global _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
+        if aot_kpool_write_plan is not None:
+            try:
+                if _disable_jit_kpool_write_plan():
+                    raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
+                kpool_write_plan_cuda(**kernel_kwargs)
+                e = None
+            except Exception as jit_e:
+                e = jit_e
+        if e is not None:
+            if (
+                not _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
+                and not _disable_jit_kpool_write_plan()
+            ):
+                logger.warning(
+                    "AOT/JIT kpool write-plan update failed; "
+                    "falling back to Triton update: %s",
+                    e,
+                )
+                _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED = True
+            update_kpool_write_plan_cuda_graph(**kernel_kwargs)
     if is_v2 and accept_length is not None and plan.effective_n_per_batch is not None:
         # effective_n = accept_length directly. v2's accept_length already
         # includes the bonus "next" token (eagle_info_v2.sample applies an
@@ -1026,6 +1102,101 @@ def update_kpool_write_plan(
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
+
+def update_kpool_write_plan_multi_decode(
+    metadata0: "NSAMetadata",
+    metadata1: "NSAMetadata",
+    metadata2: "NSAMetadata",
+    metadata3: Optional["NSAMetadata"] = None,
+    *,
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    pool_size: int,
+    real_page_size: int,
+) -> None:
+    """Refresh three backend-local decode write plans in one launch."""
+    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not (
+        is_cuda() or is_dcu()
+    ):
+        return
+
+    plan0 = metadata0.kpool_write_plan
+    plan1 = metadata1.kpool_write_plan
+    plan2 = metadata2.kpool_write_plan
+    plan3 = metadata3.kpool_write_plan if metadata3 is not None else None
+    assert plan0 is not None and plan1 is not None and plan2 is not None, (
+        "kpool_write_plan must be pre-allocated before multi update; "
+        "see init_kpool_write_plan_capture"
+    )
+    if metadata3 is not None:
+        assert plan3 is not None, (
+            "fourth kpool_write_plan must be pre-allocated before multi update; "
+            "see init_kpool_write_plan_capture"
+        )
+
+    slots_per_page = real_page_size // pool_size
+    if plan3 is not None and not _disable_jit_kpool_write_plan():
+        try:
+            kpool_write_plan_multi_decode_cuda(
+                write_start=write_start,
+                req_pool_indices=req_pool_indices,
+                real_page_table=real_page_table,
+                req_out0=plan0.req,
+                write_start_out0=plan0.write_start,
+                tail_logical_start_out0=plan0.tail_logical_start,
+                write_loc_out0=plan0.write_loc,
+                req_out1=plan1.req,
+                write_start_out1=plan1.write_start,
+                tail_logical_start_out1=plan1.tail_logical_start,
+                write_loc_out1=plan1.write_loc,
+                req_out2=plan2.req,
+                write_start_out2=plan2.write_start,
+                tail_logical_start_out2=plan2.tail_logical_start,
+                write_loc_out2=plan2.write_loc,
+                req_out3=plan3.req,
+                write_start_out3=plan3.write_start,
+                tail_logical_start_out3=plan3.tail_logical_start,
+                write_loc_out3=plan3.write_loc,
+                pool_size=pool_size,
+                slots_per_page=slots_per_page,
+            )
+            return
+        except Exception as e:
+            global _KPOOL_WRITE_PLAN_JIT_WARNED
+            if not _KPOOL_WRITE_PLAN_JIT_WARNED:
+                logger.warning(
+                    "JIT kpool write-plan multi decode failed; "
+                    "falling back to Triton multi update: %s",
+                    e,
+                )
+                _KPOOL_WRITE_PLAN_JIT_WARNED = True
+
+    update_kpool_write_plan_cuda_graph_multi_decode(
+        write_start=write_start,
+        req_pool_indices=req_pool_indices,
+        real_page_table=real_page_table,
+        req_out0=plan0.req,
+        write_start_out0=plan0.write_start,
+        tail_logical_start_out0=plan0.tail_logical_start,
+        write_loc_out0=plan0.write_loc,
+        req_out1=plan1.req,
+        write_start_out1=plan1.write_start,
+        tail_logical_start_out1=plan1.tail_logical_start,
+        write_loc_out1=plan1.write_loc,
+        req_out2=plan2.req,
+        write_start_out2=plan2.write_start,
+        tail_logical_start_out2=plan2.tail_logical_start,
+        write_loc_out2=plan2.write_loc,
+        req_out3=plan3.req if plan3 is not None else None,
+        write_start_out3=plan3.write_start if plan3 is not None else None,
+        tail_logical_start_out3=(
+            plan3.tail_logical_start if plan3 is not None else None
+        ),
+        write_loc_out3=plan3.write_loc if plan3 is not None else None,
+        pool_size=pool_size,
+        slots_per_page=slots_per_page,
+    )
 
 
 def init_kpool_write_plan(

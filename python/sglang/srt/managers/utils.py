@@ -22,6 +22,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _copy_tensor_to_cpu_pinned(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type == "cpu":
+        return tensor
+    try:
+        out = torch.empty_like(tensor, device="cpu", pin_memory=True)
+        out.copy_(tensor, non_blocking=True)
+        return out
+    except Exception:
+        return tensor.to("cpu", non_blocking=True)
+
+
+def _copy_tensor_or_list_to_cpu_pinned(value):
+    if torch.is_tensor(value):
+        return _copy_tensor_to_cpu_pinned(value)
+    if isinstance(value, list):
+        return [
+            _copy_tensor_to_cpu_pinned(x) if torch.is_tensor(x) else x for x in value
+        ]
+    return value
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -67,35 +88,42 @@ class GenerationBatchResult:
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = (
-                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                    _copy_tensor_to_cpu_pinned(
+                        self.logits_output.next_token_logprobs
+                    )
                 )
             if self.logits_output.input_token_logprobs is not None:
                 self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                    _copy_tensor_to_cpu_pinned(
+                        self.logits_output.input_token_logprobs
+                    )
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
+                self.logits_output.next_token_top_logprobs_val = (
+                    _copy_tensor_or_list_to_cpu_pinned(
+                        self.logits_output.next_token_top_logprobs_val
+                    )
+                )
             if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+                self.logits_output.next_token_top_logprobs_idx = (
+                    _copy_tensor_or_list_to_cpu_pinned(
+                        self.logits_output.next_token_top_logprobs_idx
+                    )
+                )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = (
+                    _copy_tensor_or_list_to_cpu_pinned(
+                        self.logits_output.next_token_token_ids_logprobs_val
+                    )
+                )
         if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
+            self.logits_output.hidden_states = _copy_tensor_to_cpu_pinned(
+                self.logits_output.hidden_states
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.next_token_ids = _copy_tensor_to_cpu_pinned(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _copy_tensor_to_cpu_pinned(self.accept_lens)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()

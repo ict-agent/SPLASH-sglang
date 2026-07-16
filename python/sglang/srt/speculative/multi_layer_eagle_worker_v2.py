@@ -36,7 +36,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
+from sglang.srt.speculative.eagle_info_v2 import (
+    fill_bonus_tokens,
+    start_async_seq_lens_cpu_copy,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -775,6 +778,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
+        new_seq_lens_cpu, new_seq_lens_cpu_ready = start_async_seq_lens_cpu_copy(
+            new_seq_lens, self.device
+        )
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
@@ -799,6 +805,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
+            new_seq_lens_cpu=new_seq_lens_cpu,
+            new_seq_lens_cpu_ready=new_seq_lens_cpu_ready,
             verify_done=verify_done,
         )
         return GenerationBatchResult(

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
+from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
@@ -32,6 +34,7 @@ from sglang.srt.layers.attention.nsa.kpool.planner import (
     init_kpool_write_plan_capture as _init_kpool_write_plan_capture_impl,
     init_pooled_paged_mqa_metadata as _init_pooled_paged_mqa_metadata_impl,
     update_kpool_write_plan as _update_kpool_write_plan_impl,
+    update_kpool_write_plan_multi_decode as _update_kpool_write_plan_multi_decode_impl,
     update_pooled_paged_mqa_metadata as _update_pooled_paged_mqa_metadata_impl,
 )
 from sglang.srt.layers.attention.nsa.utils import (
@@ -55,6 +58,10 @@ from sglang.srt.utils import is_cuda, is_hip, is_dcu
 from sglang.srt.utils.common import copy_cpu_values_to_device, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
+
+
+def _disable_nsa_multi_replay_opt() -> bool:
+    return os.getenv("SGLANG_DISABLE_NSA_MULTI_REPLAY_OPT", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -92,6 +99,16 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view ?we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
+
+
+@lru_cache(maxsize=1)
+def _get_deep_gemm():
+    try:
+        import deep_gemm
+
+        return deep_gemm
+    except Exception:
+        return None
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -142,6 +159,17 @@ class NSAFlashMLAMetadata:
         else:
             self.flashmla_metadata.copy_(other.flashmla_metadata)
             self.num_splits.copy_(other.num_splits)
+
+
+def _can_fuse_flashmla_metadata(
+    *metadatas: Optional[NSAFlashMLAMetadata],
+) -> bool:
+    return all(
+        metadata is not None
+        and isinstance(metadata.flashmla_metadata, torch.Tensor)
+        and isinstance(metadata.num_splits, torch.Tensor)
+        for metadata in metadatas
+    )
 
 
 @dataclass(frozen=True)
@@ -438,6 +466,13 @@ class NativeSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self._real_page_col_indices = torch.arange(
+            0,
+            self.max_context_len + (self.speculative_num_draft_tokens or 0),
+            self.real_page_size,
+            device=self.device,
+            dtype=torch.long,
+        )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -464,15 +499,24 @@ class NativeSparseAttnBackend(
             )
         return self._arange_buf[:l]
 
+    def get_real_page_col_indices(self, max_seqlen_k: int) -> torch.Tensor:
+        page_size = self.real_page_size
+        num_cols = (max_seqlen_k + page_size - 1) // page_size
+        if num_cols > len(self._real_page_col_indices):
+            next_pow_of_2 = 1 << (max_seqlen_k - 1).bit_length()
+            self._real_page_col_indices = torch.arange(
+                0, next_pow_of_2, page_size, device=self.device, dtype=torch.long
+            )
+        return self._real_page_col_indices[:num_cols]
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
         if page_size == 1:
             return page_table
-        max_seqlen_k = page_table.shape[1]
-        strided_indices = torch.arange(
-            0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
-        )
-        return page_table[:, strided_indices] // page_size
+        # Keep the old gather-then-divide memory pattern, but cache the column
+        # index as int64 so PyTorch does not insert an int32->int64 _to_copy.
+        col_indices = self.get_real_page_col_indices(page_table.shape[1])
+        return torch.index_select(page_table, 1, col_indices) // page_size
 
     # ---- Kpool metadata: delegated to nsa.kpool.planner ------------
     def _init_pooled_paged_mqa_metadata(
@@ -851,14 +895,13 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
+        if (is_cuda() or _is_dcu) and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
+            deep_gemm = _get_deep_gemm()
+            if deep_gemm is not None:
                 # NOTE: DeepGEMM paged path uses block_size=64.
                 seqlens_32 = (
                     seqlens_expanded
@@ -874,8 +917,6 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1183,14 +1224,13 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
+        if (is_cuda() or _is_dcu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
+            deep_gemm = _get_deep_gemm()
+            if deep_gemm is not None:
                 seqlens_32 = (
                     seqlens_expanded
                     if (
@@ -1203,8 +1243,6 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -1222,6 +1260,11 @@ class NativeSparseAttnBackend(
             nsa_seqlens_expanded=seqlens_expanded,
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
+        )
+        metadata = self._init_pooled_paged_mqa_metadata(
+            metadata=metadata,
+            seqlens_32=cache_seqlens_int32,
+            forward_mode=forward_mode,
         )
         if self.nsa_index_kpool > 1:
             is_verify = forward_mode.is_target_verify()
@@ -1386,14 +1429,13 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        if (is_cuda() or _is_dcu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
+            deep_gemm = _get_deep_gemm()
+            if deep_gemm is not None:
                 seqlens_32 = (
                     seqlens_expanded
                     if (
@@ -1412,7 +1454,7 @@ class NativeSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            else:
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
         # replay update kpool write plan
         if self.nsa_index_kpool > 1:
@@ -1491,6 +1533,7 @@ class NativeSparseAttnBackend(
         bs: int,
         precomputed: PrecomputedMetadata,
         forward_mode: ForwardMode,
+        skip_kpool_write_plan_update: bool = False,
     ):
         """Fast path: copy precomputed metadata to this backend's metadata.
 
@@ -1643,9 +1686,8 @@ class NativeSparseAttnBackend(
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
         if is_cuda():
-            try:
-                import deep_gemm
-
+            deep_gemm = _get_deep_gemm()
+            if deep_gemm is not None:
                 if forward_mode.is_decode_or_idle():
                     seqlens_32 = metadata.cache_seqlens_int32
                 else:
@@ -1662,8 +1704,6 @@ class NativeSparseAttnBackend(
                     )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
-                pass
 
         # The fused metadata-copy kernels only copy the ordinary NSA fields.
         # Pooled MQA metadata and the KPool write plan are backend-local graph
@@ -1673,10 +1713,11 @@ class NativeSparseAttnBackend(
             seqlens_32=metadata.cache_seqlens_int32,
             forward_mode=forward_mode,
         )
-        self._update_kpool_write_plan_from_precomputed(
-            metadata=metadata,
-            precomputed=precomputed,
-        )
+        if not skip_kpool_write_plan_update:
+            self._update_kpool_write_plan_from_precomputed(
+                metadata=metadata,
+                precomputed=precomputed,
+            )
         self.forward_metadata = metadata
 
     def _update_kpool_write_plan_from_precomputed(
@@ -1692,7 +1733,9 @@ class NativeSparseAttnBackend(
             return
 
         bs = precomputed.req_pool_indices.shape[0]
-        write_start = (precomputed.cache_seqlens[:bs] - 1).to(torch.int32)
+        write_start = precomputed.cache_seqlens[:bs] - 1
+        if write_start.dtype != torch.int32:
+            write_start = write_start.to(torch.int32)
         _update_kpool_write_plan_impl(
             metadata,
             write_start=write_start,
@@ -2954,7 +2997,10 @@ class NativeSparseAttnMultiStepBackend:
 
             # Use multi-backend fused copy when we have 3 or more backends
             # This is 3x faster than calling the single-backend copy 3 times
-            if self.speculative_num_steps > 3:
+            if (
+                self.speculative_num_steps > 3
+                and not _disable_nsa_multi_replay_opt()
+            ):
                 try:
                     from sglang.jit_kernel.fused_metadata_copy import (
                         fused_metadata_copy_multi_cuda,
@@ -2968,7 +3014,16 @@ class NativeSparseAttnMultiStepBackend:
                     for i in range(3):
                         self.attn_backends[i].set_nsa_prefill_impl(forward_batch=None)
 
-                    # Prepare FlashMLA tensors if needed
+                    # Prepare FlashMLA tensors if they are plain tensors. DCU
+                    # FlashMLA metadata can be backend objects, which the
+                    # fused metadata-copy kernel cannot accept as optional
+                    # tensor arguments.
+                    fused_flashmla_metadata = _can_fuse_flashmla_metadata(
+                        precomputed.flashmla_metadata,
+                        metadata0.flashmla_metadata,
+                        metadata1.flashmla_metadata,
+                        metadata2.flashmla_metadata,
+                    )
                     flashmla_num_splits_src = None
                     flashmla_metadata_src = None
                     flashmla_num_splits_dst0 = None
@@ -2978,7 +3033,7 @@ class NativeSparseAttnMultiStepBackend:
                     flashmla_metadata_dst1 = None
                     flashmla_metadata_dst2 = None
 
-                    if precomputed.flashmla_metadata is not None:
+                    if fused_flashmla_metadata:
                         flashmla_num_splits_src = (
                             precomputed.flashmla_metadata.num_splits
                         )
@@ -3060,9 +3115,49 @@ class NativeSparseAttnMultiStepBackend:
                         precomputed.seqlens_expanded_size,
                     )
 
+                    if (
+                        precomputed.flashmla_metadata is not None
+                        and not fused_flashmla_metadata
+                    ):
+                        size = precomputed.seqlens_expanded_size
+                        for metadata in (metadata0, metadata1, metadata2):
+                            flashmla_metadata = metadata.flashmla_metadata.slice(
+                                slice(0, size + 1)
+                            )
+                            flashmla_metadata.copy_(precomputed.flashmla_metadata)
+
                     # The multi-copy kernel only handles dense NSA fields.
-                    # Refresh backend-local KPool state for the three fused
+                    # Refresh backend-local KPool state for the fused
                     # destinations just like the single-backend replay path.
+                    kpool_multi_updated = (
+                        self.attn_backends[0].nsa_index_kpool > 1
+                        and precomputed.req_pool_indices is not None
+                    )
+                    if kpool_multi_updated:
+                        metadata3 = (
+                            self.attn_backends[3].decode_cuda_graph_metadata[bs]
+                            if self.speculative_num_steps > 4
+                            else None
+                        )
+                        write_start = precomputed.cache_seqlens[:bs] - 1
+                        if write_start.dtype != torch.int32:
+                            write_start = write_start.to(torch.int32)
+                        real_page_table = (
+                            precomputed.real_page_table
+                            if precomputed.real_page_table is not None
+                            else metadata0.real_page_table
+                        )
+                        _update_kpool_write_plan_multi_decode_impl(
+                            metadata0,
+                            metadata1,
+                            metadata2,
+                            metadata3,
+                            write_start=write_start,
+                            req_pool_indices=precomputed.req_pool_indices,
+                            real_page_table=real_page_table,
+                            pool_size=self.attn_backends[0].nsa_index_kpool,
+                            real_page_size=self.attn_backends[0].real_page_size,
+                        )
                     for i in range(3):
                         backend = self.attn_backends[i]
                         backend_metadata = backend.decode_cuda_graph_metadata[bs]
@@ -3071,10 +3166,11 @@ class NativeSparseAttnMultiStepBackend:
                             seqlens_32=backend_metadata.cache_seqlens_int32,
                             forward_mode=ForwardMode.DECODE,
                         )
-                        backend._update_kpool_write_plan_from_precomputed(
-                            metadata=backend_metadata,
-                            precomputed=precomputed,
-                        )
+                        if not kpool_multi_updated:
+                            backend._update_kpool_write_plan_from_precomputed(
+                                metadata=backend_metadata,
+                                precomputed=precomputed,
+                            )
                         backend.forward_metadata = backend_metadata
 
                     # Copy remaining backends one by one (if > 3 backends)
@@ -3085,6 +3181,9 @@ class NativeSparseAttnMultiStepBackend:
                             bs=bs,
                             precomputed=precomputed,
                             forward_mode=ForwardMode.DECODE,
+                            skip_kpool_write_plan_update=(
+                                kpool_multi_updated and i == 3
+                            ),
                         )
                 except (ImportError, Exception) as e:
                     # Fallback to loop if multi-backend kernel not available or fails

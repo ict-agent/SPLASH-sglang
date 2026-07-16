@@ -2382,7 +2382,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.sampling_info.penalizer_orchestrator.is_required:
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
-                delayed_output_ids = torch.tensor(
+                delayed_output_ids_cpu = torch.tensor(
                     [
                         (
                             req.output_ids[-1]
@@ -2392,7 +2392,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         for req in self.reqs
                     ],
                     dtype=torch.int64,
-                    device=self.device,
+                    device="cpu",
+                    pin_memory=is_pin_memory_available(self.device),
+                )
+                delayed_output_ids = delayed_output_ids_cpu.to(
+                    self.device, non_blocking=True
                 )
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     delayed_output_ids

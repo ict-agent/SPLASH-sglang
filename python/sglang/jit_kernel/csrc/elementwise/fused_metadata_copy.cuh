@@ -35,7 +35,11 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>  // for std::min
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 // Forward mode enum (must match Python ForwardMode in sglang/srt/layers/attention/nsa_backend.py)
 enum ForwardModeEnum { DECODE = 0, TARGET_VERIFY = 1, DRAFT_EXTEND = 2 };
@@ -328,7 +332,7 @@ __global__ void fused_metadata_copy_multi_kernel(const FusedMetadataCopyMultiPar
   }
 
   // Copy real page table to all 3 backends
-  if (src.real_page_table != nullptr && dst0.real_page_table != nullptr) {
+  if constexpr (HAS_REAL_PAGE_TABLE) {
     int real_table_elements = bs * real_page_table_cols;
 #pragma unroll 2
     for (int i = tid; i < real_table_elements; i += total_threads) {
@@ -421,13 +425,11 @@ inline T* unwrap_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* na
  */
 template <typename T>
 inline const T*
-unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+unwrap_optional_data_ptr(const tvm::ffi::TensorView& tensor, const char* name) {
   using namespace host;
-  if (!optional_tensor.has_value()) {
-    return nullptr;
+  if (tensor.data_ptr()) {
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   }
-  const auto& tensor = optional_tensor.value();
-  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   return static_cast<const T*>(tensor.data_ptr());
 }
 
@@ -442,13 +444,11 @@ unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optiona
  */
 template <typename T>
 inline T*
-unwrap_optional_data_ptr_mut(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+unwrap_optional_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* name) {
   using namespace host;
-  if (!optional_tensor.has_value()) {
-    return nullptr;
+  if (tensor.data_ptr()) {
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   }
-  const auto& tensor = optional_tensor.value();
-  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype int32");
   return static_cast<T*>(tensor.data_ptr());
 }
 
@@ -494,20 +494,20 @@ struct FusedMetadataCopyKernel {
       const tvm::ffi::TensorView cu_seqlens_k_src,
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView nsa_cache_seqlens_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_src,
+      const tvm::ffi::TensorView seqlens_expanded_src,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
+      const tvm::ffi::TensorView real_page_table_src,
+      const tvm::ffi::TensorView flashmla_num_splits_src,
+      const tvm::ffi::TensorView flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst,
       const tvm::ffi::TensorView cu_seqlens_k_dst,
       const tvm::ffi::TensorView page_table_1_dst,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_dst,
+      const tvm::ffi::TensorView seqlens_expanded_dst,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst,
+      const tvm::ffi::TensorView real_page_table_dst,
+      const tvm::ffi::TensorView flashmla_num_splits_dst,
+      const tvm::ffi::TensorView flashmla_metadata_dst,
       int bs,
       int max_len,
       int max_seqlen_k,
@@ -552,11 +552,11 @@ struct FusedMetadataCopyKernel {
         .page_indices_rows = static_cast<int>(page_indices_src.shape()[0]),
         .page_table_1_stride = static_cast<int>(page_table_1_dst.shape()[1]),
         .real_page_table_cols =
-            real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
+            HAS_REAL_PAGE_TABLE ? static_cast<int>(real_page_table_src.shape()[1]) : 0,
         .real_page_table_dst_stride =
-            real_page_table_dst.has_value() ? static_cast<int>(real_page_table_dst.value().stride(0)) : 0,
+            HAS_REAL_PAGE_TABLE ? static_cast<int>(real_page_table_dst.stride(0)) : 0,
         .flashmla_metadata_size =
-            flashmla_metadata_src.has_value() ? static_cast<int>(flashmla_metadata_src.value().numel()) : 0,
+            HAS_FLASHMLA ? static_cast<int>(flashmla_metadata_src.numel()) : 0,
     };
 
     // Calculate grid configuration
@@ -607,33 +607,33 @@ struct FusedMetadataCopyMultiKernel {
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView nsa_cache_seqlens_src,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
+      const tvm::ffi::TensorView real_page_table_src,
+      const tvm::ffi::TensorView flashmla_num_splits_src,
+      const tvm::ffi::TensorView flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst0,
       const tvm::ffi::TensorView cu_seqlens_k_dst0,
       const tvm::ffi::TensorView page_table_1_dst0,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst0,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst0,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst0,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst0,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst0,
+      const tvm::ffi::TensorView real_page_table_dst0,
+      const tvm::ffi::TensorView flashmla_num_splits_dst0,
+      const tvm::ffi::TensorView flashmla_metadata_dst0,
       const tvm::ffi::TensorView cache_seqlens_dst1,
       const tvm::ffi::TensorView cu_seqlens_k_dst1,
       const tvm::ffi::TensorView page_table_1_dst1,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst1,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst1,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst1,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst1,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst1,
+      const tvm::ffi::TensorView real_page_table_dst1,
+      const tvm::ffi::TensorView flashmla_num_splits_dst1,
+      const tvm::ffi::TensorView flashmla_metadata_dst1,
       const tvm::ffi::TensorView cache_seqlens_dst2,
       const tvm::ffi::TensorView cu_seqlens_k_dst2,
       const tvm::ffi::TensorView page_table_1_dst2,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst2,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst2,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst2,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst2,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst2,
+      const tvm::ffi::TensorView real_page_table_dst2,
+      const tvm::ffi::TensorView flashmla_num_splits_dst2,
+      const tvm::ffi::TensorView flashmla_metadata_dst2,
       int bs,
       int max_len,
       int seqlens_expanded_size) {
@@ -702,11 +702,11 @@ struct FusedMetadataCopyMultiKernel {
         .seqlens_expanded_size = seqlens_expanded_size,
         .page_table_1_stride = static_cast<int>(page_table_1_dst0.shape()[1]),
         .real_page_table_cols =
-            real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
+            HAS_REAL_PAGE_TABLE ? static_cast<int>(real_page_table_src.shape()[1]) : 0,
         .real_page_table_dst_stride =
-            real_page_table_dst0.has_value() ? static_cast<int>(real_page_table_dst0.value().stride(0)) : 0,
+            HAS_REAL_PAGE_TABLE ? static_cast<int>(real_page_table_dst0.stride(0)) : 0,
         .flashmla_metadata_size =
-            flashmla_metadata_src.has_value() ? static_cast<int>(flashmla_metadata_src.value().numel()) : 0,
+            HAS_FLASHMLA ? static_cast<int>(flashmla_metadata_src.numel()) : 0,
     };
 
     dim3 grid = get_launch_config(bs * max_len);

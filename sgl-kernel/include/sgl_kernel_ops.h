@@ -164,6 +164,19 @@ void rotary_embedding(
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
+void kpool_write_plan(
+    const torch::Tensor& write_start,
+    const torch::Tensor& req_pool_indices,
+    const torch::Tensor& real_page_table,
+    torch::Tensor& req_out,
+    torch::Tensor& write_start_out,
+    torch::Tensor& tail_logical_start_out,
+    torch::Tensor& write_loc_out,
+    std::optional<torch::Tensor> pool_seqlens_per_q_out,
+    std::optional<torch::Tensor> seqlens_per_q_out,
+    int64_t pool_size,
+    int64_t num_draft_tokens,
+    int64_t slots_per_page);
 
 void fast_topk_interface(
     const at::Tensor& score,

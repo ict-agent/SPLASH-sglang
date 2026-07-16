@@ -51,6 +51,7 @@ from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
+    start_async_seq_lens_cpu_copy,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1241,6 +1242,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+        new_seq_lens_cpu, new_seq_lens_cpu_ready = start_async_seq_lens_cpu_copy(
+            new_seq_lens, self.device
+        )
 
         # Update mamba state for linear-attention hybrid models after verification.
         if self.target_worker.model_runner.mambaish_config is not None:
@@ -1272,6 +1276,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
+            new_seq_lens_cpu=new_seq_lens_cpu,
+            new_seq_lens_cpu_ready=new_seq_lens_cpu_ready,
             verify_done=verify_done,
         )
 

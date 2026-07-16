@@ -36,6 +36,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_pin_memory_available
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -61,6 +62,24 @@ if is_cuda() or is_musa():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+
+def start_async_seq_lens_cpu_copy(seq_lens: torch.Tensor, device) -> tuple[torch.Tensor, Any]:
+    """Start a D2H copy for next iteration's seq_lens on the current stream."""
+    if seq_lens.numel() == 0:
+        return torch.empty(seq_lens.shape, dtype=seq_lens.dtype, device="cpu"), None
+
+    use_pin_memory = is_pin_memory_available(device)
+    seq_lens_cpu = torch.empty(
+        tuple(seq_lens.shape),
+        dtype=seq_lens.dtype,
+        device="cpu",
+        pin_memory=use_pin_memory,
+    )
+    seq_lens_cpu.copy_(seq_lens, non_blocking=use_pin_memory)
+    done = torch.get_device_module(device).Event()
+    done.record()
+    return seq_lens_cpu, done
 
 
 @triton.jit
@@ -106,7 +125,7 @@ class EagleDraftInputV2Mixin:
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
-            output_ids = torch.tensor(
+            output_ids_cpu = torch.tensor(
                 [
                     (
                         req.output_ids[-1]
@@ -116,8 +135,10 @@ class EagleDraftInputV2Mixin:
                     for req in batch.reqs
                 ],
                 dtype=torch.int64,
-                device=batch.device,
+                device="cpu",
+                pin_memory=True,
             )
+            output_ids = output_ids_cpu.to(batch.device, non_blocking=True)
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 output_ids
             )
@@ -181,8 +202,14 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        if self.new_seq_lens_cpu is not None:
+            if self.new_seq_lens_cpu_ready is not None:
+                self.new_seq_lens_cpu_ready.synchronize()
+                self.new_seq_lens_cpu_ready = None
+            batch.seq_lens_cpu = self.new_seq_lens_cpu
+            self.new_seq_lens_cpu = None
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(

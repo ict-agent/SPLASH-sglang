@@ -18,6 +18,37 @@ import torch
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 logger = logging.getLogger(__name__)
+_DUMMY_OPTIONAL_TENSOR_CACHE: dict[tuple[torch.device, tuple[int, ...]], torch.Tensor] = {}
+
+
+def _dummy_optional_tensor_like(ref: torch.Tensor, *shape: int) -> torch.Tensor:
+    key = (ref.device, tuple(shape))
+    dummy = _DUMMY_OPTIONAL_TENSOR_CACHE.get(key)
+    if dummy is None:
+        dummy = torch.empty(shape, dtype=torch.int32, device=ref.device)
+        _DUMMY_OPTIONAL_TENSOR_CACHE[key] = dummy
+    return dummy
+
+
+def _as_optional_tensor(
+    tensor: object, ref: torch.Tensor, *dummy_shape: int
+) -> torch.Tensor:
+    return (
+        tensor
+        if isinstance(tensor, torch.Tensor)
+        else _dummy_optional_tensor_like(ref, *dummy_shape)
+    )
+
+
+def _dummy_optional_tensor(ref: torch.Tensor, *, ndim: int = 1) -> torch.Tensor:
+    """Return a small int32 tensor used only to satisfy tvm-ffi DLTensor args."""
+    shape = (1, 1) if ndim == 2 else (1,)
+    return ref.new_empty(shape)
+
+
+def _all_or_none(*tensors: Optional[torch.Tensor]) -> bool:
+    present = [tensor is not None for tensor in tensors]
+    return all(present) or not any(present)
 
 
 # ============================================================================
@@ -150,7 +181,25 @@ def fused_metadata_copy_cuda(
         max_seqlen_k: Maximum sequence length for target_verify mode
         seqlens_expanded_size: Size of expanded sequence lengths
     """
-    # Determine template parameters for kernel specialization
+    uses_seqlens_expanded = forward_mode != 0
+    if uses_seqlens_expanded and (
+        seqlens_expanded_src is None or seqlens_expanded_dst is None
+    ):
+        raise ValueError(
+            "seqlens_expanded tensors are required for TARGET_VERIFY/DRAFT_EXTEND"
+        )
+
+    if not _all_or_none(real_page_table_src, real_page_table_dst):
+        raise ValueError("real_page_table source/destination tensors must match")
+    if not _all_or_none(
+        flashmla_num_splits_src,
+        flashmla_metadata_src,
+        flashmla_num_splits_dst,
+        flashmla_metadata_dst,
+    ):
+        raise ValueError("FlashMLA metadata source/destination tensors must match")
+
+    # Determine template parameters for kernel specialization.
     has_real_page_table = real_page_table_src is not None
     has_flashmla = flashmla_num_splits_src is not None
 
@@ -169,26 +218,54 @@ def fused_metadata_copy_cuda(
         seqlens_expanded_src = seqlens_expanded_src.contiguous()
     nsa_cu_seqlens_k_src = nsa_cu_seqlens_k_src.contiguous()
 
-    # Call JIT-compiled kernel (None values are passed as Optional with no value)
+    # Newer tvm-ffi does not convert Python None to Optional<DLTensor*>.
+    # Pass tiny int32 tensors for disabled optional branches; template flags keep
+    # the kernel from reading them when the feature is off.
+    real_page_table_src_arg = _as_optional_tensor(
+        real_page_table_src, cache_seqlens_src, 1, 1
+    )
+    real_page_table_dst_arg = _as_optional_tensor(
+        real_page_table_dst, cache_seqlens_dst, 1, 1
+    )
+    flashmla_num_splits_src_arg = _as_optional_tensor(
+        flashmla_num_splits_src, cache_seqlens_src, 1
+    )
+    flashmla_num_splits_dst_arg = _as_optional_tensor(
+        flashmla_num_splits_dst, cache_seqlens_dst, 1
+    )
+    flashmla_metadata_src_arg = _as_optional_tensor(
+        flashmla_metadata_src, cache_seqlens_src, 1
+    )
+    flashmla_metadata_dst_arg = _as_optional_tensor(
+        flashmla_metadata_dst, cache_seqlens_dst, 1
+    )
+    seqlens_expanded_src_arg = _as_optional_tensor(
+        seqlens_expanded_src, cache_seqlens_src, 1
+    )
+    seqlens_expanded_dst_arg = _as_optional_tensor(
+        seqlens_expanded_dst, cache_seqlens_dst, 1
+    )
+
+    # Call JIT-compiled kernel
     module.fused_metadata_copy(
         cache_seqlens_src,
         cu_seqlens_k_src,
         page_indices_src,
         nsa_cache_seqlens_src,
-        seqlens_expanded_src,
+        seqlens_expanded_src_arg,
         nsa_cu_seqlens_k_src,
-        real_page_table_src,
-        flashmla_num_splits_src,
-        flashmla_metadata_src,
+        real_page_table_src_arg,
+        flashmla_num_splits_src_arg,
+        flashmla_metadata_src_arg,
         cache_seqlens_dst,
         cu_seqlens_k_dst,
         page_table_1_dst,
         nsa_cache_seqlens_dst,
-        seqlens_expanded_dst,
+        seqlens_expanded_dst_arg,
         nsa_cu_seqlens_k_dst,
-        real_page_table_dst,
-        flashmla_num_splits_dst,
-        flashmla_metadata_dst,
+        real_page_table_dst_arg,
+        flashmla_num_splits_dst_arg,
+        flashmla_metadata_dst_arg,
         bs,
         max_len,
         max_seqlen_k,
@@ -261,7 +338,28 @@ def fused_metadata_copy_multi_cuda(
         max_len: Maximum length for decode mode
         seqlens_expanded_size: Size of expanded sequence lengths
     """
-    # Determine template parameters for kernel specialization
+    real_page_table_tensors = (
+        real_page_table_src,
+        real_page_table_dst0,
+        real_page_table_dst1,
+        real_page_table_dst2,
+    )
+    flashmla_tensors = (
+        flashmla_num_splits_src,
+        flashmla_metadata_src,
+        flashmla_num_splits_dst0,
+        flashmla_metadata_dst0,
+        flashmla_num_splits_dst1,
+        flashmla_metadata_dst1,
+        flashmla_num_splits_dst2,
+        flashmla_metadata_dst2,
+    )
+    if not _all_or_none(*real_page_table_tensors):
+        raise ValueError("real_page_table source/destination tensors must match")
+    if not _all_or_none(*flashmla_tensors):
+        raise ValueError("FlashMLA metadata source/destination tensors must match")
+
+    # Determine template parameters for kernel specialization.
     has_real_page_table = real_page_table_src is not None
     has_flashmla = flashmla_num_splits_src is not None
 
@@ -276,40 +374,77 @@ def fused_metadata_copy_multi_cuda(
     nsa_cache_seqlens_src = nsa_cache_seqlens_src.contiguous()
     nsa_cu_seqlens_k_src = nsa_cu_seqlens_k_src.contiguous()
 
-    # Call JIT-compiled kernel (None values are passed as Optional with no value)
+    real_page_table_src_arg = _as_optional_tensor(
+        real_page_table_src, cache_seqlens_src, 1, 1
+    )
+    flashmla_num_splits_src_arg = _as_optional_tensor(
+        flashmla_num_splits_src, cache_seqlens_src, 1
+    )
+    flashmla_metadata_src_arg = _as_optional_tensor(
+        flashmla_metadata_src, cache_seqlens_src, 1
+    )
+    real_page_table_dst0_arg = _as_optional_tensor(
+        real_page_table_dst0, cache_seqlens_dst0, 1, 1
+    )
+    flashmla_num_splits_dst0_arg = _as_optional_tensor(
+        flashmla_num_splits_dst0, cache_seqlens_dst0, 1
+    )
+    flashmla_metadata_dst0_arg = _as_optional_tensor(
+        flashmla_metadata_dst0, cache_seqlens_dst0, 1
+    )
+    real_page_table_dst1_arg = _as_optional_tensor(
+        real_page_table_dst1, cache_seqlens_dst1, 1, 1
+    )
+    flashmla_num_splits_dst1_arg = _as_optional_tensor(
+        flashmla_num_splits_dst1, cache_seqlens_dst1, 1
+    )
+    flashmla_metadata_dst1_arg = _as_optional_tensor(
+        flashmla_metadata_dst1, cache_seqlens_dst1, 1
+    )
+    real_page_table_dst2_arg = _as_optional_tensor(
+        real_page_table_dst2, cache_seqlens_dst2, 1, 1
+    )
+    flashmla_num_splits_dst2_arg = _as_optional_tensor(
+        flashmla_num_splits_dst2, cache_seqlens_dst2, 1
+    )
+    flashmla_metadata_dst2_arg = _as_optional_tensor(
+        flashmla_metadata_dst2, cache_seqlens_dst2, 1
+    )
+
+    # Call JIT-compiled kernel
     module.fused_metadata_copy_multi(
         cache_seqlens_src,
         cu_seqlens_k_src,
         page_indices_src,
         nsa_cache_seqlens_src,
         nsa_cu_seqlens_k_src,
-        real_page_table_src,
-        flashmla_num_splits_src,
-        flashmla_metadata_src,
+        real_page_table_src_arg,
+        flashmla_num_splits_src_arg,
+        flashmla_metadata_src_arg,
         cache_seqlens_dst0,
         cu_seqlens_k_dst0,
         page_table_1_dst0,
         nsa_cache_seqlens_dst0,
         nsa_cu_seqlens_k_dst0,
-        real_page_table_dst0,
-        flashmla_num_splits_dst0,
-        flashmla_metadata_dst0,
+        real_page_table_dst0_arg,
+        flashmla_num_splits_dst0_arg,
+        flashmla_metadata_dst0_arg,
         cache_seqlens_dst1,
         cu_seqlens_k_dst1,
         page_table_1_dst1,
         nsa_cache_seqlens_dst1,
         nsa_cu_seqlens_k_dst1,
-        real_page_table_dst1,
-        flashmla_num_splits_dst1,
-        flashmla_metadata_dst1,
+        real_page_table_dst1_arg,
+        flashmla_num_splits_dst1_arg,
+        flashmla_metadata_dst1_arg,
         cache_seqlens_dst2,
         cu_seqlens_k_dst2,
         page_table_1_dst2,
         nsa_cache_seqlens_dst2,
         nsa_cu_seqlens_k_dst2,
-        real_page_table_dst2,
-        flashmla_num_splits_dst2,
-        flashmla_metadata_dst2,
+        real_page_table_dst2_arg,
+        flashmla_num_splits_dst2_arg,
+        flashmla_metadata_dst2_arg,
         bs,
         max_len,
         seqlens_expanded_size,

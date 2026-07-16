@@ -47,6 +47,7 @@ sources = [
     "csrc/attention/decode_metadata.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
+    "csrc/elementwise/kpool_write_plan.cu",
     "csrc/elementwise/topk.cu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
@@ -71,9 +72,9 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx938", "gfx942", "gfx950"]:
+if amdgpu_target not in ["gfx936", "gfx938", "gfx942", "gfx950"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx938', 'gfx942', or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx936', 'gfx938', 'gfx942', or 'gfx950'."
     )
     sys.exit(1)
 
@@ -86,7 +87,7 @@ fp8_macro = (
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
 #topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target in ["gfx942", "gfx938"] else 32 * 1024 * 4
+topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target in ["gfx936", "gfx938", "gfx942"] else 32 * 1024 * 4
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",

@@ -10,6 +10,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     get_attention_cp_group,
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -154,6 +155,17 @@ def cp_plain_reduce_scatter(input_: torch.Tensor, cp_size: Optional[int] = None)
     cp_size = _cp_size(cp_size)
     if cp_size == 1:
         return input_
+    if input_.shape[0] % cp_size == 0:
+        out_shape = (input_.shape[0] // cp_size, *input_.shape[1:])
+        with use_symmetric_memory(
+            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+        ):
+            output = input_.new_empty(out_shape)
+        attn_cp_reduce_scatter_tensor(output, input_.contiguous())
+        return output
+
+    # Uneven CP chunks cannot use tensor reduce_scatter directly. Keep the
+    # generic path for padded or irregular batches.
     reduced = get_attention_cp_group().all_reduce(input_)
     return cp_plain_split(reduced, cp_size)
 
@@ -214,6 +226,31 @@ def cp_plain_to_scattered(
     cp_size = _cp_size(cp_size)
     if cp_size == 1:
         return input_
+
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    local_len = int(input_.shape[0])
+    total_len = _metadata_total_len(forward_batch)
+    if (
+        is_nsa_prefill_cp_round_robin_split()
+        and total_len is not None
+        and total_len % (cp_size * cp_size) == 0
+        and local_len == total_len // cp_size
+    ):
+        tail_shape = input_.shape[1:]
+        send = (
+            input_.view(local_len // cp_size, cp_size, *tail_shape)
+            .transpose(0, 1)
+            .contiguous()
+        )
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(
+            recv, send, group=get_attention_cp_group().device_group
+        )
+        return recv.flatten(0, 1)
+
     gathered = cp_plain_all_gather(input_, cp_size, forward_batch)
     return cp_split_and_rebuild_data(forward_batch, gathered)
 
@@ -225,6 +262,27 @@ def cp_scattered_to_plain(
     cp_size = _cp_size(cp_size)
     if cp_size == 1:
         return input_
+
+    from sglang.srt.layers.attention.nsa.utils import (
+        is_nsa_prefill_cp_round_robin_split,
+    )
+
+    local_len = int(input_.shape[0])
+    total_len = _metadata_total_len(forward_batch)
+    if (
+        is_nsa_prefill_cp_round_robin_split()
+        and total_len is not None
+        and total_len % (cp_size * cp_size) == 0
+        and local_len == total_len // cp_size
+    ):
+        tail_shape = input_.shape[1:]
+        send = input_.view(cp_size, local_len // cp_size, *tail_shape)
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(
+            recv, send, group=get_attention_cp_group().device_group
+        )
+        return recv.transpose(0, 1).contiguous().view(local_len, *tail_shape)
+
     gathered = cp_all_gather_rerange_output(
         input_, cp_size, forward_batch, torch.cuda.current_stream()
     )

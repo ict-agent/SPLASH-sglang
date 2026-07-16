@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.nsa.kpool.planner import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
     init_pooled_paged_mqa_metadata,
+    update_kpool_write_plan_multi_decode,
     update_pooled_paged_mqa_metadata,
 )
 
@@ -36,5 +37,6 @@ __all__ = [
     "init_kpool_extend_metadata",
     "init_kpool_write_plan",
     "init_pooled_paged_mqa_metadata",
+    "update_kpool_write_plan_multi_decode",
     "update_pooled_paged_mqa_metadata",
 ]

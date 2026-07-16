@@ -783,6 +783,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # V2 overlap worker only
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
+    new_seq_lens_cpu: Optional[torch.Tensor] = None
+    new_seq_lens_cpu_ready: Optional[torch.cuda.Event] = None
     verify_done: Optional[torch.cuda.Event] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
@@ -852,6 +854,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            # The async CPU copy is indexed by the pre-filter batch order. If a
+            # future batch is filtered, fall back to the original synchronous
+            # seq_lens.cpu() path for correctness.
+            self.new_seq_lens_cpu = None
+            self.new_seq_lens_cpu_ready = None
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -890,6 +897,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            self.new_seq_lens_cpu = None
+            self.new_seq_lens_cpu_ready = None
             return
 
         # Detect idle stub by `topk_index` length (idle inputs have

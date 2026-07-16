@@ -813,6 +813,74 @@ def update_kpool_write_plan_cuda_graph(
     )
 
 
+def update_kpool_write_plan_cuda_graph_multi_decode(
+    write_start: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    real_page_table: torch.Tensor,
+    req_out0: torch.Tensor,
+    write_start_out0: torch.Tensor,
+    tail_logical_start_out0: torch.Tensor,
+    write_loc_out0: torch.Tensor,
+    req_out1: torch.Tensor,
+    write_start_out1: torch.Tensor,
+    tail_logical_start_out1: torch.Tensor,
+    write_loc_out1: torch.Tensor,
+    req_out2: torch.Tensor,
+    write_start_out2: torch.Tensor,
+    tail_logical_start_out2: torch.Tensor,
+    write_loc_out2: torch.Tensor,
+    req_out3: Optional[torch.Tensor] = None,
+    write_start_out3: Optional[torch.Tensor] = None,
+    tail_logical_start_out3: Optional[torch.Tensor] = None,
+    write_loc_out3: Optional[torch.Tensor] = None,
+    *,
+    pool_size: int,
+    slots_per_page: int,
+) -> None:
+    """Build three or four decode kpool write plans in one Triton launch.
+
+    Multi-step EAGLE v2 replay copies identical decode metadata into the first
+    draft backends. Their kpool write-plan inputs are also identical, but the
+    destination graph buffers are backend-local. Updating the plans in one
+    launcher removes repeated Python/Triton scheduling trips between spec steps.
+    """
+    bs = write_start.shape[0]
+    if bs == 0:
+        return
+    has_fourth = req_out3 is not None
+    assert has_fourth == (
+        write_start_out3 is not None
+        and tail_logical_start_out3 is not None
+        and write_loc_out3 is not None
+    ), "fourth decode plan outputs must be all set or all None"
+
+    _update_kpool_write_plan_multi_decode_kernel[(bs,)](
+        write_start,
+        req_pool_indices,
+        real_page_table,
+        req_out0,
+        write_start_out0,
+        tail_logical_start_out0,
+        write_loc_out0,
+        req_out1,
+        write_start_out1,
+        tail_logical_start_out1,
+        write_loc_out1,
+        req_out2,
+        write_start_out2,
+        tail_logical_start_out2,
+        write_loc_out2,
+        req_out3 if has_fourth else req_out2,
+        write_start_out3 if has_fourth else write_start_out2,
+        tail_logical_start_out3 if has_fourth else tail_logical_start_out2,
+        write_loc_out3 if has_fourth else write_loc_out2,
+        real_page_table.stride(0),
+        POOL_SIZE=pool_size,
+        SLOTS_PER_PAGE=slots_per_page,
+        HAS_FOURTH=has_fourth,
+    )
+
+
 @triton.jit
 def _update_kpool_write_plan_kernel(
     write_start_ptr,
@@ -864,6 +932,65 @@ def _update_kpool_write_plan_kernel(
     # write on `(ws + N) // P > ws // P` recomputed in-kernel.
     tl.store(tail_logical_start_out_ptr + b, tail_logical_start.to(tl.int32))
     tl.store(write_loc_out_ptr + b, write_loc.to(tl.int64))
+
+
+@triton.jit
+def _update_kpool_write_plan_multi_decode_kernel(
+    write_start_ptr,
+    req_pool_indices_ptr,
+    real_page_table_ptr,
+    req_out0_ptr,
+    write_start_out0_ptr,
+    tail_logical_start_out0_ptr,
+    write_loc_out0_ptr,
+    req_out1_ptr,
+    write_start_out1_ptr,
+    tail_logical_start_out1_ptr,
+    write_loc_out1_ptr,
+    req_out2_ptr,
+    write_start_out2_ptr,
+    tail_logical_start_out2_ptr,
+    write_loc_out2_ptr,
+    req_out3_ptr,
+    write_start_out3_ptr,
+    tail_logical_start_out3_ptr,
+    write_loc_out3_ptr,
+    real_page_table_stride_0,
+    POOL_SIZE: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+    HAS_FOURTH: tl.constexpr,
+):
+    b = tl.program_id(0)
+    ws = tl.load(write_start_ptr + b).to(tl.int32)
+    req = tl.load(req_pool_indices_ptr + b)
+    base_pool = ws // POOL_SIZE
+    tail_logical_start = base_pool * POOL_SIZE
+    pool_page_group = base_pool // SLOTS_PER_PAGE
+    packed_page = tl.load(
+        real_page_table_ptr + b * real_page_table_stride_0 + pool_page_group
+    ).to(tl.int64)
+    write_loc = packed_page * SLOTS_PER_PAGE + (base_pool % SLOTS_PER_PAGE)
+
+    tl.store(req_out0_ptr + b, req)
+    tl.store(write_start_out0_ptr + b, ws)
+    tl.store(tail_logical_start_out0_ptr + b, tail_logical_start.to(tl.int32))
+    tl.store(write_loc_out0_ptr + b, write_loc.to(tl.int64))
+
+    tl.store(req_out1_ptr + b, req)
+    tl.store(write_start_out1_ptr + b, ws)
+    tl.store(tail_logical_start_out1_ptr + b, tail_logical_start.to(tl.int32))
+    tl.store(write_loc_out1_ptr + b, write_loc.to(tl.int64))
+
+    tl.store(req_out2_ptr + b, req)
+    tl.store(write_start_out2_ptr + b, ws)
+    tl.store(tail_logical_start_out2_ptr + b, tail_logical_start.to(tl.int32))
+    tl.store(write_loc_out2_ptr + b, write_loc.to(tl.int64))
+
+    if HAS_FOURTH:
+        tl.store(req_out3_ptr + b, req)
+        tl.store(write_start_out3_ptr + b, ws)
+        tl.store(tail_logical_start_out3_ptr + b, tail_logical_start.to(tl.int32))
+        tl.store(write_loc_out3_ptr + b, write_loc.to(tl.int64))
 
 
 def expand_pooled_groups_to_topk(

@@ -42,6 +42,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
+  m.def(
+      "kpool_write_plan(Tensor write_start, Tensor req_pool_indices, Tensor real_page_table, Tensor! req_out, "
+      "Tensor! write_start_out, Tensor! tail_logical_start_out, Tensor! write_loc_out, "
+      "Tensor? pool_seqlens_per_q_out, Tensor? seqlens_per_q_out, int pool_size, int num_draft_tokens, "
+      "int slots_per_page) -> ()");
+  m.impl("kpool_write_plan", torch::kCUDA, &kpool_write_plan);
+
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
   m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
 
