@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Callable, Optional
 
 import torch
@@ -60,6 +61,8 @@ class MHCLayerCommunicator(LayerCommunicator):
         self._h_post = None
         self._mlp_comm_kind = None
         self._a2a_scatter_chunks = None
+        self._attn_input_quant_args = None
+        self._mlp_input_quant_args = None
         super().__init__(
             layer_scatter_modes=layer_scatter_modes,
             input_layernorm=input_layernorm,
@@ -99,39 +102,59 @@ class MHCLayerCommunicator(LayerCommunicator):
             self.input_layernorm.variance_epsilon,
         )
         if not norm_fused and hidden_states.shape[0] != 0:
-            # The original mHC state is the cross-layer residual.  Only update
-            # hc_pre's newly produced buffer in place; if an implementation
-            # ever aliases it to residual, retain the native out-of-place path.
-            hidden_storage_ptr = hidden_states.untyped_storage().data_ptr()
-            aliases_mhc_state = any(
-                state is not None
-                and state.untyped_storage().data_ptr() == hidden_storage_ptr
-                for state in (residual, self._h_res, self._h_post)
-            )
-            can_fuse = (
-                fuse_rms_quant
-                and not aliases_mhc_state
-                and supports_fused_rms_quant_input(
-                    hidden_states, self.input_layernorm.weight
+            if fuse_rms_quant:
+                # Never update the cross-layer mHC state in place.
+                hidden_storage_ptr = hidden_states.untyped_storage().data_ptr()
+                aliases_mhc_state = any(
+                    state is not None
+                    and state.untyped_storage().data_ptr() == hidden_storage_ptr
+                    for state in (residual, self._h_res, self._h_post)
                 )
-            )
-            if can_fuse:
-                self._attn_input_quant_args = fused_rms_norm_per_token_quant(
-                    input=hidden_states,
-                    rms_weight=self.input_layernorm.weight,
-                    epsilon=self.input_layernorm.variance_epsilon,
-                    quant_dtype=torch.int8,
-                    residual=None,
-                    update_input=True,
+                can_fuse = (
+                    not aliases_mhc_state
+                    and supports_fused_rms_quant_input(
+                        hidden_states, self.input_layernorm.weight
+                    )
                 )
+                if can_fuse:
+                    self._attn_input_quant_args = fused_rms_norm_per_token_quant(
+                        input=hidden_states,
+                        rms_weight=self.input_layernorm.weight,
+                        epsilon=self.input_layernorm.variance_epsilon,
+                        quant_dtype=torch.int8,
+                        residual=None,
+                        update_input=True,
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states = self.input_layernorm(hidden_states)
 
         if self.qkv_latent_func is not None:
-            get_attn_tp_context().set_attn_inputs(
-                AttentionInputs(hidden_states, forward_batch, self.qkv_latent_func)
-            )
+            if self._attn_input_quant_args is None:
+                get_attn_tp_context().set_attn_inputs(
+                    AttentionInputs(
+                        hidden_states, forward_batch, self.qkv_latent_func
+                    )
+                )
+            else:
+                qkv_latent_func = partial(
+                    self.qkv_latent_func,
+                    input_quant_args=self._attn_input_quant_args,
+                )
+                get_attn_tp_context().set_attn_inputs(
+                    AttentionInputs(
+                        hidden_states,
+                        forward_batch,
+                        qkv_latent_func,
+                    )
+                )
         return hidden_states, residual
+
+    def take_attn_input_quant_args(self):
+        input_quant_args = self._attn_input_quant_args
+        self._attn_input_quant_args = None
+        return input_quant_args
 
     def prepare_mlp(
         self,
@@ -139,8 +162,11 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        fuse_rms_quant: bool = False,
     ):
         del cache
+        if fuse_rms_quant:
+            self._mlp_input_quant_args = None
         assert self.hc_ffn_pre is not None
         assert self.hc_post is not None
         assert self._h_res is not None and self._h_post is not None
@@ -160,7 +186,13 @@ class MHCLayerCommunicator(LayerCommunicator):
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.variance_epsilon,
         )
-        if not norm_fused and hidden_states.shape[0] != 0:
+        # Keep the disabled path byte-for-byte equivalent in operation order:
+        # native RMSNorm runs before any DP/TP MLP input transformation.
+        if (
+            not fuse_rms_quant
+            and not norm_fused
+            and hidden_states.shape[0] != 0
+        ):
             hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states = self.prepare_mlp_input(
@@ -168,7 +200,36 @@ class MHCLayerCommunicator(LayerCommunicator):
             forward_batch,
             self.is_layer_sparse,
         )
+        if fuse_rms_quant and not norm_fused and hidden_states.shape[0] != 0:
+            hidden_storage_ptr = hidden_states.untyped_storage().data_ptr()
+            aliases_mhc_state = any(
+                state is not None
+                and state.untyped_storage().data_ptr() == hidden_storage_ptr
+                for state in (residual, self._h_res, self._h_post)
+            )
+            can_fuse = (
+                not aliases_mhc_state
+                and supports_fused_rms_quant_input(
+                    hidden_states, self.post_attention_layernorm.weight
+                )
+            )
+            if can_fuse:
+                self._mlp_input_quant_args = fused_rms_norm_per_token_quant(
+                    input=hidden_states,
+                    rms_weight=self.post_attention_layernorm.weight,
+                    epsilon=self.post_attention_layernorm.variance_epsilon,
+                    quant_dtype=torch.int8,
+                    residual=None,
+                    update_input=True,
+                )
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
         return hidden_states, residual
+
+    def take_mlp_input_quant_args(self):
+        input_quant_args = self._mlp_input_quant_args
+        self._mlp_input_quant_args = None
+        return input_quant_args
 
     def postprocess_layer(
         self,

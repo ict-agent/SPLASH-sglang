@@ -65,11 +65,21 @@ if _use_fused_rms_quant:
     from sglang.srt.layers.fused_rms_quant import (
         fused_rms_norm_per_token_quant as lm_faster_rmsquant,
     )
+
 if _use_fused_silu_mul_quant:
     try:
         from lmslim.quantize.quant_ops import lm_fuse_silu_mul_quant
     except Exception as e:
         print(f"Error: Import fused silu_mul_quant error: {e}")
+_lightop_fuse_silu_mul_clamp_quant = None
+if _use_fused_silu_mul_quant:
+    try:
+        from lightop import fuse_silu_mul_clamp_quant
+
+        _lightop_fuse_silu_mul_clamp_quant = fuse_silu_mul_clamp_quant
+    except Exception:
+        pass
+
 
 if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     from lightop import fuse_silu_mul_fp8_quant
@@ -994,8 +1004,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self, input_,
         rms_weight: Optional[torch.Tensor] = None,
         residual: Optional[torch.Tensor] = None,
-        update_hd: Optional[bool] = True
+        update_hd: Optional[bool] = True,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        if input_quant_args is not None:
+            return super().forward(input_, input_quant_args=input_quant_args)
         if _use_fused_rms_quant and rms_weight is not None:
             input_quant_args = None
             assert residual is not None and rms_weight is not None
@@ -1007,7 +1020,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                                         update_input=update_hd)
 
             input_quant_args = [i_q, _scales]
-
 
             bias = self.bias if not self.skip_bias_add else None
             assert self.quant_method is not None
@@ -1652,7 +1664,26 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None, use_fused_silu_mul_quant: Optional[bool] = False, use_fused_silu_mul_fp8_quant: Optional[bool] = False):
+    def supports_fused_silu_mul_quant_input(self) -> bool:
+        return bool(
+            _use_fused_silu_mul_quant
+            and _lightop_fuse_silu_mul_clamp_quant is not None
+            and getattr(
+                self.quant_method,
+                "supports_prequantized_input",
+                False,
+            )
+        )
+
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        use_fused_silu_mul_quant: Optional[bool] = False,
+        use_fused_silu_mul_fp8_quant: Optional[bool] = False,
+        swiglu_limit: Optional[float] = None,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1667,12 +1698,29 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if use_fused_silu_mul_quant:
-            xq, xs = lm_fuse_silu_mul_quant(input_parallel)
-            silu_quant_args = [xq, xs]
+            if swiglu_limit is None:
+                xq, xs = lm_fuse_silu_mul_quant(input_parallel)
+                quant_kwargs = {"silu_quant_args": [xq, xs]}
+                gemm_input = input_parallel
+            else:
+                if _lightop_fuse_silu_mul_clamp_quant is None:
+                    raise RuntimeError(
+                        "LightOp fuse_silu_mul_clamp_quant is unavailable"
+                    )
+                xq, xs = _lightop_fuse_silu_mul_clamp_quant(
+                    input_parallel, swiglu_limit
+                )
+                # The fused op consumes [gate, up] but the down GEMM's logical
+                # input width is only H. Reuse the standard prequantized-input
+                # protocol instead of adding a second backend-specific API.
+                gemm_input = input_parallel[..., : input_parallel.shape[-1] // 2]
+                quant_kwargs = {"input_quant_args": (xq, xs)}
             with use_symmetric_memory(get_tp_group()) as sm:
-                output_parallel = self.quant_method.apply(self, input_parallel,
-                                                          bias=bias_,
-                                                          silu_quant_args=silu_quant_args
+                output_parallel = self.quant_method.apply(
+                    self,
+                    gemm_input,
+                    bias=bias_,
+                    **quant_kwargs,
                 )
                 if sm is not None:
                     sm.tag(output_parallel)

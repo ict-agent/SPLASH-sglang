@@ -90,6 +90,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.fused_rms_quant import (
+    fused_mla_qkv_a_rms_norm_per_token_quant,
+    is_lightop_sglang_mla_qkv_a_rms_quant_available,
+    supports_fused_mla_qkv_a_rms_quant_input,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -228,7 +233,18 @@ _use_fused_rmsnorm_rope = get_bool_env_var("SGLANG_USE_FUSED_RMSNORM_ROPE")
 # incomplete MoE return-value contract.  Keep it isolated from the audited
 # GLM5 KDA path selected by SGLANG_USE_FUSED_RMS_QUANT.
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
+_use_lightop_mla_qkv_a_rms_quant = (
+    get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT") and _is_hip
+)
 _rms_quant_path = get_int_env_var('SGLANG_USE_RMS_QUANT_PATH')
+
+
+def _apply_linear_with_optional_quant(linear, x, input_quant_args):
+    if input_quant_args is None:
+        return linear(x)
+    return linear(x, input_quant_args=input_quant_args)
+
+
 if _use_fused_rmsnorm_rope:
     from lightop import fused_rms_norm_rope_contiguous
     fused_rms_norm_rope_contiguous = torch._dynamo.disable(fused_rms_norm_rope_contiguous)
@@ -416,6 +432,7 @@ class DeepseekV2MLP(nn.Module):
         rms_weight: Optional[torch.Tensor] = None,
         residual: Optional[torch.Tensor] = None,
         update_hd: Optional[bool] = False,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             if _use_fused_rms_quant and rms_weight is not None and residual is not None:
@@ -424,6 +441,7 @@ class DeepseekV2MLP(nn.Module):
 
         if (
             gemm_output_zero_allocator is not None
+            and input_quant_args is None
             and x.shape[0] <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
@@ -432,7 +450,24 @@ class DeepseekV2MLP(nn.Module):
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = _apply_linear_with_optional_quant(
+            self.gate_up_proj, x, input_quant_args
+        )
+        if (
+            self.swiglu_limit is not None
+            and _use_fused_silu_mul_quant
+            and gate_up.dim() == 2
+            and gate_up.is_contiguous()
+            and self.down_proj.supports_fused_silu_mul_quant_input()
+        ):
+            output, _ = self.down_proj(
+                gate_up,
+                skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
+                use_fused_silu_mul_quant=True,
+                swiglu_limit=float(self.swiglu_limit),
+            )
+            return output
+
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -856,6 +891,15 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._shared_expert_input_quant_args = None
+
+    def set_shared_expert_input_quant_args(self, input_quant_args):
+        if self._shared_expert_input_quant_args is not None:
+            raise RuntimeError("Shared-expert prequantized input is already set")
+        self._shared_expert_input_quant_args = input_quant_args
+
+    def clear_shared_expert_input_quant_args(self):
+        self._shared_expert_input_quant_args = None
 
     def get_moe_weights(self):
         return [
@@ -1422,12 +1466,22 @@ class DeepseekV2MoE(nn.Module):
         update_hd: Optional[bool] = True,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+            input_quant_args = self._shared_expert_input_quant_args
+            if input_quant_args is None:
+                return self.shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                    rms_weight = rms_weight,
+                    residual = residual,
+                    update_hd = update_hd,
+                )
             return self.shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator=gemm_output_zero_allocator,
                 rms_weight = rms_weight,
                 residual = residual,
                 update_hd = update_hd,
+                input_quant_args=input_quant_args,
             )
         else:
             if _use_fused_rms_quant and rms_weight is not None and residual is not None:
@@ -1720,7 +1774,14 @@ class DeepseekV2AttentionMLA(
             tp_size=attn_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-
+        self.use_lightop_mla_qkv_a_rms_quant = (
+            self.q_lora_rank is not None
+            and _use_lightop_mla_qkv_a_rms_quant
+            and is_lightop_sglang_mla_qkv_a_rms_quant_available()
+            and getattr(
+                self.q_b_proj.quant_method, "supports_prequantized_input", False
+            )
+        )
         if not skip_rope:
             is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
@@ -1982,14 +2043,18 @@ class DeepseekV2AttentionMLA(
             raise NotImplementedError
 
     def prepare_qkv_latent(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_quant_args: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         assert self.q_lora_rank is not None
         # When the module is wrapped with LoRA, the fused GEMM fast-path would
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
         if (
-            (not isinstance(hidden_states, tuple))
+            input_quant_args is None
+            and not isinstance(hidden_states, tuple)
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
@@ -1999,7 +2064,13 @@ class DeepseekV2AttentionMLA(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
             )
         else:
-            if _use_fused_rms_quant and self.input_layernorm is not None:
+            if input_quant_args is not None:
+                qkv_latent, _ = _apply_linear_with_optional_quant(
+                    self.fused_qkv_a_proj_with_mqa,
+                    hidden_states,
+                    input_quant_args,
+                )
+            elif _use_fused_rms_quant and self.input_layernorm is not None:
                 # NOTE: suspected
                 if _rms_quant_path == 1:
                 # path 1
@@ -2065,24 +2136,46 @@ class DeepseekV2AttentionMLA(
         q_lora = None
         topk_indices = None
         if self.q_lora_rank is not None:
-            q, latent_cache = (
-                get_attn_tp_context()
-                .fetch_qkv_latent()
-                .split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
+            qkv_latent = get_attn_tp_context().fetch_qkv_latent()
+            q_input_quant_args = None
+            use_lightop_mla_norm_quant = (
+                self.use_lightop_mla_qkv_a_rms_quant
+                and not use_fused_rmsnorm_rope
+                and supports_fused_mla_qkv_a_rms_quant_input(
+                    qkv_latent,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
                 )
+            )
+            if use_lightop_mla_norm_quant:
+                q_input_quant_args = fused_mla_qkv_a_rms_norm_per_token_quant(
+                    packed_input=qkv_latent,
+                    q_weight=self.q_a_layernorm.weight,
+                    kv_weight=self.kv_a_layernorm.weight,
+                    q_epsilon=self.q_a_layernorm.variance_epsilon,
+                    kv_epsilon=self.kv_a_layernorm.variance_epsilon,
+                )
+
+            q, latent_cache = qkv_latent.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode() and not use_fused_rmsnorm_rope and not _use_fused_rms_quant:
+            if (
+                self.alt_stream is not None
+                and get_is_capture_mode()
+                and not use_fused_rmsnorm_rope
+                and not _use_fused_rms_quant
+                and not use_lightop_mla_norm_quant
+            ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
-            else:
+            elif not use_lightop_mla_norm_quant:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                     q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
@@ -2146,7 +2239,9 @@ class DeepseekV2AttentionMLA(
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
+                    q = _apply_linear_with_optional_quant(
+                        self.q_b_proj, q, q_input_quant_args
+                    )[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
@@ -2166,7 +2261,11 @@ class DeepseekV2AttentionMLA(
                 if not use_fused_rmsnorm_rope:
                     k_nope = k_nope.unsqueeze(1)
                 if not _use_fused_rms_quant:
-                    q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                    q = _apply_linear_with_optional_quant(
+                        self.q_b_proj, q, q_input_quant_args
+                    )[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 else:
                     q = self.q_b_proj(q, rms_weight=self.q_a_layernorm.weight.data, residual=None,
                                     update_hd=False)[0].view(-1, self.num_local_heads, self.qk_head_dim)

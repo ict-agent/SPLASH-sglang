@@ -451,7 +451,6 @@ class LayerCommunicator:
         self.layer_id = layer_id
 
         self._context = CommunicateContext.init_new()
-        self._attn_input_quant_args = None
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -514,10 +513,7 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
-        fuse_rms_quant: bool = False,
     ):
-        del fuse_rms_quant
-        self._attn_input_quant_args = None
         layer_id = self.layer_id if self.layer_id >= 0 else _get_comm_layer_id(self.qkv_latent_func)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
@@ -686,11 +682,6 @@ class LayerCommunicator:
             )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
-
-    def take_attn_input_quant_args(self):
-        input_quant_args = self._attn_input_quant_args
-        self._attn_input_quant_args = None
-        return input_quant_args
 
     def _tp_reduce_scatter(
         self,

@@ -111,3 +111,81 @@ def fused_rms_norm_per_token_quant(
         residual=residual,
         update_input=update_input,
     )
+
+
+@lru_cache(maxsize=1)
+def is_lightop_sglang_mla_qkv_a_rms_quant_available() -> bool:
+    """Return whether the packed MLA RMSNorm+INT8 entry point is available."""
+    try:
+        import lightop
+    except Exception:
+        return False
+    name = "mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang"
+    return bool(
+        torch.version.hip is not None
+        and hasattr(lightop, name)
+        and hasattr(getattr(lightop, "op", None), name)
+    )
+
+
+def supports_fused_mla_qkv_a_rms_quant_input(
+    packed_input: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+) -> bool:
+    """Check the exact packed-layout and alignment contract of the MLA op."""
+    weights = (q_weight, kv_weight)
+    q_cols = q_weight.numel()
+    kv_cols = kv_weight.numel()
+    return bool(
+        is_lightop_sglang_mla_qkv_a_rms_quant_available()
+        and packed_input.numel() > 0
+        and packed_input.dim() == 2
+        and packed_input.is_cuda
+        and packed_input.dtype in (torch.float16, torch.bfloat16)
+        and packed_input.is_contiguous()
+        and packed_input.data_ptr() % 16 == 0
+        and packed_input.shape[-1] % 8 == 0
+        and q_cols + kv_cols <= packed_input.shape[-1]
+        and all(0 < weight.numel() <= 8192 for weight in weights)
+        and all(weight.numel() % 16 == 0 for weight in weights)
+        and all(weight.dim() == 1 for weight in weights)
+        and all(weight.dtype == packed_input.dtype for weight in weights)
+        and all(weight.device == packed_input.device for weight in weights)
+        and all(weight.is_contiguous() for weight in weights)
+        and all(weight.data_ptr() % 16 == 0 for weight in weights)
+    )
+
+
+def fused_mla_qkv_a_rms_norm_per_token_quant(
+    *,
+    packed_input: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    q_epsilon: float,
+    kv_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize packed MLA q/kv in place and return prequantized q."""
+
+    if not all(
+        math.isfinite(epsilon) and epsilon > 0
+        for epsilon in (q_epsilon, kv_epsilon)
+    ):
+        raise ValueError("q_epsilon and kv_epsilon must be finite and positive")
+    if not supports_fused_mla_qkv_a_rms_quant_input(
+        packed_input, q_weight, kv_weight
+    ):
+        raise ValueError(
+            "LightOp packed MLA fusion requires an aligned contiguous 2D "
+            "FP16/BF16 [q_lora, kv_lora, q_rope] tensor and aligned weights"
+        )
+
+    from lightop import mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang
+
+    return mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang(
+        packed_input=packed_input,
+        q_weight=q_weight,
+        kv_weight=kv_weight,
+        q_epsilon=q_epsilon,
+        kv_epsilon=kv_epsilon,
+    )
