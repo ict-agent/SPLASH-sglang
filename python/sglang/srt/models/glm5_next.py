@@ -1790,6 +1790,14 @@ class Glm5NextForCausalLM(Glm5NextForCausalLMBase):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                if is_kda_prefill_cp_enabled():
+                    forward_batch.kda_cp_metadata = prepare_kda_prefill_cp_metadata(
+                        total_tokens=len(input_ids),
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                        cp_rank=self.cp_rank,
+                        cp_size=self.cp_size,
+                        device=input_ids.device,
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
@@ -1914,6 +1922,14 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, Glm5NextForCausalL
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                if is_kda_prefill_cp_enabled():
+                    forward_batch.kda_cp_metadata = prepare_kda_prefill_cp_metadata(
+                        total_tokens=len(input_ids),
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                        cp_rank=self.cp_rank,
+                        cp_size=self.cp_size,
+                        device=input_ids.device,
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = general_mm_embed_routine(
