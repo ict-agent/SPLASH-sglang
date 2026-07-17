@@ -726,10 +726,10 @@ class IndexerKPool(Indexer):
             kv_cache_fp8 = kv_cache_buf.view(
                 kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
             )
-            kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
+            # kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
             logits = gemmopt.paged_mqa_logits(
                 q_fp8,
-                kv_cache_bf16,
+                kv_cache_fp8,
                 weights.float(),
                 pool_seqlens,
                 pool_block_tables,
@@ -1246,10 +1246,10 @@ class IndexerKPool(Indexer):
             kv_cache_fp8 = kv_cache_buf.view(
                 kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
             )
-            kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
+            # kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
             logits = gemmopt.paged_mqa_logits(
                 q_index,
-                kv_cache_bf16,
+                kv_cache_fp8,
                 weights.float(),
                 pool_seqlens_per_q,
                 paged_page_table,
