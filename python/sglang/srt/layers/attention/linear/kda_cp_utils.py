@@ -41,6 +41,14 @@ class KDAPrefillContextParallelMetadata:
     cpu_track_mask: Optional[List[int]] = None
     cpu_track_seqlens: Optional[List[int]] = None
 
+    # Lazily-cached per-forward device index tensors for the radix-cache state
+    # writebacks. Both dst-idx sets are layer-invariant (they depend only on the
+    # tracked/valid requests and the mamba slot mapping, not on any layer's
+    # runtime state), so the first KDA layer computes them and every later layer
+    # reuses them — avoiding a per-layer host index build + H2D + gather.
+    cached_track_dst_idx: Optional[torch.Tensor] = None
+    cached_final_dst_idx: Optional[torch.Tensor] = None
+
 
 def is_kda_prefill_cp_enabled() -> bool:
     return bool(

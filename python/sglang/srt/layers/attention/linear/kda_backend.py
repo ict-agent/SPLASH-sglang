@@ -629,15 +629,21 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
                 owned.append((i, conv_win, ssm_state))
 
-        # Pinned host tensor + async H2D copy so the CPU doesn't block on the
-        # transfer; the gather + device/dtype cast stay on-stream, so dst_idx is
-        # ready by the time _coalesced_cp_state_writeback consumes it.
-        dst_req_idx_t = torch.tensor(
-            dst_req_idx, dtype=torch.long, pin_memory=True
-        ).to(track_indices.device, non_blocking=True)
-        dst_idx = track_indices[dst_req_idx_t].to(
-            device=persistent_conv_states.device, dtype=torch.long, non_blocking=True
-        )
+        # dst_idx is layer-invariant (depends only on the tracked/valid requests
+        # and mamba_track_indices, not on any layer's runtime state), so compute
+        # it once per forward and let every later KDA layer reuse it — this drops
+        # a per-layer host index build + H2D + gather. Build the index tensor
+        # directly on-device: a tiny pageable H2D is far cheaper than the
+        # per-call cudaHostAlloc that pinned staging incurred.
+        dst_idx = metadata.cached_track_dst_idx
+        if dst_idx is None:
+            dst_req_idx_t = torch.tensor(
+                dst_req_idx, dtype=torch.long, device=track_indices.device
+            )
+            dst_idx = track_indices[dst_req_idx_t].to(
+                device=persistent_conv_states.device, dtype=torch.long
+            )
+            metadata.cached_track_dst_idx = dst_idx
         self._coalesced_cp_state_writeback(
             dst_idx,
             owned,
@@ -764,12 +770,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # Per owned item, split its full state into cp_size contiguous
                 # blocks (block d -> rank d, matching _local_state_shard), then
                 # lay out by destination: src[d, j, :] = item j's block d.
-                if conv_components is not None:
-                    # pool layout is per-rank [q_r|k_r|v_r]; permute the
-                    # component-major full state before the rank-block split.
-                    conv_stack = self._conv_comp_to_rank_major(
-                        conv_stack, conv_components, cp_size
-                    ).contiguous()
+                # if conv_components is not None:
+                #     # pool layout is per-rank [q_r|k_r|v_r]; permute the
+                #     # component-major full state before the rank-block split.
+                #     conv_stack = self._conv_comp_to_rank_major(
+                #         conv_stack, conv_components, cp_size
+                #     ).contiguous()
                 conv_blocks = conv_stack.reshape(num_owned, cp_size, conv_shard_numel)
                 ssm_blocks = ssm_stack.reshape(num_owned, cp_size, ssm_shard_numel)
                 src = torch.cat(
@@ -875,16 +881,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     )
                 )
 
-        # Build the request-index tensor on the host in pinned memory and issue an
-        # async H2D copy (mirrors the owned_rows path in _coalesced_cp_state_writeback)
-        # so the CPU doesn't block on the transfer. The gather + device/dtype cast
-        # stay on-stream, so dst_idx is ready by the time the writeback consumes it.
-        dst_req_idx_t = torch.tensor(
-            dst_req_idx, dtype=torch.long, pin_memory=True
-        ).to(persistent_cache_indices.device, non_blocking=True)
-        dst_idx = persistent_cache_indices[dst_req_idx_t].to(
-            device=persistent_conv_states.device, dtype=torch.long, non_blocking=True
-        )
+        # dst_idx is layer-invariant (depends only on the valid requests and
+        # persistent_cache_indices, not on any layer's runtime state), so compute
+        # it once per forward and let every later KDA layer reuse it. Build the
+        # index tensor directly on-device (no pinned staging / cudaHostAlloc).
+        dst_idx = metadata.cached_final_dst_idx
+        if dst_idx is None:
+            dst_req_idx_t = torch.tensor(
+                dst_req_idx, dtype=torch.long, device=persistent_cache_indices.device
+            )
+            dst_idx = persistent_cache_indices[dst_req_idx_t].to(
+                device=persistent_conv_states.device, dtype=torch.long
+            )
+            metadata.cached_final_dst_idx = dst_idx
         self._coalesced_cp_state_writeback(
             dst_idx,
             owned,
