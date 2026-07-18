@@ -329,6 +329,130 @@ class KDAAttnBackend(MambaAttnBackendBase):
             f"expected_dim={expected_dim}, cp_size={cp_group.world_size}."
         )
 
+    def _gather_full_kda_states_fused(
+        self,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        *,
+        conv_expected_dim: int,
+        ssm_expected_dim: int,
+    ) -> tuple:
+        """Gather the full-head conv + ssm prefix-cache states in a SINGLE CP
+        all-gather when both are sharded across the CP group (the common case),
+        instead of one collective each. Behaviourally identical to two separate
+        ``_gather_full_kda_state`` calls (rank-major, no comp-major permute);
+        falls back to them when either state is not exactly cp_size-sharded or
+        is empty.
+        """
+        conv_sel = conv_states[cache_indices].contiguous()
+        ssm_sel = ssm_states[cache_indices].contiguous()
+
+        cp_group = get_attention_cp_group()
+        cp_size = cp_group.world_size
+        conv_sharded = cp_size > 1 and conv_sel.shape[1] * cp_size == conv_expected_dim
+        ssm_sharded = cp_size > 1 and ssm_sel.shape[1] * cp_size == ssm_expected_dim
+
+        if conv_sharded and ssm_sharded and conv_sel.shape[0] > 0:
+            S = conv_sel.shape[0]
+            conv_dtype = conv_sel.dtype
+            ssm_dtype = ssm_sel.dtype
+            conv_tail = tuple(conv_sel.shape[2:])
+            ssm_tail = tuple(ssm_sel.shape[2:])
+            conv_local_numel = conv_sel[0].numel()
+            ssm_local_numel = ssm_sel[0].numel()
+
+            # conv (bf16) and ssm (fp32) use different pool dtypes; pack at the
+            # BYTE level so a single all-gather carries both with NO cast copies
+            # (view(uint8) / view(dtype) are free reinterprets, unlike the fp32
+            # up/down-cast which cost 4 extra copy kernels). The rank-major gather
+            # layout ([r0_conv|r0_ssm | r1_conv|r1_ssm | ...]) de-interleaves back
+            # into each full state with one contiguous slice + view each.
+            conv_bytes = conv_sel.reshape(S, conv_local_numel).view(torch.uint8)
+            ssm_bytes = ssm_sel.reshape(S, ssm_local_numel).view(torch.uint8)
+            conv_blen = conv_bytes.shape[1]
+            packed = torch.cat([conv_bytes, ssm_bytes], dim=1)
+            gathered = cp_group.all_gather(packed, dim=1).reshape(
+                S, cp_size, packed.shape[1]
+            )
+            conv_full = (
+                gathered[:, :, :conv_blen]
+                .contiguous()
+                .view(conv_dtype)
+                .reshape(S, conv_expected_dim, *conv_tail)
+            )
+            ssm_full = (
+                gathered[:, :, conv_blen:]
+                .contiguous()
+                .view(ssm_dtype)
+                .reshape(S, ssm_expected_dim, *ssm_tail)
+            )
+            return conv_full, ssm_full
+
+        # Fallback: two separate gathers (also covers the non-sharded fast path).
+        conv_full = self._gather_full_kda_state(
+            conv_states, cache_indices, shard_dim=1, expected_dim=conv_expected_dim
+        )
+        ssm_full = self._gather_full_kda_state(
+            ssm_states, cache_indices, shard_dim=1, expected_dim=ssm_expected_dim
+        )
+        return conv_full, ssm_full
+
+    def _ensure_kda_cp_prepare_meta(
+        self,
+        metadata: KDAPrefillContextParallelMetadata,
+        forward_batch: ForwardBatch,
+        *,
+        device: torch.device,
+        cache_dtype: torch.dtype,
+    ) -> None:
+        """Populate the per-forward layer-invariant index / control-flow caches
+        used by ``_prepare_kda_cp_states`` the first time any KDA layer needs
+        them. These depend only on the metadata (+ prefix lens), not on any
+        layer's runtime state, so they are built once and reused across layers.
+        """
+        if metadata.prep_local_cache_indices is not None:
+            return
+
+        num_segments = len(metadata.local_seq_lens_cpu)
+        metadata.prep_local_cache_indices = torch.arange(
+            num_segments, dtype=cache_dtype, device=device
+        )
+        metadata.prep_has_initial_state = torch.ones(
+            num_segments, dtype=torch.bool, device=device
+        )
+        metadata.prep_continuation_index = kda_cp_continuation_segment_index(metadata)
+
+        # Request-start segments (offset 0) that have a prefix are seeded from
+        # the gathered prefix-cache state. Collect their (local, req) index pairs
+        # once so the per-layer copy becomes a single batched indexed assignment.
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        seed_local: list = []
+        seed_req: list = []
+        for local_idx, req_idx in enumerate(metadata.local_req_indices_cpu):
+            if (
+                metadata.local_req_extend_offsets_cpu[local_idx] == 0
+                and prefix_lens_cpu[req_idx] > 0
+            ):
+                seed_local.append(local_idx)
+                seed_req.append(req_idx)
+        metadata.prep_seed_local_idx = torch.tensor(
+            seed_local, dtype=torch.long, device=device
+        )
+        metadata.prep_seed_req_idx = torch.tensor(
+            seed_req, dtype=torch.long, device=device
+        )
+
+        # The continued sequence's SSM merge seed (whole-sequence prefix state)
+        # is only needed when the continuation segment's request has a prefix.
+        cont = metadata.prep_continuation_index
+        cont_h0_req = None
+        if cont is not None:
+            cont_req_idx = metadata.local_req_indices_cpu[cont]
+            if prefix_lens_cpu[cont_req_idx] > 0:
+                cont_h0_req = cont_req_idx
+        metadata.prep_continuation_h0_req_idx = cont_h0_req
+
     def _prepare_kda_cp_states(
         self,
         layer: RadixLinearAttention,
@@ -341,25 +465,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ) -> tuple:
         num_segments = len(metadata.local_seq_lens_cpu)
-        local_cache_indices = torch.arange(
-            num_segments, dtype=cache_indices.dtype, device=cache_indices.device
-        )
-        has_initial_state = torch.ones(
-            num_segments, dtype=torch.bool, device=mixed_qkv.device
-        )
 
-        full_conv_by_req = self._gather_full_kda_state(
-            conv_states,
-            cache_indices,
-            shard_dim=1,
-            expected_dim=mixed_qkv.shape[-1],
-            components=[layer.q_dim, layer.k_dim, layer.v_dim],
+        # Layer-invariant indices / control flow: computed once per forward and
+        # reused across every KDA layer. Only the gathered state values below are
+        # layer-dependent.
+        self._ensure_kda_cp_prepare_meta(
+            metadata,
+            forward_batch,
+            device=cache_indices.device,
+            cache_dtype=cache_indices.dtype,
         )
-        full_ssm_by_req = self._gather_full_kda_state(
+        local_cache_indices = metadata.prep_local_cache_indices
+        has_initial_state = metadata.prep_has_initial_state
+        continuation_index = metadata.prep_continuation_index
+
+        full_conv_by_req, full_ssm_by_req = self._gather_full_kda_states_fused(
+            conv_states,
             ssm_states,
             cache_indices,
-            shard_dim=1,
-            expected_dim=layer.num_q_heads,
+            conv_expected_dim=mixed_qkv.shape[-1],
+            ssm_expected_dim=layer.num_q_heads,
         )
 
         local_conv_states = mixed_qkv.new_zeros(
@@ -369,37 +494,34 @@ class KDAAttnBackend(MambaAttnBackendBase):
             (num_segments,) + tuple(full_ssm_by_req.shape[1:])
         )
 
-        # Prefix-cache seed for request-start segments (offset 0 with a prefix).
-        # The continuation segment (offset > 0) is intentionally skipped: its
-        # conv history comes from the cross-rank halo below and its SSM state
-        # from the all-gather + merge inside chunk_kda_cp.
-        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        for local_idx, req_idx in enumerate(metadata.local_req_indices_cpu):
-            if (
-                metadata.local_req_extend_offsets_cpu[local_idx] == 0
-                and prefix_lens_cpu[req_idx] > 0
-            ):
-                local_conv_states[local_idx].copy_(full_conv_by_req[req_idx])
-                local_ssm_states[local_idx].copy_(full_ssm_by_req[req_idx])
+        # Prefix-cache seed for request-start segments (offset 0 with a prefix),
+        # vectorized into one batched indexed copy (was a per-segment loop). The
+        # continuation segment (offset > 0) is intentionally skipped: its conv
+        # history comes from the cross-rank halo below and its SSM state from the
+        # all-gather + merge inside chunk_kda_cp.
+        seed_local_idx = metadata.prep_seed_local_idx
+        if seed_local_idx.numel() > 0:
+            seed_req_idx = metadata.prep_seed_req_idx
+            local_conv_states[seed_local_idx] = full_conv_by_req[seed_req_idx]
+            local_ssm_states[seed_local_idx] = full_ssm_by_req[seed_req_idx]
 
         # Cross-rank conv halo: all-gather each rank's W-1 tail tokens and use
         # the previous rank's tail as the continuation segment's conv history
         # (replaces the serial dist.recv of conv_states).
-        continuation_index = kda_cp_continuation_segment_index(metadata)
         self._fill_kda_cp_conv_halo(
             cp_context, mixed_qkv, local_conv_states, continuation_index
         )
 
         # Prefix seed for the continued sequence's SSM merge chain (the merge is
         # done inside chunk_kda_cp; the seed is the whole sequence's prefix
-        # state, identical on every rank thanks to _gather_full_kda_state).
+        # state, identical on every rank thanks to _gather_full_k
+        # da_state).
         continuation_h0 = None
-        if continuation_index is not None:
-            cont_req_idx = metadata.local_req_indices_cpu[continuation_index]
-            if prefix_lens_cpu[cont_req_idx] > 0:
-                continuation_h0 = (
-                    full_ssm_by_req[cont_req_idx].to(torch.float32).contiguous()
-                )
+        cont_h0_req = metadata.prep_continuation_h0_req_idx
+        if cont_h0_req is not None:
+            continuation_h0 = (
+                full_ssm_by_req[cont_h0_req].to(torch.float32).contiguous()
+            )
 
         return (
             local_conv_states,
@@ -770,12 +892,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # Per owned item, split its full state into cp_size contiguous
                 # blocks (block d -> rank d, matching _local_state_shard), then
                 # lay out by destination: src[d, j, :] = item j's block d.
-                # if conv_components is not None:
-                #     # pool layout is per-rank [q_r|k_r|v_r]; permute the
-                #     # component-major full state before the rank-block split.
-                #     conv_stack = self._conv_comp_to_rank_major(
-                #         conv_stack, conv_components, cp_size
-                #     ).contiguous()
+                if conv_components is not None:
+                    # pool layout is per-rank [q_r|k_r|v_r]; permute the
+                    # component-major full state before the rank-block split.
+                    conv_stack = self._conv_comp_to_rank_major(
+                        conv_stack, conv_components, cp_size
+                    ).contiguous()
                 conv_blocks = conv_stack.reshape(num_owned, cp_size, conv_shard_numel)
                 ssm_blocks = ssm_stack.reshape(num_owned, cp_size, ssm_shard_numel)
                 src = torch.cat(

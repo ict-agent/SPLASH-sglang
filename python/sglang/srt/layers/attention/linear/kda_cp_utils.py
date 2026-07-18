@@ -49,6 +49,18 @@ class KDAPrefillContextParallelMetadata:
     cached_track_dst_idx: Optional[torch.Tensor] = None
     cached_final_dst_idx: Optional[torch.Tensor] = None
 
+    # Lazily-cached per-forward layer-invariant index / control-flow used by
+    # _prepare_kda_cp_states. Only the gathered state *values* are layer-
+    # dependent; the segment indices, seed selection and continuation choice are
+    # pure functions of this metadata (+ prefix lens), so the first KDA layer
+    # computes them and every later layer reuses them.
+    prep_local_cache_indices: Optional[torch.Tensor] = None
+    prep_has_initial_state: Optional[torch.Tensor] = None
+    prep_seed_local_idx: Optional[torch.Tensor] = None
+    prep_seed_req_idx: Optional[torch.Tensor] = None
+    prep_continuation_index: Optional[int] = None
+    prep_continuation_h0_req_idx: Optional[int] = None
+
 
 def is_kda_prefill_cp_enabled() -> bool:
     return bool(
