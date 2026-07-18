@@ -43,10 +43,23 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_dcu, is_npu
 
+_lightop_kpool_topk = None
 if is_dcu():
     import deepgemm
     from lightop import gemmopt
     from lightop import op
+
+    try:
+        from lightop import (
+            fast_kpool_topk_transform_fused as _lightop_kpool_topk,
+        )
+        if not hasattr(op, "fast_kpool_topk_transform_interface"):
+            _lightop_kpool_topk = None
+    except (ImportError, AttributeError):
+        pass
+
+    if not envs.SGLANG_NSA_KPOOL_LIGHTOP_TOPK.get():
+        _lightop_kpool_topk = None
 
 if is_cuda():
     try:
@@ -495,6 +508,7 @@ class IndexerKPool(Indexer):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
+        allow_lightop_topk: bool = False,
     ) -> torch.Tensor:
         """Run pooled-history topk; the fused kernel fills any
         ``out_rows`` past ``logits.shape[0]`` with -1 in-kernel so the
@@ -512,8 +526,38 @@ class IndexerKPool(Indexer):
 
         group_topk = self.index_topk // self.index_kpool
         supported_group_topk = (128, 160, 192, 224, 256, 512, 2048)
+        deterministic = get_global_server_args().enable_deterministic_inference
         if (
-            get_global_server_args().enable_deterministic_inference
+            allow_lightop_topk
+            and not deterministic
+            and is_dcu()
+            and _lightop_kpool_topk is not None
+            and self.index_kpool == 16
+            and self.index_topk == 2048
+            and seq_lens is not None
+        ):
+            def as_i32(
+                tensor: Optional[torch.Tensor],
+            ) -> Optional[torch.Tensor]:
+                if tensor is None:
+                    return None
+                return tensor.to(dtype=torch.int32).contiguous()
+
+            return _lightop_kpool_topk(
+                score=logits,
+                lengths=as_i32(pool_lens),
+                pool_size=self.index_kpool,
+                topk=self.index_topk,
+                page_table=page_table,
+                topk_indices_offset=as_i32(topk_offsets),
+                row_starts=as_i32(row_starts),
+                seq_lens=as_i32(seq_lens),
+                out_rows=out_rows,
+                page_table_row_index=as_i32(page_table_row_index),
+            )
+
+        if (
+            deterministic
             or is_dcu()
             or group_topk not in supported_group_topk
         ):
@@ -761,6 +805,7 @@ class IndexerKPool(Indexer):
             # ``out_rows`` makes the topk kernel pad its output back to the
             # padded q row count (caller upstream expects topk_indices.shape[0]
             # == hidden_states.shape[0]); padding rows are filled with -1.
+            allow_lightop_topk=forward_batch.forward_mode.is_decode(),
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
 
@@ -887,6 +932,7 @@ class IndexerKPool(Indexer):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index,
+            allow_lightop_topk=forward_batch.forward_mode.is_extend_without_speculative(),
         )
 
     def _get_topk_ragged_with_cp(
@@ -1033,6 +1079,7 @@ class IndexerKPool(Indexer):
             page_table=page_table_all,
             topk_offsets=None,
             row_starts=None,  # ks is all-zero in single-batch; kernel default = 0
+            allow_lightop_topk=forward_batch.forward_mode.is_extend_without_speculative(),
             out_rows=actual_seq_q,
         )
 
@@ -1283,6 +1330,10 @@ class IndexerKPool(Indexer):
             seq_lens=seqlens_per_q,
             page_table=page_table_for_topk,
             topk_offsets=None,
+            allow_lightop_topk=(
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ),
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
 

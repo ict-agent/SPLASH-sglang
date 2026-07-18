@@ -584,7 +584,11 @@ class NativeSparseAttnBackend(
         else:
             draft_token_num = 0
 
-        cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        cache_seqlens_int32 = (
+            forward_batch.seq_lens.to(torch.int32)
+            if draft_token_num == 0
+            else (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        )
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)

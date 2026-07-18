@@ -138,7 +138,7 @@ QUANTIZATION_CHOICES = [
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    # Apple Silicon MLX backend â€?on-the-fly quantization of fp16 weights at load
+    # Apple Silicon MLX backend -- on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
     "mlx_q8",  # 8 bits, group_size=64
@@ -1164,7 +1164,7 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
-        # Native gRPC flags â€?env-only for now, not exposed as CLI args.
+        # Native gRPC flags -- env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
         self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
@@ -1263,7 +1263,7 @@ class ServerArgs:
                 if os.path.exists(alt):
                     return alt
 
-            # Cache miss â€?download from ModelScope hub
+            # Cache miss -- download from ModelScope hub
             return ms_snapshot_download(
                 path,
                 cache_dir=self.download_dir,
@@ -7652,7 +7652,7 @@ class ServerArgs:
                 self.disable_overlap_schedule
             ), "PD-Multiplexing is not compatible with overlap schedule."
 
-            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x â€?2.8.x, leading to performance degradation.
+            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x -- 2.8.x, leading to performance degradation.
             import torch
 
             if torch_release >= (2, 7):
