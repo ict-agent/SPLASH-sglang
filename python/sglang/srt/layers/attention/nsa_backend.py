@@ -1428,6 +1428,15 @@ class NativeSparseAttnBackend(
                 nsa_cache_seqlens
             )
 
+        # Pooled MQA buffers are graph-captured and backend-local. Refresh them
+        # from the runtime cache lengths before replay so every NSA layer sees
+        # the current batch rather than the capture batch's pooled lengths.
+        self._update_pooled_paged_mqa_metadata(
+            metadata=metadata,
+            seqlens_32=metadata.cache_seqlens_int32,
+            forward_mode=forward_mode,
+        )
+
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
         if (is_cuda() or _is_dcu) and (
             forward_mode.is_decode_or_idle()
