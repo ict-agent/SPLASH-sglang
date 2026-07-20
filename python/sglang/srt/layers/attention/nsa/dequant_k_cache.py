@@ -266,9 +266,7 @@ def _dequantize_k_cache_paged_kernel(
     DIM_ROPE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
-    # Physical KV slots can exceed the int32 byte-offset range on large
-    # FP8-KV pools, so keep the slot in int64 before multiplying by strides.
-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
+    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
