@@ -1,5 +1,8 @@
 ﻿from __future__ import annotations
 
+import logging
+import math
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -41,7 +44,12 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_dcu, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, is_hip, is_npu
+
+logger = logging.getLogger(__name__)
+
+_INT8_UNIFORM_STD = math.sqrt(127 * 128 / 3)
+_random_weight_simulation_logged = False
 
 _lightop_kpool_topk = None
 if is_dcu():
@@ -150,6 +158,74 @@ class IndexerKPool(Indexer):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
         )
+
+        if get_bool_env_var("SGLANG_KPOOL_USE_RANDOM_WEIGHTS"):
+            self._initialize_simulated_random_weights(config)
+
+    @staticmethod
+    def _fill_simulated_linear_weight(
+        layer: nn.Module, generator: torch.Generator, std: float
+    ) -> None:
+        weight = layer.weight
+        if weight.dtype == torch.int8:
+            weight.random_(-127, 128, generator=generator)
+            weight_scale = getattr(layer, "weight_scale", None)
+            if weight_scale is None:
+                raise RuntimeError(
+                    "INT8 KPool indexer weight is missing its weight_scale"
+                )
+            weight_scale.fill_(std / _INT8_UNIFORM_STD)
+        elif weight.is_floating_point():
+            weight.normal_(mean=0.0, std=std, generator=generator)
+        else:
+            raise RuntimeError(
+                f"Unsupported KPool indexer weight dtype: {weight.dtype}"
+            )
+
+    def _initialize_simulated_random_weights(self, config: PretrainedConfig) -> None:
+        """Initialize missing KPool/indexer weights for performance simulation."""
+        global _random_weight_simulation_logged
+
+        seed = int(os.getenv("SGLANG_KPOOL_RANDOM_WEIGHT_SEED", "42"))
+        std = float(
+            os.getenv(
+                "SGLANG_KPOOL_RANDOM_WEIGHT_STD",
+                str(getattr(config, "initializer_range", 0.02)),
+            )
+        )
+        if not math.isfinite(std) or std <= 0:
+            raise ValueError(
+                "SGLANG_KPOOL_RANDOM_WEIGHT_STD must be a positive finite value"
+            )
+
+        device = self.index_kpool_compress_gate.device
+        if device.type == "meta":
+            raise RuntimeError(
+                "KPool random-weight simulation cannot initialize meta tensors"
+            )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed + self.layer_id)
+
+        with torch.no_grad():
+            self._fill_simulated_linear_weight(self.wq_b, generator, std)
+            self._fill_simulated_linear_weight(self.wk, generator, std)
+            self._fill_simulated_linear_weight(self.weights_proj, generator, std)
+            self.index_kpool_compress_gate.normal_(
+                mean=0.0, std=std, generator=generator
+            )
+            self.index_kpool_compress_ape.normal_(
+                mean=0.0, std=std, generator=generator
+            )
+
+        if not _random_weight_simulation_logged:
+            logger.warning(
+                "SGLANG_KPOOL_USE_RANDOM_WEIGHTS is enabled: initializing "
+                "deterministic random KPool/indexer weights for performance "
+                "simulation only (seed=%d, std=%g). Model accuracy is invalid.",
+                seed,
+                std,
+            )
+            _random_weight_simulation_logged = True
 
     @torch.compile(dynamic=True) if not is_hip() else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):

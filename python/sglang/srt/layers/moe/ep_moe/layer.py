@@ -102,6 +102,45 @@ _use_torch_bf16_grouped_mm = get_bool_env_var("SGLANG_USE_TORCH_BF16_GROUPED_MM"
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
+_w8a8_int8_ep_workspace_tokens = get_int_env_var(
+    "SGLANG_REUSE_W8A8_INT8_EP_MOE_WORKSPACE", 32768
+)
+_w8a8_int8_ep_workspace: Dict[Any, torch.Tensor] = {}
+
+
+def _ep_moe_workspace_empty(
+    name: str,
+    shape: tuple,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    zero: bool = False,
+) -> torch.Tensor:
+    if _w8a8_int8_ep_workspace_tokens <= 0:
+        return torch.zeros(shape, device=device, dtype=dtype) if zero else torch.empty(
+            shape, device=device, dtype=dtype
+        )
+
+    key = (str(device), dtype, name)
+    buf = _w8a8_int8_ep_workspace.get(key)
+    if (
+        buf is None
+        or buf.device != device
+        or buf.dtype != dtype
+        or buf.shape[1:] != shape[1:]
+        or buf.shape[0] < shape[0]
+    ):
+        alloc_shape = (
+            max(shape[0], _w8a8_int8_ep_workspace_tokens),
+            *shape[1:],
+        )
+        buf = torch.empty(alloc_shape, device=device, dtype=dtype)
+        _w8a8_int8_ep_workspace[key] = buf
+
+    out = buf.narrow(0, 0, shape[0])
+    if zero:
+        out.zero_()
+    return out
 
 if _use_aiter and not _is_dcu:
     from aiter import ActivationType, QuantType
@@ -857,12 +896,14 @@ class DeepEPMoE(FusedMoE):
         hidden_states_shape = hidden_states.shape
         hidden_states_device = hidden_states.device
         input_tensor = [
-            torch.empty(
+            _ep_moe_workspace_empty(
+                "w8a8_int8_contiguous_input",
                 (all_tokens, K),
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             ),
-            torch.empty(
+            _ep_moe_workspace_empty(
+                "w8a8_int8_contiguous_input_scale",
                 (all_tokens, hidden_states_scale.shape[-1]),
                 device=hidden_states.device,
                 dtype=torch.float32,
@@ -894,11 +935,12 @@ class DeepEPMoE(FusedMoE):
             counts_are_aligned=counts_are_aligned,
         )
 
-        gateup_output_factory = torch.empty if counts_are_aligned else torch.zeros
-        gateup_output = gateup_output_factory(
+        gateup_output = _ep_moe_workspace_empty(
+            "w8a8_int8_contiguous_gateup",
             (all_tokens, N),
             device=hidden_states_device,
             dtype=torch.bfloat16,
+            zero=not counts_are_aligned,
         )
 
         if self.use_int8_w8a8_deepgemm_asm:
@@ -932,7 +974,8 @@ class DeepEPMoE(FusedMoE):
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
 
-        down_output = torch.empty(
+        down_output = _ep_moe_workspace_empty(
+            "w8a8_int8_contiguous_down",
             (all_tokens, K),
             device=hidden_states_device,
             dtype=torch.bfloat16,

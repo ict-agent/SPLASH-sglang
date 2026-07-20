@@ -2,6 +2,21 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
+
+if envs.SGLANG_USE_LIGHTOP_PREFILL_DEQUANT.get():
+    try:
+        from lightop import op as _lightop_op
+    except ImportError:
+        _lightop_op = None
+else:
+    _lightop_op = None
+
+_has_lightop_prefill_dequant = _lightop_op is not None and hasattr(
+    _lightop_op, "prefill_gather_and_upconvert_fp8_kv_cache"
+)
+
 
 def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
@@ -189,6 +204,29 @@ def dequantize_k_cache_paged(
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
+    use_lightop = (
+        _has_lightop_prefill_dequant
+        and group_size == 128
+        and quant_k_cache.dtype == torch.float8_e4m3fn
+        and quant_k_cache.is_contiguous()
+        and quant_k_cache.dim() in (3, 4)
+        and quant_k_cache.shape[-2:] == (1, 656)
+        and page_table_1_flattened.dtype == torch.int32
+        and page_table_1_flattened.is_contiguous()
+    )
+    if use_lightop:
+        output = torch.empty(
+            (page_table_1_flattened.numel(), 1, 576),
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+        _lightop_op.prefill_gather_and_upconvert_fp8_kv_cache(
+            quant_k_cache,
+            page_table_1_flattened,
+            output,
+        )
+        return output
+
     dim_quant = quant_k_cache.shape[-1]
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
