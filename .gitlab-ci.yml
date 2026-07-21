@@ -174,7 +174,7 @@ build_image:
       SHORT_SHA="$(git rev-parse --short=12 HEAD)"
       BUILD_TIME="$(date +%Y%m%d-%H%M)"
       IMAGE_TAG="sglang:0.5.12-shca17-zhiyuan-py3.10-${BUILD_TIME}-g${SHORT_SHA}"
-      FULL_IMAGE="${HARBOR_REGISTRY}/${IMAGE_REPO}/${IMAGE_TAG}"
+      FULL_IMAGE="${IMAGE_TAG}"
       echo "FULL_IMAGE=${FULL_IMAGE}" | tee image.env
 
       # ---- 收集 wheel 到构建上下文 (compile 阶段 repair 后的产物在 output/) ----
@@ -195,13 +195,31 @@ build_image:
         --device=/dev/kfd --device=/dev/dri/ --group-add video --privileged \
         "${FULL_IMAGE}" sleep infinity)
       trap 'docker rm -f "${CID}" >/dev/null 2>&1 || true' EXIT
+      # ---- 安装 AICC 编译器 (最新 nightly) ----
+      AICC_URL="${RESOURCE_SERVER}/ai_cc/nightly/"
+      LATEST_RUN=$(curl -s "${AICC_URL}" | grep -oP 'dtk_llvm_[^"]+\.run' | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
+      if [ -n "${LATEST_RUN}" ]; then
+        wget "${AICC_URL}${LATEST_RUN}.run"
+        docker cp "${LATEST_RUN}.run" "${CID}:/tmp/${LATEST_RUN}.run"
+        docker exec "${CID}" bash -lc "chmod +x /tmp/${LATEST_RUN}.run && yes | bash /tmp/${LATEST_RUN}.run && rm -f /tmp/${LATEST_RUN}.run"
+        rm -f "${LATEST_RUN}.run"
+        echo "AICC 安装完成: ${LATEST_RUN}"
+      else
+        echo "跳过 AICC 安装"
+      fi
       docker exec "${CID}" bash -lc 'source /opt/dtk/env.sh && vllm-hcu-apply-patches'
+      # ---- tvm_ffi HIP JIT 补丁: 写入 load_inline / load callable shim ----
+      docker cp "${CI_PROJECT_DIR}/scripts/hcu/fix_tvm_ffi_load_inline.sh" "${CID}:/tmp/fix_tvm_ffi.sh"
+      docker exec "${CID}" bash -lc 'source /opt/dtk/env.sh && bash /tmp/fix_tvm_ffi.sh && rm -f /tmp/fix_tvm_ffi.sh'
       docker commit "${CID}" "${FULL_IMAGE}"
       docker rm -f "${CID}"
       trap - EXIT
 
-      # ---- 只存本地, 不推 harbor ----
+      # ---- 不推 harbor, 只存本地 ----
       echo "镜像构建完成, 保存于本地: ${FULL_IMAGE}"
+      SAVE_NAME="${IMAGE_TAG//:/_}"
+      docker save "${FULL_IMAGE}" | gzip > "/rogon_admin/zhipu-images/${SAVE_NAME}.tar.gz"
+      echo "镜像已导出: /rogon_admin/zhipu-images/${SAVE_NAME}.tar.gz"
   artifacts:
     reports:
       dotenv: image.env
@@ -217,8 +235,7 @@ test:
     - 811-shell-runner
   timeout: 24h
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
   needs:
     - job: build_image
       artifacts: true
@@ -229,6 +246,7 @@ test:
       -v /opt/hyhal/:/opt/hyhal/:ro
       -v /rogon_admin/models/GLM-5-N-0707-INT8:/models/GLM-5-N-0707-INT8:ro
       -v /rogon_admin/models/glm-evals:/glm-evals:ro
+      -v /rogon_admin/models/glm-evals-datasets/data:/glm-evals-data:ro
       --network host --init --shm-size=80G
       --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
       --device=/dev/kfd --device=/dev/dri/ --group-add video --privileged
@@ -278,23 +296,27 @@ test:
       bash /workspace/start_sglang_server.sh
 
       # ---- 精度评测 (--load 与 0707 一致; 数据集在仓库 data/ 下) ----
+      echo "=== 开始精度评测 $(date) ==="
       python evaluate.py \
         --mode inference \
-        --data-path data \
+        --data-path /glm-evals-data \
         --model-config configs/sglang/glm5_next_tp8_155k.json \
         --load /models/GLM-5-N-0707-INT8/int8_ffn_mla_kda \
         --task tasks/english/simpleqa/simpleqa.yaml \
                tasks/english/simpleqa/chinese_simpleqa.yaml \
         --sglang --memory-fraction 0.7 \
         --save-dir results/full \
-        --sglang-no-launch-server --sglang-url http://127.0.0.1:30000 || true
+        --sglang-no-launch-server --sglang-url http://127.0.0.1:30000 \
+        > /workspace/eval_stdout.log 2> /workspace/eval_stderr.log || true
 
+      echo "=== 精度评测结束 $(date) ==="
       kill "$(cat /workspace/sglang_server.pid 2>/dev/null)" 2>/dev/null || true
+      echo "=== server 已停止 $(date) ==="
       EOF
 
       docker cp "${CI_PROJECT_DIR}/run_eval.sh" "${CID}:/workspace/run_eval.sh"
       docker exec "${CID}" bash /workspace/run_eval.sh || true
-      docker exec "${CID}" bash -lc 'cd /workspace/glm-evals-dcu && zip -r /workspace/precision_test_result.zip results/full 2>/dev/null || true; zip -j /workspace/precision_test_result.zip /workspace/sglang_server.log || true'
+      docker exec "${CID}" bash -lc 'cd /workspace/glm-evals-dcu && zip -r /workspace/precision_test_result.zip results/full 2>/dev/null || true; zip -j /workspace/precision_test_result.zip /workspace/sglang_server.log /workspace/eval_stdout.log /workspace/eval_stderr.log || true'
       docker cp "${CID}:/workspace/precision_test_result.zip" "${CI_PROJECT_DIR}/" || true
   artifacts:
     # ---- 精度测试结果不归档 (保密) ----

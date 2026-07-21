@@ -72,7 +72,7 @@ echo "sglang server 启动中 (pid ${SERVER_PID}), 等待 http://127.0.0.1:${POR
 # ---- 阻塞等待 ready; 进程退出或超时则失败 ----
 # /health_generate 会实际发送一个生成请求, 确保模型加载完毕且可推理
 for _ in $(seq 1 "${READY_TIMEOUT}"); do
-  if curl -sf "http://127.0.0.1:${PORT}/health_generate" >/dev/null 2>&1; then
+  if curl -sf --max-time 30 "http://127.0.0.1:${PORT}/health_generate" >/dev/null 2>&1; then
     echo "sglang server ready (pid ${SERVER_PID})"
     exit 0
   fi
