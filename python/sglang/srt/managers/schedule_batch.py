@@ -2503,10 +2503,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
-        # FIXME(lsyin): used here to get the correct seq_lens when the batch is
-        # actually compacted. Avoid synchronizing the no-op path so the next MTP
-        # replay can depend on verify_done on stream instead of blocking CPU.
-        self.maybe_wait_verify_done()
+        # Keep the verify dependency on the GPU stream. The compacted GPU
+        # tensors below will wait for verify_done without blocking CPU.
+        self.maybe_wait_verify_done_on_stream()
 
         keep_indices_device = torch.tensor(
             keep_indices,
@@ -2523,10 +2522,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
-        self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+        if self.is_spec_v2:
+            self.seq_lens_cpu = None
+        else:
+            self.seq_lens_cpu = (
+                self.seq_lens_cpu[keep_indices]
+                if self.seq_lens_cpu is not None
+                else None
+            )
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.seq_lens_sum = (
+            self.seq_lens_cpu.sum().item() if self.seq_lens_cpu is not None else None
+        )
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2566,7 +2574,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # In disagg decode + overlap, merge_batch can be called before
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
+        self.maybe_wait_verify_done_on_stream()
+        other.maybe_wait_verify_done_on_stream()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2581,10 +2590,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        if self.is_spec_v2 or other.is_spec_v2:
+            self.seq_lens_cpu = None
+        elif self.seq_lens_cpu is not None and other.seq_lens_cpu is not None:
+            self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        else:
+            self.seq_lens_cpu = None
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
+        self.seq_lens_sum = (
+            self.seq_lens_sum + other.seq_lens_sum
+            if self.seq_lens_sum is not None and other.seq_lens_sum is not None
+            else None
+        )
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None

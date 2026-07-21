@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
+    fill_decode_page_table_gpu,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.nsa.transform_index import (
@@ -1457,27 +1458,31 @@ class NativeSparseAttnBackend(
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
-        assert seq_lens_cpu is not None
 
         self.set_nsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
         metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = int(seq_lens_cpu.max().item())
-
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
-            page_indices = self.req_to_token[req_pool_indices, :max_len]
-            metadata.page_table_1[:, :max_len].copy_(page_indices)
+            fill_decode_page_table_gpu(
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                metadata.page_table_1,
+                bs,
+            )
+            page_indices = metadata.page_table_1
             nsa_cache_seqlens = compute_nsa_seqlens(
                 cache_seqlens,
                 nsa_index_topk=self.nsa_index_topk,
@@ -1486,6 +1491,7 @@ class NativeSparseAttnBackend(
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
+            assert seq_lens_cpu is not None
             max_seqlen_k = int(
                 seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
             )
@@ -1519,6 +1525,7 @@ class NativeSparseAttnBackend(
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend(include_v2=True):
+            assert seq_lens_cpu is not None
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)

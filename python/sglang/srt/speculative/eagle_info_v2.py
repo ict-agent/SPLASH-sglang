@@ -82,6 +82,32 @@ def start_async_seq_lens_cpu_copy(seq_lens: torch.Tensor, device) -> tuple[torch
     return seq_lens_cpu, done
 
 
+def _supports_gpu_only_mtp_input(cuda_graph_runner: Any) -> bool:
+    if cuda_graph_runner is None:
+        return False
+    draft_attn_backend = getattr(cuda_graph_runner, "draft_attn_backend", None)
+    return type(draft_attn_backend).__name__ in {
+        "NativeSparseAttnMultiStepBackend",
+        "TritonMultiStepDraftBackend",
+    }
+
+
+def _materialize_seq_lens_cpu(
+    batch: ModelWorkerBatch,
+    seq_lens_cpu: torch.Tensor | None = None,
+    seq_lens_cpu_ready: Any = None,
+):
+    if batch.seq_lens_cpu is None:
+        if seq_lens_cpu is not None and len(seq_lens_cpu) == len(batch.seq_lens):
+            if seq_lens_cpu_ready is not None:
+                seq_lens_cpu_ready.synchronize()
+            batch.seq_lens_cpu = seq_lens_cpu
+        else:
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+    if batch.seq_lens_sum is None:
+        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+
+
 @triton.jit
 def assign_draft_cache_locs_page_size_1(
     req_pool_indices,
@@ -111,6 +137,15 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+
+    def materialize_seq_lens_cpu_for_batch(self: EagleDraftInput, batch: ModelWorkerBatch):
+        _materialize_seq_lens_cpu(
+            batch,
+            self.new_seq_lens_cpu,
+            self.new_seq_lens_cpu_ready,
+        )
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
 
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
@@ -203,15 +238,8 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        if self.new_seq_lens_cpu is not None:
-            if self.new_seq_lens_cpu_ready is not None:
-                self.new_seq_lens_cpu_ready.synchronize()
-                self.new_seq_lens_cpu_ready = None
-            batch.seq_lens_cpu = self.new_seq_lens_cpu
-            self.new_seq_lens_cpu = None
-        else:
-            batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        batch.seq_lens_cpu = None
+        batch.seq_lens_sum = None
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
@@ -252,10 +280,16 @@ class EagleDraftInputV2Mixin:
         )
         batch.capture_hidden_mode = capture_mode
         self.positions = batch.seq_lens.repeat_interleave(
-            topk, dim=0, output_size=len(batch.seq_lens_cpu) * topk
+            topk, dim=0, output_size=len(batch.seq_lens) * topk
         )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
+        if batch.seq_lens_cpu is None and not (
+            can_cuda_graph and _supports_gpu_only_mtp_input(cuda_graph_runner)
+        ):
+            self.materialize_seq_lens_cpu_for_batch(batch)
+            forward_batch.seq_lens_cpu = batch.seq_lens_cpu
+            forward_batch.seq_lens_sum = batch.seq_lens_sum
         return forward_batch, can_cuda_graph
 
     def prepare_for_extend_to_fill_draft_kvcache(
@@ -266,6 +300,9 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        if batch.seq_lens_cpu is None:
+            self.materialize_seq_lens_cpu_for_batch(batch)
+
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
@@ -359,6 +396,13 @@ class EagleVerifyInputV2Mixin:
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
             # TBO's split_spec_info can slice the custom_mask correctly.
+            if batch.seq_lens_cpu is None:
+                _materialize_seq_lens_cpu(
+                    batch,
+                    self.seq_lens_cpu,
+                    getattr(self, "seq_lens_cpu_ready", None),
+                )
+                self.seq_lens_cpu_ready = None
             self.seq_lens_cpu = batch.seq_lens_cpu
             self.seq_lens_sum = batch.seq_lens_sum
 

@@ -448,6 +448,7 @@ class EAGLEDraftCudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        forward_batch.spec_info.cuda_graph_raw_bs = raw_bs
 
         # Pad
         if self.require_mlp_tp_gather:

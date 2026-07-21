@@ -413,7 +413,7 @@ class MambaAttnBackendBase(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         self.forward_metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+            bs, req_pool_indices, seq_lens, forward_mode, spec_info, seq_lens_cpu
         )
 
     def init_forward_metadata_capture_cpu_graph(
@@ -529,17 +529,25 @@ class MambaAttnBackendBase(AttentionBackend):
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        if seq_lens_cpu is None:
+            raw_bs = getattr(spec_info, "cuda_graph_raw_bs", bs)
+            num_padding = bs - raw_bs
+        else:
+            num_padding = int(
+                torch.count_nonzero(
+                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                ).item()
+            )
+        valid_bs = bs - num_padding
         # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
+        req_pool_indices[valid_bs:] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = -1
+        mamba_indices[valid_bs:] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
@@ -547,23 +555,21 @@ class MambaAttnBackendBase(AttentionBackend):
                     self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][:valid_bs].copy_(
+                    self.cached_cuda_graph_decode_query_start_loc[:valid_bs]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    bs - num_padding
-                )
+                self.query_start_loc_list[bs - 1][valid_bs:].fill_(valid_bs)
         elif forward_mode.is_target_verify():
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
+                self.query_start_loc_list[bs - 1][:valid_bs].copy_(
+                    self.cached_cuda_graph_verify_query_start_loc[:valid_bs]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
+                self.query_start_loc_list[bs - 1][valid_bs:].fill_(
+                    valid_bs * spec_info.draft_token_num
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -707,7 +713,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+            bs, req_pool_indices, seq_lens, forward_mode, spec_info, seq_lens_cpu
         )
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(

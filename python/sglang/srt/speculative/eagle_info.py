@@ -84,6 +84,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
+    seq_lens_cpu_ready: Optional[torch.cuda.Event] = None
     grammar: BaseGrammarObject = None
     use_sglang_assign_req_to_token_pool = get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL")
     use_sglang_align_evict_mask_to_page_size = get_bool_env_var("SGLANG_ALIGN_EVICT_MASK_TO_PAGE_SIZE")
@@ -852,6 +853,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
+
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             if self.future_indices.indices.numel() == 0:
@@ -861,8 +865,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             # The async CPU copy is indexed by the pre-filter batch order. If a
             # future batch is filtered, fall back to the original synchronous
             # seq_lens.cpu() path for correctness.
-            self.new_seq_lens_cpu = None
-            self.new_seq_lens_cpu_ready = None
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -894,6 +896,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        self.new_seq_lens_cpu = None
+        self.new_seq_lens_cpu_ready = None
+
         if (self.future_indices is None) != (spec_info.future_indices is None):
             raise ValueError(
                 "Cannot merge resolved and unresolved Eagle draft inputs; "
@@ -910,8 +915,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     and spec_info.future_indices.mtp_topk_indices_valid is True
                 ),
             )
-            self.new_seq_lens_cpu = None
-            self.new_seq_lens_cpu_ready = None
             return
 
         # Detect idle stub by `topk_index` length (idle inputs have
