@@ -38,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_local_dp_buffer,
 )
+from sglang.srt.mem_cache.layer_split import build_main_kv_page_plan
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -59,6 +60,42 @@ def maybe_prefetch_full_attention_kv(
         forward_batch.token_to_kv_pool, "prefetch_mla_kv_buffer", None
     )
     if prefetch_mla_kv is not None:
+        configure_page_plan = getattr(
+            forward_batch.token_to_kv_pool,
+            "configure_main_kv_page_plan",
+            None,
+        )
+        if configure_page_plan is not None:
+            page_plan = None
+            can_compact_main_kv = (
+                getattr(
+                    forward_batch.token_to_kv_pool,
+                    "layer_shard_enabled",
+                    False,
+                )
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and forward_batch.hisparse_coordinator is None
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and forward_batch.out_cache_loc is not None
+            )
+            if can_compact_main_kv:
+                if forward_batch.nsa_layer_split_main_kv_page_plan is None:
+                    req_to_token = (
+                        forward_batch.req_to_token_pool.req_to_token
+                    )
+                    forward_batch.nsa_layer_split_main_kv_page_plan = (
+                        build_main_kv_page_plan(
+                            req_to_token=req_to_token,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                            current_locs=forward_batch.out_cache_loc,
+                            page_size=forward_batch.token_to_kv_pool.page_size,
+                        )
+                    )
+                page_plan = forward_batch.nsa_layer_split_main_kv_page_plan
+            # An explicit None disables a compact layout left by an earlier
+            # ForwardBatch before the legacy full-pool path is entered.
+            configure_page_plan(page_plan, forward_batch)
         prefetch_mla_kv(
             full_attention_layer_id,
             has_history=nsa_prefill_has_history(forward_batch),

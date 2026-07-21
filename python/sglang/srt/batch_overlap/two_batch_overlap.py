@@ -769,6 +769,9 @@ class TboForwardBatchPreparer:
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
                 return_hidden_states_before_norm=False,
+                # Each child owns a different request slice and must build its
+                # own LayerSplit compact Main-KV page plan.
+                nsa_layer_split_main_kv_page_plan=None,
             )
         )
 

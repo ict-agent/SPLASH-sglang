@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.mem_cache.layer_split import MainKVPagePlan
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -408,6 +409,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Built once from the global request table and reused by every full-
+    # attention layer.  It is intentionally absent from Index-KV metadata.
+    nsa_layer_split_main_kv_page_plan: Optional[MainKVPagePlan] = None
 
     # For split prefill
     # intermediate values for split prefill

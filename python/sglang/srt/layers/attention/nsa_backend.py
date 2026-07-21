@@ -750,6 +750,18 @@ class NativeSparseAttnBackend(
         return metadata
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        # A prefill worker can still see idle or non-CP forwards. Do not let a
+        # compact scratch layout from the preceding CP batch leak into a path
+        # whose page tables use physical locations.
+        if not nsa_use_prefill_cp(forward_batch):
+            configure_page_plan = getattr(
+                forward_batch.token_to_kv_pool,
+                "configure_main_kv_page_plan",
+                None,
+            )
+            if configure_page_plan is not None:
+                configure_page_plan(None, forward_batch)
+
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -2077,6 +2089,15 @@ class NativeSparseAttnBackend(
                 )
             )
 
+        # Index-KV keeps the original physical metadata. Only the final Main-KV
+        # consumer locations are translated into this batch's compact scratch.
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            page_table_1 = (
+                forward_batch.token_to_kv_pool.translate_main_kv_loc_to_compact(
+                    page_table_1
+                )
+            )
+
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2097,6 +2118,11 @@ class NativeSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
+                    page_table_1_flattened = (
+                        forward_batch.token_to_kv_pool.translate_main_kv_loc_to_compact(
+                            page_table_1_flattened
+                        )
+                    )
                     kv_cache = dequantize_k_cache_paged(
                         kv_cache, page_table_1_flattened
                     )
@@ -3021,6 +3047,12 @@ class NativeSparseAttnBackend(
                 metadata.page_table_1,
                 topk_indices,
             )
+
+        page_table_1 = (
+            forward_batch.token_to_kv_pool.translate_main_kv_loc_to_compact(
+                page_table_1
+            )
+        )
 
         q_scale = 1.0
         k_scale = (
