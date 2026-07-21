@@ -455,6 +455,9 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(False)
+    # Opt in to the GLM5-Next DCU decode-only path that gathers the packed FP8
+    # sparse KV cache into contiguous BF16 before flash_mla_with_kvcache.
+    SGLANG_NSA_DCU_USE_LIGHTOP_DECODE_GATHER = EnvBool(False)
     SGLANG_NSA_KPOOL_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)

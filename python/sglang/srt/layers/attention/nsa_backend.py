@@ -438,6 +438,71 @@ class NativeSparseAttnBackend(
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
+        self._lightop_decode_gather = None
+        self._lightop_decode_gather_workspace = None
+        self._lightop_decode_compact_indices = None
+        self._lightop_decode_retired_workspaces = []
+        # The packed physical row is 656 bytes in both supported layouts:
+        # 512 FP8 latent values, four FP32 scales, then either 64 BF16 RoPE
+        # values or 128 bytes of no-RoPE padding. The LightOp destination keeps
+        # only the logical BF16 dimensions needed by FlashMLA.
+        self._lightop_decode_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # KPool keeps ``topk`` selected history tokens and appends up to
+        # ``kpool - 1`` uncompressed tail tokens.  DCU sparse FlashMLA pads
+        # that logical width to a 64-token block with -1 sentinels.  The
+        # gathered BF16 cache and its compact indices must use the exact same
+        # width so the sparse softmax mask remains unchanged.
+        self._lightop_decode_gather_logical_width = self.nsa_index_topk
+        if self.nsa_index_kpool > 1:
+            self._lightop_decode_gather_logical_width += self.nsa_index_kpool - 1
+        self._lightop_decode_gather_width = (
+            self._lightop_decode_gather_logical_width
+        )
+        if self.nsa_index_kpool > 1:
+            topk_block_size = 64
+            self._lightop_decode_gather_width = (
+                (self._lightop_decode_gather_width + topk_block_size - 1)
+                // topk_block_size
+                * topk_block_size
+            )
+        lightop_decode_requested = (
+            envs.SGLANG_NSA_DCU_USE_LIGHTOP_DECODE_GATHER.get()
+        )
+        lightop_decode_static_compatible = (
+            _is_dcu
+            and self._is_glm5_next
+            and self.nsa_decode_impl == "flashmla_kv"
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim in (0, 64)
+            and self.kv_lora_rank == 512
+            and self.kv_cache_dim == 656
+            and self.nsa_index_topk == 2048
+            and self.nsa_index_kpool in (1, 16)
+            and self.real_page_size == 64
+        )
+        if lightop_decode_requested and lightop_decode_static_compatible:
+            try:
+                from lightop import op as lightop_op
+
+                self._lightop_decode_gather = getattr(
+                    lightop_op,
+                    "decode_gather_and_up_convert_with_indices",
+                    None,
+                )
+            except (ImportError, AttributeError):
+                self._lightop_decode_gather = None
+            if self._lightop_decode_gather is None:
+                logger.warning(
+                    "LightOp decode gather was requested, but the installed "
+                    "LightOp package does not expose "
+                    "decode_gather_and_up_convert_with_indices"
+                )
+        elif lightop_decode_requested:
+            logger.warning(
+                "LightOp decode gather was requested but this NSA backend is "
+                "not the supported GLM5-Next DCU FP8 FlashMLA configuration"
+            )
+
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
         if _is_hip:
@@ -498,6 +563,62 @@ class NativeSparseAttnBackend(
                 next_pow_of_2, device=self.device, dtype=torch.int32
             )
         return self._arange_buf[:l]
+
+    def _allocate_lightop_decode_workspaces(self, capacity: int) -> None:
+        """Allocate graph-stable, contiguous buffers for BF16 sparse decode."""
+        if self._lightop_decode_gather is None or capacity <= 0:
+            return
+        current_capacity = (
+            0
+            if self._lightop_decode_gather_workspace is None
+            else self._lightop_decode_gather_workspace.shape[0]
+        )
+        if current_capacity >= capacity:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "LightOp decode gather workspace must be allocated before "
+                "CUDA graph capture"
+            )
+
+        # Keep any old allocation alive because an already captured graph may
+        # still contain its addresses even if a larger eager batch is seen.
+        if self._lightop_decode_gather_workspace is not None:
+            self._lightop_decode_retired_workspaces.append(
+                (
+                    self._lightop_decode_gather_workspace,
+                    self._lightop_decode_compact_indices,
+                )
+            )
+
+        self._lightop_decode_gather_workspace = torch.empty(
+            (
+                capacity,
+                self._lightop_decode_gather_width,
+                self._lightop_decode_head_dim,
+            ),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._lightop_decode_compact_indices = torch.empty(
+            (capacity, self._lightop_decode_gather_width),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _get_lightop_decode_workspaces(
+        self, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._allocate_lightop_decode_workspaces(num_tokens)
+        if (
+            self._lightop_decode_gather_workspace is None
+            or self._lightop_decode_compact_indices is None
+        ):
+            raise RuntimeError("LightOp decode gather workspaces are unavailable")
+        return (
+            self._lightop_decode_gather_workspace[:num_tokens],
+            self._lightop_decode_compact_indices[:num_tokens],
+        )
 
     def get_real_page_col_indices(self, max_seqlen_k: int) -> torch.Tensor:
         page_size = self.real_page_size
@@ -1086,6 +1207,16 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
             ),
         }
+        # TARGET_VERIFY expands each request into one row per speculative
+        # token.  CUDA graph capture must reserve that expanded row count up
+        # front; attempting to grow the buffer from inside capture is invalid.
+        lightop_decode_capacity = max_num_tokens
+        if self.speculative_num_draft_tokens:
+            lightop_decode_capacity = max(
+                lightop_decode_capacity,
+                max_bs * self.speculative_num_draft_tokens,
+            )
+        self._allocate_lightop_decode_workspaces(lightop_decode_capacity)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -2315,7 +2446,10 @@ class NativeSparseAttnBackend(
         if not _is_dcu:
             from sgl_kernel.flash_mla import flash_mla_with_kvcache
         else:
-            from flash_mla.flash_mla_interface import flash_mla_with_kvcache
+            from flash_mla.flash_mla_interface import (
+                flash_mla_sparse_fwd,
+                flash_mla_with_kvcache,
+            )
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
@@ -2325,7 +2459,60 @@ class NativeSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        if _is_dcu and self.nsa_kv_cache_store_fp8 and self.qk_rope_head_dim == 0:
+        is_decode_family = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        )
+        # MLATokenToKVPool stores the packed cache as uint8 but exposes it as
+        # the configured FP8 dtype.  LightOp consumes the packed bytes (rather
+        # than PyTorch FP8 values), so reinterpret the OCP E4M3FN view without
+        # copying.  Do not accept FNUZ: its bit encoding is different.
+        lightop_kv_cache = None
+        if kv_cache.is_contiguous():
+            if kv_cache.dtype == torch.uint8:
+                lightop_kv_cache = kv_cache
+            elif kv_cache.dtype == torch.float8_e4m3fn:
+                lightop_kv_cache = kv_cache.view(torch.uint8)
+        use_lightop_decode_gather = (
+            self._lightop_decode_gather is not None
+            and is_decode_family
+            and forward_batch.hisparse_coordinator is None
+            and q_all.dtype == torch.bfloat16
+            and q_all.shape[0] > 0
+            and q_all.shape[-1] == self._lightop_decode_head_dim
+            and v_head_dim == 512
+            and lightop_kv_cache is not None
+            and lightop_kv_cache.numel() % 656 == 0
+            and page_table_1.dim() == 2
+            and page_table_1.dtype == torch.int32
+            and page_table_1.is_contiguous()
+            and page_table_1.shape[0] == q_all.shape[0]
+            and page_table_1.shape[-1]
+            == self._lightop_decode_gather_logical_width
+            and cache_seqlens.dim() == 1
+            and cache_seqlens.dtype == torch.int32
+            and cache_seqlens.is_contiguous()
+            and cache_seqlens.numel() > 0
+            # DP attention pads q/page-table rows (for example 8 -> 48) while
+            # retaining one cache length per real row.  In that layout the
+            # per-row -1 indices, not an inferred repeated length, are the
+            # sparse FlashMLA validity mask.
+            and cache_seqlens.numel() <= q_all.shape[0]
+        )
+        # The installed gfx936 paged BF16 decode specialization is optimized
+        # for d_qk=512.  FlashMLA's existing flat sparse BF16 entry supports
+        # the RoPE-aware d_qk=576 layout.  LightOp has already compacted the
+        # cache, so the latter can consume it without another gather.
+        use_lightop_flat_sparse_fwd = (
+            use_lightop_decode_gather and self.qk_rope_head_dim == 64
+        )
+        if (
+            _is_dcu
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and not use_lightop_decode_gather
+        ):
             q_padded = q_all.new_zeros(
                 *q_all.shape[:-1],
                 q_all.shape[-1] + 64,
@@ -2393,14 +2580,81 @@ class NativeSparseAttnBackend(
             q_input = q_input[:n_valid]
             indices = indices[:n_valid]
             cache_seqlens = cache_seqlens[:n_valid]
-            if n_valid > 0:
+            if n_valid > 0 and not use_lightop_flat_sparse_fwd:
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=cache_seqlens,
                     seq_len_q=1,
+                    is_fp8_kvcache=(
+                        False
+                        if use_lightop_decode_gather
+                        else self.nsa_kv_cache_store_fp8
+                    ),
+                )
+
+        flashmla_is_fp8_kvcache = self.nsa_kv_cache_store_fp8
+        if use_lightop_decode_gather and (not needs_repad or n_valid > 0):
+            gathered_kv, compact_indices = self._get_lightop_decode_workspaces(
+                q_input.shape[0]
+            )
+            physical_token_ids = indices[:, 0, :]
+            assert (
+                physical_token_ids.shape[1]
+                == gathered_kv.shape[1]
+                == compact_indices.shape[1]
+                == self._lightop_decode_gather_width
+            ), "LightOp decode gather width mismatch after KPool padding"
+            self._lightop_decode_gather(
+                lightop_kv_cache,
+                physical_token_ids,
+                gathered_kv,
+                cache_seqlens,
+                compact_indices,
+            )
+
+            # FlashMLA must index the compact gathered cache, not the original
+            # physical cache.  Preserve every -1 sentinel: replacing it with a
+            # positive index to a zero row would change the softmax denominator.
+            indices = compact_indices.unsqueeze(1)
+            if use_lightop_flat_sparse_fwd:
+                kv_cache = gathered_kv.view(
+                    -1, 1, self._lightop_decode_head_dim
+                )
+            else:
+                kv_cache = gathered_kv.view(
+                    -1, 64, 1, self._lightop_decode_head_dim
+                )
+            flashmla_is_fp8_kvcache = False
+
+        # DCU get_mla_metadata returns a lazy FlashMLASchedMeta whose config is
+        # fixed by its first FlashMLA invocation. Normally every layer in this
+        # metadata lifetime selects the same path; refresh defensively if an
+        # earlier invocation initialized it for the opposite cache dtype.
+        if not use_lightop_flat_sparse_fwd:
+            dcu_sched_meta = flashmla_metadata.flashmla_metadata
+            dcu_sched_config = getattr(dcu_sched_meta, "config", None)
+            if (
+                _is_dcu
+                and getattr(dcu_sched_meta, "have_initialized", False)
+                and dcu_sched_config is not None
+                and dcu_sched_config.is_fp8_kvcache != flashmla_is_fp8_kvcache
+            ):
+                flashmla_metadata = self._compute_flashmla_metadata(
+                    cache_seqlens=cache_seqlens,
+                    seq_len_q=1,
+                    is_fp8_kvcache=flashmla_is_fp8_kvcache,
                 )
 
         if needs_repad and n_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
+        elif use_lightop_flat_sparse_fwd:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input[:, 0],
+                kv=kv_cache,
+                indices=indices,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+            o = o.unsqueeze(1)
         else:
             o, _ = flash_mla_with_kvcache(
                 q=q_input,
@@ -2415,7 +2669,7 @@ class NativeSparseAttnBackend(
                 block_table=torch.empty(
                     (q_input.shape[0], 0), dtype=torch.int32, device=q_input.device
                 ),
-                is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
+                is_fp8_kvcache=flashmla_is_fp8_kvcache,
             )
 
         if needs_repad:
@@ -2904,13 +3158,20 @@ class NativeSparseAttnBackend(
             force_unfused_topk=force_unfused,
         )
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
+    def _compute_flashmla_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        seq_len_q: int,
+        is_fp8_kvcache: Optional[bool] = None,
+    ):
         if not _is_dcu:
             from sgl_kernel.flash_mla import get_mla_metadata
         else:
             from flash_mla.flash_mla_interface import get_mla_metadata
 
         num_heads_q = self.flashmla_kv_num_q_heads
+        if is_fp8_kvcache is None:
+            is_fp8_kvcache = self.nsa_kv_cache_store_fp8
 
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
@@ -2919,7 +3180,7 @@ class NativeSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=self.nsa_kv_cache_store_fp8,
+            is_fp8_kvcache=is_fp8_kvcache,
             topk=self.nsa_index_topk,
         )
         return NSAFlashMLAMetadata(
