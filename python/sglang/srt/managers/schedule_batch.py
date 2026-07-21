@@ -2467,6 +2467,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    def maybe_wait_verify_done_on_stream(self, stream: Optional[torch.Stream] = None):
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.verify_done is not None:
+                if stream is None:
+                    stream = torch.get_device_module(self.device).current_stream()
+                stream.wait_event(draft_input.verify_done)
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2474,10 +2482,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
-
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2498,6 +2502,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
+
+        # FIXME(lsyin): used here to get the correct seq_lens when the batch is
+        # actually compacted. Avoid synchronizing the no-op path so the next MTP
+        # replay can depend on verify_done on stream instead of blocking CPU.
+        self.maybe_wait_verify_done()
 
         keep_indices_device = torch.tensor(
             keep_indices,

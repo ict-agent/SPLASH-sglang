@@ -119,8 +119,9 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
+        # Now seq_lens is correct on GPU. Keep the dependency on stream so CPU
+        # scheduling can continue into MTP replay without synchronizing here.
+        batch.maybe_wait_verify_done_on_stream()
 
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
