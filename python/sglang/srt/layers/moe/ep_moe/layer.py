@@ -81,7 +81,6 @@ if _is_dcu:
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_i8_gemm_nt_contiguous,
         m_grouped_w4a8_gemm_nt_masked,
-        op as deepgemm_op,
     )
     from lightop import (
         fuse_silu_and_mul,
@@ -935,23 +934,29 @@ class DeepEPMoE(FusedMoE):
             counts_are_aligned=counts_are_aligned,
         )
 
-        gateup_output = _ep_moe_workspace_empty(
-            "w8a8_int8_contiguous_gateup",
-            (all_tokens, N),
+        # Keep this as a flat storage so both output views stay contiguous.
+        bf16_workspace_tokens = max(
+            all_tokens, _w8a8_int8_ep_workspace_tokens
+        )
+        bf16_gemm_workspace = _ep_moe_workspace_empty(
+            "w8a8_int8_contiguous_bf16_gemm",
+            (bf16_workspace_tokens * max(N, K),),
             device=hidden_states_device,
             dtype=torch.bfloat16,
-            zero=not counts_are_aligned,
         )
+        gateup_output = bf16_gemm_workspace.narrow(
+            0, 0, all_tokens * N
+        ).view(all_tokens, N)
+        if not counts_are_aligned:
+            gateup_output.zero_()
 
-        if self.use_int8_w8a8_deepgemm_asm:
-            deepgemm_op.m_grouped_w8a8_gemm_nt_contiguous(
-                input_tensor[0],
-                self.w13_weight_deepgemm,
+        if self.deepep_mode.is_normal() or self.use_int8_w8a8_deepgemm_asm:
+            m_grouped_i8_gemm_nt_contiguous(
+                input_tensor,
+                w13_weight_int8,
                 gateup_output,
-                input_tensor[1],
-                self.w13_weight_scale,
                 m_indices,
-                1000,
+                shuffle_unique=0,
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_contiguous_gfx936
@@ -974,22 +979,17 @@ class DeepEPMoE(FusedMoE):
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
 
-        down_output = _ep_moe_workspace_empty(
-            "w8a8_int8_contiguous_down",
-            (all_tokens, K),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
-        )
+        down_output = bf16_gemm_workspace.narrow(
+            0, 0, all_tokens * K
+        ).view(all_tokens, K)
 
-        if self.use_int8_w8a8_deepgemm_asm:
-            deepgemm_op.m_grouped_w8a8_gemm_nt_contiguous(
-                q_a2_all,
-                self.w2_weight_deepgemm,
+        if self.deepep_mode.is_normal() or self.use_int8_w8a8_deepgemm_asm:
+            m_grouped_i8_gemm_nt_contiguous(
+                (q_a2_all, q_a2_scale),
+                w2_weight_int8,
                 down_output,
-                q_a2_scale,
-                self.w2_weight_scale,
                 m_indices,
-                1000,
+                shuffle_unique=0,
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_contiguous_gfx936

@@ -49,19 +49,6 @@ def _check_int8_weight(weight: torch.Tensor) -> tuple[int, int, int]:
     return int(weight.size(0)), int(weight.size(1)), int(weight.size(2))
 
 
-def _pack_w8a8_int8_asm_contiguous_weight(weight: torch.Tensor) -> torch.Tensor:
-    experts, n, k = _check_int8_weight(weight)
-    if n % 16 != 0 or k % 16 != 0:
-        raise ValueError(f"N={n}, K={k} must satisfy N%16==0 and K%16==0")
-    return (
-        weight.contiguous()
-        .reshape(experts, n // 16, 16, k // 16, 16)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-        .view(experts, n // 16, k * 16)
-    )
-
-
 def _pack_w8a8_int8_asm_masked_weight(weight: torch.Tensor) -> torch.Tensor:
     experts, n, k = _check_int8_weight(weight)
     if n % 16 != 0 or k % 64 != 0:
@@ -85,13 +72,30 @@ def prepare_w8a8_int8_deepgemm_weights(layer: torch.nn.Module) -> None:
     use_asm = use_int8_deepgemm_asm()
     need_contiguous_layout = True
     need_masked_layout = False
-    if use_asm:
-        from sglang.srt.layers.moe.utils import get_deepep_mode
+    from sglang.srt.layers.moe.utils import get_deepep_mode
 
-        deepep_mode = get_deepep_mode()
+    deepep_mode = get_deepep_mode()
+    if deepep_mode.is_normal():
+        from deepgemm import marlin_i8_contiguous_weight
+
+        def pack_weight(weight: torch.Tensor) -> torch.Tensor:
+            return marlin_i8_contiguous_weight(
+                weight,
+                shuffle_unique=0,
+                low_memory=True,
+            )
+    elif use_asm:
         need_contiguous_layout = deepep_mode.enable_normal()
         need_masked_layout = deepep_mode.enable_low_latency()
-        pack_weight = _pack_w8a8_int8_asm_contiguous_weight
+        from deepgemm import marlin_i8_contiguous_weight
+
+        def pack_weight(weight: torch.Tensor) -> torch.Tensor:
+            return marlin_i8_contiguous_weight(
+                weight,
+                shuffle_unique=0,
+                low_memory=True,
+            )
+
         pack_masked_weight = _pack_w8a8_int8_asm_masked_weight
     elif arch == "gfx936":
         from deepgemm import pack_w8a8_gfx936_weight_to_w6 as pack_weight
