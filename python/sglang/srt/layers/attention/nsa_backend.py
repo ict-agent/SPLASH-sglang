@@ -889,6 +889,10 @@ class NativeSparseAttnBackend(
                     dim=0,
                     output_size=sum(extend_seq_lens_cpu),
                 )
+
+            if use_kpool:
+                kpool_inputs.full_real_page_table = self._transform_table_1_to_real(page_table)
+                kpool_inputs.full_seqlens_expanded = seqlens_expanded
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
