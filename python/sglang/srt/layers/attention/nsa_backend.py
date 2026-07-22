@@ -349,6 +349,13 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
+        if (
+            self.topk_transform_method == TopkTransformMethod.PAGED
+            and page_table_size_1.shape[1] < logits.shape[1]
+        ):
+            seq_lens_topk = torch.clamp(
+                seq_lens_topk, max=page_table_size_1.shape[1]
+            )
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
@@ -2018,14 +2025,7 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_mode
         )
-        # A fused top-k result has already been transformed for this worker's
-        # allocator. MTP capture/reuse deliberately keeps logical token
-        # positions instead: they are portable across P/D allocators and are
-        # transformed against the local page table below.
-        if (
-            envs.SGLANG_NSA_FUSE_TOPK.get()
-            and not forward_batch.uses_logical_mtp_topk_indices()
-        ):
+        if self._use_fused_topk(forward_batch):
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -2238,10 +2238,7 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif (
-            envs.SGLANG_NSA_FUSE_TOPK.get()
-            and not forward_batch.uses_logical_mtp_topk_indices()
-        ):
+        elif self._use_fused_topk(forward_batch):
             page_table_1 = topk_indices
         else:
             page_table_1 = self._transform_decode_topk_indices(
@@ -3003,10 +3000,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if (
-            envs.SGLANG_NSA_FUSE_TOPK.get()
-            and not forward_batch.uses_logical_mtp_topk_indices()
-        ):
+        if self._use_fused_topk(forward_batch):
             page_table_1 = topk_indices
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3329,18 +3323,42 @@ class NativeSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
-    def get_indexer_metadata(
-        self, layer_id: int, forward_batch: ForwardBatch
-    ) -> NSAIndexerMetadata:
+    def _force_unfused_topk(self, forward_batch: ForwardBatch) -> bool:
+        forward_mode = effective_forward_mode(forward_batch)
         # Cross-PD MTP sharing must carry logical positions. Fused top-k
         # produces allocator-local page/offset indices, which cannot be reused
         # by another worker. The attention path transforms these logical ids
         # locally, while normal non-sharing forwards keep the fused fast path.
-        forward_mode = effective_forward_mode(forward_batch)
-        force_unfused = forward_batch.uses_logical_mtp_topk_indices() or (
+        if forward_batch.uses_logical_mtp_topk_indices():
+            return True
+
+        if (
             forward_batch.hisparse_coordinator is not None
             and forward_mode.is_decode_or_idle()
+        ):
+            return True
+
+        return (
+            _is_dcu
+            and self._is_glm5_next
+            and self.nsa_index_kpool <= 1
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
+            )
         )
+
+    def _use_fused_topk(self, forward_batch: ForwardBatch) -> bool:
+        return envs.SGLANG_NSA_FUSE_TOPK.get() and not self._force_unfused_topk(
+            forward_batch
+        )
+
+    def get_indexer_metadata(
+        self, layer_id: int, forward_batch: ForwardBatch
+    ) -> NSAIndexerMetadata:
+        forward_mode = effective_forward_mode(forward_batch)
+        force_unfused = self._force_unfused_topk(forward_batch)
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
