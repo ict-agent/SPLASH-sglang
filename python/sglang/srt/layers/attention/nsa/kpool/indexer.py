@@ -1317,6 +1317,9 @@ class IndexerKPool(Indexer):
             pool = forward_batch.token_to_kv_pool
             tail_k_buf, tail_score_buf = pool.get_tail_buffers(layer_id)
             buf = pool.get_kpool_index_k_with_scale_write_buffer(layer_id=layer_id)
+            batch = key.shape[0] // plan.num_draft_tokens
+            close_rows = batch * plan.max_closed_pools
+            write_loc = plan.write_loc[:close_rows]
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
@@ -1325,20 +1328,22 @@ class IndexerKPool(Indexer):
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
-                req_pool_indices=plan.req,
-                write_start=plan.write_start,
-                tail_logical_start=plan.tail_logical_start,
-                write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                req_pool_indices=plan.req[:batch],
+                write_start=plan.write_start[:batch],
+                tail_logical_start=plan.tail_logical_start[:close_rows],
+                write_loc=write_loc,
+                out_cache_loc=forward_batch.out_cache_loc[: key.shape[0]],
                 num_draft_tokens=plan.num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 # v2 only (None for target_verify): defer compress to the
                 # round whose real advance crosses a pool boundary.
-                effective_n_per_batch=plan.effective_n_per_batch,
+                effective_n_per_batch=(
+                    plan.effective_n_per_batch[:batch]
+                    if plan.effective_n_per_batch is not None
+                    else None
+                ),
             )
-            pool.commit_kpool_index_k_with_scale_write_buffer(
-                layer_id, plan.write_loc
-            )
+            pool.commit_kpool_index_k_with_scale_write_buffer(layer_id, write_loc)
 
         # (2) Run tail/compress on the alt stream while the current stream
         # prepares the platform-specific query representation and head-gate

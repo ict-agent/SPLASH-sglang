@@ -453,7 +453,10 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "Glm5NextForCausalLM":
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
             self.hf_config.linear_attn_config = None

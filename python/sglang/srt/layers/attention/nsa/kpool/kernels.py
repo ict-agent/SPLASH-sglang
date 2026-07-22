@@ -761,6 +761,7 @@ def update_kpool_write_plan_cuda_graph(
     *,
     pool_size: int,
     num_draft_tokens: int,
+    max_closed_pools: int = 1,
     slots_per_page: int,
 ) -> None:
     """Build the kpool write plan (decode + target_verify) device-side in one launch.
@@ -769,21 +770,17 @@ def update_kpool_write_plan_cuda_graph(
       decode (N=1):  write_start = positions[b]
       verify (N>=1): write_start = committed_seq_lens[b] (= seq_lens)
 
-    Per-batch shape ``[B]`` relies on EAGLE topk=1 chain-only with
-    ``num_draft_tokens <= pool_size`` -- each batch's N drafts cross at
-    most one pool boundary, so 0 or 1 pool closes per batch. Whether a
-    batch actually closed a pool is derived in-kernel by the consumer
-    (compress) from the stored ``write_start`` value; the addressing
-    fields here are computed unconditionally.
+    ``req`` / ``write_start`` are per-batch. Close-pool addressing tensors
+    are flattened as ``[B * max_closed_pools]`` so chain-only speculative
+    verify can close more than one pool when ``num_draft_tokens > pool_size``.
 
     ``pool_seqlens_per_q_out`` / ``seqlens_per_q_out`` are verify-only
     (shape ``[B*N]``); pass ``None`` for decode and the kernel skips them.
     """
-    # Algorithm invariant: closure-row shape [B] assumes each batch closes
-    # at most one pool (see KPoolWritePlan docstring).
-    assert num_draft_tokens <= pool_size, (
-        f"write plan assumes N <= pool_size (got N={num_draft_tokens}, "
-        f"pool_size={pool_size}); see KPoolWritePlan docstring"
+    required_closed_pools = max(1, (num_draft_tokens + pool_size - 1) // pool_size)
+    assert max_closed_pools >= required_closed_pools, (
+        f"kpool write plan needs max_closed_pools >= {required_closed_pools} "
+        f"for N={num_draft_tokens}, pool_size={pool_size}; got {max_closed_pools}."
     )
 
     bs = write_start.shape[0]
@@ -808,6 +805,7 @@ def update_kpool_write_plan_cuda_graph(
         real_page_table.stride(0),
         POOL_SIZE=pool_size,
         N=num_draft_tokens,
+        MAX_CLOSED_POOLS=max_closed_pools,
         SLOTS_PER_PAGE=slots_per_page,
         HAS_PER_Q=has_per_q_outputs,
     )
@@ -895,6 +893,7 @@ def _update_kpool_write_plan_kernel(
     real_page_table_stride_0,
     POOL_SIZE: tl.constexpr,
     N: tl.constexpr,
+    MAX_CLOSED_POOLS: tl.constexpr,
     SLOTS_PER_PAGE: tl.constexpr,
     HAS_PER_Q: tl.constexpr,
 ):
@@ -902,9 +901,9 @@ def _update_kpool_write_plan_kernel(
     ws = tl.load(write_start_ptr + b).to(tl.int32)
     req = tl.load(req_pool_indices_ptr + b)
 
-    # _decompose_compress(ws, N, POOL_SIZE): under N <= POOL_SIZE the
-    # N writes cross at most one pool boundary, so n_pool is 0 or 1. The
-    # closure consumer re-derives this in-kernel from write_start.
+    # _decompose_compress(ws, N, POOL_SIZE): the consumer re-derives the
+    # actual close count in-kernel from write_start and gate_n, while the
+    # plan precomputes the maximum candidate close addresses for this N.
     base_pool = ws // POOL_SIZE
 
     # Per-q expanded fields (verify only): cover all N draft positions.
@@ -917,21 +916,27 @@ def _update_kpool_write_plan_kernel(
 
     tl.store(write_start_out_ptr + b, ws)
 
-    tail_logical_start = base_pool * POOL_SIZE
-    pool_page_group = base_pool // SLOTS_PER_PAGE
-    # Read packed page from row (b * N): for verify the page table is
-    # repeat_interleave'd to [B*N, max_pages] so this picks the first-of-N
-    # (identical across N); for decode N=1 so this is just row b.
-    packed_page = tl.load(
-        real_page_table_ptr + (b * N) * real_page_table_stride_0 + pool_page_group
-    ).to(tl.int64)
-    write_loc = packed_page * SLOTS_PER_PAGE + (base_pool % SLOTS_PER_PAGE)
-
     tl.store(req_out_ptr + b, req)
-    # Addressing fields stored unconditionally; closure consumer gates the
-    # write on `(ws + N) // P > ws // P` recomputed in-kernel.
-    tl.store(tail_logical_start_out_ptr + b, tail_logical_start.to(tl.int32))
-    tl.store(write_loc_out_ptr + b, write_loc.to(tl.int64))
+    # Addressing fields stored unconditionally; the consumer gates each
+    # candidate on `(ws + gate_n) // P - ws // P` recomputed in-kernel.
+    for i_pool in tl.static_range(0, MAX_CLOSED_POOLS):
+        pool_id = base_pool + i_pool
+        pool_page_group = pool_id // SLOTS_PER_PAGE
+        # Read packed page from row (b * N): for verify the page table is
+        # repeat_interleave'd to [B*N, max_pages] so this picks the first-of-N
+        # (identical across N); for decode N=1 so this is just row b.
+        packed_page = tl.load(
+            real_page_table_ptr
+            + (b * N) * real_page_table_stride_0
+            + pool_page_group
+        ).to(tl.int64)
+        write_loc = packed_page * SLOTS_PER_PAGE + (pool_id % SLOTS_PER_PAGE)
+        out_row = b * MAX_CLOSED_POOLS + i_pool
+        tl.store(
+            tail_logical_start_out_ptr + out_row,
+            (pool_id * POOL_SIZE).to(tl.int32),
+        )
+        tl.store(write_loc_out_ptr + out_row, write_loc.to(tl.int64))
 
 
 @triton.jit
@@ -1881,11 +1886,11 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     tail_k_ptr,  # bf16 [req_pool, TAIL_SIZE, head_dim]
     tail_score_ptr,  # bf16 same shape
     ape_ptr,  # fp32 [POOL_SIZE, head_dim]
-    # Plan tensors ([B] from update_kpool_write_plan_cuda_graph).
+    # Plan tensors from update_kpool_write_plan_cuda_graph.
     req_pool_indices_ptr,  # int64 [B]
     write_start_ptr,  # int32 [B] -- decode: positions[b]; verify: committed[b]
-    tail_logical_start_ptr,  # int32 [B] -- base_pool * POOL_SIZE
-    write_loc_ptr,  # int64 [B]
+    tail_logical_start_ptr,  # int32 [B * MAX_CLOSED_POOLS]
+    write_loc_ptr,  # int64 [B * MAX_CLOSED_POOLS]
     # Padding sentinel: out_cache_loc[b*N] == 0 means batch b is a
     # cuda-graph padded slot (the cache allocator reserves slot 0 as a
     # dummy sink, see NSATokenToKVPool init -- "padded slot 0 is used for
@@ -1919,13 +1924,14 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
+    MAX_CLOSED_POOLS: tl.constexpr,
 ):
-    """Per-batch program: write N tokens to tail ring then compress closed pool.
+    """Per-batch program: write N tokens to tail ring then compress closed pools.
 
     Pool-close gating: ``(write_start + N) // POOL_SIZE > write_start // POOL_SIZE``.
-    Under EAGLE topk=1 chain-only with ``N <= POOL_SIZE`` each batch closes 0 or 1
-    pool. Padded batches (``out_cache_loc[b*N] == 0``, the reserved sink) early-return
-    to avoid poisoning req=0's tail.
+    Under EAGLE topk=1 chain-only, each batch closes up to
+    ``ceil(N / POOL_SIZE)`` pools. Padded batches (``out_cache_loc[b*N] == 0``,
+    the reserved sink) early-return to avoid poisoning req=0's tail.
     """
     b = tl.program_id(0)
     # Padded-batch gate: any draft of this batch landing at the reserved
@@ -1963,44 +1969,54 @@ def _kpool_write_tail_and_maybe_compress_kernel(
         gate_n = tl.load(effective_n_ptr + b).to(tl.int32)
     else:
         gate_n = N
+    gate_n = tl.minimum(tl.maximum(gate_n, 0), N)
     base_pool = write_start // POOL_SIZE
     n_pool = (write_start + gate_n) // POOL_SIZE - base_pool
     if n_pool == 0:
         return
 
-    base = tl.load(tail_logical_start_ptr + b)
-    m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
-    acc = tl.full((BLOCK_D,), 0.0, tl.float32)
-    denom = tl.full((BLOCK_D,), 0.0, tl.float32)
-    for slot in tl.static_range(0, POOL_SIZE):
-        phys = (base + slot) % TAIL_SIZE
-        off = req * tail_stride_0 + phys * tail_stride_1 + offs
-        score = tl.load(tail_score_ptr + off, mask=dim_mask, other=0.0).to(tl.float32)
-        k_ld = tl.load(tail_k_ptr + off, mask=dim_mask, other=0.0).to(tl.float32)
-        score += tl.load(
-            ape_ptr + slot * ape_stride_0 + offs, mask=dim_mask, other=0.0
-        ).to(tl.float32)
-        new_m = tl.maximum(m, score)
-        rescale = tl.exp(m - new_m)
-        prob = tl.exp(score - new_m)
-        denom = denom * rescale + prob
-        acc = acc * rescale + k_ld * prob
-        m = new_m
+    for i_pool in tl.static_range(0, MAX_CLOSED_POOLS):
+        if i_pool < n_pool:
+            plan_row = b * MAX_CLOSED_POOLS + i_pool
+            base = tl.load(tail_logical_start_ptr + plan_row)
+            m = tl.full((BLOCK_D,), -float("inf"), tl.float32)
+            acc = tl.full((BLOCK_D,), 0.0, tl.float32)
+            denom = tl.full((BLOCK_D,), 0.0, tl.float32)
+            for slot in tl.static_range(0, POOL_SIZE):
+                phys = (base + slot) % TAIL_SIZE
+                off = req * tail_stride_0 + phys * tail_stride_1 + offs
+                score = tl.load(tail_score_ptr + off, mask=dim_mask, other=0.0).to(
+                    tl.float32
+                )
+                k_ld = tl.load(tail_k_ptr + off, mask=dim_mask, other=0.0).to(
+                    tl.float32
+                )
+                score += tl.load(
+                    ape_ptr + slot * ape_stride_0 + offs, mask=dim_mask, other=0.0
+                ).to(tl.float32)
+                new_m = tl.maximum(m, score)
+                rescale = tl.exp(m - new_m)
+                prob = tl.exp(score - new_m)
+                denom = denom * rescale + prob
+                acc = acc * rescale + k_ld * prob
+                m = new_m
 
-    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
-    loc = tl.load(write_loc_ptr + b)
-    loc_page_index = loc // SLOTS_PER_PAGE
-    loc_token_offset_in_page = loc % SLOTS_PER_PAGE
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * HEAD_DIM + offs
-    )
-    out_s_offset = (
-        loc_page_index * BUF_NUMEL_PER_PAGE // 4
-        + S_OFFSET_NBYTES_IN_PAGE // 4
-        + loc_token_offset_in_page
-    )
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
-    tl.store(buf_fp32_ptr + out_s_offset, scale)
+            quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+            loc = tl.load(write_loc_ptr + plan_row)
+            loc_page_index = loc // SLOTS_PER_PAGE
+            loc_token_offset_in_page = loc % SLOTS_PER_PAGE
+            out_k_offsets = (
+                loc_page_index * BUF_NUMEL_PER_PAGE
+                + loc_token_offset_in_page * HEAD_DIM
+                + offs
+            )
+            out_s_offset = (
+                loc_page_index * BUF_NUMEL_PER_PAGE // 4
+                + S_OFFSET_NBYTES_IN_PAGE // 4
+                + loc_token_offset_in_page
+            )
+            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
 def kpool_write_tail_and_maybe_compress(
@@ -2102,4 +2118,5 @@ def kpool_write_tail_and_maybe_compress(
         S_OFFSET_NBYTES_IN_PAGE=slots_per_page * INDEX_HEAD_DIM,
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
+        MAX_CLOSED_POOLS=max(1, write_loc.numel() // bs),
     )

@@ -2037,14 +2037,12 @@ class ServerArgs:
                             )
                             if spec_on and not (
                                 self.speculative_num_draft_tokens
-                                and 0
-                                < self.speculative_num_draft_tokens
-                                < kpool_pool_size
+                                and self.speculative_num_draft_tokens > 0
                             ):
                                 raise ValueError(
                                     f"NSA kpool + speculative decoding requires 0 < "
-                                    f"--speculative-num-draft-tokens < pool_size "
-                                    f"({kpool_pool_size}), got {self.speculative_num_draft_tokens}."
+                                    f"--speculative-num-draft-tokens, got "
+                                    f"{self.speculative_num_draft_tokens}."
                                 )
                         self.page_size = 64
                         logger.warning("Setting page size to 64 for DeepSeek DSA.")

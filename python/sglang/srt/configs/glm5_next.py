@@ -282,6 +282,24 @@ class Glm5NextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        if not hasattr(self, "rope_scaling"):
+            self.rope_scaling = rope_scaling
+        rope_parameters = getattr(self, "rope_parameters", None)
+        if rope_parameters is None:
+            if self.rope_scaling is None:
+                rope_parameters = {
+                    "rope_theta": self.rope_theta,
+                    "rope_type": "default",
+                }
+            else:
+                rope_parameters = dict(self.rope_scaling)
+                rope_parameters.setdefault("rope_theta", self.rope_theta)
+                rope_parameters.setdefault(
+                    "rope_type", rope_parameters.get("type", "default")
+                )
+            self.rope_parameters = rope_parameters
+        if self.rope_scaling is None:
+            self.rope_scaling = self.rope_parameters
         self.architectures = architectures or ["Glm5NextForCausalLM"]
 
     @property
@@ -353,12 +371,18 @@ class Glm5NextConfig(PretrainedConfig):
 class Glm5NextTextConfig(Glm5NextConfig):
     model_type = "glm5next_text"
 
+    def __init__(self, model_type="glm5next_text", **kwargs):
+        super().__init__(model_type=model_type, **kwargs)
+
 
 Glm5NextConfig.sub_configs["text_config"] = Glm5NextTextConfig
 
 
 class Glm5NextTextUnderscoreConfig(Glm5NextTextConfig):
     model_type = "glm5_next_text"
+
+    def __init__(self, model_type="glm5_next_text", **kwargs):
+        super().__init__(model_type=model_type, **kwargs)
 
 
 class Glm5VNextConfig(Glm5NextConfig):

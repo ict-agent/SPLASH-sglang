@@ -222,18 +222,19 @@ class KPoolExtendPlan:
 class KPoolWritePlan:
     """Layer-invariant plan for kpool tail-write + closed-pool compress.
 
-    Shared by decode (N=1) and target_verify (N=num_draft_tokens). Per-batch
-    shape ``[B]`` because under EAGLE topk=1 chain-only with ``N <= POOL_SIZE``
-    each batch closes at most one pool. Pool-close + cuda-graph-padding gating
-    are both derived in-kernel; see ``_kpool_write_tail_and_maybe_compress_kernel``.
+    Shared by decode (N=1) and target_verify (N=num_draft_tokens). ``req`` and
+    ``write_start`` stay per-batch, while close-pool addressing is flattened as
+    ``[B * max_closed_pools]`` so EAGLE topk=1 chain-only verify can close more
+    than one kpool when ``N > POOL_SIZE``.
     """
 
     req: torch.Tensor  # int64 [B]
     write_start: torch.Tensor  # int32 [B] -- decode: positions; verify: committed
-    tail_logical_start: torch.Tensor  # int32 [B]
-    write_loc: torch.Tensor  # int64 [B]
+    tail_logical_start: torch.Tensor  # int32 [B * max_closed_pools]
+    write_loc: torch.Tensor  # int64 [B * max_closed_pools]
 
     num_draft_tokens: int
+    max_closed_pools: int = 1
 
     # Verify-only (decode leaves these None).
     paged_page_table: Optional[torch.Tensor] = None  # int32 [B*N, max_seq_pages]
@@ -893,6 +894,7 @@ def update_pooled_paged_mqa_metadata(
 def _alloc_kpool_write_plan_buffers(
     *,
     max_bs: int,
+    pool_size: int,
     num_draft_tokens: int,
     device: torch.device,
     is_verify: bool,
@@ -902,7 +904,9 @@ def _alloc_kpool_write_plan_buffers(
     ``update_kpool_write_plan_cuda_graph``. Eager uses ``max_bs = bs``;
     capture uses the cuda-graph max batch.
     """
+    max_closed_pools = max(1, (num_draft_tokens + pool_size - 1) // pool_size)
     n_rows = max_bs * num_draft_tokens
+    n_close_rows = max_bs * max_closed_pools
     verify_extras = {}
     if is_verify:
         verify_extras = dict(
@@ -916,9 +920,10 @@ def _alloc_kpool_write_plan_buffers(
     return KPoolWritePlan(
         req=torch.zeros(max_bs, dtype=torch.int64, device=device),
         write_start=torch.zeros(max_bs, dtype=torch.int32, device=device),
-        tail_logical_start=torch.zeros(max_bs, dtype=torch.int32, device=device),
-        write_loc=torch.zeros(max_bs, dtype=torch.int64, device=device),
+        tail_logical_start=torch.zeros(n_close_rows, dtype=torch.int32, device=device),
+        write_loc=torch.zeros(n_close_rows, dtype=torch.int64, device=device),
         num_draft_tokens=num_draft_tokens,
+        max_closed_pools=max_closed_pools,
         **verify_extras,
     )
 
@@ -975,6 +980,7 @@ def init_kpool_write_plan_capture(
 
     plan = _alloc_kpool_write_plan_buffers(
         max_bs=max_bs,
+        pool_size=pool_size,
         num_draft_tokens=num_draft_tokens,
         device=device,
         is_verify=is_verify,
@@ -1056,38 +1062,50 @@ def update_kpool_write_plan(
         seqlens_per_q_out=plan.seqlens_per_q,
         pool_size=pool_size,
         num_draft_tokens=num_draft_tokens,
+        max_closed_pools=plan.max_closed_pools,
         slots_per_page=slots_per_page,
     )
-    aot_kpool_write_plan = _get_aot_kpool_write_plan()
-    try:
-        if aot_kpool_write_plan is not None:
-            aot_kpool_write_plan(**kernel_kwargs)
-        else:
-            if _disable_jit_kpool_write_plan():
-                raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
-            kpool_write_plan_cuda(**kernel_kwargs)
-    except Exception as e:
-        global _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
-        if aot_kpool_write_plan is not None:
-            try:
+    if plan.max_closed_pools == 1:
+        single_close_kwargs = dict(kernel_kwargs)
+        single_close_kwargs.pop("max_closed_pools")
+        aot_kpool_write_plan = _get_aot_kpool_write_plan()
+        try:
+            if aot_kpool_write_plan is not None:
+                aot_kpool_write_plan(**single_close_kwargs)
+            else:
                 if _disable_jit_kpool_write_plan():
                     raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
-                kpool_write_plan_cuda(**kernel_kwargs)
-                e = None
-            except Exception as jit_e:
-                e = jit_e
-        if e is not None:
-            if (
-                not _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
-                and not _disable_jit_kpool_write_plan()
-            ):
-                logger.warning(
-                    "AOT/JIT kpool write-plan update failed; "
-                    "falling back to Triton update: %s",
-                    e,
-                )
-                _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED = True
+                kpool_write_plan_cuda(**single_close_kwargs)
+        except Exception as e:
+            global _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
+            if aot_kpool_write_plan is not None:
+                try:
+                    if _disable_jit_kpool_write_plan():
+                        raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
+                    kpool_write_plan_cuda(**single_close_kwargs)
+                    e = None
+                except Exception as jit_e:
+                    e = jit_e
+            if e is not None:
+                if (
+                    not _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED
+                    and not _disable_jit_kpool_write_plan()
+                ):
+                    logger.warning(
+                        "AOT/JIT kpool write-plan update failed; "
+                        "falling back to Triton update: %s",
+                        e,
+                    )
+                    _KPOOL_WRITE_PLAN_SINGLE_JIT_WARNED = True
+                update_kpool_write_plan_cuda_graph(**kernel_kwargs)
+    else:
+        try:
+            if _disable_jit_kpool_write_plan():
+                raise RuntimeError("disabled by SGLANG_DISABLE_JIT_KPOOL_WRITE_PLAN")
             update_kpool_write_plan_cuda_graph(**kernel_kwargs)
+        except Exception:
+            # Preserve the same exception surface as the single-close fallback.
+            raise
     if is_v2 and accept_length is not None and plan.effective_n_per_batch is not None:
         # effective_n = accept_length directly. v2's accept_length already
         # includes the bonus "next" token (eagle_info_v2.sample applies an
