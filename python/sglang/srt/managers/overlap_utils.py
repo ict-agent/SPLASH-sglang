@@ -41,6 +41,9 @@ else:
 class FutureIndices:
     indices: torch.Tensor
     interval: Optional[slice] = None
+    # Python-side validity lets the scheduler make a graph/eager decision
+    # before the asynchronous seed tensor is resolved from FutureMap.
+    mtp_topk_indices_valid: Optional[bool] = None
 
 
 class FutureMap:
@@ -51,6 +54,7 @@ class FutureMap:
         context_len: int,
         device: torch.device,
         spec_algo: Optional[SpeculativeAlgorithm] = None,
+        mtp_topk_indices_dim: int = 0,
     ):
         # FIXME: the calculation of future_limit and future_buffer_len maybe too conservative
         self.future_ct = 0
@@ -69,6 +73,7 @@ class FutureMap:
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
         self.spec_algo = spec_algo
+        self.mtp_topk_indices_dim = mtp_topk_indices_dim
 
         if self.spec_algo.is_none():
             # For non-speculative decoding, we only need to store the token ids.
@@ -119,6 +124,13 @@ class FutureMap:
                 device=self.device,
             )
 
+        if self.mtp_topk_indices_dim > 0:
+            self.mtp_topk_indices_buf = torch.empty(
+                (self.future_buffer_len, self.mtp_topk_indices_dim),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
     def alloc_future_indices(self, bs: int) -> FutureIndices:
         """Update the circular buffer pointer and allocate future indices."""
         cur_future_ct = self.future_ct
@@ -148,19 +160,34 @@ class FutureMap:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
+            if indices.numel() == 0:
+                # Idle-first speculative iterations must not touch buffers that
+                # are initialized lazily by the first active result.
+                return
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at
             # model_worker_batch.spec_info and batch.spec_info), so the
             # caching allocator (torch GC) could reclaim the memory before
             # the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            if torch.device(self.device).type != "cpu":
+                indices.record_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
+            if self.mtp_topk_indices_dim > 0:
+                if draft_input.future_indices.mtp_topk_indices_valid is True:
+                    draft_input.mtp_topk_indices = self.mtp_topk_indices_buf[indices]
+                else:
+                    # Zero is a valid logical index.  Missing must remain the
+                    # Python None sentinel rather than an in-band tensor value.
+                    draft_input.mtp_topk_indices = None
+
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
         if step > 0:
@@ -182,8 +209,13 @@ class FutureMap:
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
         intv = future_indices.interval
+        if intv is None:
+            raise ValueError("FutureMap can only store into an allocated interval")
         if self.is_empty_slice(intv):
             # idle indices in dp attention do not need store info
+            if self.mtp_topk_indices_dim > 0:
+                # Empty rows are the identity when future batches are merged.
+                future_indices.mtp_topk_indices_valid = True
             return
 
         if not self.buf_initialized:
@@ -195,3 +227,26 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+        if self.mtp_topk_indices_dim > 0:
+            mtp_topk_indices = draft_input.mtp_topk_indices
+            # Publish only after validation/copy; exceptions remain fail-closed.
+            future_indices.mtp_topk_indices_valid = False
+            if mtp_topk_indices is None:
+                self.mtp_topk_indices_buf[intv].zero_()
+            else:
+                expected_shape = (
+                    future_indices.indices.shape[0],
+                    self.mtp_topk_indices_dim,
+                )
+                if tuple(mtp_topk_indices.shape) != expected_shape:
+                    raise ValueError(
+                        "MTP top-k seed shape does not match FutureMap rows: "
+                        f"expected {expected_shape}, got {tuple(mtp_topk_indices.shape)}"
+                    )
+                if mtp_topk_indices.dtype != torch.int32:
+                    raise TypeError(
+                        "MTP top-k seed must use torch.int32, got "
+                        f"{mtp_topk_indices.dtype}"
+                    )
+                self.mtp_topk_indices_buf[intv] = mtp_topk_indices
+                future_indices.mtp_topk_indices_valid = True

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -19,6 +20,27 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+
+def _mtp_draft_seed_missing(local_batch: Optional[ScheduleBatch]) -> bool:
+    """Return whether this rank's active EAGLE draft needs seed recomputation."""
+    if local_batch is None or local_batch.forward_mode.is_idle():
+        return False
+
+    spec_info = getattr(local_batch, "spec_info", None)
+    is_draft_input = getattr(spec_info, "is_draft_input", None)
+    if not (callable(is_draft_input) and is_draft_input()):
+        return False
+
+    future_indices = getattr(spec_info, "future_indices", None)
+    if future_indices is not None:
+        # During overlap scheduling the seed tensor still lives in FutureMap
+        # when the scheduler makes the graph/eager decision.  Python validity
+        # is authoritative; None means the producer has not published it yet.
+        return getattr(future_indices, "mtp_topk_indices_valid", None) is not True
+
+    seed = getattr(spec_info, "mtp_topk_indices", None)
+    return seed is None or seed.shape[0] != local_batch.batch_size()
 
 
 @dataclass
@@ -139,6 +161,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    mtp_index_share_for_topk1: bool = False,
 ):
     # Check if other DP workers have running batches
     if local_batch is None or local_batch.forward_mode.is_prebuilt():
@@ -168,6 +191,14 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    if mtp_index_share_for_topk1 and _mtp_draft_seed_missing(local_batch):
+        # Feed the active rank's seed fallback into the existing DP all-gather
+        # so active and idle ranks cannot choose graph/eager independently.
+        can_cuda_graph = False
+    if skip_all_gather and mtp_index_share_for_topk1:
+        # Without DP consensus there is no safe way to know whether another
+        # rank is missing its seed.  Fall back uniformly.
+        can_cuda_graph = False
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -238,6 +269,11 @@ class SchedulerDPAttnMixin:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            mtp_index_share_for_topk1=(
+                self.spec_algorithm.is_eagle()
+                and self.server_args.speculative_eagle_topk == 1
+                and is_mtp_index_share_enabled(self.model_config.hf_config)
+            ),
         )
 
     def maybe_prepare_mlp_sync_batch(

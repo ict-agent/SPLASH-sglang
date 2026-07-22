@@ -230,14 +230,19 @@ class EAGLEDraftCudaGraphRunner:
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        if self.enable_mtp_index_share:
+        if self.enable_mtp_index_share and (
+            not forward_batch.forward_mode.is_idle() or self.topk != 1
+        ):
             mtp_topk_indices = getattr(
                 forward_batch.spec_info, "mtp_topk_indices", None
             )
-            if (
-                mtp_topk_indices is None
-                or mtp_topk_indices.shape[0] != forward_batch.batch_size
-            ):
+            has_usable_seed = (
+                mtp_topk_indices is not None
+                and mtp_topk_indices.dtype == torch.int32
+                and tuple(mtp_topk_indices.shape)
+                == (forward_batch.batch_size, self.mtp_index_share_topk)
+            )
+            if not has_usable_seed:
                 # The graph input is per-request. Let eager mode compute a
                 # missing/misaligned seed instead of replaying a zero seed.
                 is_bs_supported = False

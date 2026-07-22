@@ -40,7 +40,9 @@ from sglang.srt.layers.attention.nsa.kpool.planner import (
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
+    effective_forward_mode,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
     nsa_prefill_has_history,
     nsa_cp_round_robin_split_data,
     nsa_cp_round_robin_split_q_seqs,
@@ -1909,11 +1911,13 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
+        forward_mode = effective_forward_mode(forward_batch)
         nsa_impl = (
             self.nsa_decode_impl
             if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
             )
             else self.nsa_prefill_impl
         )
@@ -1936,7 +1940,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
-                is_prefill=True,
+                is_prefill=not forward_mode.is_decode_or_idle(),
             )
 
         if k is not None:
@@ -2012,14 +2016,24 @@ class NativeSparseAttnBackend(
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
-            forward_batch.forward_mode
+            forward_mode
         )
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        # A fused top-k result has already been transformed for this worker's
+        # allocator. MTP capture/reuse deliberately keeps logical token
+        # positions instead: they are portable across P/D allocators and are
+        # transformed against the local page table below.
+        if (
+            envs.SGLANG_NSA_FUSE_TOPK.get()
+            and not forward_batch.uses_logical_mtp_topk_indices()
+        ):
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                topk_indices_offset = metadata.topk_indices_offset
-                assert topk_indices_offset is not None
+                topk_indices_offset = self._get_aligned_topk_indices_offset(
+                    forward_batch,
+                    metadata,
+                    topk_indices.shape[0],
+                )
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
@@ -2030,13 +2044,24 @@ class NativeSparseAttnBackend(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
-                assert metadata.nsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
-                    page_size=1,
-                )
+                if forward_mode.is_decode_or_idle():
+                    page_table_1 = self._transform_decode_topk_indices(
+                        forward_batch,
+                        metadata.page_table_1,
+                        topk_indices,
+                    )
+                else:
+                    extend_lens_cpu = self._get_topk_transform_lens(
+                        forward_batch,
+                        metadata,
+                        topk_indices.shape[0],
+                    )
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=extend_lens_cpu,
+                        page_size=1,
+                    )
 
         # todo hisparse: to cover more backends
         if forward_batch.hisparse_coordinator is not None:
@@ -2213,13 +2238,16 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_NSA_FUSE_TOPK.get():
+        elif (
+            envs.SGLANG_NSA_FUSE_TOPK.get()
+            and not forward_batch.uses_logical_mtp_topk_indices()
+        ):
             page_table_1 = topk_indices
         else:
-            page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
+            page_table_1 = self._transform_decode_topk_indices(
+                forward_batch,
+                metadata.page_table_1,
+                topk_indices,
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -2570,6 +2598,8 @@ class NativeSparseAttnBackend(
         # its schedule for that exact batch, then restore the caller's shape.
         n_total = q_input.shape[0]
         n_valid = forward_batch.extend_num_valid_tokens
+        if n_valid is None:
+            n_valid = self._decode_dp_padding_num_valid(forward_batch, n_total)
         needs_repad = (
             _is_dcu
             and n_valid is not None
@@ -2973,7 +3003,10 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if (
+            envs.SGLANG_NSA_FUSE_TOPK.get()
+            and not forward_batch.uses_logical_mtp_topk_indices()
+        ):
             page_table_1 = topk_indices
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2983,10 +3016,10 @@ class NativeSparseAttnBackend(
                 page_size=1,
             )
         else:
-            page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                page_size=1,
+            page_table_1 = self._transform_decode_topk_indices(
+                forward_batch,
+                metadata.page_table_1,
+                topk_indices,
             )
 
         q_scale = 1.0
@@ -3043,6 +3076,160 @@ class NativeSparseAttnBackend(
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+    @staticmethod
+    def _decode_dp_padding_num_valid(
+        forward_batch: ForwardBatch, num_rows: int
+    ) -> Optional[int]:
+        """Return real topk=1 decode rows when eager DP padding grew the batch."""
+        if not effective_forward_mode(forward_batch).is_decode_or_idle():
+            return None
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if getattr(spec_info, "num_tokens_per_req", None) != 1:
+            return None
+        planned_rows = getattr(
+            forward_batch, "forward_metadata_planned_num_tokens", None
+        )
+        planned_batch_size = getattr(
+            forward_batch, "forward_metadata_planned_bs", None
+        )
+        original_batch_size = getattr(forward_batch, "_original_batch_size", None)
+        if (
+            isinstance(planned_rows, int)
+            and 0 <= planned_rows < num_rows
+            and planned_batch_size == planned_rows
+            and original_batch_size == planned_rows
+        ):
+            return planned_rows
+        return None
+
+    def _transform_decode_topk_indices(
+        self,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Localize logical decode indices while preserving DP padding rows.
+
+        Multi-step eager draft metadata is planned before MLP-sync padding.
+        When DP padding later grows the forward batch, ``page_table`` still
+        contains only the planned request rows while ``topk_indices`` follows
+        the padded q layout.  Transform the planned rows and keep synthetic
+        rows invalid instead of indexing a non-existent request page table.
+        """
+        page_table_rows = page_table.shape[0]
+        topk_rows = topk_indices.shape[0]
+        if page_table_rows == topk_rows:
+            return transform_index_page_table_decode(
+                page_table=page_table,
+                topk_indices=topk_indices,
+                page_size=1,
+            )
+
+        num_valid = self._decode_dp_padding_num_valid(forward_batch, topk_rows)
+        uses_logical_indices = forward_batch.uses_logical_mtp_topk_indices()
+        assert (
+            _is_dcu
+            and self.nsa_decode_impl == "flashmla_kv"
+            and uses_logical_indices
+            and num_valid == page_table_rows
+        ), (
+            "decode page-table rows only may differ from top-k rows after "
+            "topk=1 MLP-sync DP padding on the DCU flashmla_kv logical-index "
+            "fallback: "
+            f"page_table_rows={page_table_rows}, topk_rows={topk_rows}, "
+            "planned_rows="
+            f"{getattr(forward_batch, 'forward_metadata_planned_num_tokens', None)}, "
+            "planned_batch_size="
+            f"{getattr(forward_batch, 'forward_metadata_planned_bs', None)}, "
+            f"original_batch_size={getattr(forward_batch, '_original_batch_size', None)}, "
+            "num_tokens_per_req="
+            f"{getattr(getattr(forward_batch, 'spec_info', None), 'num_tokens_per_req', None)}, "
+            f"nsa_decode_impl={self.nsa_decode_impl}, uses_logical_indices={uses_logical_indices}"
+        )
+
+        localized = (
+            transform_index_page_table_decode(
+                page_table=page_table,
+                topk_indices=topk_indices[:page_table_rows],
+                page_size=1,
+            )
+            if page_table_rows > 0
+            else topk_indices[:0]
+        )
+        padding = localized.new_full(
+            (topk_rows - page_table_rows, *topk_indices.shape[1:]), -1
+        )
+        return torch.cat([localized, padding], dim=0)
+
+    def _pad_topk_indices_offset(
+        self, topk_indices_offset: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices_offset.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices_offset
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices_offset rows ({current_tokens}) > num_tokens "
+            f"({num_tokens}); this indicates a mismatch between NSA metadata "
+            "and q layout."
+        )
+        padding = torch.zeros(
+            (num_tokens - current_tokens, *topk_indices_offset.shape[1:]),
+            dtype=topk_indices_offset.dtype,
+            device=topk_indices_offset.device,
+        )
+        return torch.cat([topk_indices_offset, padding], dim=0)
+
+    def _get_aligned_topk_indices_offset(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        topk_indices_offset = metadata.topk_indices_offset
+        assert topk_indices_offset is not None
+
+        if (
+            nsa_use_prefill_cp(forward_batch)
+            and is_nsa_prefill_cp_in_seq_split()
+        ):
+            # in-seq-split currently supports one request. Its indexer emits
+            # only this rank's q rows, while metadata keeps the full-request
+            # offset vector. Every local row shares the request's base offset.
+            assert metadata.page_table_1.shape[0] == 1
+            return topk_indices_offset[:1].expand(num_tokens)
+
+        assert (
+            topk_indices_offset.shape[0]
+            == metadata.nsa_seqlens_expanded.shape[0]
+        ), (
+            "topk_indices_offset must have one row per logical NSA "
+            f"query token: {topk_indices_offset.shape[0]} != "
+            f"{metadata.nsa_seqlens_expanded.shape[0]}"
+        )
+        # CP/DP alignment pads q and top-k to physical rows after the indexer
+        # has emitted one offset per logical token. Extend offsets with neutral
+        # zeros; matching padded top-k rows remain -1 under the caller's mask.
+        return self._pad_topk_indices_offset(topk_indices_offset, num_tokens)
+
+    @staticmethod
+    def _get_topk_transform_lens(
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        num_tokens: int,
+    ) -> List[int]:
+        if (
+            nsa_use_prefill_cp(forward_batch)
+            and is_nsa_prefill_cp_in_seq_split()
+        ):
+            # in-seq-split is single-request today, so all rank-local q rows
+            # map through the same request-local page-table row.
+            assert metadata.page_table_1.shape[0] == 1
+            return [num_tokens]
+
+        assert metadata.nsa_extend_seq_lens_list is not None
+        return metadata.nsa_extend_seq_lens_list
 
     @staticmethod
     def _get_nsa_page_table_transform_lens(
@@ -3145,14 +3332,19 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        force_unfused = (
+        # Cross-PD MTP sharing must carry logical positions. Fused top-k
+        # produces allocator-local page/offset indices, which cannot be reused
+        # by another worker. The attention path transforms these logical ids
+        # locally, while normal non-sharing forwards keep the fused fast path.
+        forward_mode = effective_forward_mode(forward_batch)
+        force_unfused = forward_batch.uses_logical_mtp_topk_indices() or (
             forward_batch.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_mode.is_decode_or_idle()
         )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
-                forward_batch.forward_mode
+                forward_mode
             ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,

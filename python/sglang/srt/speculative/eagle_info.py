@@ -854,6 +854,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.future_indices.indices.numel() == 0:
+                # Empty future rows are the identity when merged with an
+                # active batch and therefore do not invalidate its seed.
+                self.future_indices.mtp_topk_indices_valid = True
             # The async CPU copy is indexed by the pre-filter batch order. If a
             # future batch is filtered, fall back to the original synchronous
             # seq_lens.cpu() path for correctness.
@@ -890,12 +894,21 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.mtp_topk_indices = self.mtp_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        if (self.future_indices is None) != (spec_info.future_indices is None):
+            raise ValueError(
+                "Cannot merge resolved and unresolved Eagle draft inputs; "
+                "their MTP seed rows do not share a common lifecycle"
+            )
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
-                )
+                ),
+                mtp_topk_indices_valid=(
+                    self.future_indices.mtp_topk_indices_valid is True
+                    and spec_info.future_indices.mtp_topk_indices_valid is True
+                ),
             )
             self.new_seq_lens_cpu = None
             self.new_seq_lens_cpu_ready = None
@@ -922,12 +935,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
-        # NSA MTP index share: cat when both sides have seeds. If one side is
-        # missing we rely on !929 (MHA fast path also emits seed indices) to
-        # guarantee this state can't arise once the feature is enabled.
-        if self.mtp_topk_indices is None:
-            self.mtp_topk_indices = spec_info.mtp_topk_indices
-        elif spec_info.mtp_topk_indices is not None:
+        if self.mtp_topk_indices is None or spec_info.mtp_topk_indices is None:
+            # A partially seeded batch has no request-to-row preserving tensor.
+            # Recompute the first draft step for the entire merged batch.
+            self.mtp_topk_indices = None
+        else:
             self.mtp_topk_indices = torch.cat(
                 [self.mtp_topk_indices, spec_info.mtp_topk_indices]
             )

@@ -11,6 +11,7 @@ from einops import rearrange
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    effective_forward_mode,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
     nsa_prefill_has_history,
@@ -744,9 +745,10 @@ class Indexer(MultiPlatformOp):
         max_seq_len = block_tables.shape[1] * page_size
 
         blocksize = page_size
+        forward_mode = effective_forward_mode(forward_batch)
         if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
@@ -915,7 +917,9 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert effective_forward_mode(
+            forward_batch
+        ).is_extend_without_speculative()
 
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip and not _is_dcu:
@@ -1174,7 +1178,9 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert effective_forward_mode(
+            forward_batch
+        ).is_extend_without_speculative()
         x_meta = x[0] if isinstance(x, tuple) else x
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
@@ -1646,10 +1652,16 @@ class Indexer(MultiPlatformOp):
         if metadata is None:
             return None
 
+        # DP max-length padding temporarily rewrites DECODE/VERIFY/DRAFT_EXTEND
+        # to EXTEND so the padded MLP path can be reused. Indexer dispatch must
+        # follow the original algorithmic mode; otherwise decode consumes the
+        # extend/RAGGED layout before the backend can localize shared indices.
+        forward_mode = effective_forward_mode(forward_batch)
+
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if (not _is_dcu) and forward_batch.forward_mode.is_extend_without_speculative():
+        if (not _is_dcu) and forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
@@ -1670,7 +1682,7 @@ class Indexer(MultiPlatformOp):
                 ),
             )
 
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+        if enable_dual_stream and forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if _is_dcu:
@@ -1861,9 +1873,9 @@ class Indexer(MultiPlatformOp):
                 )
 
             if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend(include_v2=True)
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_index, weights, metadata

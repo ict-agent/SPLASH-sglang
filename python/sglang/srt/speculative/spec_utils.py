@@ -531,12 +531,14 @@ def _select_top_k_tokens_later(
 
     if hidden_states is not None and hidden_states.shape[0] > 0:
         flat_cs = topk_cs_index.flatten()
+        # Keep this purely shape-arithmetic. On Torch 2.10,
+        # repeat_interleave(..., output_size=flat_cs.shape[0]) specializes the
+        # dynamic batch dimension and recompiles once per observed batch size.
         batch_offsets = torch.arange(
-            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+            hidden_states.shape[0], device=flat_cs.device
         )
-        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(
-            topk, output_size=flat_cs.shape[0]
-        )
+        batch_offsets = (batch_offsets // topk) * topk
+        selected_input_index = flat_cs // topk + batch_offsets
         hidden_states = hidden_states[selected_input_index]
 
     tree_info = (

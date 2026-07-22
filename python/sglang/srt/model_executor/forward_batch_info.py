@@ -356,6 +356,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     forward_metadata_planned_num_tokens: Optional[int] = None
     forward_metadata_replan_equivalent: bool = False
 
+    def uses_logical_mtp_topk_indices(self) -> bool:
+        """Whether MTP top-k uses allocator-independent logical positions."""
+        return bool(
+            self.capture_mtp_topk_indices or self.reuse_mtp_topk_indices
+        )
+
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         self.forward_metadata_ready = True
         self.forward_metadata_planned_bs = self.batch_size
@@ -1151,7 +1157,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             if getattr(spec_info, "mtp_topk_indices", None) is not None:
                 spec_info.mtp_topk_indices = self._pad_tensor_to_size(
-                    spec_info.mtp_topk_indices, bs
+                    spec_info.mtp_topk_indices, bs, value=-1
                 )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens

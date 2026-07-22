@@ -1391,6 +1391,9 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
             self.spec_algorithm,
+            mtp_topk_indices_dim=get_mtp_index_share_topk(
+                self.model_config.hf_config
+            ),
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0

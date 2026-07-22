@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_fused,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    effective_forward_mode,
     is_nsa_prefill_cp_in_seq_split,
     nsa_use_prefill_cp,
 )
@@ -364,7 +365,9 @@ class IndexerKPool(Indexer):
 
         use_cp = (
             nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            and effective_forward_mode(
+                forward_batch
+            ).is_extend_without_speculative()
         )
         # precompute_compress_gate only fires in dual-stream decode/verify; CP
         # only fires in prefill. They are mutually exclusive by mode --
@@ -664,6 +667,12 @@ class IndexerKPool(Indexer):
         )
 
     @staticmethod
+    def _uses_fused_topk_mapping(metadata: BaseIndexerMetadata) -> bool:
+        return envs.SGLANG_NSA_FUSE_TOPK.get() and not getattr(
+            metadata, "force_unfused_topk", False
+        )
+
+    @staticmethod
     def _kpool_fused_topk_mapping(
         metadata: BaseIndexerMetadata,
         paged_page_table: Optional[torch.Tensor] = None,
@@ -680,15 +689,15 @@ class IndexerKPool(Indexer):
         page table (the full ``req_to_token``) can be shared across q-tokens
         instead of densely replicated per q-token.
 
-        ``force_unfused_topk`` (hisparse decode) requires the topk kernel to
-        emit *logical* positions so the downstream hisparse coordinator can
-        do its own page-table swap; mirrors the community Indexer guard in
-        ``NSAIndexerMetadata.topk_transform``.
+        ``force_unfused_topk`` requires the result to stay in *logical*
+        positions so a downstream consumer can apply its own allocator-local
+        mapping.  This disables only the mapping arguments: when
+        ``SGLANG_NSA_KPOOL_LIGHTOP_TOPK=1``, the LightOP KPool kernel still
+        performs TopK, token expansion, and tail append and returns logical
+        indices because both mapping inputs are ``None``.
         """
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get() or getattr(
-            metadata, "force_unfused_topk", False
-        ):
+        if not IndexerKPool._uses_fused_topk_mapping(metadata):
             return None, None, None
 
         method = metadata.topk_transform_method
@@ -720,7 +729,13 @@ class IndexerKPool(Indexer):
         token_ids = cols.unsqueeze(0).expand(rows, -1)
         valid = cols.unsqueeze(0) < seq_lens.to(torch.int64).unsqueeze(1)
 
-        if metadata.topk_transform_method == TopkTransformMethod.PAGED:
+        use_fused_mapping = self._uses_fused_topk_mapping(metadata)
+        if not use_fused_mapping:
+            # MTP index sharing uses logical token positions as its canonical
+            # cross-worker representation. The attention backend localizes a
+            # temporary copy against the current worker's allocator.
+            topk_full = token_ids.to(torch.int32)
+        elif metadata.topk_transform_method == TopkTransformMethod.PAGED:
             page_table = metadata.attn_metadata.page_table_1
             if page_table.shape[0] != rows:
                 token_to_batch_idx = metadata.get_token_to_batch_idx()
@@ -809,7 +824,8 @@ class IndexerKPool(Indexer):
         only for the row layout it was built for.
         """
 
-        assert forward_batch.forward_mode.is_decode_or_idle()
+        forward_mode = effective_forward_mode(forward_batch)
+        assert forward_mode.is_decode_or_idle()
 
         page_size = forward_batch.token_to_kv_pool.page_size
 
@@ -881,7 +897,7 @@ class IndexerKPool(Indexer):
             # ``out_rows`` makes the topk kernel pad its output back to the
             # padded q row count (caller upstream expects topk_indices.shape[0]
             # == hidden_states.shape[0]); padding rows are filled with -1.
-            allow_lightop_topk=forward_batch.forward_mode.is_decode(),
+            allow_lightop_topk=forward_mode.is_decode(),
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
 
@@ -906,9 +922,10 @@ class IndexerKPool(Indexer):
         is accepted but unused.
         """
 
+        forward_mode = effective_forward_mode(forward_batch)
         assert (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            or forward_batch.forward_mode.is_draft_extend()
+            forward_mode.is_extend_without_speculative()
+            or forward_mode.is_draft_extend()
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
@@ -1008,7 +1025,7 @@ class IndexerKPool(Indexer):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index,
-            allow_lightop_topk=forward_batch.forward_mode.is_extend_without_speculative(),
+            allow_lightop_topk=forward_mode.is_extend_without_speculative(),
         )
 
     def _get_topk_ragged_with_cp(
@@ -1142,9 +1159,8 @@ class IndexerKPool(Indexer):
         # RAGGED -> topk_indices_offset is 0 for batch 0, so leave None
         # (full-seq metadata copy would shape-mismatch logits.shape[0]).
         page_table_all: Optional[torch.Tensor] = None
-        if (
-            envs.SGLANG_NSA_FUSE_TOPK.get()
-            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+        if self._uses_fused_topk_mapping(metadata) and (
+            metadata.topk_transform_method == TopkTransformMethod.PAGED
         ):
             page_table_all = bt_row.unsqueeze(0).expand(actual_seq_q, -1)
 
@@ -1155,7 +1171,9 @@ class IndexerKPool(Indexer):
             page_table=page_table_all,
             topk_offsets=None,
             row_starts=None,  # ks is all-zero in single-batch; kernel default = 0
-            allow_lightop_topk=forward_batch.forward_mode.is_extend_without_speculative(),
+            allow_lightop_topk=effective_forward_mode(
+                forward_batch
+            ).is_extend_without_speculative(),
             out_rows=actual_seq_q,
         )
 
@@ -1168,7 +1186,9 @@ class IndexerKPool(Indexer):
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert effective_forward_mode(
+            forward_batch
+        ).is_extend_without_speculative()
 
         use_cp = nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
 
@@ -1407,8 +1427,8 @@ class IndexerKPool(Indexer):
             page_table=page_table_for_topk,
             topk_offsets=None,
             allow_lightop_topk=(
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
+                effective_forward_mode(forward_batch).is_target_verify()
+                or effective_forward_mode(forward_batch).is_draft_extend_v2()
             ),
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
@@ -1446,7 +1466,10 @@ class IndexerKPool(Indexer):
 
         # Cache mode predicates: forward_mode methods are non-trivial and
         # we'd otherwise call each one 2-4 times in this function.
-        mode = forward_batch.forward_mode
+        # Keep decode/verify/draft dispatch tied to the pre-padding mode. DP
+        # max-length padding may expose a temporary EXTEND mode here, but KPool
+        # still needs decode's write plan and PAGED logits layout.
+        mode = effective_forward_mode(forward_batch)
         is_extend = mode.is_extend_without_speculative()
         is_decode = mode.is_decode_or_idle()
         is_target_verify = mode.is_target_verify()
