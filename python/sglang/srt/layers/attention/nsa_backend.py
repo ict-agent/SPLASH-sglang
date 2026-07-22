@@ -451,7 +451,7 @@ class NativeSparseAttnBackend(
         self._lightop_decode_gather = None
         self._lightop_decode_gather_workspace = None
         self._lightop_decode_compact_indices = None
-        self._lightop_decode_retired_workspaces = []
+        self._lightop_decode_graph_workspaces = None
         # The packed physical row is 656 bytes in both supported layouts:
         # 512 FP8 latent values, four FP32 scales, then either 64 BF16 RoPE
         # values or 128 bytes of no-RoPE padding. The LightOp destination keeps
@@ -575,7 +575,7 @@ class NativeSparseAttnBackend(
         return self._arange_buf[:l]
 
     def _allocate_lightop_decode_workspaces(self, capacity: int) -> None:
-        """Allocate graph-stable, contiguous buffers for BF16 sparse decode."""
+        """Allocate contiguous buffers for BF16 sparse decode."""
         if self._lightop_decode_gather is None or capacity <= 0:
             return
         current_capacity = (
@@ -589,16 +589,6 @@ class NativeSparseAttnBackend(
             raise RuntimeError(
                 "LightOp decode gather workspace must be allocated before "
                 "CUDA graph capture"
-            )
-
-        # Keep any old allocation alive because an already captured graph may
-        # still contain its addresses even if a larger eager batch is seen.
-        if self._lightop_decode_gather_workspace is not None:
-            self._lightop_decode_retired_workspaces.append(
-                (
-                    self._lightop_decode_gather_workspace,
-                    self._lightop_decode_compact_indices,
-                )
             )
 
         self._lightop_decode_gather_workspace = torch.empty(
@@ -619,15 +609,24 @@ class NativeSparseAttnBackend(
     def _get_lightop_decode_workspaces(
         self, num_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._allocate_lightop_decode_workspaces(num_tokens)
         if (
-            self._lightop_decode_gather_workspace is None
-            or self._lightop_decode_compact_indices is None
+            torch.cuda.is_current_stream_capturing()
+            and self._lightop_decode_graph_workspaces is not None
         ):
+            workspace, compact_indices = self._lightop_decode_graph_workspaces
+            if workspace.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "LightOp decode gather exceeded its CUDA graph capacity"
+                )
+        else:
+            self._allocate_lightop_decode_workspaces(num_tokens)
+            workspace = self._lightop_decode_gather_workspace
+            compact_indices = self._lightop_decode_compact_indices
+        if workspace is None or compact_indices is None:
             raise RuntimeError("LightOp decode gather workspaces are unavailable")
         return (
-            self._lightop_decode_gather_workspace[:num_tokens],
-            self._lightop_decode_compact_indices[:num_tokens],
+            workspace[:num_tokens],
+            compact_indices[:num_tokens],
         )
 
     def get_real_page_col_indices(self, max_seqlen_k: int) -> torch.Tensor:
@@ -1217,16 +1216,16 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
             ),
         }
-        # TARGET_VERIFY expands each request into one row per speculative
-        # token.  CUDA graph capture must reserve that expanded row count up
-        # front; attempting to grow the buffer from inside capture is invalid.
-        lightop_decode_capacity = max_num_tokens
-        if self.speculative_num_draft_tokens:
-            lightop_decode_capacity = max(
-                lightop_decode_capacity,
-                max_bs * self.speculative_num_draft_tokens,
-            )
-        self._allocate_lightop_decode_workspaces(lightop_decode_capacity)
+        # max_num_tokens already includes speculative expansion.
+        if self._lightop_decode_graph_workspaces is None:
+            self._allocate_lightop_decode_workspaces(max_num_tokens)
+            if self._lightop_decode_gather_workspace is not None:
+                self._lightop_decode_graph_workspaces = (
+                    self._lightop_decode_gather_workspace,
+                    self._lightop_decode_compact_indices,
+                )
+        elif self._lightop_decode_graph_workspaces[0].shape[0] < max_num_tokens:
+            raise RuntimeError("LightOp decode CUDA graph workspace cannot grow")
 
     def init_forward_metadata_capture_cuda_graph(
         self,
