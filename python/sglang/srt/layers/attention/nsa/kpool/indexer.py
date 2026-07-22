@@ -30,6 +30,9 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
     Indexer,
+    _get_dcu_mqa_logits_max_rows,
+    _run_dcu_mqa_logits_with_workspace,
+    reserve_dcu_mqa_logits_workspace,
     rotate_activation,
 )
 from sglang.srt.layers.attention.nsa.utils import (
@@ -912,11 +915,9 @@ class IndexerKPool(Indexer):
     ) -> torch.Tensor:
         """Kpool-aware ragged extend top-k.
 
-        Single-launch path: one ``gather_index_k_scale_prefix_into`` over
-        all batches' compressed K, one ``deep_gemm.fp8_mqa_logits`` on
-        the concatenated K with per-q ``ks/ke`` from the plan, and one
-        fused topk that honors per-row ``row_starts``. All CPU planning
-        lives in ``KPoolExtendPlan`` (see planner.py).
+        Gathers all batches' compressed K once and uses per-q ``ks/ke`` from
+        ``KPoolExtendPlan``. DCU bounds logits memory by chunking Q rows through
+        a shared workspace and immediately running topk for each chunk.
 
         Signature matches ``Indexer._get_topk_ragged``; ``enable_dual_stream``
         is accepted but unused.
@@ -957,6 +958,14 @@ class IndexerKPool(Indexer):
             n_real <= total_q
         ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
 
+        page_table_all, topk_offsets_all, page_table_row_index = (
+            self._kpool_fused_topk_mapping(
+                metadata,
+                paged_page_table=plan.ragged_paged_page_table,
+                paged_page_table_row_index=plan.ragged_paged_page_table_row_index,
+            )
+        )
+
         if total_k_rows > 0:
             # Layer-shared workspace allocated by the planner.
             k_u8 = plan.ragged_k_u8
@@ -977,22 +986,58 @@ class IndexerKPool(Indexer):
             # Rows with ks==ke (pool_seq_len==0) get no writes; cleaned
             # to zero by ``clean_logits=True``.
             if is_dcu():
+                q_bf16 = q_fp8[:n_real].to(torch.bfloat16).contiguous()
                 kv_bf16 = (
                     k_fp8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
                 ).to(torch.bfloat16).unsqueeze(1).contiguous()
-                logits = op.mqa_logits(
-                    q_fp8[:n_real].to(torch.bfloat16).contiguous(),
-                    kv_bf16,
-                    weights[:n_real].to(torch.float32).contiguous(),
-                    ks_per_q,
-                    ke_per_q,
-                    q_fp8[:n_real].shape[0],
-                    kv_bf16.shape[0],
-                    q_fp8.shape[1],
-                    q_fp8.shape[2],
-                    None,
-                    True,
+                weights_f32 = weights[:n_real].to(torch.float32).contiguous()
+                logits_workspace = reserve_dcu_mqa_logits_workspace(
+                    device, q_bf16.dtype
                 )
+                topk_result = torch.full(
+                    (total_q, self.index_topk + self.index_kpool - 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if n_real == 0:
+                    return topk_result
+                max_rows = _get_dcu_mqa_logits_max_rows(
+                    logits_workspace.numel(), n_real, total_k_rows, q_bf16.dtype
+                )
+
+                for start in range(0, n_real, max_rows):
+                    end = min(start + max_rows, n_real)
+                    logits_chunk = _run_dcu_mqa_logits_with_workspace(
+                        q_bf16[start:end],
+                        kv_bf16,
+                        weights_f32[start:end],
+                        ks_per_q[start:end],
+                        ke_per_q[start:end],
+                        None,
+                        logits_workspace,
+                    )
+                    topk_result[start:end] = self._topk_from_kpool_logits(
+                        logits_chunk,
+                        pool_lens[start:end],
+                        seq_lens=seq_lens_expanded[start:end],
+                        page_table=page_table_all,
+                        topk_offsets=(
+                            None
+                            if topk_offsets_all is None
+                            else topk_offsets_all[start:end]
+                        ),
+                        row_starts=ks_per_q[start:end],
+                        page_table_row_index=(
+                            None
+                            if page_table_row_index is None
+                            else page_table_row_index[start:end]
+                        ),
+                        allow_lightop_topk=(
+                            forward_batch.forward_mode.is_extend_without_speculative()
+                        ),
+                    )
+                return topk_result
             else:
                 logits = deep_gemm.fp8_mqa_logits(
                     q_fp8[:n_real].contiguous(),
@@ -1006,15 +1051,6 @@ class IndexerKPool(Indexer):
             # No batch has any pool history yet -- topk falls through
             # to the tail-only path on a zero-width logits.
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
-
-        # --- single fused topk over the whole batch -----------------
-        page_table_all, topk_offsets_all, page_table_row_index = (
-            self._kpool_fused_topk_mapping(
-                metadata,
-                paged_page_table=plan.ragged_paged_page_table,
-                paged_page_table_row_index=plan.ragged_paged_page_table_row_index,
-            )
-        )
 
         return self._topk_from_kpool_logits(
             logits,

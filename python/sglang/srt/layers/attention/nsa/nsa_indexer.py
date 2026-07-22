@@ -109,10 +109,12 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 _DCU_MQA_LOGITS_ALIGNMENT = 128
-# With a 16K prefill chunk and CP8, each rank has at most 2048 Q rows. A 2 GiB
-# FP32 D_out buffer bounds the peak while preserving more KV-cache capacity;
-# the current ~484K context is processed in two large Q chunks.
-_DCU_MQA_LOGITS_MAX_ELEMENTS = 16384 * 32768
+_DCU_MQA_LOGITS_WORKSPACE_GB = envs.SGLANG_NSA_DCU_MQA_LOGITS_WORKSPACE_GB.get()
+if _DCU_MQA_LOGITS_WORKSPACE_GB <= 0:
+    raise ValueError("SGLANG_NSA_DCU_MQA_LOGITS_WORKSPACE_GB must be positive")
+_DCU_MQA_LOGITS_MAX_ELEMENTS = (
+    int(_DCU_MQA_LOGITS_WORKSPACE_GB * (1 << 30)) // 4
+)
 _dcu_mqa_logits_workspaces: Dict[torch.device, torch.Tensor] = {}
 
 
@@ -124,7 +126,7 @@ def reserve_dcu_mqa_logits_workspace(
     device: Union[str, torch.device],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Reserve the shared 2 GiB FP32 LightOp D_out buffer for one DCU device."""
+    """Reserve the shared bounded FP32 LightOp D_out buffer for one DCU device."""
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError(
