@@ -282,3 +282,7 @@ artifacts/
 # hip_kernel
 *.hip
 *_hip.*
+
+# -- docker build: rocblas/hipblaslt lib/ 需要在镜像构建时 COPY 到容器内 --
+!rocblas-install/lib/
+!hipblaslt-install/lib/

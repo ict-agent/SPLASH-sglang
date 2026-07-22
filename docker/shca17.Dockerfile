@@ -1,28 +1,19 @@
 # =============================================================================
 # sglang shca17 运行镜像
-#
-# BASE_IMAGE: 已装完所有驱动 / 编译器 (DTK/UCX/OpenMPI/RCCL/shca17)，但未装任何
-#             python whl 包的基础镜像。
-# 本 Dockerfile 在构建时现装:
-#   1) install_sglang_0.5.12_shca17.sh 中的依赖 whl 层 (ray/vllm/torch 栈等)
-#   2) CI compile 阶段编译出的本仓库 whl (sgl-kernel / sglang / gateway)，force
-#      覆盖依赖层里 pip 装的 sglang==0.5.12
-#
-# 参考: model-test-ci/docker/conf/install_sglang_0.5.12_shca17.sh (# ---layer--- 之后的 pip 段)
 # =============================================================================
 ARG BASE_IMAGE=42.228.13.241:5000/jenkins/base_env/shca17:ubuntu22.04-dtk2604-py3.10-dtk2604
 FROM ${BASE_IMAGE}
 
 ARG TORCH_VERSION=2.10.0
-# 本仓库编译出的 sglang 版本 (compile 阶段 SETUPTOOLS_SCM_PRETEND_VERSION)
 ARG SGLANG_VERSION=0.5.12
-# 内部 nightly 源 (dtk2604)；base 镜像通常已配 ~/.pip/pip.conf，这里再显式声明一次兜底
 ARG PIP_INDEX_URL=http://42.228.13.241:666/nightly/dtk2604/+simple/
 ARG PIP_TRUSTED_HOST=42.228.13.241
-ENV PIP_INDEX_URL=${PIP_INDEX_URL} \
-    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 SHELL ["/bin/bash", "-c"]
+
+# ---- 配置内部 pip 源 ----
+RUN mkdir -p /root/.pip && \
+    printf "[global]\nindex-url = ${PIP_INDEX_URL}\ntrusted-host = ${PIP_TRUSTED_HOST}\n" > /root/.pip/pip.conf
 
 # ---------------------------------------------------------------------------
 # layer 1: ray / amdsmi / cupy + vllm 栈
@@ -37,9 +28,6 @@ RUN pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.ali
 
 # ---------------------------------------------------------------------------
 # layer 2: torch 栈 + hcu 生态 whl + sglang 的第三方依赖
-# 注意: sglang / sgl-kernel / sglang-router 不在此从 pip 装 —— 由本仓库编译，
-#       在 layer 3 用 wheelhouse 现装。
-# 每条 pip 带上 torch==${TORCH_VERSION} 是为了锁定解析时的 torch 版本 (沿用原脚本写法)
 # ---------------------------------------------------------------------------
 RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip install --no-cache-dir torch==${TORCH_VERSION} flash-attn && \
@@ -64,13 +52,14 @@ RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip cache purge
 
 # ---------------------------------------------------------------------------
+# layer 2.5: 定制 rocblas / hipblaslt (覆盖镜像内的版本)
+# ---------------------------------------------------------------------------
+COPY rocblas-install/ /opt/rocblas-install/
+COPY hipblaslt-install/ /opt/hipblaslt-install/
+ENV LD_LIBRARY_PATH=/opt/rocblas-install/lib:/opt/hipblaslt-install/lib:${LD_LIBRARY_PATH}
+
+# ---------------------------------------------------------------------------
 # layer 3: 装入 CI 编译出的本仓库 whl (sgl-kernel / sglang)
-# sglang-router 不编译，从 pip 源装 (其依赖 setproctitle/aiohttp/... 不含 sglang，
-#   不会覆盖本地 sglang)。
-# 再装 sglang[diffusion]==${SGLANG_VERSION}: 版本已被本地 whl 满足，pip 只补 diffusion
-#   extra 依赖，不会重新从 pip 覆盖本地 sglang。
-# 最后钉一次 numpy==1.25.0 (沿用原脚本，防依赖解析把 numpy 顶掉)。
-# 构建上下文里需存在 wheelhouse/ (CI 从 compile 阶段产物 cp 过来)
 # ---------------------------------------------------------------------------
 COPY wheelhouse/ /tmp/wheelhouse/
 RUN pip install --no-cache-dir /tmp/wheelhouse/*.whl && \
@@ -80,3 +69,6 @@ RUN pip install --no-cache-dir /tmp/wheelhouse/*.whl && \
     pip cache purge && \
     source /opt/dtk/env.sh && \
     python -c "import sgl_kernel; import sglang; import sglang_router; print('sglang', sglang.__version__)"
+
+# ---- 删除内部 pip 源配置 ----
+RUN rm -f /root/.pip/pip.conf
