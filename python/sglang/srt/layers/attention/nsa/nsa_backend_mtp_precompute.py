@@ -88,7 +88,7 @@ def _fill_decode_page_table_kernel(
         mask=valid,
         other=0,
     ).to(tl.int32)
-    tl.store(page_table + row * page_table_stride + cols, vals, mask=in_bounds)
+    tl.store(page_table + row * page_table_stride + cols, vals, mask=valid)
 
 
 def fill_decode_page_table_gpu(
@@ -104,7 +104,9 @@ def fill_decode_page_table_gpu(
     max_len = page_table.shape[1]
     if max_len == 0:
         return
-    block = 256
+    # Only columns below each row's seq_len are part of the metadata contract.
+    # Leaving the tail untouched avoids clearing the graph-capture width on every replay.
+    block = 1024
     _fill_decode_page_table_kernel[(bs, triton.cdiv(max_len, block))](
         req_to_token,
         req_pool_indices,
@@ -114,6 +116,7 @@ def fill_decode_page_table_gpu(
         page_table.stride(0),
         max_len,
         BLOCK=block,
+        num_warps=8,
     )
 
 
