@@ -191,13 +191,13 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    if mtp_index_share_for_topk1 and _mtp_draft_seed_missing(local_batch):
-        # Feed the active rank's seed fallback into the existing DP all-gather
-        # so active and idle ranks cannot choose graph/eager independently.
-        can_cuda_graph = False
-    if skip_all_gather and mtp_index_share_for_topk1:
-        # Without DP consensus there is no safe way to know whether another
-        # rank is missing its seed.  Fall back uniformly.
+    if (
+        not skip_all_gather
+        and mtp_index_share_for_topk1
+        and _mtp_draft_seed_missing(local_batch)
+    ):
+        # With the full gather enabled, make a missing seed force every DP rank
+        # to eager. Skip mode keeps its original zero-collective local decision.
         can_cuda_graph = False
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
