@@ -1241,6 +1241,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
+        if logits_output.draft_top1_token_ids is not None:
+            output_rows = logits_output.next_token_logits.shape[0]
+            logits_output.draft_top1_token_ids = (
+                logits_output.draft_top1_token_ids[:output_rows]
+            )
+            logits_output.draft_top1_probs = logits_output.draft_top1_probs[
+                :output_rows
+            ]
+
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None

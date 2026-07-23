@@ -259,6 +259,28 @@ class EagleDraftWorker(BaseDraftWorker):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
 
+        vp_size = self.server_args.speculative_draft_lm_head_vp_size
+        if vp_size > 1:
+            from sglang.srt.speculative.draft_lm_head_vp import (
+                DraftLMHeadVocabParallelTop1,
+            )
+
+            logits_processor = getattr(
+                self.draft_runner.model, "logits_processor", None
+            )
+            if logits_processor is None:
+                raise RuntimeError(
+                    "Draft LM-head VP requires the draft model to expose "
+                    "logits_processor."
+                )
+            draft_lm_head_vp = DraftLMHeadVocabParallelTop1(
+                full_weight=head,
+                vocab_size=self.draft_runner.model_config.vocab_size,
+                vp_size=vp_size,
+                max_rows_per_rank=self.draft_runner.req_to_token_pool.size,
+            )
+            logits_processor.set_draft_lm_head_vp(draft_lm_head_vp)
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -569,16 +591,33 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
+            if logits_output.draft_top1_token_ids is not None:
+                if self.hot_token_id is not None:
+                    raise RuntimeError(
+                        "Draft LM-head VP cannot be combined with a speculative "
+                        "token map."
+                    )
+                topk_p = logits_output.draft_top1_probs
+                topk_index = logits_output.draft_top1_token_ids
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    self.draft_runner.model_config.vocab_size,
+                    f"draft_forward step {i}: VP top1_index OOB vs vocab_size="
+                    f"{self.draft_runner.model_config.vocab_size}",
+                )
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size="
+                    f"{logits_output.next_token_logits.shape[-1]}",
+                )
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
 

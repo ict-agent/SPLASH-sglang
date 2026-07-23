@@ -595,6 +595,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_draft_lm_head_vp_size: int = 1
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_draft_window_size: Optional[int] = None
@@ -4111,6 +4112,51 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+        if self.speculative_draft_lm_head_vp_size < 1:
+            raise ValueError(
+                "--speculative-draft-lm-head-vp-size must be positive, got "
+                f"{self.speculative_draft_lm_head_vp_size}."
+            )
+        if self.speculative_draft_lm_head_vp_size > 1:
+            vp_size = self.speculative_draft_lm_head_vp_size
+            if self.speculative_algorithm != "EAGLE":
+                raise ValueError(
+                    "--speculative-draft-lm-head-vp-size > 1 currently requires "
+                    "speculative_algorithm == EAGLE."
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "--speculative-draft-lm-head-vp-size > 1 currently requires "
+                    "--speculative-eagle-topk 1."
+                )
+            if self.speculative_token_map is not None:
+                raise ValueError(
+                    "--speculative-draft-lm-head-vp-size and "
+                    "--speculative-token-map cannot be enabled together."
+                )
+            if not self.enable_dp_attention or not self.enable_dp_lm_head:
+                raise ValueError(
+                    "--speculative-draft-lm-head-vp-size > 1 requires both "
+                    "--enable-dp-attention and --enable-dp-lm-head."
+                )
+            if self.tp_size != self.dp_size * self.attn_cp_size:
+                raise ValueError(
+                    "Draft LM-head VP currently requires attention TP size 1, "
+                    "i.e. tp_size == dp_size * attn_cp_size. Got "
+                    f"tp_size={self.tp_size}, dp_size={self.dp_size}, "
+                    f"attn_cp_size={self.attn_cp_size}."
+                )
+            if self.tp_size % vp_size != 0:
+                raise ValueError(
+                    f"tp_size={self.tp_size} must be divisible by draft LM-head "
+                    f"vp_size={vp_size}."
+                )
+            if self.enable_fp32_lm_head:
+                raise ValueError(
+                    "Draft LM-head VP does not currently support "
+                    "--enable-fp32-lm-head."
+                )
+
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -6126,6 +6172,16 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-draft-lm-head-vp-size",
+            type=int,
+            default=ServerArgs.speculative_draft_lm_head_vp_size,
+            help=(
+                "Node-local vocabulary-parallel group size for full-vocabulary "
+                "top-1 in EAGLE draft decode. A value greater than 1 shards only "
+                "the draft LM-head computation; target verification is unchanged."
+            ),
         )
         parser.add_argument(
             "--speculative-attention-mode",
