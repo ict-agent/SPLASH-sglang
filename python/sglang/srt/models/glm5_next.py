@@ -230,7 +230,7 @@ class ModelNextLinearAttention(nn.Module):
             if self.nsa_enable_prefill_cp
             else get_tensor_model_parallel_world_size()
         )
-        self.do_fuse_qkvbfg = requested_fuse_qkvbfg and fuse_qkvbfg_supported
+        self.do_fuse_qkvbfg = requested_fuse_qkvbfg #  and fuse_qkvbfg_supported
         if requested_fuse_qkvbfg and not fuse_qkvbfg_supported:
             log_info_on_rank0(
                 logger,
@@ -740,15 +740,18 @@ class ModelNextDecoderLayer(nn.Module):
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
-        attn_prequantized_projection = (
-            self.self_attn.qkv_proj
-            if self.is_linear_attn
-            else getattr(
+        if self.is_linear_attn:
+            if self.self_attn.do_fuse_qkvbfg:
+                attn_prequantized_projection = None
+            else:
+                attn_prequantized_projection = self.self_attn.qkv_proj
+        else:
+            attn_prequantized_projection = getattr(
                 self.self_attn,
                 "fused_qkv_a_proj_with_mqa",
                 None,
             )
-        )
+
         use_mhc_rms_quant = (
             envs.SGLANG_USE_FUSED_RMS_QUANT.get()
             and is_lightop_sglang_rms_quant_available()
