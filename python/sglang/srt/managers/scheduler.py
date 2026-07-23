@@ -1068,10 +1068,12 @@ class Scheduler(
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
+            NSATokenToKVPool,
         )
         from sglang.srt.mem_cache.memory_pool_host import (
             MHATokenToKVPoolHost,
             MLATokenToKVPoolHost,
+            NSATokenToKVPoolHost,
         )
 
         pool = draft_kv_pool
@@ -1087,7 +1089,21 @@ class Scheduler(
             page_size=self.page_size,
             layout=self.server_args.hicache_mem_layout,
         )
-        if isinstance(pool, MHATokenToKVPool):
+        if (
+            isinstance(pool, NSATokenToKVPool)
+            and self.server_args.hicache_storage_backend is not None
+        ):
+            raise RuntimeError(
+                "Draft NSA does not support a HiCache L3 storage backend yet "
+                "because Draft Index-K storage serialization is not "
+                "implemented. Disable the storage backend."
+            )
+
+        if isinstance(pool, NSATokenToKVPool):
+            # NSA draft correctness requires restoring both latent Main KV and
+            # Index K. The generic MLA host pool only carries the former.
+            draft_host_pool = NSATokenToKVPoolHost(pool, **kw)
+        elif isinstance(pool, MHATokenToKVPool):
             draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
         elif isinstance(pool, MLATokenToKVPool):
             draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
@@ -3459,6 +3475,23 @@ class Scheduler(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.waiting_queue)} "
                     f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+        draft_device_pool = getattr(
+            self.tree_cache.cache_controller,
+            "mem_pool_device_draft",
+            None,
+        )
+        if isinstance(draft_device_pool, NSATokenToKVPool):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Draft NSA does not support a HiCache L3 storage backend "
+                    "yet because Draft Index-K storage serialization is not "
+                    "implemented."
                 ),
             )
 
