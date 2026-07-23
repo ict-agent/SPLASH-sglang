@@ -746,7 +746,10 @@ class SchedulerMetricsMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
+            self.stats.decode_sum_seq_lens = (
+                batch.seq_lens_cpu if batch.seq_lens_cpu is not None
+                else batch.seq_lens
+            ).sum().item()
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
