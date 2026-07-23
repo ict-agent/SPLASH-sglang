@@ -614,7 +614,7 @@ class IndexerKPool(Indexer):
             and not deterministic
             and is_dcu()
             and _lightop_kpool_topk is not None
-            and self.index_kpool == 16
+            and self.index_kpool in (4, 16)
             and self.index_topk == 2048
             and seq_lens is not None
         ):

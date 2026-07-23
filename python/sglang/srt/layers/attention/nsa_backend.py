@@ -487,7 +487,7 @@ class NativeSparseAttnBackend(
             and self.kv_lora_rank == 512
             and self.kv_cache_dim == 656
             and self.nsa_index_topk == 2048
-            and self.nsa_index_kpool in (1, 16)
+            and self.nsa_index_kpool in (1, 4, 16)
             and self.real_page_size == 64
         )
         if lightop_decode_requested and lightop_decode_static_compatible:
