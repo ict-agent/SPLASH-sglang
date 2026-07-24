@@ -364,12 +364,18 @@ class EagleDraftWorker(BaseDraftWorker):
         is_nsa_draft_extend_backend = _is_nsa_attn_backend(
             self.draft_extend_attn_backend
         )
+        nsa_draft_extend_kpool = getattr(
+            self.draft_extend_attn_backend, "nsa_index_kpool", None
+        )
+        supports_nsa_draft_extend_graph = (
+            is_nsa_draft_extend_backend and nsa_draft_extend_kpool != 1
+        )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_dcu or _is_musa or is_cuda_draft_extend_device
         ) and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
-            or is_nsa_draft_extend_backend
+            or supports_nsa_draft_extend_graph
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -401,6 +407,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"is_cuda={_is_cuda}, is_dcu={_is_dcu}, is_musa={_is_musa}, is_npu={_is_npu}, "
                 f"is_hip={_is_hip}, is_cuda_draft_extend_device={is_cuda_draft_extend_device}, "
                 f"is_nsa_draft_extend_backend={is_nsa_draft_extend_backend}, "
+                f"nsa_index_kpool={nsa_draft_extend_kpool}, "
                 f"speculative_attention_mode={self.server_args.speculative_attention_mode}.",
             )
 

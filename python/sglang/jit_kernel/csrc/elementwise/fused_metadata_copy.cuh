@@ -563,6 +563,7 @@ struct FusedMetadataCopyKernel {
     int max_elements = std::max(
         {bs,
          params.page_indices_rows * max_seqlen_k,
+         HAS_REAL_PAGE_TABLE ? bs * params.real_page_table_cols : 0,
          seqlens_expanded_size,
          HAS_FLASHMLA ? (seqlens_expanded_size + 1) : 0,
          HAS_FLASHMLA ? params.flashmla_metadata_size : 0});
@@ -709,7 +710,10 @@ struct FusedMetadataCopyMultiKernel {
             HAS_FLASHMLA ? static_cast<int>(flashmla_metadata_src.numel()) : 0,
     };
 
-    dim3 grid = get_launch_config(bs * max_len);
+    int max_elements = std::max(
+        bs * max_len,
+        HAS_REAL_PAGE_TABLE ? bs * params.real_page_table_cols : 0);
+    dim3 grid = get_launch_config(max_elements);
     dim3 block(THREADS_PER_BLOCK);
     DLDevice device = cache_seqlens_src.device();
 

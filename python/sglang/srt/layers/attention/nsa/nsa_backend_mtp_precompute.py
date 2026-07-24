@@ -88,7 +88,7 @@ def _fill_decode_page_table_kernel(
         mask=valid,
         other=0,
     ).to(tl.int32)
-    tl.store(page_table + row * page_table_stride + cols, vals, mask=valid)
+    tl.store(page_table + row * page_table_stride + cols, vals, mask=in_bounds)
 
 
 def fill_decode_page_table_gpu(
@@ -97,15 +97,18 @@ def fill_decode_page_table_gpu(
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     bs: int,
+    max_fill_len: Optional[int] = None,
 ):
     """Fill decode page table from GPU seq_lens without materializing CPU lengths."""
     if bs == 0:
         return
     max_len = page_table.shape[1]
+    if max_fill_len is not None:
+        max_len = min(max_len, max_fill_len)
     if max_len == 0:
         return
-    # Only columns below each row's seq_len are part of the metadata contract.
-    # Leaving the tail untouched avoids clearing the graph-capture width on every replay.
+    # Keep the optimized launch shape, but zero the invalid tail inside the
+    # filled window so page-table transforms never consume uninitialized ids.
     block = 1024
     _fill_decode_page_table_kernel[(bs, triton.cdiv(max_len, block))](
         req_to_token,
@@ -161,9 +164,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # Dispatch to mode-specific precomputation
         if forward_mode.is_decode_or_idle():
-            return self._precompute_decode_mode(
-                bs, req_pool_indices, seq_lens
-            )
+            return self._precompute_decode_mode(bs, req_pool_indices, seq_lens)
         elif forward_mode.is_target_verify():
             assert seq_lens_cpu is not None
             return self._precompute_target_verify_mode(
@@ -190,12 +191,17 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # Get page indices from cache on device. The shape is the captured graph
         # width; the kernel masks each row by GPU seq_lens.
-        max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+        metadata = self.decode_cuda_graph_metadata[bs]
+        max_len = metadata.page_table_1.shape[1]
         page_indices = torch.empty(
             (bs, max_len), dtype=torch.int32, device=seq_lens.device
         )
         fill_decode_page_table_gpu(
-            self.req_to_token, req_pool_indices, seq_lens, page_indices, bs
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_indices,
+            bs,
         )
 
         # Compute NSA seqlens
