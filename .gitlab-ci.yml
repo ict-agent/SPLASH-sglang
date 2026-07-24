@@ -188,7 +188,7 @@ build_image:
 
       # ---- 构建镜像 (Dockerfile 现装依赖栈 + 本仓库 whl) ----
       source image.env
-      docker build --network=host --build-arg BASE_IMAGE="${BASE_IMAGE}" --build-arg TORCH_VERSION="${TORCH_VERSION}" -t "${FULL_IMAGE}" -f docker/shca17.Dockerfile .
+      docker build --no-cache --network=host --build-arg BASE_IMAGE="${BASE_IMAGE}" --build-arg TORCH_VERSION="${TORCH_VERSION}" -t "${FULL_IMAGE}" -f docker/shca17.Dockerfile .
 
       # ---- 起带设备的容器执行 vllm-hcu-apply-patches, 再 commit 回镜像 (补丁烘进镜像) ----
       #      docker build 无设备访问, apply-patches 需要 /dev/kfd, 故用 run+exec+commit
