@@ -2083,6 +2083,7 @@ class NativeSparseAttnBackend(
                         metadata.page_table_1,
                         topk_indices,
                         extend_lens_cpu,
+                        page_table_row_indices=metadata.token_to_batch_idx
                     )
 
         # todo hisparse: to cover more backends
@@ -3049,6 +3050,7 @@ class NativeSparseAttnBackend(
                 metadata.page_table_1,
                 topk_indices,
                 extend_lens_cpu,
+                page_table_row_indices=metadata.token_to_batch_idx,
             )
         else:
             page_table_1 = self._transform_decode_topk_indices(
@@ -3189,19 +3191,11 @@ class NativeSparseAttnBackend(
             f"nsa_decode_impl={self.nsa_decode_impl}, uses_logical_indices={uses_logical_indices}"
         )
 
-        localized = (
-            transform_index_page_table_decode(
-                page_table=page_table,
-                topk_indices=topk_indices[:page_table_rows],
-                page_size=1,
-            )
-            if page_table_rows > 0
-            else topk_indices[:0]
+        return transform_index_page_table_decode(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            page_size=1,
         )
-        padding = localized.new_full(
-            (topk_rows - page_table_rows, *topk_indices.shape[1:]), -1
-        )
-        return torch.cat([localized, padding], dim=0)
 
     def _transform_prefill_topk_indices(
         self,
@@ -3209,6 +3203,7 @@ class NativeSparseAttnBackend(
         page_table: torch.Tensor,
         topk_indices: torch.Tensor,
         extend_lens_cpu: List[int],
+        page_table_row_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Localize prefill indices while preserving synthetic padded q rows."""
         described_rows = sum(extend_lens_cpu)
