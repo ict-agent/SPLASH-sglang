@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip install --no-cache-dir torch==${TORCH_VERSION} flash_mla && \
     pip install --no-cache-dir torch==${TORCH_VERSION} fastsafetensors && \
     pip install --no-cache-dir torch==${TORCH_VERSION} sglang-router && \
+    pip install --no-cache-dir triton==3.6.0 && \
     pip install --no-cache-dir numpy==1.25.0 && \
     pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator && \
     pip install --no-cache-dir "fastapi==0.115.12" "starlette==0.46.2" "prometheus-fastapi-instrumentator==7.1.0" && \
@@ -57,6 +58,7 @@ RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
 COPY rocblas-install/ /opt/rocblas-install/
 COPY hipblaslt-install/ /opt/hipblaslt-install/
 ENV LD_LIBRARY_PATH=/opt/rocblas-install/lib:/opt/hipblaslt-install/lib:${LD_LIBRARY_PATH}
+RUN echo 'export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH' >> /root/.bashrc
 
 # ---------------------------------------------------------------------------
 # layer 3: 装入 CI 编译出的本仓库 whl (sgl-kernel / sglang)
@@ -66,6 +68,7 @@ RUN pip install --no-cache-dir /tmp/wheelhouse/*.whl && \
     pip install --no-cache-dir "sglang[diffusion]==${SGLANG_VERSION}" && \
     pip install --no-cache-dir numpy==1.25.0 && \
     rm -rf /tmp/wheelhouse && \
+    pip install --no-cache-dir transformers==5.3.0 && \
     pip cache purge && \
     source /opt/dtk/env.sh && \
     python -c "import sgl_kernel; import sglang; import sglang_router; print('sglang', sglang.__version__)"
