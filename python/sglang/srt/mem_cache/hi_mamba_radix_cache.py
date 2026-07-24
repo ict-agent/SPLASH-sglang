@@ -41,7 +41,17 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     TreeNode,
     get_last_access_time,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    NSATokenToKVPool,
+)
+from sglang.srt.mem_cache.memory_pool_host import (
+    NSATokenToKVPoolHost,
+    NSATokenToKVPoolHostShared,
+    NSATokenToKVPoolHostSharedLayerGroup,
+    PoolEntry,
+)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
@@ -179,6 +189,8 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_host_leaves: set[TreeNode] = set()
         self.mamba_host_lru_list = HostLRUList()
 
+        self.extra_hicache_entries: list[PoolEntry] = []
+
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -232,6 +244,123 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         super().reset()
 
+    def register_mtp_hicache_pools(
+        self,
+        mtp_kv_pools: list[NSATokenToKVPool],
+        server_args: "ServerArgs",
+    ) -> None:
+        """Register MTP draft KV pool for HiMambaRadixCache."""
+        if not mtp_kv_pools or not isinstance(self.kvcache, NSATokenToKVPool):
+            return
+
+        # Unwrap HybridLinearKVPool (GLM5 Next hybrid model) to inner NSA pool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        unwrapped = []
+        for pool in mtp_kv_pools:
+            if isinstance(pool, HybridLinearKVPool):
+                pool = pool.full_kv_pool
+            unwrapped.append(pool)
+        mtp_kv_pools = unwrapped
+
+        mtp_host_to_device_ratio = (
+            self.full_kv_pool_host.size / self.kvcache.size
+        )
+
+        seen = {id(entry.device_pool) for entry in self.extra_hicache_entries}
+        offset = sum(e.device_pool.layer_num for e in self.extra_hicache_entries)
+        added = False
+        for pool in mtp_kv_pools:
+            if id(pool) in seen:
+                continue
+            if pool.layer_num == 1:
+                # MTP draft pool: a single layer reused across speculative
+                # steps, so there is no layer dimension to shard. Skip both
+                # shared variants and use a per-rank plain host pool (same
+                # model as the per-rank private MambaPoolHost).
+                host_pool = NSATokenToKVPoolHost(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            elif server_args.glm_nsa_shared_hicache:
+                host_pool = NSATokenToKVPoolHostShared(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            elif server_args.glm_nsa_shared_layer_group_hicache:
+                host_pool = NSATokenToKVPoolHostSharedLayerGroup(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            else:
+                host_pool = NSATokenToKVPoolHost(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            start, layer_num = offset, pool.layer_num
+            self.extra_hicache_entries.append(
+                PoolEntry(
+                    name=f"mtp_{len(self.extra_hicache_entries)}",
+                    host_pool=host_pool,
+                    device_pool=pool,
+                    layer_mapper=(
+                        lambda i, s=start, n=layer_num: (i - s)
+                        if s <= i < s + n
+                        else None
+                    ),
+                )
+            )
+            offset += pool.layer_num
+            seen.add(id(pool))
+            added = True
+
+        if not added:
+            return
+        logger.info("MTP HiCache registered: %d pools, entries=%s", len(self.extra_hicache_entries), [e.name for e in self.extra_hicache_entries])
+
+        # Rebuild host_pool_group with MTP entries
+        if hasattr(self, "host_pool_group") and self.host_pool_group is not None:
+            new_entries = list(self.host_pool_group.entries) + self.extra_hicache_entries
+            from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+            self.host_pool_group = HostPoolGroup(new_entries)
+            self.cache_controller.mem_pool_host = self.host_pool_group
+
+        if self.enable_storage and self.cache_controller.storage_backend is not None:
+            for entry in self.extra_hicache_entries:
+                self.cache_controller.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+
+    def _mtp_pool_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.extra_hicache_entries:
+            return None
+        return [PoolTransfer(name=entry.name) for entry in self.extra_hicache_entries]
+
+    def _merge_mtp_if_needed(
+        self, existing: Optional[list[PoolTransfer]] = None
+    ) -> Optional[list[PoolTransfer]]:
+        mtp = self._mtp_pool_transfers()
+        if mtp:
+            return (existing or []) + mtp
+        return existing
+
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
@@ -246,7 +375,8 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.mamba_host_lru_list.in_list(node):
                 self.mamba_host_lru_list.reset_node_mru(node)
 
-        extra_pools = self.mamba_backup_transfers(node)
+        mamba_pools = self.mamba_backup_transfers(node)
+        extra_pools = self._merge_mtp_if_needed(mamba_pools)
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -254,6 +384,13 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         if host_indices is None:
             self.evict_host(len(node.value))
+            # Rebuild the transfer lists for the retry: a failed write() has
+            # already bound (now-freed) primary host indices onto the MTP
+            # transfers via _bind_primary_indices, and stale bindings are
+            # skipped—not rebound—on the next attempt, so reusing the list
+            # would back up MTP data into freed slots.
+            mamba_pools = self.mamba_backup_transfers(node)
+            extra_pools = self._merge_mtp_if_needed(mamba_pools)
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
@@ -261,8 +398,13 @@ class HiMambaRadixCache(MambaRadixCache):
             )
         if host_indices is not None:
             node.host_value = host_indices.clone()
-            if extra_pools is not None:
-                self.mamba_backup_commit(node, extra_pools)
+            # Commit only the mamba transfers: extra_pools may start with an
+            # MTP transfer (when the node has no mamba state), and
+            # mamba_backup_commit blindly reads transfers[0].host_indices —
+            # committing MTP-bound (main-KV) indices as mamba_host_value would
+            # create a phantom mamba backup and corrupt later restores.
+            if mamba_pools is not None:
+                self.mamba_backup_commit(node, mamba_pools)
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
@@ -321,10 +463,11 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_pools = self.mamba_restore_transfers(
             last_hit_node, mamba_restore_nodes, req
         )
+        extra_load_pools = self._merge_mtp_if_needed(mamba_pools)
         full_device_indices = self.cache_controller.load(
             host_indices=full_host_indices,
             node_id=last_hit_node.id,
-            extra_pools=mamba_pools,
+            extra_pools=extra_load_pools,
         )
         if full_device_indices is None:
             if len(full_host_indices) > 0:
@@ -333,10 +476,11 @@ class HiMambaRadixCache(MambaRadixCache):
             mamba_pools = self.mamba_restore_transfers(
                 last_hit_node, mamba_restore_nodes, req
             )
+            extra_load_pools = self._merge_mtp_if_needed(mamba_pools)
             full_device_indices = self.cache_controller.load(
                 host_indices=full_host_indices,
                 node_id=last_hit_node.id,
-                extra_pools=mamba_pools,
+                extra_pools=extra_load_pools,
             )
         self.dec_lock_ref(ancestor_node)
         if full_device_indices is None:
@@ -2091,9 +2235,10 @@ class HiMambaRadixCache(MambaRadixCache):
         self, node: TreeNode, transfers: list[PoolTransfer]
     ) -> None:
         # store auto-allocated mamba host indices into the node after D→H backup
-        if not transfers:
-            return
-        host_indices = transfers[0].host_indices
+        host_indices = next(
+            (t.host_indices for t in transfers or [] if t.name == PoolName.MAMBA),
+            None,
+        )
         if node.mamba_host_value is None and host_indices is not None:
             node.mamba_host_value = host_indices.clone()
             self.mamba_host_lru_list.insert_mru(node)

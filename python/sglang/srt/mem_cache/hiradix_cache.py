@@ -38,16 +38,20 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_nsa_pool_to_hiradix_cache,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    NSATokenToKVPoolHost,
     NSATokenToKVPoolHostShared,
     NSATokenToKVPoolHostSharedLayerGroup,
+    PoolEntry,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -149,6 +153,8 @@ class HiRadixCache(RadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        self.extra_hicache_entries: list[PoolEntry] = []
+
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
             attach_hybrid_nsa_pool_to_hiradix_cache(
@@ -231,6 +237,137 @@ class HiRadixCache(RadixCache):
                 waited = True
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
+
+    def register_mtp_hicache_pools(
+        self,
+        mtp_kv_pools: list[NSATokenToKVPool],
+        server_args: "ServerArgs",
+    ) -> None:
+        """Register MTP draft KV pools so HiCache moves draft KV with the main KV."""
+        if not mtp_kv_pools or not isinstance(self.kv_cache, NSATokenToKVPool):
+            return
+
+        # Unwrap HybridLinearKVPool (GLM5 Next hybrid model) to inner NSA pool
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        unwrapped = []
+        for pool in mtp_kv_pools:
+            if isinstance(pool, HybridLinearKVPool):
+                pool = pool.full_kv_pool
+            unwrapped.append(pool)
+        mtp_kv_pools = unwrapped
+
+        mtp_host_to_device_ratio = (
+            self.token_to_kv_pool_host.size / self.kv_cache.size
+            if hasattr(self, "token_to_kv_pool_host") and self.token_to_kv_pool_host is not None
+            else server_args.hicache_ratio
+        )
+
+        seen = {id(entry.device_pool) for entry in self.extra_hicache_entries}
+        offset = sum(e.device_pool.layer_num for e in self.extra_hicache_entries)
+        added = False
+        for pool in mtp_kv_pools:
+            if id(pool) in seen:
+                continue
+            if pool.layer_num == 1:
+                # MTP draft pool: a single layer reused across speculative
+                # steps, so there is no layer dimension to shard. Skip both
+                # shared variants and use a per-rank plain host pool (same
+                # model as the per-rank private MambaPoolHost).
+                host_pool = NSATokenToKVPoolHost(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            elif server_args.glm_nsa_shared_hicache:
+                host_pool = NSATokenToKVPoolHostShared(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            elif server_args.glm_nsa_shared_layer_group_hicache:
+                host_pool = NSATokenToKVPoolHostSharedLayerGroup(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    tp_group=self.tp_group,
+                )
+            else:
+                host_pool = NSATokenToKVPoolHost(
+                    pool,
+                    mtp_host_to_device_ratio,
+                    0,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            start, layer_num = offset, pool.layer_num
+            self.extra_hicache_entries.append(
+                PoolEntry(
+                    name=f"mtp_{len(self.extra_hicache_entries)}",
+                    host_pool=host_pool,
+                    device_pool=pool,
+                    layer_mapper=(
+                        lambda i, s=start, n=layer_num: (i - s)
+                        if s <= i < s + n
+                        else None
+                    ),
+                )
+            )
+            offset += pool.layer_num
+            seen.add(id(pool))
+            added = True
+
+        if not added:
+            return
+        logger.info(
+            "MTP HiCache registered: %d pools, entries=%s",
+            len(self.extra_hicache_entries),
+            [e.name for e in self.extra_hicache_entries],
+        )
+
+        main_layer_num = self.kv_cache.layer_num
+        # Preserve the existing HostPoolGroup's entries (kv + indexer) and
+        # append MTP entries. Do NOT wrap the whole old group under a single
+        # "kv" PoolEntry: the nested group's entry_map would hide the
+        # "indexer" entry, so INDEXER PoolTransfers get skipped and the main
+        # model's indexer is lost on L2 evict/restore.
+        if isinstance(self.token_to_kv_pool_host, HostPoolGroup):
+            base_entries = list(self.token_to_kv_pool_host.entries)
+        else:
+            base_entries = [
+                PoolEntry(
+                    name="kv",
+                    host_pool=self.token_to_kv_pool_host,
+                    device_pool=self.kv_cache,
+                    layer_mapper=(
+                        lambda i, n=main_layer_num: i if 0 <= i < n else None
+                    ),
+                    is_primary_index_anchor=True,
+                ),
+            ]
+        group = HostPoolGroup([*base_entries, *self.extra_hicache_entries])
+        self.cache_controller.mem_pool_host = group
+
+        if self.enable_storage and self.cache_controller.storage_backend is not None:
+            for entry in self.extra_hicache_entries:
+                self.cache_controller.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+
+    def _mtp_pool_transfers(self) -> Optional[list[PoolTransfer]]:
+        if not self.extra_hicache_entries:
+            return None
+        return [PoolTransfer(name=entry.name) for entry in self.extra_hicache_entries]
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -671,15 +808,17 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
+        pools = []
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pool = PoolTransfer(
+            pools.append(PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
                 indices_from_pool=PoolName.KV,
-            )
-            return {"extra_pools": [pool]}
-        else:
-            return {}
+            ))
+        mtp = self._mtp_pool_transfers()
+        if mtp:
+            pools.extend(mtp)
+        return {"extra_pools": pools} if pools else {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""

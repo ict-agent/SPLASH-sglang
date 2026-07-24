@@ -228,6 +228,24 @@ class HybridCacheController(BaseHiCacheController):
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    @staticmethod
+    def _bind_primary_indices(
+        extra_pools: Optional[list[PoolTransfer]],
+        *,
+        host_indices: Optional[torch.Tensor] = None,
+        device_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Bind MTP PoolTransfers to the primary pool's host/device indices.
+        Only binds pools where both indices are currently None (fresh MTP
+        transfers). Pools with pre-set indices (MAMBA, etc.) are skipped."""
+        for pool in extra_pools or []:
+            if pool.host_indices is not None or pool.device_indices is not None:
+                continue
+            if host_indices is not None:
+                pool.host_indices = host_indices
+            if device_indices is not None:
+                pool.device_indices = device_indices
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -238,6 +256,9 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
+        self._bind_primary_indices(
+            extra_pools, host_indices=host_indices, device_indices=device_indices
+        )
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
             alloc_host=True,
@@ -310,6 +331,9 @@ class HybridCacheController(BaseHiCacheController):
             if device_indices is None:
                 return None
 
+        self._bind_primary_indices(
+            extra_pools, host_indices=host_indices, device_indices=device_indices
+        )
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
             alloc_host=False,
@@ -396,6 +420,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
+        self._bind_primary_indices(extra_pools, host_indices=host_indices)
         operation = PrefetchOperation(
             request_id,
             host_indices,
@@ -415,6 +440,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
+        self._bind_primary_indices(extra_pools, host_indices=host_indices)
         operation = StorageOperation(
             host_indices,
             token_ids,

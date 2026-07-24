@@ -447,8 +447,35 @@ class Scheduler(
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
-        # Register draft KV pool (when spec + HiCache co-enabled).
-        self._maybe_register_hicache_draft()
+        # Register draft KV pool for HiCache. Two mutually exclusive paths:
+        #   * NSA draft pool + HiRadix/HiMambaRadixCache + GLM_USE_HICACHE_MTP_FIX
+        #     → HostPoolGroup/extra_pools path (lockstep MTP transfer).
+        #   * everything else (MHA/MLA draft pools, fix disabled, no hicache)
+        #     → legacy set_draft_kv_pool + has_draft path.
+        # Picking the new path also avoids allocating the unused legacy
+        # mem_pool_host_draft buffer (~1GB/rank), which HybridCacheController
+        # never reads.
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            NSATokenToKVPool,
+        )
+
+        draft_pool, _ = self._get_draft_kv_pool()
+        use_new_mtp_path = (
+            self.enable_hierarchical_cache
+            and self.draft_worker is not None
+            and envs.GLM_USE_HICACHE_MTP_FIX.get()
+            and isinstance(draft_pool, (NSATokenToKVPool, HybridLinearKVPool))
+            and isinstance(self.tree_cache, (HiRadixCache, HiMambaRadixCache))
+        )
+        if use_new_mtp_path:
+            # Register MTP draft KV pools through HiRadixCache (GLM-NSA + EAGLE-MTP).
+            self._register_mtp_hicache_pools(draft_pool)
+        else:
+            # Register draft KV pool (when spec + HiCache co-enabled).
+            self._maybe_register_hicache_draft()
 
         # Init running status
         self.init_running_status()
@@ -1072,6 +1099,14 @@ class Scheduler(
             return
 
         self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+
+    def _register_mtp_hicache_pools(self, draft_pool):
+        """Register MTP draft KV pools with HiRadixCache so hicache offload/load
+        moves the MTP KV in lockstep with the main KV. Caller has already
+        verified tree_cache type and pool type."""
+        if draft_pool is None:
+            return
+        self.tree_cache.register_mtp_hicache_pools([draft_pool], self.server_args)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []

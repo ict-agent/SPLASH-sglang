@@ -709,6 +709,9 @@ class Envs:
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # GLM
+    GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
+
+    # GLM
     # Max number of grammar cache entries per scheduler/rank.
     # < 0: unbounded caching (current default); 0: disables grammar caching.
     GLM_GRAMMAR_OBJECT_CACHE_MAX_COUNT = EnvInt(-1)

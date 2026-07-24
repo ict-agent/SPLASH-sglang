@@ -1787,6 +1787,7 @@ class MambaPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend="kernel",
+        pool_transfers=None,
     ):
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
@@ -3101,6 +3102,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend,
+        pool_transfers=None,
     ):
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
