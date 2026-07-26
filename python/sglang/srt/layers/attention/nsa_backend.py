@@ -2078,11 +2078,11 @@ class NativeSparseAttnBackend(
                         metadata,
                         topk_indices.shape[0],
                     )
-                    page_table_1 = transform_index_page_table_prefill(
-                        page_table=metadata.page_table_1,
-                        topk_indices=topk_indices,
-                        extend_lens_cpu=extend_lens_cpu,
-                        page_size=1,
+                    page_table_1 = self._transform_prefill_topk_indices(
+                        forward_batch,
+                        metadata.page_table_1,
+                        topk_indices,
+                        extend_lens_cpu,
                     )
 
         # todo hisparse: to cover more backends
@@ -3039,11 +3039,16 @@ class NativeSparseAttnBackend(
         if self._use_fused_topk(forward_batch):
             page_table_1 = topk_indices
         elif is_prefill:
-            page_table_1 = transform_index_page_table_prefill(
-                page_table=metadata.page_table_1,
-                topk_indices=topk_indices,
-                extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
-                page_size=1,
+            extend_lens_cpu = self._get_topk_transform_lens(
+                forward_batch,
+                metadata,
+                topk_indices.shape[0],
+            )
+            page_table_1 = self._transform_prefill_topk_indices(
+                forward_batch,
+                metadata.page_table_1,
+                topk_indices,
+                extend_lens_cpu,
             )
         else:
             page_table_1 = self._transform_decode_topk_indices(
@@ -3195,6 +3200,51 @@ class NativeSparseAttnBackend(
         )
         padding = localized.new_full(
             (topk_rows - page_table_rows, *topk_indices.shape[1:]), -1
+        )
+        return torch.cat([localized, padding], dim=0)
+
+    def _transform_prefill_topk_indices(
+        self,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        topk_indices: torch.Tensor,
+        extend_lens_cpu: List[int],
+    ) -> torch.Tensor:
+        """Localize prefill indices while preserving synthetic padded q rows."""
+        described_rows = sum(extend_lens_cpu)
+        topk_rows = topk_indices.shape[0]
+        if described_rows == topk_rows:
+            return transform_index_page_table_prefill(
+                page_table=page_table,
+                topk_indices=topk_indices,
+                extend_lens_cpu=extend_lens_cpu,
+                page_size=1,
+            )
+
+        assert described_rows <= topk_rows, (
+            "prefill page-table lengths describe more rows than top-k has: "
+            f"described_rows={described_rows}, topk_rows={topk_rows}, "
+            f"page_table_rows={page_table.shape[0]}, "
+            f"forward_mode={forward_batch.forward_mode}, "
+            f"effective_forward_mode={effective_forward_mode(forward_batch)}, "
+            f"planned_rows={getattr(forward_batch, 'forward_metadata_planned_num_tokens', None)}, "
+            f"planned_batch_size={getattr(forward_batch, 'forward_metadata_planned_bs', None)}"
+        )
+
+        localized = (
+            transform_index_page_table_prefill(
+                page_table=page_table,
+                topk_indices=topk_indices[:described_rows],
+                extend_lens_cpu=extend_lens_cpu,
+                page_size=1,
+            )
+            if described_rows > 0
+            else topk_indices.new_empty(
+                (0, *topk_indices.shape[1:]), dtype=torch.int32
+            )
+        )
+        padding = localized.new_full(
+            (topk_rows - described_rows, *topk_indices.shape[1:]), -1
         )
         return torch.cat([localized, padding], dim=0)
 

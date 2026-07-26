@@ -2475,6 +2475,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     stream = torch.get_device_module(self.device).current_stream()
                 stream.wait_event(draft_input.verify_done)
 
+    def _refresh_seq_lens_sum_from_reqs(self):
+        self.seq_lens_sum = sum(req.seqlen for req in self.reqs)
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2532,9 +2535,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = (
-            self.seq_lens_cpu.sum().item() if self.seq_lens_cpu is not None else None
-        )
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_sum = self.seq_lens_cpu.sum().item()
+        elif self.is_spec_v2:
+            self._refresh_seq_lens_sum_from_reqs()
+        else:
+            self.seq_lens_sum = None
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2598,7 +2604,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = None
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum = (
+        merged_seq_lens_sum = (
             self.seq_lens_sum + other.seq_lens_sum
             if self.seq_lens_sum is not None and other.seq_lens_sum is not None
             else None
@@ -2618,6 +2624,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
+        if merged_seq_lens_sum is not None:
+            self.seq_lens_sum = merged_seq_lens_sum
+        elif self.is_spec_v2 or other.is_spec_v2:
+            self._refresh_seq_lens_sum_from_reqs()
+        else:
+            self.seq_lens_sum = None
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
 
