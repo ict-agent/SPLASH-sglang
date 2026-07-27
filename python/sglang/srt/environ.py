@@ -459,6 +459,7 @@ class Envs:
     # sparse KV cache into contiguous BF16 before flash_mla_with_kvcache.
     SGLANG_NSA_DCU_USE_LIGHTOP_DECODE_GATHER = EnvBool(False)
     SGLANG_NSA_KPOOL_LIGHTOP_TOPK = EnvBool(False)
+    SGLANG_NSA_KPOOL_AITER_TOPK = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_NSA_DCU_MQA_LOGITS_WORKSPACE_GB = EnvFloat(2.0)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)

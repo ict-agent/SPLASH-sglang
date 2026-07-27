@@ -73,6 +73,16 @@ if is_dcu():
     if not envs.SGLANG_NSA_KPOOL_LIGHTOP_TOPK.get():
         _lightop_kpool_topk = None
 
+    if envs.SGLANG_NSA_KPOOL_AITER_TOPK.get():
+        try:
+            import aiter
+
+            _aiter_kpool_topk = aiter.kpool_topk
+        except (ImportError, AttributeError):
+            _aiter_kpool_topk = None
+    else:
+        _aiter_kpool_topk = None
+
 if is_cuda():
     try:
         import deep_gemm
@@ -609,6 +619,51 @@ class IndexerKPool(Indexer):
         group_topk = self.index_topk // self.index_kpool
         supported_group_topk = (128, 160, 192, 224, 256, 512, 2048)
         deterministic = get_global_server_args().enable_deterministic_inference
+
+        if (
+            allow_lightop_topk
+            and not deterministic
+            and is_dcu()
+            and _aiter_kpool_topk is not None
+            and self.index_kpool in (4, 16)
+            and self.index_topk == 2048
+            and seq_lens is not None
+        ):
+            def as_i32(
+                tensor: Optional[torch.Tensor],
+            ) -> Optional[torch.Tensor]:
+                if tensor is None:
+                    return None
+                return tensor.to(dtype=torch.int32).contiguous()
+
+            topk_indices = _aiter_kpool_topk(
+                score=logits,
+                lengths=as_i32(pool_lens),
+                pool_size=self.index_kpool,
+                topk=self.index_topk,
+                page_table=page_table,
+                topk_indices_offset=as_i32(topk_offsets),
+                row_starts=as_i32(row_starts),
+                seq_lens=as_i32(seq_lens),
+                page_table_row_index=as_i32(page_table_row_index),
+            )
+            if out_rows is None or topk_indices.shape[0] == out_rows:
+                return topk_indices
+
+            assert topk_indices.shape[0] < out_rows
+            return torch.cat(
+                (
+                    topk_indices,
+                    torch.full(
+                        (out_rows - topk_indices.shape[0], topk_indices.shape[1]),
+                        -1,
+                        dtype=topk_indices.dtype,
+                        device=topk_indices.device,
+                    ),
+                ),
+                dim=0,
+            )
+
         if (
             allow_lightop_topk
             and not deterministic
