@@ -57,7 +57,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_dcu, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_dcu, is_mps, is_npu, is_xpu,get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_dcu = is_dcu()
@@ -71,11 +71,13 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_lf_D2H_dcu,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
         transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_lf_lf_H2D_dcu,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
@@ -84,7 +86,7 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
-
+_use_hicache_optimization_kernel = get_bool_env_var("SGLANG_USE_HICACHE_OPTIMIZATION_KERNEL", default="true")
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
@@ -370,6 +372,7 @@ class HostKVCache(abc.ABC):
             for layer_id in range(layer_num)
             if self._is_device_layer_owned(device_pool, layer_id)
         ]
+
 
     @abc.abstractmethod
     def init_kv_buffer(self):
@@ -1164,6 +1167,15 @@ class MLATokenToKVPoolHost(HostKVCache):
             return
         if io_backend == "kernel":
             if self.layout == "layer_first":
+                kernel_name = (
+                    "jit_transfer_hicache_one_layer_mla"
+                    if self.can_use_jit
+                    else (
+                        "transfer_kv_per_layer_mla_lf_lf_H2D_dcu"
+                        if _use_hicache_optimization_kernel
+                        else "transfer_kv_per_layer_mla"
+                    )
+                )
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[layer_id],
@@ -1173,13 +1185,23 @@ class MLATokenToKVPoolHost(HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    transfer_kv_per_layer_mla(
-                        src=self.kv_buffer[layer_id],
-                        dst=device_pool.kv_buffer[layer_id],
-                        src_indices=host_indices,
-                        dst_indices=device_indices,
-                        item_size=self.token_stride_size,
-                    )
+                    if _use_hicache_optimization_kernel:
+                        transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                            src=self.kv_buffer[layer_id],
+                            dst=device_pool.kv_buffer[layer_id],
+                            src_indices=host_indices,
+                            dst_indices=device_indices,
+                            item_size=self.token_stride_size,
+                            page_size=self.page_size,
+                        )
+                    else:
+                        transfer_kv_per_layer_mla(
+                            src=self.kv_buffer[layer_id],
+                            dst=device_pool.kv_buffer[layer_id],
+                            src_indices=host_indices,
+                            dst_indices=device_indices,
+                            item_size=self.token_stride_size,
+                        )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
@@ -1256,13 +1278,23 @@ class MLATokenToKVPoolHost(HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 else:
-                    transfer_kv_per_layer_mla(
-                        src=device_pool.kv_buffer[layer_id],
-                        dst=self.kv_buffer[layer_id],
-                        src_indices=device_indices,
-                        dst_indices=host_indices,
-                        item_size=self.token_stride_size,
-                    )
+                    if _use_hicache_optimization_kernel:
+                        transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                            src=device_pool.kv_buffer[layer_id],
+                            dst=self.kv_buffer[layer_id],
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                            page_size=self.page_size,
+                        )
+                    else:
+                        transfer_kv_per_layer_mla(
+                            src=device_pool.kv_buffer[layer_id],
+                            dst=self.kv_buffer[layer_id],
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                        )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
@@ -1322,14 +1354,24 @@ class MLATokenToKVPoolHost(HostKVCache):
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
                 else:
-                    transfer_kv_all_layer_mla(
-                        src_layers=device_pool.data_ptrs,
-                        dst_layers=self.data_ptrs,
-                        src_indices=device_indices,
-                        dst_indices=host_indices,
-                        item_size=self.token_stride_size,
-                        num_layers=self.layer_num,
-                    )
+                    if _use_hicache_optimization_kernel:
+                        transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+                            src_layers=device_pool.data_ptrs,
+                            dst_layers=self.data_ptrs,
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                            num_layers=self.layer_num,
+                        )
+                    else:
+                        transfer_kv_all_layer_mla(
+                            src_layers=device_pool.data_ptrs,
+                            dst_layers=self.data_ptrs,
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                            num_layers=self.layer_num,
+                        )
             elif self.layout == "page_first":
                 if self.can_use_jit:
                     jit_transfer_hicache_all_layer_mla(
@@ -1687,13 +1729,29 @@ class MambaPoolHost(HostKVCache):
             # TODO: Rename the interface for clarity.
             # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
             # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
-            transfer_kv_per_layer_mla(
-                src=src,
-                dst=dst,
-                src_indices=src_indices,
-                dst_indices=dst_indices,
-                item_size=MambaPoolHost._item_size_per_index(src),
-            )
+            # 目前只有H2D的情况使用transfer_kv_per_layer_mla_lf_lf_H2D_dcu接口，D2H的per_layer transfer没有什么优化空间还是走原来的transfer_kv_per_layer_mla
+            if (
+                _is_dcu
+                and _use_hicache_optimization_kernel
+                and not src.is_cuda
+                and dst.is_cuda
+            ):
+                transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    item_size=MambaPoolHost._item_size_per_index(src),
+                    page_size=1,
+                )
+            else:  
+                transfer_kv_per_layer_mla(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    item_size=MambaPoolHost._item_size_per_index(src),
+                )
         elif io_backend == "direct":
             transfer_kv_direct(
                 src_layers=[src],
@@ -2787,13 +2845,25 @@ class NSAIndexerPoolHost(HostKVCache):
         device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         if use_kernel:
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[layer_id],
-                    dst=device_index_k_cache[layer_id],
-                    src_indices=host_page_indices,
-                    dst_indices=device_page_indices,
-                    item_size=self.indexer_page_stride_size,
-                )
+                if _use_hicache_optimization_kernel:
+                    transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                        src=self.index_k_with_scale_buffer[layer_id],
+                        dst=device_index_k_cache[layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                        # Indices above are already page/item ids; do not page
+                        # them a second time inside the shared kernel entry.
+                        page_size=1,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=self.index_k_with_scale_buffer[layer_id],
+                        dst=device_index_k_cache[layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
@@ -2839,13 +2909,23 @@ class NSAIndexerPoolHost(HostKVCache):
         device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         if use_kernel:
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=device_index_k_cache[layer_id],
-                    dst=self.index_k_with_scale_buffer[layer_id],
-                    src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
-                    item_size=self.indexer_page_stride_size,
-                )
+                if _use_hicache_optimization_kernel:
+                    transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                        src=device_index_k_cache[layer_id],
+                        dst=self.index_k_with_scale_buffer[layer_id],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                        page_size=1,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=device_index_k_cache[layer_id],
+                        dst=self.index_k_with_scale_buffer[layer_id],
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
             elif self.layout == "page_first":
                 raise ValueError(
                     "Layer-sharded NSA indexer HiCache backup with page_first "
@@ -2886,14 +2966,24 @@ class NSAIndexerPoolHost(HostKVCache):
         device_index_k_cache = self._get_device_index_k_cache_for_transfer(device_pool)
         if use_kernel:
             if self.layout == "layer_first":
-                transfer_kv_all_layer_mla(
-                    src_layers=self.index_k_device_ptrs,
-                    dst_layers=self.index_k_data_ptrs,
-                    src_indices=device_page_indices,
-                    dst_indices=host_page_indices,
-                    item_size=self.indexer_page_stride_size,
-                    num_layers=self.layer_num,
-                )
+                if _use_hicache_optimization_kernel:
+                    transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+                        src_layers=self.index_k_device_ptrs,
+                        dst_layers=self.index_k_data_ptrs,
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                        num_layers=self.layer_num,
+                    )
+                else:
+                    transfer_kv_all_layer_mla(
+                        src_layers=self.index_k_device_ptrs,
+                        dst_layers=self.index_k_data_ptrs,
+                        src_indices=device_page_indices,
+                        dst_indices=host_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=self.index_k_device_ptrs,
@@ -3396,13 +3486,24 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
         device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
 
         if io_backend == "kernel":
-            transfer_kv_per_layer_mla(
-                src=self.index_k_with_scale_buffer[layer_id],
-                dst=device_index_k_cache[layer_id],
-                src_indices=page_indices_host,
-                dst_indices=page_indices_device,
-                item_size=item_size,
-            )
+            if _use_hicache_optimization_kernel:
+                transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                    src=self.index_k_with_scale_buffer[layer_id],
+                    dst=device_index_k_cache[layer_id],
+                    src_indices=page_indices_host,
+                    dst_indices=page_indices_device,
+                    item_size=item_size,
+                    # page_indices_* are already divided by self.page_size.
+                    page_size=1,
+                )
+            else:
+                transfer_kv_per_layer_mla(
+                    src=self.index_k_with_scale_buffer[layer_id],
+                    dst=device_index_k_cache[layer_id],
+                    src_indices=page_indices_host,
+                    dst_indices=page_indices_device,
+                    item_size=item_size,
+                )
         elif io_backend == "direct":
             transfer_kv_direct(
                 src_layers=[self.index_k_with_scale_buffer[layer_id]],
@@ -3431,14 +3532,24 @@ class NSATokenToKVPoolHostShared(NSATokenToKVPoolHost):
             item_size = self.index_stride_size * self.indexer_slots_per_pool_page
 
             if io_backend == "kernel":
-                transfer_kv_all_layer_mla(
-                    src_layers=self.index_k_device_ptrs,
-                    dst_layers=self.index_data_ptrs,
-                    src_indices=page_indices_device,
-                    dst_indices=page_indices_host,
-                    item_size=item_size,
-                    num_layers=self.layer_num,
-                )
+                if _use_hicache_optimization_kernel:
+                    transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+                        src_layers=self.index_k_device_ptrs,
+                        dst_layers=self.index_data_ptrs,
+                        src_indices=page_indices_device,
+                        dst_indices=page_indices_host,
+                        item_size=item_size,
+                        num_layers=self.layer_num,
+                    )
+                else:
+                    transfer_kv_all_layer_mla(
+                        src_layers=self.index_k_device_ptrs,
+                        dst_layers=self.index_data_ptrs,
+                        src_indices=page_indices_device,
+                        dst_indices=page_indices_host,
+                        item_size=item_size,
+                        num_layers=self.layer_num,
+                    )
             elif io_backend == "direct":
                 device_index_k_cache = self._get_index_device_cache_for_transfer(
                     device_pool
@@ -3911,13 +4022,29 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
         device_index_k_cache = self._get_index_device_cache_for_transfer(device_pool)
 
         if io_backend == "kernel":
-            transfer_kv_per_layer_mla(
-                src=self.index_k_with_scale_buffer[layer_id],
-                dst=device_index_k_cache[layer_id],
-                src_indices=page_indices_host,
-                dst_indices=page_indices_device,
-                item_size=item_size,
+            kernel_name = (
+                "transfer_kv_per_layer_mla_lf_lf_H2D_dcu"
+                if _use_hicache_optimization_kernel
+                else "transfer_kv_per_layer_mla"
             )
+            if _use_hicache_optimization_kernel:
+                transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+                    src=self.index_k_with_scale_buffer[layer_id],
+                    dst=device_index_k_cache[layer_id],
+                    src_indices=page_indices_host,
+                    dst_indices=page_indices_device,
+                    item_size=item_size,
+                    # page_indices_* are already divided by self.page_size.
+                    page_size=1,
+                )
+            else:
+                transfer_kv_per_layer_mla(
+                    src=self.index_k_with_scale_buffer[layer_id],
+                    dst=device_index_k_cache[layer_id],
+                    src_indices=page_indices_host,
+                    dst_indices=page_indices_device,
+                    item_size=item_size,
+                )
         elif io_backend == "direct":
             transfer_kv_direct(
                 src_layers=[self.index_k_with_scale_buffer[layer_id]],
@@ -3947,15 +4074,24 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             dst_ptrs = self.data_ptrs[
                 self.my_rel_start : self.my_rel_end
             ].contiguous()
-
-            transfer_kv_all_layer_mla(
-                src_layers=src_ptrs,
-                dst_layers=dst_ptrs,
-                src_indices=device_indices,
-                dst_indices=host_indices,
-                item_size=self.token_stride_size,
-                num_layers=self.my_num_layers,
-            )
+            if _use_hicache_optimization_kernel:
+                transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+                    src_layers=src_ptrs,
+                    dst_layers=dst_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    num_layers=self.my_num_layers,
+                )
+            else:
+                transfer_kv_all_layer_mla(
+                    src_layers=src_ptrs,
+                    dst_layers=dst_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    num_layers=self.my_num_layers,
+                )
         elif io_backend == "direct":
             src_layers = [
                 device_pool.kv_buffer[i]
@@ -3985,15 +4121,24 @@ class NSATokenToKVPoolHostSharedLayerGroup(NSATokenToKVPoolHost):
             dst_ptrs = self.index_data_ptrs[
                 self.my_rel_start : self.my_rel_end
             ].contiguous()
-
-            transfer_kv_all_layer_mla(
-                src_layers=src_ptrs,
-                dst_layers=dst_ptrs,
-                src_indices=page_indices_device,
-                dst_indices=page_indices_host,
-                item_size=item_size,
-                num_layers=self.my_num_layers,
-            )
+            if _use_hicache_optimization_kernel:
+                transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+                    src_layers=src_ptrs,
+                    dst_layers=dst_ptrs,
+                    src_indices=page_indices_device,
+                    dst_indices=page_indices_host,
+                    item_size=item_size,
+                    num_layers=self.my_num_layers,
+                )
+            else:
+                transfer_kv_all_layer_mla(
+                    src_layers=src_ptrs,
+                    dst_layers=dst_ptrs,
+                    src_indices=page_indices_device,
+                    dst_indices=page_indices_host,
+                    item_size=item_size,
+                    num_layers=self.my_num_layers,
+                )
         elif io_backend == "direct":
             device_index_k_cache = self._get_index_device_cache_for_transfer(
                 device_pool

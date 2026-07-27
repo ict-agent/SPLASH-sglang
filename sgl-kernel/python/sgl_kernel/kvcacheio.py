@@ -312,6 +312,47 @@ def transfer_kv_per_layer_mla_pf_lf(
         num_warps_per_block,
     )
 
+def transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    page_size: int,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_mla_lf_lf_H2D_dcu.default(
+        src,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size,
+        page_size,
+        num_warps_per_block,
+    )
+
+def transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+    src_layers: torch.Tensor,
+    dst_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    num_layers: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_lf_D2H_dcu.default(
+        src_layers,
+        dst_layers,
+        src_indices,
+        dst_indices,
+        item_size,
+        num_layers,
+        block_quota,
+        num_warps_per_block,
+    )
+
+
 
 def transfer_kv_all_layer_mla(
     src_layers: torch.Tensor,

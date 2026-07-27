@@ -3647,8 +3647,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
         src_tensor = (
             local_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        transfer_counter = layer_transfer_counter or self.layer_transfer_counter
+        transfer_idx = (
+            layer_transfer_idx if layer_transfer_idx is not None else local_idx
+        )
 
         if self.layer_broadcast_comm is None:
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
             self._broadcast_tensor_from_owner(
                 remote_buffer,
                 layer_id,
@@ -3661,8 +3667,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_broadcast_stream):
-            if layer_transfer_counter is not None and layer_transfer_idx is not None:
-                layer_transfer_counter.wait_until(layer_transfer_idx)
+            if transfer_counter is not None:
+                transfer_counter.wait_until(transfer_idx)
             self._broadcast_tensor_from_owner(
                 remote_buffer,
                 layer_id,

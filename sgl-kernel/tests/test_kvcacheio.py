@@ -7,12 +7,15 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_lf_D2H_dcu,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
+    transfer_kv_per_layer_mla_lf_lf_H2D_dcu,
 )
 
+from sglang.srt.mem_cache.memory_pool_host import kernel_accessible_host_ptr
 from sglang.srt.utils import get_cuda_version, is_hip
 
 # Skip entire module on CUDA 13.x — segfaults in transfer_kv kernel.
@@ -25,6 +28,142 @@ pytestmark = pytest.mark.skipif(
 
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
+
+
+@pytest.mark.skipif(not is_hip(), reason="DCU H2D optimization requires HIP")
+@pytest.mark.parametrize("num_pages", [1, 4, 16])
+def test_transfer_kv_per_layer_mla_lf_lf_h2d_dcu(num_pages: int):
+    page_size = 64
+    token_elements = 328
+    item_size = token_elements * torch.bfloat16.itemsize
+    total_pages = 2 * num_pages + 2
+    total_tokens = total_pages * page_size
+
+    src_pool = torch.randn(
+        total_tokens, token_elements, dtype=torch.bfloat16
+    ).pin_memory()
+    dst_pool = torch.zeros(
+        total_tokens, token_elements, dtype=torch.bfloat16, device="cuda"
+    )
+    dst_ref = torch.zeros_like(dst_pool)
+
+    src_pages = torch.arange(num_pages, dtype=torch.int64) * 2
+    dst_pages = torch.arange(num_pages, dtype=torch.int64) * 2 + 1
+    page_offsets = torch.arange(page_size, dtype=torch.int64)
+    src_indices_host = (src_pages[:, None] * page_size + page_offsets).reshape(-1)
+    dst_indices_host = (dst_pages[:, None] * page_size + page_offsets).reshape(-1)
+    src_indices = src_indices_host.to("cuda")
+    dst_indices = dst_indices_host.to("cuda")
+
+    ref_copy_with_indices(
+        src_pool, dst_ref, src_indices_host, dst_indices
+    )
+    transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+        src=src_pool,
+        dst=dst_pool,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size,
+        page_size=page_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(dst_pool, dst_ref)
+
+
+@pytest.mark.skipif(not is_hip(), reason="DCU H2D optimization requires HIP")
+@pytest.mark.parametrize("num_items", [1, 17, 128])
+def test_transfer_kv_per_layer_mla_lf_lf_h2d_dcu_indexer(num_items: int):
+    item_elements = 264
+    item_size = item_elements * torch.bfloat16.itemsize
+    total_items = 2 * num_items + 2
+
+    src_pool = torch.randn(
+        total_items, item_elements, dtype=torch.bfloat16
+    ).pin_memory()
+    dst_pool = torch.zeros(
+        total_items, item_elements, dtype=torch.bfloat16, device="cuda"
+    )
+    dst_ref = torch.zeros_like(dst_pool)
+
+    src_indices_host = torch.arange(num_items, dtype=torch.int64) * 2
+    dst_indices_host = torch.arange(num_items, dtype=torch.int64) * 2 + 1
+    src_indices = src_indices_host.to("cuda")
+    dst_indices = dst_indices_host.to("cuda")
+
+    ref_copy_with_indices(
+        src_pool, dst_ref, src_indices_host, dst_indices
+    )
+    transfer_kv_per_layer_mla_lf_lf_H2D_dcu(
+        src=src_pool,
+        dst=dst_pool,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size,
+        page_size=1,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(dst_pool, dst_ref)
+
+
+@pytest.mark.skipif(not is_hip(), reason="DCU D2H optimization requires HIP")
+@pytest.mark.parametrize("num_layers", [1, 3, 11])
+@pytest.mark.parametrize("num_items", [1, 17, 128])
+def test_transfer_kv_all_layer_mla_lf_lf_d2h_dcu_indexer(
+    num_layers: int, num_items: int
+):
+    item_size = 528
+    total_items = 2 * num_items + 2
+    src_pool = torch.randint(
+        0,
+        256,
+        (num_layers, total_items, item_size),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    dst_pool = torch.zeros(
+        (num_layers, total_items, item_size),
+        dtype=torch.uint8,
+        pin_memory=True,
+    )
+    dst_ref = torch.zeros_like(dst_pool)
+
+    src_indices_host = torch.arange(num_items, dtype=torch.int64) * 2
+    dst_indices_host = torch.arange(num_items, dtype=torch.int64) * 2 + 1
+    src_indices = src_indices_host.to("cuda")
+    dst_indices = dst_indices_host.to("cuda")
+
+    for layer_id in range(num_layers):
+        dst_ref[layer_id, dst_indices_host] = src_pool[
+            layer_id, src_indices
+        ].cpu()
+
+    src_layers = torch.tensor(
+        [src_pool[layer_id].data_ptr() for layer_id in range(num_layers)],
+        dtype=torch.uint64,
+        device="cuda",
+    )
+    dst_layers = torch.tensor(
+        [
+            kernel_accessible_host_ptr(dst_pool[layer_id])
+            for layer_id in range(num_layers)
+        ],
+        dtype=torch.uint64,
+        device="cuda",
+    )
+
+    transfer_kv_all_layer_mla_lf_lf_D2H_dcu(
+        src_layers=src_layers,
+        dst_layers=dst_layers,
+        src_indices=src_indices,
+        dst_indices=dst_indices,
+        item_size=item_size,
+        num_layers=num_layers,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(dst_pool, dst_ref)
 
 
 def ref_copy_with_indices_pf_direct(
