@@ -256,8 +256,9 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
-        self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
-        self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        server_args = get_global_server_args()
+        self.use_attn_tp_group = server_args.enable_dp_lm_head
+        self.use_fp32_lm_head = server_args.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -281,12 +282,26 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.enable_mis = get_global_server_args().enable_mis
+        self.enable_mis = server_args.enable_mis
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        page_size = getattr(server_args, "page_size", None)
+        if (
+            self.enable_logprobs_chunk
+            and page_size is not None
+            and page_size > 1
+            and self.logprobs_chunk_size > page_size
+        ):
+            logger.warning(
+                "Capping logits processor chunk size from %s to page_size=%s "
+                "for paged KV input logprobs.",
+                self.logprobs_chunk_size,
+                page_size,
+            )
+            self.logprobs_chunk_size = page_size
 
     def forward(
         self,

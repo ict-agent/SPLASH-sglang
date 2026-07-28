@@ -141,6 +141,18 @@ def _ep_moe_workspace_empty(
         out.zero_()
     return out
 
+
+def _apply_swiglu_limit_inplace(
+    gateup_output: torch.Tensor, swiglu_limit: Optional[float]
+) -> None:
+    if swiglu_limit is None:
+        return
+
+    half = gateup_output.shape[-1] // 2
+    gateup_output[..., :half].clamp_(max=swiglu_limit)
+    gateup_output[..., half:].clamp_(min=-swiglu_limit, max=swiglu_limit)
+
+
 if _use_aiter and not _is_dcu:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -976,6 +988,9 @@ class DeepEPMoE(FusedMoE):
             )
         del input_tensor
 
+        _apply_swiglu_limit_inplace(
+            gateup_output, self.moe_runner_config.swiglu_limit
+        )
         q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
 
@@ -1553,6 +1568,9 @@ class DeepEPMoE(FusedMoE):
                 expected_m,
             )
 
+        _apply_swiglu_limit_inplace(
+            gateup_output, self.moe_runner_config.swiglu_limit
+        )
         q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
             gateup_output, masked_m
         )
