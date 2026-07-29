@@ -84,6 +84,7 @@ if _is_dcu:
     )
     from lightop import (
         fuse_silu_and_mul,
+        fuse_silu_mul_clamp_quant,
         fuse_silu_mul_fp8_quant,
         fuse_silu_mul_fp8_quant_ep,
         fuse_silu_mul_quant,
@@ -988,10 +989,17 @@ class DeepEPMoE(FusedMoE):
             )
         del input_tensor
 
-        _apply_swiglu_limit_inplace(
-            gateup_output, self.moe_runner_config.swiglu_limit
-        )
-        q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+        swiglu_limit = self.moe_runner_config.swiglu_limit
+        if (
+            swiglu_limit is not None
+            and envs.SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT.get()
+        ):
+            q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                gateup_output, float(swiglu_limit)
+            )
+        else:
+            _apply_swiglu_limit_inplace(gateup_output, swiglu_limit)
+            q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
         del gateup_output
 
         down_output = bf16_gemm_workspace.narrow(
