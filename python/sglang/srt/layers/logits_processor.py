@@ -305,7 +305,8 @@ class LogitsProcessor(nn.Module):
                 page_size,
             )
             self.logprobs_chunk_size = page_size
-            
+        self.draft_lm_head_vp = None
+        
     def set_draft_lm_head_vp(self, draft_lm_head_vp) -> None:
         """Install the draft-only vocabulary-parallel top-1 helper."""
         self.draft_lm_head_vp = draft_lm_head_vp
