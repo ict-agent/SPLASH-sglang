@@ -1577,11 +1577,25 @@ class DeepEPMoE(FusedMoE):
                 expected_m,
             )
 
-        q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
-                input = gateup_output,
-                limit = self.moe_runner_config.swiglu_limit,
-                mask_m = masked_m,
-                expect_m = expected_m)
+        if self.moe_runner_config.swiglu_limit is None:
+            q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                    gateup_output, masked_m
+            )
+        else:
+            if not envs.SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT.get():
+                _apply_swiglu_limit_inplace(
+                        gateup_output, self.moe_runner_config.swiglu_limit
+                )
+                q_a2_all, q_a2_scale = torch.ops.sglang.fuse_silu_mul_quant_ep(
+                        gateup_output, masked_m
+                )
+            else:
+                q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
+                        input = gateup_output,
+                        limit = self.moe_runner_config.swiglu_limit,
+                        mask_m = masked_m,
+                        expect_m = expected_m)
+                
         del gateup_output
 
         n2 = self.w2_weight_scale.size(1)
