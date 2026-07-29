@@ -325,6 +325,9 @@ void transfer_kv_launcher(
 
   auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
   const int64_t num_items = src_indices.numel();
+    if (num_items == 0) {
+    return;
+  }
   const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
   const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
   dim3 grid_dim(num_blocks, 1, 1);
