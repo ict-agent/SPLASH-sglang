@@ -1627,16 +1627,24 @@ class NativeSparseAttnBackend(
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             else:
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+
+        # Keep graph-captured page-table tensor addresses stable while refreshing
+        # runtime values before kpool write-plan or attention replay consumes them.
+        assert self.real_page_size == metadata.page_size
+        if self.real_page_size > 1:
+            real_table = self._transform_table_1_to_real(page_indices)
+            new_rows = real_table.shape[0]
+            new_cols = real_table.shape[1]
+            metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
+        else:
+            assert metadata.real_page_table is metadata.page_table_1
+
         # replay update kpool write plan
         if self.nsa_index_kpool > 1:
             is_verify = forward_mode.is_target_verify()
             is_v2 = forward_mode.is_draft_extend_v2()
             is_ring_write = forward_mode.is_decode_or_idle() or is_verify or is_v2
             if is_ring_write:
-                updated_real_page_table = self._transform_table_1_to_real(
-                    metadata.page_table_1
-                )
-                metadata.real_page_table.copy_(updated_real_page_table)
                 real_page_table = metadata.real_page_table
                 num_draft_tokens = (
                     1 if forward_mode.is_decode_or_idle() else self.speculative_num_draft_tokens
@@ -1679,15 +1687,6 @@ class NativeSparseAttnBackend(
             torch.cumsum(nsa_cache_seqlens, dim=0, dtype=torch.int32)
         )
         # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
-
-        assert self.real_page_size == metadata.page_size
-        if self.real_page_size > 1:
-            real_table = self._transform_table_1_to_real(page_indices)
-            new_rows = real_table.shape[0]
-            new_cols = real_table.shape[1]
-            metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
-        else:
-            assert metadata.real_page_table is metadata.page_table_1
 
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
