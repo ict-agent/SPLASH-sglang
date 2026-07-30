@@ -32,7 +32,6 @@ RUN pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.ali
 RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip install --no-cache-dir torch==${TORCH_VERSION} flash-attn && \
     pip install --no-cache-dir torch==${TORCH_VERSION} lightop && \
-    pip install --no-cache-dir torch==${TORCH_VERSION} lmslim && \
     pip install --no-cache-dir torch==${TORCH_VERSION} deepgemm && \
     pip install --no-cache-dir torch==${TORCH_VERSION} aiter && \
     pip install --no-cache-dir mooncake_transfer_engine_shca && \
@@ -47,6 +46,7 @@ RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip install --no-cache-dir numpy==1.25.0 && \
     pip uninstall -y starlette fastapi prometheus-fastapi-instrumentator && \
     pip install --no-cache-dir "fastapi==0.115.12" "starlette==0.46.2" "prometheus-fastapi-instrumentator==7.1.0" && \
+    pip install --no-cache-dir torchaudio==2.11.0 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install --no-cache-dir nvidia-cutlass-dsl==4.4.2 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install --no-cache-dir sgl-deep-gemm==0.1.0 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install --no-cache-dir kernels==0.14 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
