@@ -32,6 +32,7 @@ RUN pip install --no-cache-dir ray[data,train,tune,serve] -i https://mirrors.ali
 RUN pip install --no-cache-dir torch==${TORCH_VERSION} torchvision && \
     pip install --no-cache-dir torch==${TORCH_VERSION} flash-attn && \
     pip install --no-cache-dir torch==${TORCH_VERSION} lightop && \
+    pip install --no-cache-dir torch==${torchversion} lmslim && \
     pip install --no-cache-dir torch==${TORCH_VERSION} deepgemm && \
     pip install --no-cache-dir torch==${TORCH_VERSION} aiter && \
     pip install --no-cache-dir mooncake_transfer_engine_shca && \
