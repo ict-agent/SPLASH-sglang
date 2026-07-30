@@ -441,6 +441,13 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                # The prefill side transfers only persistent conv/temporal Mamba
+                # states to decode. In PD mode, target-verify scratch is needed only on D.
+                mamba_speculative_num_draft_tokens = (
+                    None
+                    if self.server_args.disaggregation_mode == "prefill"
+                    else self.server_args.speculative_num_draft_tokens
+                )
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -458,7 +465,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_num_draft_tokens=mamba_speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
