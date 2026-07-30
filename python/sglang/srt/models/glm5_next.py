@@ -36,8 +36,8 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.attention.nsa.utils import can_nsa_cp_split as can_cp_split
 from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_cp_split as can_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
@@ -85,7 +85,6 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_plain_all_gather,
@@ -96,6 +95,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -117,14 +117,12 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
-    _is_cuda,
     _is_dcu,
+    _is_cuda,
     _is_gfx95_supported,
     _use_aiter_gfx95,
 )
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2AttentionMLA as ModelNextMLAAttention,
-)
+from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as ModelNextMLAAttention
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as ModelNextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as ModelNextMoe
 from sglang.srt.models.glm4v import Glm4vVisionModel
@@ -232,7 +230,7 @@ class ModelNextLinearAttention(nn.Module):
             if self.nsa_enable_prefill_cp
             else get_tensor_model_parallel_world_size()
         )
-        self.do_fuse_qkvbfg = requested_fuse_qkvbfg  #  and fuse_qkvbfg_supported
+        self.do_fuse_qkvbfg = requested_fuse_qkvbfg #  and fuse_qkvbfg_supported
         if requested_fuse_qkvbfg and not fuse_qkvbfg_supported:
             log_info_on_rank0(
                 logger,
@@ -254,7 +252,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=None,  # quant_config,
+                quant_config=None,#quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
@@ -555,50 +553,7 @@ class ModelNextLinearAttention(nn.Module):
                 scatter_dim=0,
                 group_name=get_attention_cp_group().device_group.group_name,
             )
-        if (
-            os.getenv("SGLANG_GLM5_DP_ATTN_TP_COMPAT", "0") == "1"
-            and is_dp_attention_enabled()
-            and self.o_proj.tp_size == 1
-        ):
-            compat_tp_size = get_tensor_model_parallel_world_size()
-            input_chunks = core_attn_out.chunk(compat_tp_size, dim=-1)
-            weight_chunks = self.o_proj.weight.chunk(compat_tp_size, dim=1)
-            if (
-                self.o_proj.weight.dtype == torch.int8
-                and os.getenv("W8A8_SUPPORT_METHODS", "1") == "3"
-            ):
-                from sglang.srt.layers.quantization.w8a8_int8 import (
-                    compressed_quant_ops,
-                    per_token_quant_int8,
-                )
-
-                partials = []
-                for input_chunk, weight_chunk in zip(input_chunks, weight_chunks):
-                    input_2d = input_chunk.contiguous().view(-1, input_chunk.shape[-1])
-                    input_q, input_scale = per_token_quant_int8(input_2d)
-                    partials.append(
-                        compressed_quant_ops.blaslt_scaled_mm(
-                            input_q,
-                            weight_chunk.contiguous(),
-                            input_scale,
-                            self.o_proj.weight_scale,
-                            out_dtype=core_attn_out.dtype,
-                        )
-                    )
-            else:
-                partials = [
-                    torch.nn.functional.linear(input_chunk, weight_chunk)
-                    for input_chunk, weight_chunk in zip(input_chunks, weight_chunks)
-                ]
-            # RCCL accumulates the TP partials in FP32 before casting once.
-            # DP attention has attn_tp_size=1, so reproduce that order locally.
-            output = (
-                torch.stack([partial.float() for partial in partials], dim=0)
-                .sum(dim=0)
-                .to(partials[0].dtype)
-            )
-        else:
-            output = self.o_proj(core_attn_out)[0]
+        output = self.o_proj(core_attn_out)[0]
         if cp_prefill:
             output = cp_plain_reduce_scatter(output, get_attention_cp_size())
         elif self.nsa_enable_prefill_cp:
@@ -806,7 +761,9 @@ class ModelNextDecoderLayer(nn.Module):
             use_mhc_rms_quant
             and (not self.is_linear_attn or not self.self_attn.do_fuse_qkvbfg)
             and attn_prequantized_projection is not None
-            and _linear_supports_prequantized_input(attn_prequantized_projection)
+            and _linear_supports_prequantized_input(
+                attn_prequantized_projection
+            )
         )
         mlp_with_gate_up = (
             self.mlp.shared_experts
@@ -914,10 +871,15 @@ class ModelNextDecoderLayer(nn.Module):
             )
         )
 
-        fuse_attn_rms_quant = self._can_fuse_attn_rms_quant and not nsa_use_prefill_cp(
-            forward_batch, self.nsa_enable_prefill_cp
+        fuse_attn_rms_quant = (
+            self._can_fuse_attn_rms_quant
+            and not nsa_use_prefill_cp(
+                forward_batch, self.nsa_enable_prefill_cp
+            )
         )
-        prepare_attn_kwargs = {"fuse_rms_quant": True} if fuse_attn_rms_quant else {}
+        prepare_attn_kwargs = (
+            {"fuse_rms_quant": True} if fuse_attn_rms_quant else {}
+        )
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -980,7 +942,9 @@ class ModelNextDecoderLayer(nn.Module):
             maybe_prefetch(forward_batch, next_full_attention_layer_id)
 
         prepare_mlp_kwargs = (
-            {"fuse_rms_quant": True} if self._can_fuse_mlp_rms_quant else {}
+            {"fuse_rms_quant": True}
+            if self._can_fuse_mlp_rms_quant
+            else {}
         )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
@@ -1010,11 +974,13 @@ class ModelNextDecoderLayer(nn.Module):
 
         mlp_quant_kwargs = (
             {"input_quant_args": mlp_input_quant_args}
-            if mlp_input_quant_args is not None and isinstance(self.mlp, ModelNextMLP)
+            if mlp_input_quant_args is not None
+            and isinstance(self.mlp, ModelNextMLP)
             else {}
         )
-        prequantized_shared_expert = mlp_input_quant_args is not None and isinstance(
-            self.mlp, ModelNextMoe
+        prequantized_shared_expert = (
+            mlp_input_quant_args is not None
+            and isinstance(self.mlp, ModelNextMoe)
         )
         if prequantized_shared_expert:
             self.mlp.set_shared_expert_input_quant_args(mlp_input_quant_args)
