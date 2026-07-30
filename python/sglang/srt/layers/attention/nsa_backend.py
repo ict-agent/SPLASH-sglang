@@ -1633,8 +1633,11 @@ class NativeSparseAttnBackend(
             is_v2 = forward_mode.is_draft_extend_v2()
             is_ring_write = forward_mode.is_decode_or_idle() or is_verify or is_v2
             if is_ring_write:
-                real_page_table = self._transform_table_1_to_real(metadata.page_table_1)
-                object.__setattr__(metadata, "real_page_table", real_page_table)
+                updated_real_page_table = self._transform_table_1_to_real(
+                    metadata.page_table_1
+                )
+                metadata.real_page_table.copy_(updated_real_page_table)
+                real_page_table = metadata.real_page_table
                 num_draft_tokens = (
                     1 if forward_mode.is_decode_or_idle() else self.speculative_num_draft_tokens
                 )
