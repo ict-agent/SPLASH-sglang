@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import time
@@ -152,6 +153,36 @@ def normalize_tool_content(role: str, content):
         text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
         return " ".join(text_parts)
     return content
+
+
+@functools.lru_cache(maxsize=4096)
+def _check_schema_cached(schema_json: bytes) -> Optional[str]:
+    try:
+        Draft202012Validator.check_schema(orjson.loads(schema_json))
+    except SchemaError as e:
+        return str(e)
+    return None
+
+
+def _check_tool_parameters_schema(parameters) -> Optional[str]:
+    """Validate a tool's JSON-schema `parameters`, returning an error string
+    or None.
+
+    check_schema walks the whole Draft-2020-12 metaschema ($ref/$dynamicRef
+    resolution in pure Python) and runs on the http worker event loop; agent
+    clients resend an identical tool list on every turn, so cache verdicts by
+    the canonicalized schema.
+    """
+    try:
+        key = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS)
+    except (TypeError, orjson.JSONEncodeError):
+        # Not canonicalizable (non-JSON types); validate uncached.
+        try:
+            Draft202012Validator.check_schema(parameters)
+        except SchemaError as e:
+            return str(e)
+        return None
+    return _check_schema_cached(key)
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -448,10 +479,9 @@ class OpenAIServingChat(OpenAIServingBase):
         for i, tool in enumerate(request.tools or []):
             if tool.function.parameters is None:
                 continue
-            try:
-                Draft202012Validator.check_schema(tool.function.parameters)
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+            error = _check_tool_parameters_schema(tool.function.parameters)
+            if error is not None:
+                return f"Tool {i} function has invalid 'parameters' schema: {error}"
 
         # Validate tool_references in messages
         if tool_reference_error := self._validate_tool_references(request):
@@ -1650,12 +1680,21 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The total number of tool calls in the history, or 0 if not applicable.
         """
+        # Called per tool-call chunk while streaming; messages are immutable
+        # for the request's lifetime, so scan them once and memoize.
+        cached = getattr(request, "_history_tool_calls_cnt", None)
+        if cached is not None:
+            return cached
         messages = getattr(request, "messages", [])
         idx = 0
         for msg in messages:
             if msg.role == "assistant":
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        try:
+            request._history_tool_calls_cnt = idx
+        except (AttributeError, ValueError):
+            pass
         return idx
 
     def _patch_mistral_skip_special_tokens(

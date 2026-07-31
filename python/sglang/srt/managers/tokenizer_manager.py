@@ -25,6 +25,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -359,20 +360,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.async_dynamic_batch_tokenizer = None
 
-    async def run_tokenizer_offload(self, fn, *args, **kwargs):
+    async def run_tokenizer_offload(
+        self, fn, *args, _tokenization_timing=None, **kwargs
+    ):
         """Run blocking tokenizer work without blocking the event loop.
 
         Calls are serialized on a single thread because fast tokenizers mutate
         shared truncation/padding state during encode. When tokenization is
         disabled, or the kill switch is off, preserve the old inline behavior.
         """
+        call = functools.partial(fn, *args, **kwargs)
+        if _tokenization_timing is not None:
+            _tokenization_timing["queue_entry"] = time.perf_counter()
+
+            def call():
+                _tokenization_timing["exec_start"] = time.perf_counter()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _tokenization_timing["exec_finish"] = time.perf_counter()
+
         if self.tokenizer_offload_executor is None:
-            return fn(*args, **kwargs)
+            return call()
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.tokenizer_offload_executor,
-            functools.partial(fn, *args, **kwargs),
+            call,
         )
 
     def init_ipc_channels(self, port_args: PortArgs):
@@ -680,7 +694,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return input_ids, token_type_ids
 
     async def _tokenize_texts(
-        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+        self,
+        texts: Union[str, List[str]],
+        is_cross_encoder: bool = False,
+        tokenization_timing: Optional[Dict[str, float]] = None,
     ) -> Union[
         Tuple[List[int], Optional[List[int]]],
         Tuple[List[List[int]], Optional[List[List[int]]]],
@@ -739,7 +756,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if use_async_tokenizer:
             logger.debug("Using async dynamic batch tokenizer for single text")
             result = await self.async_dynamic_batch_tokenizer.encode(
-                tokenizer_input[0], **tokenizer_kwargs
+                tokenizer_input[0],
+                _tokenization_timing=tokenization_timing,
+                **tokenizer_kwargs,
             )
             # Convert to batch format for consistency
             input_ids = [result["input_ids"]]
@@ -753,12 +772,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
                 input_ids = await self.run_tokenizer_offload(
-                    lambda: [self.tokenizer.encode(t) for t in tokenizer_input]
+                    lambda: [self.tokenizer.encode(t) for t in tokenizer_input],
+                    _tokenization_timing=tokenization_timing,
                 )
                 token_type_ids = None
             else:
                 encoded = await self.run_tokenizer_offload(
-                    self.tokenizer, tokenizer_input, **tokenizer_kwargs
+                    self.tokenizer,
+                    tokenizer_input,
+                    _tokenization_timing=tokenization_timing,
+                    **tokenizer_kwargs,
                 )
                 input_ids = encoded["input_ids"]
                 token_type_ids = (
@@ -807,8 +830,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
+                tokenization_timing = {}
                 input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
+                    input_text,
+                    is_cross_encoder_request,
+                    tokenization_timing=tokenization_timing,
+                )
+                obj.tokenize_queue_entry_ts = tokenization_timing.get(
+                    "queue_entry", 0.0
+                )
+                obj.tokenize_exec_start_ts = tokenization_timing.get(
+                    "exec_start", 0.0
+                )
+                obj.tokenize_exec_finish_ts = tokenization_timing.get(
+                    "exec_finish", 0.0
                 )
 
         contains_mm_input = obj.contains_mm_input()
@@ -1206,6 +1241,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state.get(obj.rid)
         if state is not None:
             tokenized_obj.time_stats = state.time_stats
+            # Stashed by _tokenize_one_request; absent for input_ids-only
+            # requests where there is nothing to encode.
+            if getattr(obj, "tokenize_queue_entry_ts", 0.0) > 0.0:
+                state.time_stats.set_tokenize_queue_entry_time(
+                    obj.tokenize_queue_entry_ts
+                )
+                state.time_stats.set_tokenize_exec_start_time(
+                    obj.tokenize_exec_start_ts
+                )
+                state.time_stats.set_tokenize_exec_finish_time(
+                    obj.tokenize_exec_finish_ts
+                )
             state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
@@ -2346,6 +2393,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.metrics_collector.observe_time_to_first_token(
                 labels, state.time_stats.get_first_token_latency()
             )
+            # Outbound path: scheduler batch emit -> first-token observation
+            # here (detokenizer + router + this worker's event loop). The
+            # emit stamp is clock-converted into this process's
+            # perf_counter() domain by ReqTimeStatsBase.__setstate__.
+            if recv_obj.time_stats is not None:
+                output_emit_time = getattr(
+                    recv_obj.time_stats[i], "output_emit_time", 0.0
+                )
+                if output_emit_time > 0.0 and state.time_stats.first_token_time > 0.0:
+                    self.metrics_collector.observe_outbound_latency(
+                        labels,
+                        state.time_stats.first_token_time - output_emit_time,
+                    )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:

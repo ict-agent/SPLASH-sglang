@@ -1463,6 +1463,34 @@ class TokenizerMetricsCollector:
             buckets=bucket_time_to_first_token,
         )
 
+        self.histogram_outbound_latency = Histogram(
+            name="sglang:outbound_latency_seconds",
+            documentation=(
+                "Latency from scheduler output-batch emit to first-token "
+                "observation in the API server (detokenizer + router + http "
+                "worker event loop)."
+            ),
+            labelnames=labels.keys(),
+            buckets=[
+                0.001,
+                0.002,
+                0.005,
+                0.010,
+                0.020,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
+                1.000,
+                2.000,
+                5.000,
+                10.000,
+                20.000,
+                40.000,
+                60.000,
+            ],
+        )
+
         self.histogram_inter_token_latency = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
@@ -1529,6 +1557,9 @@ class TokenizerMetricsCollector:
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)
+
+    def observe_outbound_latency(self, labels: Dict[str, str], value: float):
+        self.histogram_outbound_latency.labels(**labels).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
