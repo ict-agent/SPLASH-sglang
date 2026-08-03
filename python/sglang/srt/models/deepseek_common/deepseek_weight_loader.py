@@ -157,6 +157,8 @@ class DeepseekV2WeightLoaderMixin:
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                if "language_model." in name:
+                    name = name.replace("language_model.", "")
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
