@@ -49,6 +49,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, is_hip, is_npu
+from lmslim.layers.gemm.int8_utils import per_token_quant_int8
 
 logger = logging.getLogger(__name__)
 
@@ -917,10 +918,9 @@ class IndexerKPool(Indexer):
         pool_max_seq_len = pool_block_tables.shape[1] * block_kv
         if is_dcu():
             from lightop import gemmopt
-            kv_cache_fp8 = kv_cache_buf.view(
+            kv_cache_fp8 = kv_cache_buf.view(torch.int8).view(
                 kv_cache_buf.shape[0], block_kv, num_heads_kv, head_dim_with_sf
             )
-            # kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
             logits = gemmopt.paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1421,14 +1421,16 @@ class IndexerKPool(Indexer):
         else:
             _compress_write()
             if return_indices:
-                if is_dcu():
-                    q_index = query
-                    weights = self._get_bf16_logits_head_gate(x)
-                else:
-                    q_index, q_scale = act_quant(
-                        query, self.block_size, self.scale_fmt
-                    )
-                    weights = self._get_logits_head_gate(x, q_scale)
+                # if is_dcu():
+                #     q_index = query
+                #     weights = self._get_bf16_logits_head_gate(x)
+                # else:
+                #     q_index, q_scale = act_quant(
+                #         query, self.block_size, self.scale_fmt
+                #     )
+                #     weights = self._get_logits_head_gate(x, q_scale)
+                q_index, q_scale = per_token_quant_int8(query)
+                weights = self._get_logits_head_gate(x, q_scale)
 
         if not return_indices:
             return None
@@ -1482,10 +1484,9 @@ class IndexerKPool(Indexer):
         pool_max_seq_len = paged_page_table.shape[1] * block_kv
         if is_dcu():
             from lightop import gemmopt
-            kv_cache_fp8 = kv_cache_buf.view(
+            kv_cache_fp8 = kv_cache_buf.view(torch.int8).view(
                 kv_cache_buf.shape[0], block_kv, 1, head_dim_with_sf
             )
-            # kv_cache_bf16 = kpool_dequantize_fp8_paged_kv_cache(kv_cache_fp8)
             logits = gemmopt.paged_mqa_logits(
                 q_index,
                 kv_cache_fp8,
@@ -1675,12 +1676,14 @@ class IndexerKPool(Indexer):
                 layer_id=layer_id,
                 metadata=metadata,
             )
-            if is_dcu():
-                q_index = query
-                weights = self._get_bf16_logits_head_gate(x)
-            else:
-                q_index, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+            # if is_dcu():
+            #     q_index = query
+            #     weights = self._get_bf16_logits_head_gate(x)
+            # else:
+            #     q_index, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            #     weights = self._get_logits_head_gate(x, q_scale)
+            q_index, q_scale = per_token_quant_int8(query)
+            weights = self._get_logits_head_gate(x, q_scale)
 
         # K-only fast path (extend only): caller wants the cache
         # populated but not the topk indices.

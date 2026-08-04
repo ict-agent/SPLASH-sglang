@@ -519,10 +519,10 @@ def gather_index_k_scale_prefix_into(
 
     slots_per_page = pool.slots_per_page
     _gather_index_k_scale_prefix_into_kernel[(seq_len,)](
-        buf,
+        buf.view(torch.int8),
         buf.view(torch.float32),
         page_indices,
-        k_out,
+        k_out.view(torch.float8_e4m3fn),
         scale_out,
         SLOTS_PER_PAGE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
@@ -534,10 +534,10 @@ def gather_index_k_scale_prefix_into(
 
 @triton.jit
 def _gather_index_k_scale_prefix_into_kernel(
-    buf_u8_ptr,
+    buf_i8_ptr,
     buf_fp32_ptr,
     page_indices_ptr,
-    k_out_ptr,
+    k_out_fp8_ptr,
     scale_out_ptr,
     SLOTS_PER_PAGE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
@@ -554,15 +554,16 @@ def _gather_index_k_scale_prefix_into_kernel(
     mask = offs < HEAD_DIM
     src_k_offsets = page * BUF_NUMEL_PER_PAGE + token_offset_in_page * HEAD_DIM + offs
     dst_k_offsets = token_id * HEAD_DIM + offs
-    k = tl.load(buf_u8_ptr + src_k_offsets, mask=mask)
-    tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
+    k_i8 = tl.load(buf_i8_ptr + src_k_offsets, mask=mask).to(tl.float32)
+    k_fp8 = k_i8 * (448.0 / 127.0)
+    tl.store(k_out_fp8_ptr + dst_k_offsets, k_fp8, mask=mask)
 
     src_s_offset = (
         page * BUF_NUMEL_PER_PAGE // 4
         + S_OFFSET_NBYTES_IN_PAGE // 4
         + token_offset_in_page
     )
-    scale = tl.load(buf_fp32_ptr + src_s_offset)
+    scale = tl.load(buf_fp32_ptr + src_s_offset) * (127.0 / 448.0)
     tl.store(scale_out_ptr + token_id, scale)
 
 
@@ -1425,8 +1426,32 @@ def _hadamard_quantize_fp8(acc, denom, ROUND_SCALE: tl.constexpr):
 
 
 @triton.jit
+def _round_to_nearest_int(x):
+    return tl.where(x >= 0.0, tl.floor(x + 0.5), tl.ceil(x - 0.5))
+
+
+@triton.jit
+def _hadamard_quantize_int8(acc, denom, ROUND_SCALE: tl.constexpr):
+    """Normalize -> bf16 round-trip -> Hadamard rotate -> bf16 round-trip
+    -> int8 quantize. Returns (quantized, scale)."""
+    x = (acc / denom).to(tl.bfloat16).to(tl.float32)
+    x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+
+    int8_max_inv = 1.0 / 127.0
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(absmax * int8_max_inv)))
+    else:
+        scale = absmax * int8_max_inv
+
+    quantized = tl.minimum(tl.maximum(x / scale, -127.0), 127.0)
+    quantized = _round_to_nearest_int(quantized).to(tl.int8)
+    return quantized, scale
+
+
+@triton.jit
 def _kpool_assemble_softmax_rotate_write_cache_kernel(
-    buf_fp8_ptr,
+    buf_i8_ptr,
     buf_fp32_ptr,
     chunk_k_ptr,
     chunk_score_ptr,
@@ -1511,7 +1536,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         acc = acc * rescale + k * prob
         m = new_m
 
-    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+    quantized, scale = _hadamard_quantize_int8(acc, denom, ROUND_SCALE)
 
     loc = tl.load(loc_ptr + row)
     loc_page_index = loc // SLOTS_PER_PAGE
@@ -1525,7 +1550,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+    tl.store(buf_i8_ptr + out_k_offsets, quantized, mask=mask)
     tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1545,7 +1570,7 @@ def kpool_assemble_softmax_rotate_write_cache(
     write_mask: torch.Tensor | None = None,
     round_scale: bool = False,
 ) -> None:
-    """Fused gather + softmax + Hadamard rotate + fp8 quant + cache write.
+    """Fused gather + softmax + Hadamard rotate + int8 quant + cache write.
 
     For each output pool row r, slots are gathered from tail or chunk
     based on n_from_tail[r] (see _kpool_assemble_softmax_rotate_write_cache_kernel).
@@ -1586,12 +1611,12 @@ def kpool_assemble_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_i8 = buf.view(torch.int8)
     buf_fp32 = buf.view(torch.float32)
     slots_per_page = pool.slots_per_page
 
     _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
-        buf_fp8,
+        buf_i8,
         buf_fp32,
         chunk_k,
         chunk_score,
@@ -1905,7 +1930,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     # as the gate window (verify / decode behavior).
     effective_n_ptr,  # int32 [B] or null
     # Compress sink.
-    buf_fp8_ptr,
+    buf_i8_ptr,
     buf_fp32_ptr,
     # Strides.
     key_stride_0,
@@ -2001,7 +2026,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 acc = acc * rescale + k_ld * prob
                 m = new_m
 
-            quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+            quantized, scale = _hadamard_quantize_int8(acc, denom, ROUND_SCALE)
             loc = tl.load(write_loc_ptr + plan_row)
             loc_page_index = loc // SLOTS_PER_PAGE
             loc_token_offset_in_page = loc % SLOTS_PER_PAGE
@@ -2015,7 +2040,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(buf_i8_ptr + out_k_offsets, quantized, mask=dim_mask)
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -2086,7 +2111,7 @@ def kpool_write_tail_and_maybe_compress(
     key = key.contiguous()
     score = score.contiguous()
     slots_per_page = pool.slots_per_page
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_i8 = buf.view(torch.int8)
     buf_fp32 = buf.view(torch.float32)
 
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
@@ -2101,7 +2126,7 @@ def kpool_write_tail_and_maybe_compress(
         write_loc,
         out_cache_loc,
         effective_n_per_batch,
-        buf_fp8,
+        buf_i8,
         buf_fp32,
         key.stride(0),
         score.stride(0),
