@@ -36,6 +36,146 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_nsa_kv_pool(pool: Any):
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        NSATokenToKVPool,
+    )
+
+    if isinstance(pool, HybridLinearKVPool):
+        pool = pool.full_kv_pool
+    return pool if isinstance(pool, NSATokenToKVPool) else None
+
+
+def _nsa_hicache_layer_geometry(pool: Any, page_size: int) -> tuple:
+    """Return the per-layer geometry that determines NSA host-cache bytes."""
+    if pool.page_size != page_size:
+        raise ValueError(
+            "Target and Draft NSA HiCache page sizes must match: "
+            f"pool={pool.page_size}, expected={page_size}."
+        )
+
+    use_fp8_index = bool(pool.use_fp8_index_k_cache)
+    if use_fp8_index:
+        quant_block_size = pool.quant_block_size
+        index_row_width = pool.index_head_dim + (
+            pool.index_head_dim // quant_block_size * 4
+        )
+        index_dtype = pool.index_k_with_scale_buffer_dtype
+        index_slots_per_page = getattr(pool, "slots_per_page", page_size)
+    else:
+        quant_block_size = None
+        index_row_width = pool.index_head_dim
+        index_dtype = pool.index_k_buffer_dtype
+        index_slots_per_page = page_size
+
+    return (
+        pool.store_dtype,
+        pool.kv_cache_dim,
+        use_fp8_index,
+        quant_block_size,
+        index_dtype,
+        index_row_width,
+        index_slots_per_page,
+    )
+
+
+def _nsa_hicache_bytes_per_token_per_layer(pool: Any, page_size: int) -> int:
+    (
+        store_dtype,
+        kv_cache_dim,
+        _,
+        _,
+        index_dtype,
+        index_row_width,
+        index_slots_per_page,
+    ) = _nsa_hicache_layer_geometry(pool, page_size)
+    main_bytes = kv_cache_dim * torch.empty((), dtype=store_dtype).element_size()
+    index_bytes = (
+        index_row_width
+        * torch.empty((), dtype=index_dtype).element_size()
+        * index_slots_per_page
+        // page_size
+    )
+    return main_bytes + index_bytes
+
+
+def _split_hybrid_hicache_budget(
+    *,
+    total_size_gb: float,
+    mamba_full_memory_ratio: float,
+    target_pool: Any,
+    draft_pool: Any,
+    page_size: int,
+) -> tuple[float, float, float]:
+    """Split an explicit hybrid HiCache budget into target, Draft, and Mamba.
+
+    Ratio mode (``total_size_gb == 0``) intentionally keeps its existing
+    per-device-pool semantics. An explicit size is a machine-total budget for
+    shared NSA HiCache, so a LayerSplit Draft pool must reserve its share before
+    the target host pool is allocated.
+    """
+    if total_size_gb <= 0:
+        return 0.0, 0.0, 0.0
+
+    mamba_size_gb = (
+        total_size_gb * mamba_full_memory_ratio / (1 + mamba_full_memory_ratio)
+    )
+    full_size_gb = total_size_gb - mamba_size_gb
+
+    draft_nsa_pool = _unwrap_nsa_kv_pool(draft_pool)
+    if draft_nsa_pool is None or not getattr(
+        draft_nsa_pool, "layer_shard_enabled", False
+    ):
+        return full_size_gb, 0.0, mamba_size_gb
+
+    target_nsa_pool = _unwrap_nsa_kv_pool(target_pool)
+    if target_nsa_pool is None or not getattr(
+        target_nsa_pool, "layer_shard_enabled", False
+    ):
+        raise ValueError(
+            "Draft NSA LayerSplit HiCache requires a LayerSplit target NSA pool."
+        )
+    if draft_nsa_pool.layer_num != 1:
+        raise ValueError(
+            "Draft NSA LayerSplit HiCache currently requires exactly one layer, "
+            f"got {draft_nsa_pool.layer_num}."
+        )
+    if target_nsa_pool.size != draft_nsa_pool.size:
+        raise ValueError(
+            "Target and Draft NSA LayerSplit pools must have the same token "
+            f"capacity: target={target_nsa_pool.size}, draft={draft_nsa_pool.size}."
+        )
+
+    target_geometry = _nsa_hicache_layer_geometry(target_nsa_pool, page_size)
+    draft_geometry = _nsa_hicache_layer_geometry(draft_nsa_pool, page_size)
+    if target_geometry != draft_geometry:
+        raise ValueError(
+            "Target and Draft NSA LayerSplit pools must have identical per-layer "
+            "HiCache geometry before sharing one slot capacity."
+        )
+
+    bytes_per_layer = _nsa_hicache_bytes_per_token_per_layer(target_nsa_pool, page_size)
+    target_weight = bytes_per_layer * target_nsa_pool.layer_num
+    draft_weight = bytes_per_layer * draft_nsa_pool.layer_num
+    target_size_gb = full_size_gb * target_weight / (target_weight + draft_weight)
+    draft_size_gb = full_size_gb - target_size_gb
+
+    # Mirror HostKVCache's page alignment so an undersized explicit budget
+    # fails with a useful message before the large host tensors are allocated.
+    target_size_per_token = bytes_per_layer * target_nsa_pool.layer_num
+    raw_target_slots = int(target_size_gb * 1e9 // target_size_per_token)
+    aligned_target_slots = (raw_target_slots // page_size + 1) * page_size
+    if aligned_target_slots <= target_nsa_pool.size:
+        raise ValueError(
+            "--hicache-size is too small after reserving Draft LayerSplit "
+            "capacity: target host slots "
+            f"{aligned_target_slots} <= device slots {target_nsa_pool.size}."
+        )
+
+    return target_size_gb, draft_size_gb, mamba_size_gb
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -515,19 +655,24 @@ def build_hybrid_mamba_stack(
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     layer_group_cache_group = (
-        attn_cp_group
-        if server_args.glm_nsa_shared_layer_group_hicache
-        else tp_group
+        attn_cp_group if server_args.glm_nsa_shared_layer_group_hicache else tp_group
     )
-    # Split --hicache-size (total host budget in GB) between the full-attention
-    # host pool and the mamba-state host pool, using --mamba-full-memory-ratio
-    # (same semantics as the device-side split in model_runner_kv_cache_mixin).
-    # Without this split the same hicache_size value would be passed to both
-    # pools independently, doubling actual host memory usage on hybrid models.
+    # Split --hicache-size (a machine-total host budget for shared NSA) between
+    # Target full-attention, LayerSplit Draft, and Mamba. Draft is registered
+    # after tree-cache construction, so its share must be reserved here before
+    # the Target host tensor consumes the entire full-attention bucket.
     if server_args.hicache_size > 0:
-        r = server_args.mamba_full_memory_ratio
-        mamba_host_size_gb = server_args.hicache_size * r / (1 + r)
-        full_host_size_gb = server_args.hicache_size - mamba_host_size_gb
+        (
+            full_host_size_gb,
+            draft_host_size_gb,
+            mamba_host_size_gb,
+        ) = _split_hybrid_hicache_budget(
+            total_size_gb=server_args.hicache_size,
+            mamba_full_memory_ratio=server_args.mamba_full_memory_ratio,
+            target_pool=kv_pool,
+            draft_pool=params.draft_token_to_kv_pool,
+            page_size=page_size,
+        )
         if getattr(kv_pool, "use_nsa", False) and (
             server_args.glm_nsa_shared_hicache
             or server_args.glm_nsa_shared_layer_group_hicache
@@ -540,9 +685,7 @@ def build_hybrid_mamba_stack(
             cache_group_world = (
                 1
                 if layer_group_cache_group is None
-                else torch.distributed.get_world_size(
-                    group=layer_group_cache_group
-                )
+                else torch.distributed.get_world_size(group=layer_group_cache_group)
             )
             mamba_host_size_gb /= cache_group_world
             logger.info(
@@ -551,14 +694,18 @@ def build_hybrid_mamba_stack(
                 f"(cache group world size {cache_group_world})."
             )
         logger.info(
-            f"hybrid host hicache split: full={full_host_size_gb:.2f} GB, "
+            "hybrid host hicache split: "
+            f"target_full={full_host_size_gb:.2f} GB, "
+            f"draft_reserved={draft_host_size_gb:.2f} GB, "
             f"mamba={mamba_host_size_gb:.2f} GB "
             f"(hicache_size={server_args.hicache_size}, "
-            f"mamba_full_memory_ratio={r})"
+            "mamba_full_memory_ratio="
+            f"{server_args.mamba_full_memory_ratio})"
         )
     else:
         mamba_host_size_gb = 0
         full_host_size_gb = 0
+        draft_host_size_gb = 0
 
     # NSA/DSA (e.g. GLM5-Next) full-attention KV pools carry a separate indexer
     # buffer in addition to the latent KV, and their device KV buffer is

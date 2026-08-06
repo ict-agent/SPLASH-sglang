@@ -124,10 +124,7 @@ class PrefillBootstrapQueue:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.is_hybrid_mla_backend = is_hybrid_mla_backend(token_to_kv_pool)
-        if (
-            self.is_hybrid_mla_backend
-            and transfer_backend != TransferBackend.MOONCAKE
-        ):
+        if self.is_hybrid_mla_backend and transfer_backend != TransferBackend.MOONCAKE:
             # Hybrid state-aware rank fan-in is currently implemented by
             # Mooncake only. Preserve the existing behavior for other backends.
             self.is_mla_backend = True
@@ -174,9 +171,30 @@ class PrefillBootstrapQueue:
         transfer_draft_cache = (
             not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
         )
+        if self.draft_token_to_kv_pool is not None:
+            draft_pool = getattr(
+                self.draft_token_to_kv_pool,
+                "full_kv_pool",
+                self.draft_token_to_kv_pool,
+            )
+            if getattr(draft_pool, "layer_shard_enabled", False):
+                if draft_pool.layer_num != 1:
+                    raise RuntimeError(
+                        "Prefill draft LayerSplit currently requires exactly "
+                        f"one NSA layer, got {draft_pool.layer_num}."
+                    )
+                draft_owner_rank = draft_pool._get_layer_owner_rank(
+                    draft_pool.start_layer
+                )
+                if layer_shard_enabled and draft_owner_rank != layer_shard_size - 1:
+                    raise RuntimeError(
+                        "Draft LayerSplit owner must match the existing P-to-D "
+                        "draft transfer rank: "
+                        f"owner={draft_owner_rank}, expected={layer_shard_size - 1}."
+                    )
+                transfer_draft_cache = draft_pool.layer_shard_rank == draft_owner_rank
         kv_args.prefill_start_layer = (
-            self.token_to_kv_pool.start_layer
-            + self.token_to_kv_pool.layer_shard_start
+            self.token_to_kv_pool.start_layer + self.token_to_kv_pool.layer_shard_start
             if layer_shard_enabled
             else self.token_to_kv_pool.start_layer
         )
@@ -858,7 +876,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         req.req_pool_idx
                     ].item()
-            )
+                )
             state_indices = build_state_indices(
                 token_to_kv_pool=token_to_kv_pool,
                 draft_token_to_kv_pool=(

@@ -159,6 +159,20 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        target_kv_pool = target_worker.model_runner.token_to_kv_pool
+        nsa_layer_split_scratch_source = None
+        if (
+            server_args.disaggregation_mode == "prefill"
+            and server_args.enable_nsa_cache_layer_split
+            and getattr(target_kv_pool, "layer_shard_enabled", False)
+        ):
+            # Prefill enqueues target before draft on the compute stream. Draft
+            # prefetch waits on that stream before its communication stream can
+            # overwrite the target's remote Main-KV scratch, so the draft can
+            # safely reuse it after target attention. Index-K scratch, page
+            # mapping, events, stream, and persistent owner buffers stay local
+            # to the draft pool.
+            nsa_layer_split_scratch_source = target_kv_pool
 
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
@@ -183,6 +197,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
+                nsa_layer_split_scratch_source=nsa_layer_split_scratch_source,
             )
 
         # Alias for better readability
@@ -302,9 +317,9 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_backend_factory.create_draft_extend_backend()
         )
         actual_draft_attn_backend = self.draft_runner.attn_backend
-        if _is_nsa_attn_backend(
-            actual_draft_attn_backend
-        ) and not _is_nsa_attn_backend(self.draft_extend_attn_backend):
+        if _is_nsa_attn_backend(actual_draft_attn_backend) and not _is_nsa_attn_backend(
+            self.draft_extend_attn_backend
+        ):
             log_info_on_rank0(
                 logger,
                 "Using the draft model's NSA attention backend for draft extend "
@@ -673,9 +688,7 @@ class EagleDraftWorker(BaseDraftWorker):
         last accepted row already used for logits/hidden states.
         """
         next_draft_input.mtp_topk_indices = None
-        if not is_mtp_index_share_enabled(
-            self.draft_runner.model_config.hf_config
-        ):
+        if not is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
             return
 
         topk_indices = forward_batch.topk_indices if source is None else source

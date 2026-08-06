@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_nsa_pool_to_hiradix_cache,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -249,6 +248,7 @@ class HiRadixCache(RadixCache):
 
         # Unwrap HybridLinearKVPool (GLM5 Next hybrid model) to inner NSA pool
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
         unwrapped = []
         for pool in mtp_kv_pools:
             if isinstance(pool, HybridLinearKVPool):
@@ -257,8 +257,9 @@ class HiRadixCache(RadixCache):
         mtp_kv_pools = unwrapped
 
         mtp_host_to_device_ratio = (
-            self.token_to_kv_pool_host.size / self.kv_cache.size
-            if hasattr(self, "token_to_kv_pool_host") and self.token_to_kv_pool_host is not None
+            (self.token_to_kv_pool_host.size - 1) / self.kv_cache.size
+            if hasattr(self, "token_to_kv_pool_host")
+            and self.token_to_kv_pool_host is not None
             else server_args.hicache_ratio
         )
 
@@ -268,11 +269,35 @@ class HiRadixCache(RadixCache):
         for pool in mtp_kv_pools:
             if id(pool) in seen:
                 continue
+            if pool.size != self.kv_cache.size:
+                raise ValueError(
+                    "Target and MTP Draft KV pools must have the same token "
+                    "capacity before sharing HiCache indices: "
+                    f"target={self.kv_cache.size}, draft={pool.size}."
+                )
+            if getattr(pool, "layer_shard_enabled", False):
+                if pool.layer_num != 1:
+                    raise ValueError(
+                        "MTP Draft LayerSplit HiCache currently requires exactly "
+                        f"one NSA layer, got {pool.layer_num}."
+                    )
+                # Every rank needs the device-pool registration so an L2 restore
+                # invalidates its replicated Main/Index scratch markers. Only the
+                # persistent-layer owner gets a host pool and transfer entry.
+                self.cache_controller.set_draft_kv_pool(pool, None)
+                if not pool._is_layer_owned(pool.start_layer):
+                    logger.info(
+                        "Skipping MTP Draft HiCache host allocation on non-owner "
+                        "LayerSplit rank %s/%s.",
+                        pool.layer_shard_rank,
+                        pool.layer_shard_size,
+                    )
+                    continue
             if pool.layer_num == 1:
-                # MTP draft pool: a single layer reused across speculative
-                # steps, so there is no layer dimension to shard. Skip both
-                # shared variants and use a per-rank plain host pool (same
-                # model as the per-rank private MambaPoolHost).
+                # A single Draft layer is either unsharded (legacy path) or
+                # owner-only (LayerSplit path above). In both cases the local
+                # persistent layer uses a plain host pool rather than another
+                # shared layer group.
                 host_pool = NSATokenToKVPoolHost(
                     pool,
                     mtp_host_to_device_ratio,
@@ -317,9 +342,9 @@ class HiRadixCache(RadixCache):
                     host_pool=host_pool,
                     device_pool=pool,
                     layer_mapper=(
-                        lambda i, s=start, n=layer_num: (i - s)
-                        if s <= i < s + n
-                        else None
+                        lambda i, s=start, n=layer_num: (
+                            (i - s) if s <= i < s + n else None
+                        )
                     ),
                 )
             )
@@ -810,11 +835,13 @@ class HiRadixCache(RadixCache):
             return {}
         pools = []
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pools.append(PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
-                indices_from_pool=PoolName.KV,
-            ))
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
         mtp = self._mtp_pool_transfers()
         if mtp:
             pools.extend(mtp)

@@ -376,7 +376,10 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            has_host_indices = host_indices.numel() > 0
             for i in range(self.layer_num):
+                if has_host_indices:
+                    self._invalidate_draft_layer_split_buffers(i)
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -385,7 +388,11 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                if (
+                    self.has_draft
+                    and has_host_indices
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,

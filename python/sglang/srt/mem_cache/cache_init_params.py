@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -29,6 +29,11 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+
+    # The draft pool already exists when the scheduler initializes HiCache.
+    # Passing it here lets hybrid host-pool assembly reserve a share of an
+    # explicit --hicache-size budget before the target pool consumes it all.
+    draft_token_to_kv_pool: Optional[Any] = None
 
     pp_rank: int = 0
     pp_size: int = 1

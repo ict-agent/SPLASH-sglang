@@ -234,6 +234,7 @@ class TpModelWorker(BaseTpWorker):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
+        nsa_layer_split_scratch_source: Optional[object] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -254,6 +255,7 @@ class TpModelWorker(BaseTpWorker):
         self.moe_dp_rank = moe_dp_rank
         # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
         self.memory_pool_config = memory_pool_config
+        self.nsa_layer_split_scratch_source = nsa_layer_split_scratch_source
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -364,6 +366,7 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            nsa_layer_split_scratch_source=self.nsa_layer_split_scratch_source,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -390,6 +393,7 @@ class TpModelWorker(BaseTpWorker):
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
+                    nsa_layer_split_scratch_source=self.nsa_layer_split_scratch_source,
                 )
             )
 

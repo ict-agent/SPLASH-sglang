@@ -148,6 +148,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.input_buffers import get_pp_proxy_hidden_states_shape
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -350,6 +351,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        nsa_layer_split_scratch_source: Optional[object] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -357,6 +359,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # workers so they reuse target's resolved sizes (replaces legacy
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
+        self.nsa_layer_split_scratch_source = nsa_layer_split_scratch_source
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank

@@ -255,6 +255,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         # Unwrap HybridLinearKVPool (GLM5 Next hybrid model) to inner NSA pool
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
         unwrapped = []
         for pool in mtp_kv_pools:
             if isinstance(pool, HybridLinearKVPool):
@@ -262,9 +263,11 @@ class HiMambaRadixCache(MambaRadixCache):
             unwrapped.append(pool)
         mtp_kv_pools = unwrapped
 
-        mtp_host_to_device_ratio = (
-            self.full_kv_pool_host.size / self.kvcache.size
-        )
+        # HostKVCache always rounds ``int(device_size * ratio)`` up to the next
+        # page. Seed it one slot below the already page-aligned Target size so
+        # the Draft pool lands on exactly the same host slot count instead of
+        # consuming one additional page outside the explicit HiCache budget.
+        mtp_host_to_device_ratio = (self.full_kv_pool_host.size - 1) / self.kvcache.size
 
         seen = {id(entry.device_pool) for entry in self.extra_hicache_entries}
         offset = sum(e.device_pool.layer_num for e in self.extra_hicache_entries)
@@ -272,11 +275,35 @@ class HiMambaRadixCache(MambaRadixCache):
         for pool in mtp_kv_pools:
             if id(pool) in seen:
                 continue
+            if pool.size != self.kvcache.size:
+                raise ValueError(
+                    "Target and MTP Draft KV pools must have the same token "
+                    "capacity before sharing HiCache indices: "
+                    f"target={self.kvcache.size}, draft={pool.size}."
+                )
+            if getattr(pool, "layer_shard_enabled", False):
+                if pool.layer_num != 1:
+                    raise ValueError(
+                        "MTP Draft LayerSplit HiCache currently requires exactly "
+                        f"one NSA layer, got {pool.layer_num}."
+                    )
+                # Register the device pool on every rank so L2 restore can
+                # invalidate replicated Draft scratch. The host entry exists
+                # only on the persistent-layer owner.
+                self.cache_controller.set_draft_kv_pool(pool, None)
+                if not pool._is_layer_owned(pool.start_layer):
+                    logger.info(
+                        "Skipping MTP Draft HiCache host allocation on non-owner "
+                        "LayerSplit rank %s/%s.",
+                        pool.layer_shard_rank,
+                        pool.layer_shard_size,
+                    )
+                    continue
             if pool.layer_num == 1:
-                # MTP draft pool: a single layer reused across speculative
-                # steps, so there is no layer dimension to shard. Skip both
-                # shared variants and use a per-rank plain host pool (same
-                # model as the per-rank private MambaPoolHost).
+                # A single Draft layer is either unsharded (legacy path) or
+                # owner-only (LayerSplit path above). In both cases the local
+                # persistent layer uses a plain host pool rather than another
+                # shared layer group.
                 host_pool = NSATokenToKVPoolHost(
                     pool,
                     mtp_host_to_device_ratio,
@@ -321,9 +348,9 @@ class HiMambaRadixCache(MambaRadixCache):
                     host_pool=host_pool,
                     device_pool=pool,
                     layer_mapper=(
-                        lambda i, s=start, n=layer_num: (i - s)
-                        if s <= i < s + n
-                        else None
+                        lambda i, s=start, n=layer_num: (
+                            (i - s) if s <= i < s + n else None
+                        )
                     ),
                 )
             )
@@ -333,12 +360,19 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if not added:
             return
-        logger.info("MTP HiCache registered: %d pools, entries=%s", len(self.extra_hicache_entries), [e.name for e in self.extra_hicache_entries])
+        logger.info(
+            "MTP HiCache registered: %d pools, entries=%s",
+            len(self.extra_hicache_entries),
+            [e.name for e in self.extra_hicache_entries],
+        )
 
         # Rebuild host_pool_group with MTP entries
         if hasattr(self, "host_pool_group") and self.host_pool_group is not None:
-            new_entries = list(self.host_pool_group.entries) + self.extra_hicache_entries
+            new_entries = (
+                list(self.host_pool_group.entries) + self.extra_hicache_entries
+            )
             from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
             self.host_pool_group = HostPoolGroup(new_entries)
             self.cache_controller.mem_pool_host = self.host_pool_group
 

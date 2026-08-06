@@ -42,10 +42,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
-    is_float4_e2m1fn_x2,
-    is_hip,
     is_dcu,
     is_dcu_native_fp8_supported,
+    is_float4_e2m1fn_x2,
+    is_hip,
     is_npu,
 )
 
@@ -67,19 +67,38 @@ _is_dcu = is_dcu()
 
 
 def _is_nsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
-    return (
-        not model_runner.is_draft_worker
-        and model_runner.server_args.enable_nsa_cache_layer_split
-    )
+    if not model_runner.server_args.enable_nsa_cache_layer_split:
+        return False
+    if not model_runner.is_draft_worker:
+        return True
+    # Draft LayerSplit is enabled only when its scratch can alias the target
+    # pool. Allocating another full remote scratch for the one-layer draft
+    # would merely trade replicated persistent KV for equally large scratch.
+    return getattr(model_runner, "nsa_layer_split_scratch_source", None) is not None
 
 
-def _get_nsa_cp_layer_shard_info(model_runner: ModelRunner) -> tuple[Optional[int], int]:
+def _get_nsa_cp_layer_shard_info(
+    model_runner: ModelRunner,
+) -> tuple[Optional[int], int, int]:
     if not _is_nsa_cache_layer_split_enabled(model_runner):
-        return None, 1
+        return None, 1, 0
     shard_size = get_attention_cp_size()
     if shard_size <= 1:
-        return None, 1
-    return get_attention_cp_rank(), shard_size
+        return None, 1, 0
+    # The target distributes 11 NSA layers from CP0 upward. Its last rank has
+    # only one target layer, so place the one draft NSA layer on that CP rank
+    # instead of adding it to CP0 (which already owns two target layers).
+    rank_offset = shard_size - 1 if model_runner.is_draft_worker else 0
+    return get_attention_cp_rank(), shard_size, rank_offset
+
+
+def _get_nsa_layer_split_scratch_source(
+    model_runner: ModelRunner,
+) -> Optional[NSATokenToKVPool]:
+    source = getattr(model_runner, "nsa_layer_split_scratch_source", None)
+    if isinstance(source, HybridLinearKVPool):
+        source = source.full_kv_pool
+    return source
 
 
 class ModelRunnerKVCacheMixin:
@@ -99,11 +118,9 @@ class ModelRunnerKVCacheMixin:
             and is_deepseek_nsa(self.model_config.hf_config)
             and _is_nsa_cache_layer_split_enabled(self)
         ):
-            shard_rank, shard_size = _get_nsa_cp_layer_shard_info(self)
+            shard_rank, shard_size, _ = _get_nsa_cp_layer_shard_info(self)
             if shard_rank is not None:
-                owned_layers_upper_bound = (
-                    num_layers + shard_size - 1
-                ) // shard_size
+                owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
                 kv_cache_num_layers = max(
                     1,
                     owned_layers_upper_bound
@@ -114,9 +131,7 @@ class ModelRunnerKVCacheMixin:
                 index_cache_num_layers = max(1, owned_layers_upper_bound + 1)
         if self.use_mla_backend:
             mla_kv_cache_dim = self.calculate_mla_kv_cache_dim()
-            cell_size = (
-                mla_kv_cache_dim * kv_cache_num_layers * kv_size
-            )
+            cell_size = mla_kv_cache_dim * kv_cache_num_layers * kv_size
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -136,8 +151,7 @@ class ModelRunnerKVCacheMixin:
             if is_deepseek_nsa(self.model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
                 use_bf16_index_cache = _is_dcu and (
-                    self.kv_cache_dtype
-                    not in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    self.kv_cache_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
                     or not is_dcu_native_fp8_supported()
                 )
                 if use_bf16_index_cache:
@@ -319,10 +333,14 @@ class ModelRunnerKVCacheMixin:
                 + kv_lora_rank // quant_block_size * 4
                 + qk_rope_head_dim * rope_storage_dtype.itemsize
             )
-            if _is_dcu and qk_rope_head_dim == 0 and (
-                self.server_args.nsa_prefill_backend
-                in ("flashmla_auto", "flashmla_kv")
-                or self.server_args.nsa_decode_backend == "flashmla_kv"
+            if (
+                _is_dcu
+                and qk_rope_head_dim == 0
+                and (
+                    self.server_args.nsa_prefill_backend
+                    in ("flashmla_auto", "flashmla_kv")
+                    or self.server_args.nsa_decode_backend == "flashmla_kv"
+                )
             ):
                 kv_cache_dim += 64 * rope_storage_dtype.itemsize
             return kv_cache_dim
@@ -361,11 +379,7 @@ class ModelRunnerKVCacheMixin:
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
-        elif (
-            self.use_mla_backend
-            and is_nsa_model
-            and not self.mambaish_config
-        ):
+        elif self.use_mla_backend and is_nsa_model and not self.mambaish_config:
             unsupported_pool_family = "NSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
@@ -484,11 +498,18 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
-        nsa_cp_layer_shard_rank, nsa_cp_layer_shard_size = (
-            _get_nsa_cp_layer_shard_info(self)
+        (
+            nsa_cp_layer_shard_rank,
+            nsa_cp_layer_shard_size,
+            nsa_cp_layer_shard_rank_offset,
+        ) = _get_nsa_cp_layer_shard_info(self)
+        nsa_layer_split_scratch_source = (
+            _get_nsa_layer_split_scratch_source(self)
+            if _is_nsa_cache_layer_split_enabled(self)
+            else None
         )
 
-        # Out-of-tree platform plugin system â€?used by elif below
+        # Out-of-tree platform plugin system ï¿½?used by elif below
         from sglang.srt.platforms import current_platform
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
@@ -656,11 +677,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif (
-            self.use_mla_backend
-            and is_nsa_model
-            and not self.mambaish_config
-        ):
+        elif self.use_mla_backend and is_nsa_model and not self.mambaish_config:
             PoolCls = (
                 HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
             )
@@ -678,7 +695,11 @@ class ModelRunnerKVCacheMixin:
             else:
                 pool_kwargs.update(
                     nsa_index_kpool=self.model_config.nsa_index_kpool,
-                    tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
+                    tail_extra_slots=(
+                        (self.server_args.speculative_num_draft_tokens or 0)
+                        if self.model_config.nsa_index_kpool > 1
+                        else 0
+                    ),
                     max_running_requests=self.max_running_requests,
                 )
             self.token_to_kv_pool = PoolCls(
@@ -696,7 +717,9 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
                 layer_shard_rank=nsa_cp_layer_shard_rank,
                 layer_shard_size=nsa_cp_layer_shard_size,
+                layer_shard_rank_offset=nsa_cp_layer_shard_rank_offset,
                 mla_kv_prefetch_ring_size=self.server_args.mla_kv_prefetch_ring_size,
+                layer_split_scratch_source=nsa_layer_split_scratch_source,
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
@@ -776,16 +799,21 @@ class ModelRunnerKVCacheMixin:
                                 self.model_config.hf_config
                             ),
                             nsa_index_kpool=self.model_config.nsa_index_kpool,
-                            tail_extra_slots=((self.server_args.speculative_num_draft_tokens or 0) if self.model_config.nsa_index_kpool > 1 else 0),
+                            tail_extra_slots=(
+                                (self.server_args.speculative_num_draft_tokens or 0)
+                                if self.model_config.nsa_index_kpool > 1
+                                else 0
+                            ),
                             # Decode preallocation uses request slots beyond
                             # max_running_requests. The dense kpool tail is
                             # indexed by req_pool_idx, so it must cover every
                             # allocatable request-pool row.
-                            max_running_requests=self.req_to_token_pool._alloc_size
-                            - 1,
+                            max_running_requests=self.req_to_token_pool._alloc_size - 1,
                             layer_shard_rank=nsa_cp_layer_shard_rank,
                             layer_shard_size=nsa_cp_layer_shard_size,
+                            layer_shard_rank_offset=nsa_cp_layer_shard_rank_offset,
                             mla_kv_prefetch_ring_size=self.server_args.mla_kv_prefetch_ring_size,
+                            layer_split_scratch_source=nsa_layer_split_scratch_source,
                         )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,

@@ -795,7 +795,10 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
+            has_host_indices = host_indices.numel() > 0
             for i in range(self.layer_num):
+                if has_host_indices:
+                    self._invalidate_draft_layer_split_buffers(i)
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -803,7 +806,11 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                if (
+                    self.has_draft
+                    and has_host_indices
+                    and i < self.mem_pool_host_draft.layer_num
+                ):
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
@@ -840,16 +847,52 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
-        self.has_draft = True
+    def _invalidate_draft_layer_split_buffers(self, local_layer_id: int) -> None:
+        """Invalidate replicated Draft scratch before an owner-only L2 restore.
+
+        Every CP rank executes this hook. Only the owner has a Draft host pool,
+        but all ranks keep independent Main/Index scratch validity markers.
+        Leaving a non-owner marker valid after the owner restores different KV
+        would make the next prefetch skip its collective and consume stale data.
+        """
+        pool = self.mem_pool_device_draft
+        if (
+            pool is None
+            or not getattr(pool, "layer_shard_enabled", False)
+            or local_layer_id >= pool.layer_num
+        ):
+            return
+
+        absolute_layer_id = pool.start_layer + local_layer_id
+        pool.invalidate_remote_kv_buffer_for_layer(absolute_layer_id)
+        invalidate_index = getattr(pool, "invalidate_index_buffer_for_layer", None)
+        if invalidate_index is not None:
+            invalidate_index(absolute_layer_id)
+
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool=None) -> None:
+        """Register Draft pools for L2/L3 transfer and LayerSplit invalidation.
+
+        A LayerSplit non-owner intentionally has no persistent Draft KV and no
+        host pool. It still registers the device pool so L2 restores invalidate
+        its replicated scratch markers in lockstep with the owner.
+        """
+        self.has_draft = draft_host_pool is not None
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
-        logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
-            type(draft_device_pool).__name__,
-            draft_host_pool.size,
-        )
+        if draft_device_pool is not None:
+            draft_device_pool.register_layer_transfer_counter(self.layer_done_counter)
+        if self.has_draft:
+            logger.info(
+                "HiCache draft KV registered: %s (host %d slots)",
+                type(draft_device_pool).__name__,
+                draft_host_pool.size,
+            )
+        else:
+            logger.info(
+                "HiCache Draft LayerSplit device pool registered for scratch "
+                "invalidation without a legacy host pool: %s",
+                type(draft_device_pool).__name__,
+            )
 
     def prefetch(
         self,

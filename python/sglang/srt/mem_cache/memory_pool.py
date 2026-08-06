@@ -46,7 +46,6 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -62,10 +61,10 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_hip,
-    is_npu,
     is_dcu,
     is_dcu_native_fp8_supported,
+    is_hip,
+    is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -90,6 +89,7 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 _is_dcu = is_dcu()
+
 
 @triton.jit
 def copy_all_layer_kv_cache_tiled(
@@ -125,6 +125,7 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
@@ -423,7 +424,9 @@ class MambaPool:
                 # the TP-sharded feature dimension first.
                 is_kda_conv = len(components) > 1
                 self._state_dim_axis_by_type.append(1 if is_kda_conv else 0)
-                self._state_dim_outer_by_type.append(conv_shape[0] if is_kda_conv else 1)
+                self._state_dim_outer_by_type.append(
+                    conv_shape[0] if is_kda_conv else 1
+                )
             self._state_dim_components_by_type.append([shape.num_heads])
             self._state_dim_axis_by_type.append(0)
             self._state_dim_outer_by_type.append(1)
@@ -803,6 +806,7 @@ class KVCache(abc.ABC):
         end_layer: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
+        layer_shard_rank_offset: int = 0,
     ):
         self.size = size
         self.page_size = page_size
@@ -818,12 +822,17 @@ class KVCache(abc.ABC):
         self.end_layer = end_layer or layer_num - 1
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
-        self.layer_shard_enabled = (
-            layer_shard_rank is not None and layer_shard_size > 1
-        )
+        self.layer_shard_rank_offset = layer_shard_rank_offset
+        self.layer_shard_enabled = layer_shard_rank is not None and layer_shard_size > 1
         self.layer_shard_start = 0
         if self.layer_shard_enabled:
             assert 0 <= self.layer_shard_rank < self.layer_shard_size
+            if not 0 <= self.layer_shard_rank_offset < self.layer_shard_size:
+                raise ValueError(
+                    "LayerSplit rank offset must be in the shard rank space: "
+                    f"offset={self.layer_shard_rank_offset}, "
+                    f"shard_size={self.layer_shard_size}"
+                )
             self._log_layer_shard_plan()
             owned_start, _ = self._owned_local_layer_range()
             self.layer_shard_start = owned_start
@@ -849,24 +858,36 @@ class KVCache(abc.ABC):
 
     def _owned_local_layer_range(self) -> tuple[int, int]:
         assert self.layer_shard_rank is not None
+        logical_rank = (
+            self.layer_shard_rank - self.layer_shard_rank_offset
+        ) % self.layer_shard_size
         return _get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
+            logical_rank, self.layer_shard_size, self.layer_num
         )
 
     def _log_layer_shard_plan(self) -> None:
         partitions = []
-        for rank in range(self.layer_shard_size):
+        for logical_rank in range(self.layer_shard_size):
             start, end = _get_layer_shard_range(
-                rank, self.layer_shard_size, self.layer_num
+                logical_rank, self.layer_shard_size, self.layer_num
             )
-            partitions.append(f"r{rank}:[{start},{end})")
+            physical_rank = (
+                logical_rank + self.layer_shard_rank_offset
+            ) % self.layer_shard_size
+            partitions.append(f"r{physical_rank}:[{start},{end})")
         owned_start, owned_end = self._owned_local_layer_range()
+        logical_rank = (
+            self.layer_shard_rank - self.layer_shard_rank_offset
+        ) % self.layer_shard_size
         logger.info(
             "Layer shard plan (continuous): layer_num=%s, shard_size=%s, "
-            "rank=%s, local=[%s,%s), global=[%s,%s), partitions=%s",
+            "rank=%s, logical_rank=%s, rank_offset=%s, local=[%s,%s), "
+            "global=[%s,%s), partitions=%s",
             self.layer_num,
             self.layer_shard_size,
             self.layer_shard_rank,
+            logical_rank,
+            self.layer_shard_rank_offset,
             owned_start,
             owned_end,
             self.start_layer + owned_start,
@@ -882,9 +903,10 @@ class KVCache(abc.ABC):
         return owned_start <= local_idx < owned_end
 
     def _get_layer_owner_rank(self, layer_id: int) -> int:
-        return _get_layer_owner(
+        logical_owner = _get_layer_owner(
             self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
         )
+        return (logical_owner + self.layer_shard_rank_offset) % self.layer_shard_size
 
     def _init_layer_broadcast_comm(self) -> None:
         if not self.layer_shard_enabled:
@@ -1106,7 +1128,7 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                
+
                 if _kv_layout_dcu_fa:
                     page_num = int((self.size + self.page_size) / self.page_size)
                     self.k_buffer = [
@@ -1139,7 +1161,11 @@ class MHATokenToKVPool(KVCache):
                     ]
                     self.v_buffer = [
                         torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
                             dtype=self.store_dtype,
                             device=self.device,
                         )
@@ -1157,7 +1183,7 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
-        
+
         if _kv_layout_dcu_fa:
             self.data_strides = torch.tensor(
                 [
@@ -1208,7 +1234,7 @@ class MHATokenToKVPool(KVCache):
             self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
-        
+
         if _kv_layout_dcu_fa:
             kv_item_lens = [
                 self._get_key_buffer(i)[0].nbytes
@@ -1243,7 +1269,7 @@ class MHATokenToKVPool(KVCache):
                 else:
                     k_chunk = self.k_buffer[layer_id][chunk_indices]
                     v_chunk = self.v_buffer[layer_id][chunk_indices]
-                
+
                 k_cpu = k_chunk.to("cpu", non_blocking=True)
                 v_cpu = v_chunk.to("cpu", non_blocking=True)
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
@@ -1273,8 +1299,8 @@ class MHATokenToKVPool(KVCache):
                 if _kv_layout_dcu_fa:
                     page_idxs = chunk_indices // 64
                     offsets = chunk_indices % 64
-                    self.k_buffer[layer_id][page_idxs,:,offsets,:] = k_chunk
-                    self.v_buffer[layer_id][page_idxs,:,:,offsets] = v_chunk
+                    self.k_buffer[layer_id][page_idxs, :, offsets, :] = k_chunk
+                    self.v_buffer[layer_id][page_idxs, :, :, offsets] = v_chunk
                 else:
                     self.k_buffer[layer_id][chunk_indices] = k_chunk
                     self.v_buffer[layer_id][chunk_indices] = v_chunk
@@ -1319,6 +1345,7 @@ class MHATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -1342,13 +1369,21 @@ class MHATokenToKVPool(KVCache):
                 # Overlap the copy of K and V cache for small batch size
                 current_stream = self.device_module.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                self.k_buffer[layer_id - self.start_layer][page_idxs,:,offsets,:] = cache_k
+                self.k_buffer[layer_id - self.start_layer][
+                    page_idxs, :, offsets, :
+                ] = cache_k
                 with self.device_module.stream(self.alt_stream):
-                    self.v_buffer[layer_id - self.start_layer][page_idxs,:,:,offsets] = cache_v
+                    self.v_buffer[layer_id - self.start_layer][
+                        page_idxs, :, :, offsets
+                    ] = cache_v
                 current_stream.wait_stream(self.alt_stream)
             else:
-                self.k_buffer[layer_id - self.start_layer][page_idxs,:,offsets,:] = cache_k
-                self.v_buffer[layer_id - self.start_layer][page_idxs,:,:,offsets] = cache_v
+                self.k_buffer[layer_id - self.start_layer][
+                    page_idxs, :, offsets, :
+                ] = cache_k
+                self.v_buffer[layer_id - self.start_layer][
+                    page_idxs, :, :, offsets
+                ] = cache_v
         else:
             _set_kv_buffer_impl(
                 cache_k,
@@ -1694,7 +1729,9 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
+        layer_shard_rank_offset: int = 0,
         mla_kv_prefetch_ring_size: int = 1,
+        layer_split_scratch_source: Optional[NSATokenToKVPool] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1754,16 +1791,14 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 layer_shard_rank=layer_shard_rank,
                 layer_shard_size=layer_shard_size,
+                layer_shard_rank_offset=layer_shard_rank_offset,
                 mla_kv_prefetch_ring_size=mla_kv_prefetch_ring_size,
+                layer_split_scratch_source=layer_split_scratch_source,
             )
-            self.use_fp8_index_k_cache = (
-                self.full_kv_pool.use_fp8_index_k_cache
-            )
+            self.use_fp8_index_k_cache = self.full_kv_pool.use_fp8_index_k_cache
             self.index_head_dim = self.full_kv_pool.index_head_dim
             self.index_k_buffer_dtype = self.full_kv_pool.index_k_buffer_dtype
-            self.nsa_kv_cache_store_fp8 = (
-                self.full_kv_pool.nsa_kv_cache_store_fp8
-            )
+            self.nsa_kv_cache_store_fp8 = self.full_kv_pool.nsa_kv_cache_store_fp8
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
             self.index_kpool = self.full_kv_pool.index_kpool
             self.tail_extra_slots = self.full_kv_pool.tail_extra_slots
@@ -1858,6 +1893,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "layer_shard_size", 1)
 
     @property
+    def layer_shard_rank_offset(self) -> int:
+        return getattr(self.full_kv_pool, "layer_shard_rank_offset", 0)
+
+    @property
     def layer_shard_start(self) -> int:
         return getattr(self.full_kv_pool, "layer_shard_start", 0)
 
@@ -1878,9 +1917,7 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
-    def get_key_buffer_with_prefetch_history(
-        self, layer_id: int, *, has_history: bool
-    ):
+    def get_key_buffer_with_prefetch_history(self, layer_id: int, *, has_history: bool):
         """Read one MLA layer while preserving the current batch's history state."""
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
@@ -1996,20 +2033,14 @@ class HybridLinearKVPool(KVCache):
     ) -> None:
         if not self.use_mla:
             return
-        configure = getattr(
-            self.full_kv_pool, "configure_main_kv_page_plan", None
-        )
+        configure = getattr(self.full_kv_pool, "configure_main_kv_page_plan", None)
         if configure is not None:
             configure(page_plan, batch_marker)
 
-    def translate_main_kv_loc_to_compact(
-        self, loc: torch.Tensor
-    ) -> torch.Tensor:
+    def translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
         if not self.use_mla:
             return loc
-        translate = getattr(
-            self.full_kv_pool, "translate_main_kv_loc_to_compact", None
-        )
+        translate = getattr(self.full_kv_pool, "translate_main_kv_loc_to_compact", None)
         return loc if translate is None else translate(loc)
 
     def prefetch_mla_kv_buffer(
@@ -2061,16 +2092,12 @@ class HybridLinearKVPool(KVCache):
             self._get_nsa_layer_id(layer_id)
         )
 
-    def get_dcu_index_k_with_scale_write_buffer(
-        self, layer_id: int
-    ) -> torch.Tensor:
+    def get_dcu_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
         return self.full_kv_pool.get_dcu_index_k_with_scale_write_buffer(
             self._get_nsa_layer_id(layer_id)
         )
 
-    def get_kpool_index_k_with_scale_write_buffer(
-        self, layer_id: int
-    ) -> torch.Tensor:
+    def get_kpool_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
         return self.full_kv_pool.get_kpool_index_k_with_scale_write_buffer(
             self._get_nsa_layer_id(layer_id)
         )
@@ -2114,9 +2141,7 @@ class HybridLinearKVPool(KVCache):
         return self.full_kv_pool._owned_local_layer_range()
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
-        return self.full_kv_pool.get_index_k_buffer(
-            self._get_nsa_layer_id(layer_id)
-        )
+        return self.full_kv_pool.get_index_k_buffer(self._get_nsa_layer_id(layer_id))
 
     def get_index_k_continuous(
         self,
@@ -2215,7 +2240,9 @@ class MLATokenToKVPool(KVCache):
         override_kv_cache_dim: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
+        layer_shard_rank_offset: int = 0,
         mla_kv_prefetch_ring_size: int = 1,
+        layer_split_scratch_source: Optional[MLATokenToKVPool] = None,
     ):
         super().__init__(
             size,
@@ -2228,6 +2255,7 @@ class MLATokenToKVPool(KVCache):
             end_layer,
             layer_shard_rank,
             layer_shard_size,
+            layer_shard_rank_offset,
         )
 
         self.kv_lora_rank = kv_lora_rank
@@ -2246,6 +2274,8 @@ class MLATokenToKVPool(KVCache):
             else (kv_lora_rank + qk_rope_head_dim)
         )
         self.mla_kv_prefetch_ring_size = max(1, mla_kv_prefetch_ring_size)
+        self.layer_split_scratch_source = layer_split_scratch_source
+        self.shares_layer_split_scratch = layer_split_scratch_source is not None
 
         self._create_buffers()
 
@@ -2288,17 +2318,30 @@ class MLATokenToKVPool(KVCache):
                             "LayerSplit MLA KV buffer must contain whole pages: "
                             f"size={self.size}, page_size={self.page_size}"
                         )
-                    self.num_pool_pages = (
-                        self.size + self.page_size
-                    ) // self.page_size
-                    self.remote_kv_buffers = [
-                        torch.zeros(
-                            (self.size + self.page_size, 1, self.kv_cache_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
+                    self.num_pool_pages = (self.size + self.page_size) // self.page_size
+                    shared_buffers = self._get_shared_main_kv_scratch()
+                    if shared_buffers is None:
+                        self.remote_kv_buffers = [
+                            torch.zeros(
+                                (
+                                    self.size + self.page_size,
+                                    1,
+                                    self.kv_cache_dim,
+                                ),
+                                dtype=self.store_dtype,
+                                device=self.device,
+                            )
+                            for _ in range(self.mla_kv_prefetch_ring_size)
+                        ]
+                    else:
+                        self.remote_kv_buffers = shared_buffers
+                        logger.info(
+                            "Reusing LayerSplit Main-KV scratch buffers: "
+                            "rank=%s, ring_size=%s, bytes_per_buffer=%s",
+                            self.layer_shard_rank,
+                            self.mla_kv_prefetch_ring_size,
+                            self.remote_kv_buffers[0].nbytes,
                         )
-                        for _ in range(self.mla_kv_prefetch_ring_size)
-                    ]
                     self.remote_kv_layer_ids: List[Optional[int]] = [
                         None
                     ] * self.mla_kv_prefetch_ring_size
@@ -2317,9 +2360,7 @@ class MLATokenToKVPool(KVCache):
                         device=self.device,
                     )
                     self.physical_to_compact_main_kv_page[0] = 0
-                    self._active_main_kv_page_plan: Optional[
-                        MainKVPagePlan
-                    ] = None
+                    self._active_main_kv_page_plan: Optional[MainKVPagePlan] = None
                     self._active_main_kv_batch_marker: Optional[
                         weakref.ReferenceType[Any]
                     ] = None
@@ -2329,6 +2370,73 @@ class MLATokenToKVPool(KVCache):
                     self.device_module = torch.get_device_module(self.device)
                     self.kv_broadcast_stream = self.device_module.Stream()
         self._init_layer_broadcast_comm()
+
+    def _get_shared_main_kv_scratch(self) -> Optional[List[torch.Tensor]]:
+        source = self.layer_split_scratch_source
+        if source is None:
+            return None
+        if source is self:
+            raise ValueError("LayerSplit scratch source cannot be the pool itself.")
+        if not self.layer_shard_enabled or not source.layer_shard_enabled:
+            raise ValueError(
+                "LayerSplit scratch sharing requires both KV pools to be "
+                "layer-sharded."
+            )
+
+        compatibility = {
+            "size": (self.size, source.size),
+            "page_size": (self.page_size, source.page_size),
+            "kv_cache_dim": (self.kv_cache_dim, source.kv_cache_dim),
+            "store_dtype": (self.store_dtype, source.store_dtype),
+            "device": (self.device, source.device),
+            "layer_shard_rank": (
+                self.layer_shard_rank,
+                source.layer_shard_rank,
+            ),
+            "layer_shard_size": (
+                self.layer_shard_size,
+                source.layer_shard_size,
+            ),
+            "mla_kv_prefetch_ring_size": (
+                self.mla_kv_prefetch_ring_size,
+                source.mla_kv_prefetch_ring_size,
+            ),
+        }
+        mismatches = [
+            f"{name}: draft={draft_value!r}, target={target_value!r}"
+            for name, (draft_value, target_value) in compatibility.items()
+            if draft_value != target_value
+        ]
+        if mismatches:
+            raise ValueError(
+                "Incompatible LayerSplit Main-KV scratch source: "
+                + "; ".join(mismatches)
+            )
+
+        buffers = getattr(source, "remote_kv_buffers", None)
+        if buffers is None or len(buffers) != self.mla_kv_prefetch_ring_size:
+            raise ValueError(
+                "LayerSplit scratch source does not expose the expected "
+                f"Main-KV ring: expected={self.mla_kv_prefetch_ring_size}, "
+                f"actual={0 if buffers is None else len(buffers)}"
+            )
+        expected_shape = (
+            self.size + self.page_size,
+            1,
+            self.kv_cache_dim,
+        )
+        for slot, buffer in enumerate(buffers):
+            if (
+                tuple(buffer.shape) != expected_shape
+                or buffer.dtype != self.store_dtype
+            ):
+                raise ValueError(
+                    "Incompatible LayerSplit Main-KV scratch tensor: "
+                    f"slot={slot}, shape={tuple(buffer.shape)}, "
+                    f"dtype={buffer.dtype}, expected_shape={expected_shape}, "
+                    f"expected_dtype={self.store_dtype}"
+                )
+        return list(buffers)
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -2370,16 +2478,10 @@ class MLATokenToKVPool(KVCache):
     def get_key_buffer(self, layer_id: int):
         return self._get_key_buffer_impl(layer_id, prefetch_has_history=True)
 
-    def get_key_buffer_with_prefetch_history(
-        self, layer_id: int, *, has_history: bool
-    ):
-        return self._get_key_buffer_impl(
-            layer_id, prefetch_has_history=has_history
-        )
+    def get_key_buffer_with_prefetch_history(self, layer_id: int, *, has_history: bool):
+        return self._get_key_buffer_impl(layer_id, prefetch_has_history=has_history)
 
-    def _get_key_buffer_impl(
-        self, layer_id: int, *, prefetch_has_history: bool
-    ):
+    def _get_key_buffer_impl(self, layer_id: int, *, prefetch_has_history: bool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
@@ -2397,7 +2499,9 @@ class MLATokenToKVPool(KVCache):
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
         if self.store_dtype != self.dtype and self.dtype not in (
-            torch.float8_e5m2, torch.float8_e4m3fn):
+            torch.float8_e5m2,
+            torch.float8_e4m3fn,
+        ):
             return kv_buffer.view(self.dtype)
         return kv_buffer, self.dtype
 
@@ -2440,9 +2544,7 @@ class MLATokenToKVPool(KVCache):
         if self.layer_shard_enabled:
             slot = self._remote_kv_slot(layer_id)
             if self.pending_remote_kv_layer_ids[slot] == layer_id:
-                self._finalize_pending_kv_broadcast(
-                    slot, set_remote_layer_id=False
-                )
+                self._finalize_pending_kv_broadcast(slot, set_remote_layer_id=False)
             if self.remote_kv_layer_ids[slot] == layer_id:
                 self.remote_kv_layer_ids[slot] = None
         if not self._is_layer_owned(layer_id):
@@ -2467,14 +2569,12 @@ class MLATokenToKVPool(KVCache):
         if self.layer_shard_enabled:
             slot = self._remote_kv_slot(layer_id)
             if self.pending_remote_kv_layer_ids[slot] == layer_id:
-                self._finalize_pending_kv_broadcast(
-                    slot, set_remote_layer_id=False
-                )
+                self._finalize_pending_kv_broadcast(slot, set_remote_layer_id=False)
             if self.remote_kv_layer_ids[slot] == layer_id:
                 self.remote_kv_layer_ids[slot] = None
         if not self._is_layer_owned(layer_id):
             return
-        cache_k = torch.cat([cache_k_nope, cache_k_rope],dim=-1)
+        cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -2504,8 +2604,8 @@ class MLATokenToKVPool(KVCache):
                 from lightop import op
 
                 op.fused_quantize_and_store_mla_kv_cache(
-                    cache_k_nope, 
-                    cache_k_rope, 
+                    cache_k_nope,
+                    cache_k_rope,
                     dst_buffer,
                     loc,
                     "fp8_e4m3",
@@ -2552,9 +2652,7 @@ class MLATokenToKVPool(KVCache):
         if self.layer_shard_enabled:
             slot = self._remote_kv_slot(layer_id)
             if self.pending_remote_kv_layer_ids[slot] == layer_id:
-                self._finalize_pending_kv_broadcast(
-                    slot, set_remote_layer_id=True
-                )
+                self._finalize_pending_kv_broadcast(slot, set_remote_layer_id=True)
             remote_kv_updatable = self.remote_kv_layer_ids[slot] == layer_id
 
         if remote_kv_updatable:
@@ -2609,9 +2707,7 @@ class MLATokenToKVPool(KVCache):
         # by the next ForwardBatch.
         self._drain_pending_layer_broadcasts()
         self.remote_kv_layer_ids[:] = [None] * self.mla_kv_prefetch_ring_size
-        self.pending_remote_kv_layer_ids[:] = [
-            None
-        ] * self.mla_kv_prefetch_ring_size
+        self.pending_remote_kv_layer_ids[:] = [None] * self.mla_kv_prefetch_ring_size
         self.physical_to_compact_main_kv_page.fill_(-1)
         self.physical_to_compact_main_kv_page[0] = 0
         self._active_main_kv_batch_marker = None
@@ -2650,10 +2746,7 @@ class MLATokenToKVPool(KVCache):
         # those pages not already represented by a history page. A boundary
         # page is already mapped by the history side and is patched in place.
         current_only_mask = (
-            self.physical_to_compact_main_kv_page.index_select(
-                0, all_page_ids
-            )
-            < 0
+            self.physical_to_compact_main_kv_page.index_select(0, all_page_ids) < 0
         )
         current_only_page_ids = all_page_ids[current_only_mask]
         current_compact_ids = torch.arange(
@@ -2671,9 +2764,7 @@ class MLATokenToKVPool(KVCache):
         self._active_main_kv_page_plan = page_plan
         self._active_main_kv_batch_marker = weakref.ref(batch_marker)
 
-    def translate_main_kv_loc_to_compact(
-        self, loc: torch.Tensor
-    ) -> torch.Tensor:
+    def translate_main_kv_loc_to_compact(self, loc: torch.Tensor) -> torch.Tensor:
         """Translate physical token locations for the active compact buffer."""
 
         if not self.layer_shard_enabled or self._active_main_kv_page_plan is None:
@@ -2681,9 +2772,9 @@ class MLATokenToKVPool(KVCache):
 
         valid = loc >= 0
         safe_loc = loc.clamp_min(0)
-        physical_page = torch.div(
-            safe_loc, self.page_size, rounding_mode="floor"
-        ).to(torch.long)
+        physical_page = torch.div(safe_loc, self.page_size, rounding_mode="floor").to(
+            torch.long
+        )
         page_offset = safe_loc % self.page_size
         compact_page = self.physical_to_compact_main_kv_page.index_select(
             0, physical_page.reshape(-1)
@@ -2827,7 +2918,9 @@ class MLATokenToKVPool(KVCache):
             return
 
         local_idx = self._local_layer_idx(layer_id)
-        src_tensor = self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+        src_tensor = (
+            self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
+        )
         transfer_counter = layer_transfer_counter or self.layer_transfer_counter
         transfer_idx = (
             layer_transfer_idx if layer_transfer_idx is not None else local_idx
@@ -2836,9 +2929,7 @@ class MLATokenToKVPool(KVCache):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             if self._active_main_kv_page_plan is not None:
-                self._broadcast_compact_main_kv_pages(
-                    slot, layer_id, src_tensor
-                )
+                self._broadcast_compact_main_kv_pages(slot, layer_id, src_tensor)
             else:
                 self._broadcast_tensor_from_owner(
                     self.remote_kv_buffers[slot],
@@ -2854,9 +2945,7 @@ class MLATokenToKVPool(KVCache):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             if self._active_main_kv_page_plan is not None:
-                self._broadcast_compact_main_kv_pages(
-                    slot, layer_id, src_tensor
-                )
+                self._broadcast_compact_main_kv_pages(slot, layer_id, src_tensor)
             else:
                 self._broadcast_tensor_from_owner(
                     self.remote_kv_buffers[slot],
@@ -2880,18 +2969,14 @@ class MLATokenToKVPool(KVCache):
             self._finalize_pending_kv_broadcast(slot, set_remote_layer_id=True)
         if self.remote_kv_layer_ids[slot] != layer_id:
             if self.pending_remote_kv_layer_ids[slot] is not None:
-                self._finalize_pending_kv_broadcast(
-                    slot, set_remote_layer_id=False
-                )
+                self._finalize_pending_kv_broadcast(slot, set_remote_layer_id=False)
             # The main and index broadcasts share one communicator. A fallback
             # broadcast on the current stream must not race with work still
             # queued on the communication stream.
             self._drain_pending_layer_broadcasts(discard_main_slot=slot)
             local_idx = self._local_layer_idx(layer_id)
             src_tensor = (
-                self.kv_buffer[local_idx]
-                if self._is_layer_owned(layer_id)
-                else None
+                self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
             )
             if self._active_main_kv_page_plan is not None:
                 # The normal prefetch path transmits history only. A missed
@@ -3129,7 +3214,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         layer_shard_rank: Optional[int] = None,
         layer_shard_size: int = 1,
+        layer_shard_rank_offset: int = 0,
         mla_kv_prefetch_ring_size: int = 1,
+        layer_split_scratch_source: Optional[NSATokenToKVPool] = None,
     ):
 
         override_dim = (
@@ -3151,12 +3238,14 @@ class NSATokenToKVPool(MLATokenToKVPool):
             override_kv_cache_dim=override_dim,
             layer_shard_rank=layer_shard_rank,
             layer_shard_size=layer_shard_size,
+            layer_shard_rank_offset=layer_shard_rank_offset,
             mla_kv_prefetch_ring_size=mla_kv_prefetch_ring_size,
+            layer_split_scratch_source=layer_split_scratch_source,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
-        #assert nsa_index_kpool > 1 or tail_extra_slots == 0
+        # assert nsa_index_kpool > 1 or tail_extra_slots == 0
         self.index_kpool = nsa_index_kpool
         self.tail_extra_slots = tail_extra_slots
         self.slots_per_page = self.page_size // nsa_index_kpool
@@ -3169,7 +3258,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
         if _is_dcu:
             self.use_fp8_index_k_cache = nsa_index_kpool > 1 or (
-                dtype in (
+                dtype
+                in (
                     torch.float8_e4m3fn,
                     torch.float8_e5m2,
                 )
@@ -3180,11 +3270,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         self.index_k_buffer_dtype = (
             torch.bfloat16 if _is_dcu and not self.use_fp8_index_k_cache else self.dtype
         )
-        assert self.index_kpool <= 1 or self.use_fp8_index_k_cache, (
-            "kpool layout requires FP8 index K cache"
-        )
+        assert (
+            self.index_kpool <= 1 or self.use_fp8_index_k_cache
+        ), "kpool layout requires FP8 index K cache"
 
-        if _is_hip and not _is_dcu: #and  not _is_dcu:nhb
+        if _is_hip and not _is_dcu:  # and  not _is_dcu:nhb
             assert self.page_size == 1
         else:
             assert self.page_size == 64
@@ -3205,9 +3295,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         #         * buf[i, :page_size * head_dim] for fp8 data
                         #         * buf[i, page_size * head_dim:].view(float32) for scale
                         (
-                            num_pages
-                            if self._is_layer_owned(self.start_layer + i)
-                            else 0,
+                            (
+                                num_pages
+                                if self._is_layer_owned(self.start_layer + i)
+                                else 0
+                            ),
                             self.slots_per_page
                             * (
                                 index_head_dim
@@ -3223,9 +3315,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 self.index_k_buffer = [
                     torch.zeros(
                         (
-                            num_pages
-                            if self._is_layer_owned(self.start_layer + i)
-                            else 0,
+                            (
+                                num_pages
+                                if self._is_layer_owned(self.start_layer + i)
+                                else 0
+                            ),
                             self.page_size,
                             1,
                             self.index_head_dim,
@@ -3236,9 +3330,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     for i in range(layer_num)
                 ]
             if self.index_kpool > 1:
-                assert max_running_requests is not None, (
-                    "kpool layout requires max_running_requests for the per-req tail"
-                )
+                assert (
+                    max_running_requests is not None
+                ), "kpool layout requires max_running_requests for the per-req tail"
                 tail_shape = (
                     max_running_requests + 1,
                     self.index_kpool + self.tail_extra_slots,
@@ -3253,6 +3347,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
                     for _ in range(layer_num)
                 ]
             if self.layer_shard_enabled:
+                # Keep the draft Index-K scratch independent from the target
+                # pool. Unlike Main-KV scratch, whose compact page plan is
+                # invalidated for every ForwardBatch, Index-K scratch uses a
+                # persistent ``remote_index_layer_id`` validity marker. If two
+                # pools alias the tensor while keeping separate markers, one
+                # pool can overwrite the bytes and the other can still treat
+                # them as current, silently consuming another model's Index K.
                 if self.use_fp8_index_k_cache:
                     self.remote_index_k_with_scale_buffer = torch.zeros(
                         (
@@ -3312,9 +3413,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         if self.use_fp8_index_k_cache:
             return [buf.data_ptr() for buf in self.index_k_with_scale_buffer]
 
-        row_width = self.page_size * self.index_head_dim * torch.empty(
-            (), dtype=self.index_k_buffer_dtype
-        ).element_size()
+        row_width = (
+            self.page_size
+            * self.index_head_dim
+            * torch.empty((), dtype=self.index_k_buffer_dtype).element_size()
+        )
         return [
             buf.view(torch.uint8).view(buf.shape[0], row_width).data_ptr()
             for buf in self.index_k_buffer
@@ -3326,9 +3429,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_broadcastable_index_buffer(layer_id)
 
-    def get_dcu_index_k_with_scale_write_buffer(
-        self, layer_id: int
-    ) -> torch.Tensor:
+    def get_dcu_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
         """Return the DCU fused-write target for the current index K."""
         assert self.use_fp8_index_k_cache, "FP8 index K cache is not enabled"
         if self.layer_transfer_counter is not None:
@@ -3342,9 +3443,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self.remote_index_layer_id = None
         return self.remote_index_k_with_scale_buffer
 
-    def get_kpool_index_k_with_scale_write_buffer(
-        self, layer_id: int
-    ) -> torch.Tensor:
+    def get_kpool_index_k_with_scale_write_buffer(self, layer_id: int) -> torch.Tensor:
         """Return a LayerSplit-aware persistent kpool write target.
 
         All ranks first make the shared scratch current for this layer (a cold
@@ -3599,19 +3698,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
     def _finalize_pending_index_broadcast(
         self, *, set_remote_layer_id: bool = True
     ) -> None:
-        if (
-            not self.layer_shard_enabled
-            or not getattr(self, "pending_remote_index_broadcast", False)
+        if not self.layer_shard_enabled or not getattr(
+            self, "pending_remote_index_broadcast", False
         ):
             return
-        self.device_module.current_stream().wait_event(
-            self.pending_remote_index_event
-        )
+        self.device_module.current_stream().wait_event(self.pending_remote_index_event)
         self.pending_remote_index_broadcast = False
-        if (
-            set_remote_layer_id
-            and self.pending_remote_index_layer_id is not None
-        ):
+        if set_remote_layer_id and self.pending_remote_index_layer_id is not None:
             self.remote_index_layer_id = self.pending_remote_index_layer_id
         elif not set_remote_layer_id:
             self.remote_index_layer_id = None
@@ -3644,9 +3737,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             local_buffer = self.index_k_buffer
             remote_buffer = self.remote_index_k_buffer
         local_idx = self._local_layer_idx(layer_id)
-        src_tensor = (
-            local_buffer[local_idx] if self._is_layer_owned(layer_id) else None
-        )
+        src_tensor = local_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         transfer_counter = layer_transfer_counter or self.layer_transfer_counter
         transfer_idx = (
             layer_transfer_idx if layer_transfer_idx is not None else local_idx
@@ -3685,9 +3776,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             return False
         if getattr(self, "pending_remote_index_broadcast", False):
             self._finalize_pending_index_broadcast(
-                set_remote_layer_id=(
-                    self.pending_remote_index_layer_id == layer_id
-                )
+                set_remote_layer_id=(self.pending_remote_index_layer_id == layer_id)
             )
         return self.remote_index_layer_id == layer_id
 
@@ -3716,9 +3805,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             return local_buffer[layer_id - self.start_layer]
         if getattr(self, "pending_remote_index_broadcast", False):
             self._finalize_pending_index_broadcast(
-                set_remote_layer_id=(
-                    self.pending_remote_index_layer_id == layer_id
-                )
+                set_remote_layer_id=(self.pending_remote_index_layer_id == layer_id)
             )
         if self.remote_index_layer_id != layer_id:
             # Main KV prefetch is queued after index prefetch on the same
@@ -3791,9 +3878,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(
-                    index_k_cache[0].device, non_blocking=True
-                )
+                idx_chunk = idx_cpu.to(index_k_cache[0].device, non_blocking=True)
                 index_k_cache[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
 
@@ -3809,9 +3894,9 @@ class NSATokenToKVPool(MLATokenToKVPool):
 
         remote_updatable = self._prepare_remote_index_write(layer_id)
         if remote_updatable:
-            self.remote_index_k_buffer[
-                loc // self.page_size, loc % self.page_size
-            ] = index_k
+            self.remote_index_k_buffer[loc // self.page_size, loc % self.page_size] = (
+                index_k
+            )
         if not self._is_layer_owned(layer_id):
             return
         self.index_k_buffer[layer_id - self.start_layer][

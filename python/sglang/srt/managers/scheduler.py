@@ -470,8 +470,8 @@ class Scheduler(
         # Picking the new path also avoids allocating the unused legacy
         # mem_pool_host_draft buffer (~1GB/rank), which HybridCacheController
         # never reads.
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
         from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             NSATokenToKVPool,
@@ -924,6 +924,8 @@ class Scheduler(
         if self.model_config.is_multimodal and uses_transformers_backend:
             effective_chunked_prefill_size = None
 
+        draft_token_to_kv_pool, _ = self._get_draft_kv_pool()
+
         params = CacheInitParams(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -941,6 +943,7 @@ class Scheduler(
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
@@ -1095,11 +1098,31 @@ class Scheduler(
         if isinstance(pool, HybridLinearKVPool):
             pool = pool.full_kv_pool
 
+        owns_persistent_layers = True
+        if getattr(pool, "layer_shard_enabled", False):
+            owned_layer_ids = [
+                layer_id
+                for layer_id in range(pool.layer_num)
+                if pool._is_layer_owned(pool.start_layer + layer_id)
+            ]
+            if not owned_layer_ids:
+                owns_persistent_layers = False
+                logger.info(
+                    "Registering HiCache Draft LayerSplit device pool only on "
+                    "non-owner "
+                    "LayerSplit rank %s/%s.",
+                    pool.layer_shard_rank,
+                    pool.layer_shard_size,
+                )
+
         # Create host pool for draft with the same slot count as the target host pool,
         # so that host indices stay 1-to-1 between target and draft KV caches.
         primary = self.tree_cache.cache_controller.mem_pool_host
         kw = dict(
-            host_to_device_ratio=primary.size / pool.size,
+            # HostKVCache aligns upward by one page. Start one slot below the
+            # page-aligned Target size so Draft gets exactly the same index
+            # capacity rather than one extra page outside --hicache-size.
+            host_to_device_ratio=(primary.size - 1) / pool.size,
             host_size=0,
             page_size=self.page_size,
             layout=self.server_args.hicache_mem_layout,
@@ -1114,7 +1137,9 @@ class Scheduler(
                 "implemented. Disable the storage backend."
             )
 
-        if isinstance(pool, NSATokenToKVPool):
+        if not owns_persistent_layers:
+            draft_host_pool = None
+        elif isinstance(pool, NSATokenToKVPool):
             # NSA draft correctness requires restoring both latent Main KV and
             # Index K. The generic MLA host pool only carries the former.
             draft_host_pool = NSATokenToKVPoolHost(pool, **kw)
@@ -1366,7 +1391,7 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-           
+
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1476,9 +1501,7 @@ class Scheduler(
             self.model_config.context_len,
             self.device,
             self.spec_algorithm,
-            mtp_topk_indices_dim=get_mtp_index_share_topk(
-                self.model_config.hf_config
-            ),
+            mtp_topk_indices_dim=get_mtp_index_share_topk(self.model_config.hf_config),
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -2580,9 +2603,10 @@ class Scheduler(
         """Return the Mamba-pool slots needed to admit ``req``."""
         req_pool = self.req_to_token_pool
         slots = 1 if getattr(req, "mamba_pool_idx", None) is None else 0
-        if getattr(req_pool, "enable_mamba_extra_buffer", False) and getattr(
-            req, "mamba_ping_pong_track_buffer", None
-        ) is None:
+        if (
+            getattr(req_pool, "enable_mamba_extra_buffer", False)
+            and getattr(req, "mamba_ping_pong_track_buffer", None) is None
+        ):
             slots += req_pool.mamba_ping_pong_track_buffer_size
         return slots
 
@@ -2621,9 +2645,7 @@ class Scheduler(
         extra_kv_cost = 0
         max_total_len = self.server_args.prefill_short_req_max_total_len
 
-        for req in self.waiting_queue[
-            : self.server_args.prefill_short_req_scan_depth
-        ]:
+        for req in self.waiting_queue[: self.server_args.prefill_short_req_scan_depth]:
             if len(selected) >= max_short_reqs:
                 break
             if req is self.chunked_req:
