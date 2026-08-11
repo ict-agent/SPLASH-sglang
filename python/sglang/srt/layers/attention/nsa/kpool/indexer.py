@@ -1023,9 +1023,9 @@ class IndexerKPool(Indexer):
 
         if total_k_rows > 0:
             # Layer-shared workspace allocated by the planner.
-            k_u8 = plan.ragged_k_u8
+            k_i8 = plan.ragged_k_u8
             k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
+            assert k_i8 is not None and k_scale is not None
             gather_index_k_scale_prefix_into(
                 pool=forward_batch.token_to_kv_pool,
                 buf=forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -1033,17 +1033,17 @@ class IndexerKPool(Indexer):
                 ),
                 page_indices=plan.ragged_concat_page_table,
                 seq_len=total_k_rows,
-                k_out=k_u8,
+                k_out=k_i8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
+            k_int8 = k_i8.view(torch.int8)
 
             # Rows with ks==ke (pool_seq_len==0) get no writes; cleaned
             # to zero by ``clean_logits=True``.
             if is_dcu():
                 q_bf16 = q_fp8[:n_real].to(torch.bfloat16).contiguous()
                 kv_bf16 = (
-                    k_fp8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
+                    k_int8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
                 ).to(torch.bfloat16).unsqueeze(1).contiguous()
                 weights_f32 = weights[:n_real].to(torch.float32).contiguous()
                 logits_workspace = reserve_dcu_mqa_logits_workspace(
@@ -1189,8 +1189,8 @@ class IndexerKPool(Indexer):
             # leading `n_pages` entries of this batch's page-table row.
             n_pages = (pool_kv_len + slots_per_page - 1) // slots_per_page
             packed_page_indices = bt_row[:n_pages].to(torch.int32).contiguous()
-            k_u8 = torch.empty(
-                (pool_kv_len, INDEX_HEAD_DIM), dtype=torch.uint8, device=device
+            k_i8 = torch.empty(
+                (pool_kv_len, INDEX_HEAD_DIM), dtype=torch.int8, device=device
             )
             k_scale = torch.empty((pool_kv_len,), dtype=torch.float32, device=device)
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
@@ -1199,10 +1199,9 @@ class IndexerKPool(Indexer):
                 buf=buf,
                 page_indices=packed_page_indices,
                 seq_len=pool_kv_len,
-                k_out=k_u8,
+                k_out=k_i8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
 
             # Pool-level ks/ke: ks all 0; ke = right-edge pool index
             # (exclusive), i.e. tail_token // pool_size.
@@ -1213,7 +1212,7 @@ class IndexerKPool(Indexer):
 
             if is_dcu():
                 kv_bf16 = (
-                    k_fp8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
+                    k_i8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
                 ).to(torch.bfloat16).unsqueeze(1).contiguous()
                 logits = op.mqa_logits(
                     q_fp8.to(torch.bfloat16).contiguous(),

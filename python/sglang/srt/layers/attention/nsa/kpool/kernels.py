@@ -522,7 +522,7 @@ def gather_index_k_scale_prefix_into(
         buf.view(torch.int8),
         buf.view(torch.float32),
         page_indices,
-        k_out.view(torch.float8_e4m3fn),
+        k_out.view(torch.int8),
         scale_out,
         SLOTS_PER_PAGE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
@@ -534,10 +534,10 @@ def gather_index_k_scale_prefix_into(
 
 @triton.jit
 def _gather_index_k_scale_prefix_into_kernel(
-    buf_i8_ptr,
+    buf_ptr,
     buf_fp32_ptr,
     page_indices_ptr,
-    k_out_fp8_ptr,
+    k_out_ptr,
     scale_out_ptr,
     SLOTS_PER_PAGE: tl.constexpr,
     BUF_NUMEL_PER_PAGE: tl.constexpr,
@@ -554,16 +554,15 @@ def _gather_index_k_scale_prefix_into_kernel(
     mask = offs < HEAD_DIM
     src_k_offsets = page * BUF_NUMEL_PER_PAGE + token_offset_in_page * HEAD_DIM + offs
     dst_k_offsets = token_id * HEAD_DIM + offs
-    k_i8 = tl.load(buf_i8_ptr + src_k_offsets, mask=mask).to(tl.float32)
-    k_fp8 = k_i8 * (448.0 / 127.0)
-    tl.store(k_out_fp8_ptr + dst_k_offsets, k_fp8, mask=mask)
+    k = tl.load(buf_ptr + src_k_offsets, mask=mask)
+    tl.store(k_out_ptr + dst_k_offsets, k, mask=mask)
 
     src_s_offset = (
         page * BUF_NUMEL_PER_PAGE // 4
         + S_OFFSET_NBYTES_IN_PAGE // 4
         + token_offset_in_page
     )
-    scale = tl.load(buf_fp32_ptr + src_s_offset) * (127.0 / 448.0)
+    scale = tl.load(buf_fp32_ptr + src_s_offset)
     tl.store(scale_out_ptr + token_id, scale)
 
 
