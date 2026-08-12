@@ -780,6 +780,12 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
+                self.stats.pre_allocated_token_usage = (
+                    self.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                    / self.max_total_num_tokens
+                    if self.max_total_num_tokens > 0
+                    else 0.0
+                )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )

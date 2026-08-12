@@ -121,6 +121,7 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    pre_allocated_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -423,6 +424,12 @@ class SchedulerMetricsCollector:
         self.pending_prealloc_token_usage = Gauge(
             name="sglang:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pre_allocated_token_usage = Gauge(
+            name="sglang:pre_allocated_token_usage",
+            documentation="The token usage for pre-allocated tokens (already allocated, transferring KV).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1154,6 +1161,9 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge(
+            self.pre_allocated_token_usage, stats.pre_allocated_token_usage
         )
 
         # Utilization
