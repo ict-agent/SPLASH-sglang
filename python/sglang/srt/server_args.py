@@ -431,6 +431,14 @@ class ServerArgs:
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
+    # GLM5-Next PD-prefill adaptive chunking. When a long request is already
+    # chunk-prefilled, reserve part of the next chunk for short FCFS requests.
+    prefill_short_req_reserve: bool = False
+    prefill_short_req_threshold: int = 16384
+    prefill_short_req_max_reserve_ratio: float = 0.5
+    prefill_short_req_scan_depth: int = 8
+    prefill_long_req_starve_threshold: int = 8
+    prefill_short_req_max_total_len: int = 262144
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
@@ -910,6 +918,11 @@ class ServerArgs:
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
+
+        # Auto chunking is a PD-prefill-only feature. Validate static mode
+        # combinations before model configuration or weights are loaded so the
+        # scheduler hot path only needs to reason about per-round resources.
+        self._validate_auto_chunking_args()
 
         # Resolve --quantization unquant: explicitly opt out of quantization.
         # Convert to None now (before model config validation), but record
@@ -4414,6 +4427,50 @@ class ServerArgs:
                     f"got '{self.disaggregation_transfer_backend}'."
                 )
 
+    def _validate_auto_chunking_args(self):
+        """Validate static constraints for GLM5-Next PD-prefill auto chunking."""
+        if not self.prefill_short_req_reserve:
+            return
+
+        if self.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--prefill-short-req-reserve is supported only on a PD "
+                "prefill server (--disaggregation-mode prefill)."
+            )
+
+        incompatible = []
+        if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
+            incompatible.append("disabled chunked prefill")
+        if self.schedule_policy != "fcfs":
+            incompatible.append("non-FCFS scheduling")
+        if self.enable_priority_scheduling:
+            incompatible.append("priority scheduling")
+        if self.enable_dynamic_chunking:
+            incompatible.append("dynamic chunking")
+        if self.dllm_algorithm is not None:
+            incompatible.append("diffusion LLM scheduling")
+        if self.enable_prefill_delayer:
+            incompatible.append("prefill delaying")
+        if self.enable_lora or self.lora_paths:
+            incompatible.append("LoRA serving")
+        if self.enable_prefill_context_parallel:
+            incompatible.append("general prefill context parallelism")
+        if (
+            self.enable_nsa_prefill_context_parallel
+            and self.nsa_prefill_cp_mode != "round-robin-split"
+        ):
+            incompatible.append(
+                f"NSA prefill CP mode {self.nsa_prefill_cp_mode!r}"
+            )
+
+        if incompatible:
+            raise ValueError(
+                "--prefill-short-req-reserve is incompatible with: "
+                + ", ".join(incompatible)
+                + ". PD-prefill auto chunking supports NSA CP only in "
+                "round-robin-split mode."
+            )
+
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
@@ -5202,6 +5259,42 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_dynamic_chunking,
             help="Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-reserve",
+            action="store_true",
+            default=ServerArgs.prefill_short_req_reserve,
+            help="Enable GLM5-Next adaptive chunking on a PD prefill server: reserve part of an in-flight long request's chunk budget for short FCFS requests. Off by default.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-threshold",
+            type=int,
+            default=ServerArgs.prefill_short_req_threshold,
+            help="Maximum existing-prefix-adjusted input length that is eligible for adaptive chunk reservation.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-max-reserve-ratio",
+            type=float,
+            default=ServerArgs.prefill_short_req_max_reserve_ratio,
+            help="Maximum fraction of a chunk that adaptive chunking may reserve. Must be in (0, 1), so the long request always keeps progress.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-scan-depth",
+            type=int,
+            default=ServerArgs.prefill_short_req_scan_depth,
+            help="Maximum number of FCFS waiting requests scanned per scheduling round.",
+        )
+        parser.add_argument(
+            "--prefill-long-req-starve-threshold",
+            type=int,
+            default=ServerArgs.prefill_long_req_starve_threshold,
+            help="Number of consecutive compressed rounds before forcing one full-budget round for the long request.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-max-total-len",
+            type=int,
+            default=ServerArgs.prefill_short_req_max_total_len,
+            help="Ignore waiting requests longer than this value during adaptive chunk scanning. Set to 0 to disable the limit.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -7690,6 +7783,24 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        if self.prefill_short_req_reserve:
+            assert 0.0 < self.prefill_short_req_max_reserve_ratio < 1.0, (
+                "prefill_short_req_max_reserve_ratio must be in (0, 1), got "
+                f"{self.prefill_short_req_max_reserve_ratio}"
+            )
+            assert self.prefill_short_req_threshold > 0, (
+                "prefill_short_req_threshold must be positive"
+            )
+            assert self.prefill_short_req_scan_depth > 0, (
+                "prefill_short_req_scan_depth must be positive"
+            )
+            assert self.prefill_long_req_starve_threshold > 0, (
+                "prefill_long_req_starve_threshold must be positive"
+            )
+            assert self.prefill_short_req_max_total_len >= 0, (
+                "prefill_short_req_max_total_len must be non-negative"
+            )
 
         # Check pdmux
         if self.enable_pdmux:

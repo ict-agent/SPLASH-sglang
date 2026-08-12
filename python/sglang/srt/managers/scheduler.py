@@ -169,6 +169,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -261,6 +262,20 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
+GLM5_NEXT_ARCHS = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+}
+
+
+@dataclass
+class AutoChunkPlan:
+    """One-round plan for sharing a long GLM5-Next prefill chunk."""
+
+    chunk_cap: int
+    reserved_tokens: int
+    short_reqs: List[Req]
 
 
 @dataclass
@@ -1169,6 +1184,25 @@ class Scheduler(
         # init_next_round_input, so running stash would double-free and
         # corrupt prefix_indices.
         self._chunked_req_scheduled_last_iter = False
+        architectures = (
+            getattr(self.model_config.hf_config, "architectures", None) or []
+        )
+        is_glm5_next = any(arch in GLM5_NEXT_ARCHS for arch in architectures)
+        self.enable_prefill_short_req_reserve = (
+            self.server_args.prefill_short_req_reserve
+            and is_glm5_next
+            and self.chunked_prefill_size is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        )
+        if (
+            self.server_args.prefill_short_req_reserve
+            and not self.enable_prefill_short_req_reserve
+        ):
+            logger.warning(
+                "Adaptive prefill chunk reservation is currently supported only "
+                "for GLM5-Next on a PD prefill server with chunked prefill "
+                "enabled; disabling it."
+            )
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2542,6 +2576,218 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def _mamba_slots_needed(self, req: Req) -> int:
+        """Return the Mamba-pool slots needed to admit ``req``."""
+        req_pool = self.req_to_token_pool
+        slots = 1 if getattr(req, "mamba_pool_idx", None) is None else 0
+        if getattr(req_pool, "enable_mamba_extra_buffer", False) and getattr(
+            req, "mamba_ping_pong_track_buffer", None
+        ) is None:
+            slots += req_pool.mamba_ping_pong_track_buffer_size
+        return slots
+
+    def _select_auto_chunk_short_reqs(
+        self,
+        adder: PrefillAdder,
+        max_short_reqs: int,
+        max_reserve: int,
+        full_chunk: int,
+    ) -> List[Req]:
+        """Select short requests using conservative token and Mamba budgets.
+
+        GLM5-Next uses a Mamba radix cache whose prefix match can mutate cache
+        state.  This dry run therefore only consumes prefix information already
+        present on the request; the normal admission path remains authoritative.
+        """
+        if max_short_reqs <= 0 or max_reserve <= 0:
+            return []
+
+        req_pool = self.req_to_token_pool
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return []
+
+        page_size = adder.page_size
+        # Reserving input tokens merely moves them from the long request to the
+        # short requests.  The additional KV cost is each short request's decode
+        # reserve and page overhead, plus the long request's own page overhead.
+        kv_headroom = int(adder.rem_total_tokens) - full_chunk - page_size
+        if kv_headroom <= 0:
+            return []
+
+        mamba_slots_left = int(mamba_pool.available_size())
+        selected: List[Req] = []
+        reserved = 0
+        extra_kv_cost = 0
+        max_total_len = self.server_args.prefill_short_req_max_total_len
+
+        for req in self.waiting_queue[
+            : self.server_args.prefill_short_req_scan_depth
+        ]:
+            if len(selected) >= max_short_reqs:
+                break
+            if req is self.chunked_req:
+                continue
+            if max_total_len > 0 and req.seqlen > max_total_len:
+                continue
+            if req.sampling_params.ignore_eos:
+                continue
+
+            prefix_len = (
+                len(req.prefix_indices) if req.prefix_indices is not None else 0
+            )
+            effective_len = req.seqlen - prefix_len
+            if not (0 < effective_len <= self.server_args.prefill_short_req_threshold):
+                continue
+
+            chunk_cost = adder.ceil_paged_tokens(effective_len)
+            # PrefillAdder requires a new request's input to be strictly less
+            # than rem_input_tokens once the long request is in can_run_list.
+            # Keep one additional page so the final selected short request does
+            # not hit the equality case and get rejected after we compressed
+            # the long request for it.
+            if reserved + chunk_cost + page_size > max_reserve:
+                continue
+
+            # Use the full clipped generation reserve.  This is at least as
+            # conservative as add_one_req's remaining-generation admission
+            # check and also matches _update_prefill_budget's deduction.
+            max_new_tokens = min(
+                max(req.sampling_params.max_new_tokens, 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            candidate_extra_kv = max_new_tokens + page_size
+            if extra_kv_cost + candidate_extra_kv >= kv_headroom:
+                continue
+
+            mamba_slots = self._mamba_slots_needed(req)
+            if mamba_slots > mamba_slots_left:
+                continue
+
+            selected.append(req)
+            reserved += chunk_cost
+            extra_kv_cost += candidate_extra_kv
+            mamba_slots_left -= mamba_slots
+
+        return selected
+
+    def _plan_auto_chunk(
+        self, adder: PrefillAdder, max_short_reqs: int
+    ) -> AutoChunkPlan:
+        """Plan one GLM5-Next adaptive chunk round without mutating state."""
+        page_size = adder.page_size
+        rem_chunk_tokens = int(adder.rem_chunk_tokens or 0)
+        full_chunk = rem_chunk_tokens // page_size * page_size
+        full_plan = AutoChunkPlan(
+            chunk_cap=full_chunk, reserved_tokens=0, short_reqs=[]
+        )
+
+        # Static deployment compatibility is validated once by ServerArgs.
+        # Per-round planning only checks state and resource availability.
+        if (
+            not self.enable_prefill_short_req_reserve
+            or not self.waiting_queue
+            or max_short_reqs <= 0
+            or full_chunk < 2 * page_size
+        ):
+            return full_plan
+
+        long_req = self.chunked_req
+        if long_req is None:
+            return full_plan
+        if (
+            getattr(long_req, "chunk_starved_rounds", 0)
+            >= self.server_args.prefill_long_req_starve_threshold
+        ):
+            return full_plan
+
+        max_reserve = min(
+            int(full_chunk * self.server_args.prefill_short_req_max_reserve_ratio),
+            full_chunk - page_size,
+        )
+        max_reserve = max_reserve // page_size * page_size
+        short_reqs = self._select_auto_chunk_short_reqs(
+            adder, max_short_reqs, max_reserve, full_chunk
+        )
+        short_input_tokens = sum(
+            adder.ceil_paged_tokens(
+                req.seqlen
+                - (len(req.prefix_indices) if req.prefix_indices is not None else 0)
+            )
+            for req in short_reqs
+        )
+        reserved = short_input_tokens + page_size if short_reqs else 0
+        chunk_cap = full_chunk - reserved
+
+        # If the long request would finish under this cap, the existing adder
+        # already has enough room for short requests; compression is unnecessary.
+        if reserved <= 0 or long_req.extend_input_len <= chunk_cap:
+            return full_plan
+
+        return AutoChunkPlan(
+            chunk_cap=chunk_cap,
+            reserved_tokens=reserved,
+            short_reqs=short_reqs,
+        )
+
+    def _promote_auto_chunk_reqs(self, short_reqs: List[Req]) -> None:
+        """Stably promote selected requests within the configured scan window."""
+        scan_depth = self.server_args.prefill_short_req_scan_depth
+        head = self.waiting_queue[:scan_depth]
+        tail = self.waiting_queue[scan_depth:]
+        selected_ids = {id(req) for req in short_reqs}
+        promoted = [req for req in head if id(req) in selected_ids]
+        rest = [req for req in head if id(req) not in selected_ids]
+        self.waiting_queue = promoted + rest + tail
+
+    def _commit_auto_chunk_plan(
+        self,
+        long_req: Req,
+        plan: AutoChunkPlan,
+        scheduled: bool,
+    ) -> List[Req]:
+        """Commit starvation and queue state after actual long-req admission."""
+        if not scheduled:
+            return []
+        if plan.reserved_tokens <= 0:
+            long_req.chunk_starved_rounds = 0
+            return []
+
+        long_req.chunk_starved_rounds += 1
+        self._promote_auto_chunk_reqs(plan.short_reqs)
+        self._log_auto_chunk_intent(long_req, plan)
+        return plan.short_reqs
+
+    def _log_auto_chunk_intent(self, long_req: Req, plan: AutoChunkPlan) -> None:
+        if not getattr(self, "is_stats_logging_rank", False):
+            return
+        logger.info(
+            "GLM5-Next auto chunk intent: cap=%s reserved=%s short_reqs=%s "
+            "starved_rounds=%s queue_len=%s scan_depth=%s rid=%s",
+            plan.chunk_cap,
+            plan.reserved_tokens,
+            len(plan.short_reqs),
+            long_req.chunk_starved_rounds,
+            len(self.waiting_queue),
+            self.server_args.prefill_short_req_scan_depth,
+            long_req.rid,
+        )
+
+    def _log_auto_chunk_actual(
+        self, long_req: Req, short_reqs: List[Req], can_run_list: List[Req]
+    ) -> None:
+        if not short_reqs or not getattr(self, "is_stats_logging_rank", False):
+            return
+        admitted_ids = {id(req) for req in can_run_list}
+        admitted = [req for req in short_reqs if id(req) in admitted_ids]
+        logger.info(
+            "GLM5-Next auto chunk actual: admitted=%s/%s tokens=%s rid=%s",
+            len(admitted),
+            len(short_reqs),
+            sum(req.extend_input_len for req in admitted),
+            long_req.rid,
+        )
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2794,12 +3040,39 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        auto_chunk_long_req = None
+        auto_chunk_short_reqs: List[Req] = []
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            self._chunked_req_scheduled_last_iter = (
-                self.chunked_req in adder.can_run_list
+            original_chunked_req = self.chunked_req
+            original_chunked_req.init_next_round_input()
+
+            max_short_reqs = max(
+                self.get_num_allocatable_reqs(running_bs) - 1,
+                0,
             )
+            if self.server_args.prefill_max_requests is not None:
+                max_short_reqs = min(
+                    max_short_reqs,
+                    max(self.server_args.prefill_max_requests - 1, 0),
+                )
+            auto_chunk_plan = self._plan_auto_chunk(adder, max_short_reqs)
+            self.chunked_req = adder.add_chunked_req(
+                original_chunked_req,
+                max_tokens=auto_chunk_plan.chunk_cap,
+            )
+            self._chunked_req_scheduled_last_iter = (
+                original_chunked_req in adder.can_run_list
+            )
+
+            # Planning is side-effect free.  Only commit starvation state and
+            # queue promotion after the long request really entered this batch.
+            auto_chunk_short_reqs = self._commit_auto_chunk_plan(
+                original_chunked_req,
+                auto_chunk_plan,
+                self._chunked_req_scheduled_last_iter,
+            )
+            if auto_chunk_short_reqs:
+                auto_chunk_long_req = original_chunked_req
         else:
             self._chunked_req_scheduled_last_iter = False
 
@@ -2882,6 +3155,10 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if auto_chunk_long_req is not None:
+            self._log_auto_chunk_actual(
+                auto_chunk_long_req, auto_chunk_short_reqs, can_run_list
+            )
         if len(can_run_list) == 0:
             return None
 

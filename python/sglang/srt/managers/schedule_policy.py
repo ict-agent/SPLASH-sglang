@@ -665,7 +665,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, max_tokens: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -676,6 +676,11 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
+            if max_tokens is not None:
+                # The caller uses this cap to reserve chunk budget for short
+                # requests. Keep at least one page for the in-flight request so
+                # the leak-protection fallback below never defeats the cap.
+                _rem_tokens = min(_rem_tokens, max(int(max_tokens), self.page_size))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
@@ -717,7 +722,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
@@ -801,6 +806,13 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            # A prefill batch can carry at most one unfinished request. Adaptive
+            # chunking may deliberately leave budget after the existing
+            # chunked request, but that budget is only for requests that finish
+            # prefill in this batch.
+            if has_chunked_req:
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -837,7 +849,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead. The paged allocator
         # may consume up to one extra page per request (see alloc_extend), and
@@ -918,6 +930,11 @@ class PrefillAdder:
                     ),
                 )
             else:
+                # Do not turn another waiting request into a second unfinished
+                # request after adaptive chunking capped the in-flight one.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 

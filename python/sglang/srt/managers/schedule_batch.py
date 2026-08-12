@@ -763,6 +763,11 @@ class Req(ReqDllmMixin):
         # processed.
         self.is_chunked = 0
 
+        # Number of consecutive prefill rounds in which this request's chunk
+        # was reduced to admit short requests. Used by GLM5-Next adaptive
+        # chunking to periodically grant the long request a full-budget round.
+        self.chunk_starved_rounds = 0
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
@@ -1273,6 +1278,7 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
+        self.chunk_starved_rounds = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
