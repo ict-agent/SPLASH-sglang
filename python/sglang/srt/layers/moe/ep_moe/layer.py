@@ -996,11 +996,15 @@ class DeepEPMoE(FusedMoE):
             and envs.SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT.get()
         ):
             q_a2_all, q_a2_scale = fuse_silu_mul_clamp_quant(
-                gateup_output, float(swiglu_limit)
+                input=gateup_output,
+                limit=float(swiglu_limit),
+                mask_m=num_recv_tokens_per_expert_gpu,
             )
         else:
             _apply_swiglu_limit_inplace(gateup_output, swiglu_limit)
-            q_a2_all, q_a2_scale = fuse_silu_mul_quant(gateup_output)
+            q_a2_all, q_a2_scale = fuse_silu_mul_quant(
+                gateup_output, expert_ids=m_indices
+            )
         del gateup_output
 
         down_output = bf16_gemm_workspace.narrow(
