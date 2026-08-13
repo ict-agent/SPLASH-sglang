@@ -57,7 +57,7 @@ compile:
       echo "Building HCU wheels for ${WHEEL_COMMIT_SHA}"
 
       # ---- 安装构建依赖 (maturin<1.7: 避开 v1.7 起 readme 路径越界的严格校验) ----
-      pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.7" ciupload
+      pip install torch==${TORCH_VERSION} build scikit-build-core cmake ninja wheel setuptools setuptools-scm setuptools-rust "maturin<1.7" ciupload==0.2.2
       wget ${RESOURCE_SERVER}/Jenkins/CompileDep/sglang/protoc-24.4-linux-x86_64.zip
       unzip protoc-24.4-linux-x86_64.zip -d /usr/local/
       chmod +x /usr/local/bin/protoc
