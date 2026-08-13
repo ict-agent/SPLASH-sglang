@@ -11,8 +11,6 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.utils import input_guard
 
-BT_LIST = [8, 16, 32, 64, 128]
-
 
 # @triton.autotune(
 #     configs=[
@@ -43,21 +41,12 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BT": BT}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8, 16]
-#         for BT in BT_LIST
-#     ],
-#     key=["D", "NB"],
-# )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -91,7 +80,6 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -100,7 +88,6 @@ def l2norm_fwd(
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,
