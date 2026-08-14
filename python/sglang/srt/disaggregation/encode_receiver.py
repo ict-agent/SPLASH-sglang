@@ -313,11 +313,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
-                    groups[self.modality_list[i]].append(e.cuda())
-            return {
-                mod: torch.concat(tensors).to("cpu", non_blocking=True)
-                for mod, tensors in groups.items()
-            }
+                    groups[self.modality_list[i]].append(e)
+            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
     @property
