@@ -69,6 +69,11 @@ class GlmVisualEncoderMixin:
         return torch.cat(outs, dim=0)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if getattr(self, "visual", None) is None:
+            raise RuntimeError(
+                "GLM visual encoder is not initialized; multimodal embeddings must "
+                "be provided by the disaggregated encoder before prefill."
+            )
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
@@ -78,6 +83,11 @@ class GlmVisualEncoderMixin:
         return self._run_visual_chunked(pixel_values, image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if getattr(self, "visual", None) is None:
+            raise RuntimeError(
+                "GLM visual encoder is not initialized; multimodal embeddings must "
+                "be provided by the disaggregated encoder before prefill."
+            )
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )

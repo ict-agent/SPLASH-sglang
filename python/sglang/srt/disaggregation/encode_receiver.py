@@ -438,7 +438,11 @@ class WaitingImageRequest:
         async def _send_single_request(session, url, payload):
             try:
                 async with session.post(url, json=payload) as response:
-                    response.raise_for_status()
+                    if response.status != 200:
+                        msg = await response.text()
+                        raise RuntimeError(
+                            f"encoder {url} returned {response.status}: {msg}"
+                        )
                     return await response.text()
             except Exception as e:
                 logger.error(f"Failed to send request to {url}: {e}")
@@ -491,11 +495,22 @@ class WaitingImageRequest:
                 logger.info(f"Concurrently sending {len(tasks)} requests...")
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"Request {i} failed: {result}")
-                    else:
-                        logger.debug(f"Request {i} succeeded.")
+                failed_results = [
+                    result for result in results if isinstance(result, Exception)
+                ]
+                if failed_results:
+                    self.error_msg = (
+                        f"Failed to notify encoder backends for request {req_id}: "
+                        + "; ".join(str(result) for result in failed_results)
+                    )
+                    self.error_code = HTTPStatus.SERVICE_UNAVAILABLE
+                    self.status = WaitingImageRequestStatus.FAIL
+                    self.recv_socket.close()
+                    logger.error(self.error_msg)
+                    return
+
+                for i, _ in enumerate(results):
+                    logger.debug(f"Request {i} succeeded.")
 
         asyncio.run(
             send_embedding_port(
@@ -1198,13 +1213,16 @@ class MMReceiverHTTP(MMReceiverBase):
                 for encode_request in encode_requests
             ]
 
-            responses = await asyncio.gather(*tasks)
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
             for response in responses:
+                if isinstance(response, Exception):
+                    logger.error(f"Encoder request failed for {req_id}: {response}")
+                    return
                 if response.status != 200:
                     try:
                         err_data = await response.json()
                         msg = err_data.get("message", "Unknown encoder error")
-                    except:
+                    except Exception:
                         msg = await response.text()
 
                     logger.error(f"Encoder returned error {response.status}: {msg}")
