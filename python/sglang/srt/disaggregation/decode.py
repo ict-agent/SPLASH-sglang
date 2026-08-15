@@ -1602,6 +1602,12 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        def pop_and_process():
+            if not self.result_queue:
+                return
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1613,6 +1619,14 @@ class SchedulerDisaggregationDecodeMixin:
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            # This is required for spec-v2 + grammar so the current batch's grammar
+            # mask is generated from an up-to-date matcher state.
+            if disable_overlap_for_batch:
+                pop_and_process()
 
             # Launch the current batch
             if batch:
@@ -1623,8 +1637,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.on_idle()
 

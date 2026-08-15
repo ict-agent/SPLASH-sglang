@@ -109,6 +109,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self.tokens_after_end -= 1
 
     def accept_token(self, token: int):
+        token = int(token)
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.accepted_tokens.append(token)
@@ -124,6 +125,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
             steps_after = min(k, max(0, self.tokens_after_end))
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
+        if k > 0:
+            self.accepted_tokens = self.accepted_tokens[:-k]
         for _ in range(k):
             self.rollback_state()
 
@@ -135,9 +138,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        idx = int(idx)
         if self._is_thinking():
             if not self.enable_token_filter:
-                vocab_mask.fill_(-1)
+                vocab_mask[idx].fill_(-1)
                 return
             if self._can_think_more():
                 self._do_token_filter(
@@ -170,6 +174,17 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self.grammar is not None:
             return self.grammar.apply_vocab_mask
         return self.apply_vocab_mask_fn
+
+    @property
+    def matcher(self):
+        # Expose the underlying xgrammar matcher only in generation phase.
+        # spec_utils.traverse_tree uses matcher.traverse_draft_tree (xgrammar
+        # C++ fast path) when present. During thinking the grammar hasn't been
+        # advanced, so returning None forces the Python fallback which respects
+        # the reasoner state via fill_vocab_mask.
+        if self._is_thinking() or self.grammar is None:
+            return None
+        return getattr(self.grammar, "matcher", None)
 
     def copy(self):
         new_obj = ReasonerGrammarObject(
