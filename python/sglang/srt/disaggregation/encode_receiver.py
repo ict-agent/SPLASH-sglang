@@ -492,22 +492,46 @@ class WaitingImageRequest:
                 logger.info(f"Concurrently sending {len(tasks)} requests...")
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                failed_results = [
-                    result for result in results if isinstance(result, Exception)
-                ]
+                failed_results = []
+                timed_out = False
+                timeout_val = 1800
+                for i, result in enumerate(results):
+                    if isinstance(result, asyncio.TimeoutError):
+                        timed_out = True
+                        msg = (
+                            f"Request {i} to encoder /scheduler_receive_url timed out "
+                            f"({timeout_val}s) for req_id={req_id}"
+                        )
+                        logger.error(msg)
+                        failed_results.append(msg)
+                    elif isinstance(result, Exception):
+                        msg = (
+                            f"Request {i} to encoder /scheduler_receive_url failed for "
+                            f"req_id={req_id}: {result}"
+                        )
+                        logger.error(msg, exc_info=result)
+                        failed_results.append(msg)
+                    else:
+                        logger.debug(f"Request {i} succeeded.")
+
                 if failed_results:
                     self.error_msg = (
                         f"Failed to notify encoder backends for request {req_id}: "
-                        + "; ".join(str(result) for result in failed_results)
+                        + "; ".join(failed_results)
                     )
-                    self.error_code = HTTPStatus.SERVICE_UNAVAILABLE
-                    self.status = WaitingImageRequestStatus.FAIL
+                    self.error_code = (
+                        HTTPStatus.REQUEST_TIMEOUT
+                        if timed_out
+                        else HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+                    self.status = (
+                        WaitingImageRequestStatus.TIMEOUT
+                        if timed_out
+                        else WaitingImageRequestStatus.FAIL
+                    )
                     self.recv_socket.close()
                     logger.error(self.error_msg)
                     return
-
-                for i, _ in enumerate(results):
-                    logger.debug(f"Request {i} succeeded.")
 
         asyncio.run(
             send_embedding_port(

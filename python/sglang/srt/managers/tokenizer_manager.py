@@ -801,7 +801,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         prompt=(input_text or input_ids),
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
-                if mm_inputs is None:
+                    if mm_inputs is None:
+                        raise HTTPException(
+                            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                            detail=(
+                                "Timed out waiting for multimodal embeddings from "
+                                "the disaggregated encoder."
+                            ),
+                        )
+                elif mm_inputs is None:
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
