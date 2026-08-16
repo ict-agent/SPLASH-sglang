@@ -5,6 +5,10 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sgl_kernel.kvcacheio import (
+    dcu_align_evict_mask_to_page_size,
+    dcu_create_extend_after_decode_spec_info,
+)
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
@@ -17,7 +21,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import ScheduleBatch, FINISH_ABORT
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -29,6 +33,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
+    sample_mtp_target_ids,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -44,9 +49,10 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2, get_bool_env_var
-from sgl_kernel.kvcacheio import dcu_create_extend_after_decode_spec_info,dcu_assign_req_to_token_pool,dcu_align_evict_mask_to_page_size
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, next_power_of_2
+
 # _is_npu = is_npu()
+_is_hip = is_hip()
 if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
@@ -86,8 +92,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     seq_lens_cpu_ready: Optional[torch.cuda.Event] = None
     grammar: BaseGrammarObject = None
-    use_sglang_assign_req_to_token_pool = get_bool_env_var("SGLANG_ASSIGN_REQ_TO_TOKEN_POOL")
-    use_sglang_align_evict_mask_to_page_size = get_bool_env_var("SGLANG_ALIGN_EVICT_MASK_TO_PAGE_SIZE")
+    use_sglang_assign_req_to_token_pool = get_bool_env_var(
+        "SGLANG_ASSIGN_REQ_TO_TOKEN_POOL"
+    )
+    use_sglang_align_evict_mask_to_page_size = get_bool_env_var(
+        "SGLANG_ALIGN_EVICT_MASK_TO_PAGE_SIZE"
+    )
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -351,14 +361,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         # Sample tokens. Force greedy sampling on AMD
         is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        sampled_target_ids = None
+        if not is_all_greedy and _is_hip and self.topk == 1:
+            sampled_target_ids = sample_mtp_target_ids(
+                logits_output.next_token_logits,
+                sampling_info,
+                self.draft_token_num,
+                self.positions,
+            )
+
+        if (
+            not is_all_greedy
+            and not TREE_SPEC_KERNEL_AVAILABLE
+            and sampled_target_ids is None
+        ):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+        if (
+            is_all_greedy
+            or not TREE_SPEC_KERNEL_AVAILABLE
+            or sampled_target_ids is not None
+        ):
+            target_predict = (
+                torch.argmax(logits_output.next_token_logits, dim=-1)
+                if sampled_target_ids is None
+                else sampled_target_ids
+            )
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
@@ -371,6 +402,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 target_predict=target_predict,
                 topk=self.topk,
             )
+
+            if sampled_target_ids is not None:
+                tp_group = (
+                    get_attention_tp_group()
+                    if is_dp_attention_enabled()
+                    else get_tp_group()
+                )
+                if tp_group.world_size > 1:
+                    tp_group.broadcast(predict, src=0)
+                    tp_group.broadcast(accept_index, src=0)
+                    tp_group.broadcast(num_correct_drafts, src=0)
 
         else:
             # apply temperature and get target probs
@@ -532,11 +574,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 # Only evict full empty page. Do not evict partial empty page
                 if self.use_sglang_align_evict_mask_to_page_size:
                     dcu_align_evict_mask_to_page_size(
-                        seq_lens = batch.seq_lens,
-                        evict_mask = evict_mask,
-                        page_size = page_size,
-                        num_draft_tokens = self.draft_token_num,
-                        bs = len(batch.seq_lens),
+                        seq_lens=batch.seq_lens,
+                        evict_mask=evict_mask,
+                        page_size=page_size,
+                        num_draft_tokens=self.draft_token_num,
+                        bs=len(batch.seq_lens),
                     )
                 else:
                     align_evict_mask_to_page_size[len(batch.seq_lens),](

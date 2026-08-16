@@ -14,6 +14,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import (
+    top_k_top_p_min_p_sampling_from_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
@@ -33,21 +36,94 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
+    fast_topk,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_pin_memory_available,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
-from sglang.srt.utils import get_bool_env_var
+import logging
+
 from sgl_kernel.kvcacheio import dcu_assign_extend_cache_locs
 
-import logging
+from sglang.srt.utils import get_bool_env_var
+
 logger = logging.getLogger(__name__)
+
+lightop_top_k_top_p_sampling_from_probs = None
+if _is_hip:
+    try:
+        from lightop.sampling import (
+            top_k_top_p_sampling_from_probs as lightop_top_k_top_p_sampling_from_probs,
+        )
+    except (ImportError, AttributeError):
+        pass
+
+
+def sample_mtp_target_ids(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    draft_token_num: int,
+    positions: torch.Tensor,
+):
+    """Sample target ids for top-1 MTP verification on HIP."""
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    target_probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
+    expanded_top_ks = torch.repeat_interleave(
+        sampling_info.top_ks, draft_token_num, dim=0
+    )
+    expanded_top_ps = torch.repeat_interleave(
+        sampling_info.top_ps, draft_token_num, dim=0
+    )
+
+    # LightOp implements the common top-k-first/top-p path. Keep SGLang's
+    # existing compatibility path for min-p and request-specific RNG seeds.
+    if (
+        lightop_top_k_top_p_sampling_from_probs is None
+        or sampling_info.sampling_seed is not None
+        or sampling_info.need_min_p_sampling
+    ):
+        expanded_min_ps = torch.repeat_interleave(
+            sampling_info.min_ps, draft_token_num, dim=0
+        )
+        expanded_sampling_seed = (
+            None
+            if sampling_info.sampling_seed is None
+            else torch.repeat_interleave(
+                sampling_info.sampling_seed, draft_token_num, dim=0
+            )
+        )
+        return top_k_top_p_min_p_sampling_from_probs_torch(
+            target_probs,
+            expanded_top_ks,
+            expanded_top_ps,
+            expanded_min_ps,
+            sampling_info.need_min_p_sampling,
+            expanded_sampling_seed,
+            positions,
+        ).to(torch.long)
+
+    return lightop_top_k_top_p_sampling_from_probs(
+        target_probs.contiguous(),
+        expanded_top_ks,
+        expanded_top_ps,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+    ).to(torch.long)
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -64,7 +140,9 @@ if is_cuda() or is_musa():
     )
 
 
-def start_async_seq_lens_cpu_copy(seq_lens: torch.Tensor, device) -> tuple[torch.Tensor, Any]:
+def start_async_seq_lens_cpu_copy(
+    seq_lens: torch.Tensor, device
+) -> tuple[torch.Tensor, Any]:
     """Start a D2H copy for next iteration's seq_lens on the current stream."""
     if seq_lens.numel() == 0:
         return torch.empty(seq_lens.shape, dtype=seq_lens.dtype, device="cpu"), None
@@ -138,7 +216,9 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
 
-    def materialize_seq_lens_cpu_for_batch(self: EagleDraftInput, batch: ModelWorkerBatch):
+    def materialize_seq_lens_cpu_for_batch(
+        self: EagleDraftInput, batch: ModelWorkerBatch
+    ):
         _materialize_seq_lens_cpu(
             batch,
             self.new_seq_lens_cpu,
@@ -336,7 +416,9 @@ class EagleDraftInputV2Mixin:
 @dataclass
 class EagleVerifyInputV2Mixin:
 
-    use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+    use_sglang_assign_extend_cache_locs = get_bool_env_var(
+        "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+    )
 
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
@@ -507,8 +589,26 @@ class EagleVerifyInputV2Mixin:
         num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu or _is_hip:
-            target_predict = torch.argmax(next_token_logits, dim=-1)
+        sampled_target_ids = None
+        if not sampling_info.is_all_greedy and _is_hip and self.topk == 1:
+            sampled_target_ids = sample_mtp_target_ids(
+                next_token_logits,
+                sampling_info,
+                self.draft_token_num,
+                self.positions,
+            )
+
+        if (
+            sampling_info.is_all_greedy
+            or _is_npu
+            or _is_hip
+            or sampled_target_ids is not None
+        ):
+            target_predict = (
+                torch.argmax(next_token_logits, dim=-1)
+                if sampled_target_ids is None
+                else sampled_target_ids
+            )
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
@@ -521,6 +621,17 @@ class EagleVerifyInputV2Mixin:
                 target_predict=target_predict,
                 topk=self.topk,
             )
+
+            if sampled_target_ids is not None:
+                tp_group = (
+                    get_attention_tp_group()
+                    if is_dp_attention_enabled()
+                    else get_tp_group()
+                )
+                if tp_group.world_size > 1:
+                    tp_group.broadcast(predict, src=0)
+                    tp_group.broadcast(accept_index, src=0)
+                    tp_group.broadcast(num_correct_drafts, src=0)
         else:
             # Apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(
@@ -610,7 +721,7 @@ class EagleVerifyInputV2Mixin:
         return predict, num_correct_drafts + 1, accept_index
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)  #disable on dcu, is cause large bubble
+# @torch.compile(dynamic=True, disable=_is_npu)  #disable on dcu, is cause large bubble
 def select_top_k_tokens_tmp(
     i: int,
     topk_p: torch.Tensor,
@@ -671,16 +782,18 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if is_cuda() or is_hip() :
+    if is_cuda() or is_hip():
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,
             device=device,
         )
-        use_sglang_assign_extend_cache_locs = get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true")
+        use_sglang_assign_extend_cache_locs = get_bool_env_var(
+            "SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"
+        )
         if use_sglang_assign_extend_cache_locs:
             dcu_assign_extend_cache_locs(
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -690,7 +803,7 @@ def assign_extend_cache_locs_func(
             )
         else:
             assign_extend_cache_locs[(batch_size,)](
-                req_pool_indices,         
+                req_pool_indices,
                 req_to_token,
                 start_offset,
                 start_offset + draft_token_num,
@@ -700,6 +813,7 @@ def assign_extend_cache_locs_func(
             )
 
         return out_cache_loc
+
 
 @triton.jit
 def fill_bonus_tokens(
