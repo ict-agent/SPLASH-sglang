@@ -782,6 +782,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+            # Mirror the req.mamba_pool_idx = None clear above so the
+            # alloc()/free() pair stays symmetric. alloc() decides whether
+            # to (re)allocate a ping-pong buffer by checking
+            # `req.mamba_ping_pong_track_buffer is None`; leaving a stale
+            # reference here would let a future alloc reuse a freed slot.
+            # Defensive against streaming-session / retract paths.
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")

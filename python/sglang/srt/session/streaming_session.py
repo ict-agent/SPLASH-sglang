@@ -85,8 +85,14 @@ class SessionSlot:
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
+        # Ownership has moved to the session slot. Clear all req-side
+        # mamba refs so later alloc/free paths cannot observe stale slots.
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_seqlen = None
+        req.mamba_branching_seqlen = None
         req.mamba_cow_src_index = None
         req.mamba_needs_clear = False
 
@@ -296,11 +302,20 @@ class StreamingSession(BasePrefixCache):
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    mamba_pool_idx=req.mamba_pool_idx,
+                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
                 self.slots[session_id] = slot
             slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
             self.release_session(session_id)
             req.req_pool_idx = None
+            req.mamba_pool_idx = None
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
+            req.mamba_last_track_seqlen = None
+            req.mamba_branching_seqlen = None
+            req.mamba_cow_src_index = None
+            req.mamba_needs_clear = False
             req.session.abort_req()
             self._mark_kv_freed(req)
             return True
