@@ -712,6 +712,8 @@ class Envs:
 
     # GLM
     GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
+    # Add a SHA-256-derived Session-Id header to encoder requests for LB affinity.
+    GLM_ENABLE_ENCODER_SESSION_ID_HEADER = EnvBool(False)
 
     # GLM
     # Max number of grammar cache entries per scheduler/rank.

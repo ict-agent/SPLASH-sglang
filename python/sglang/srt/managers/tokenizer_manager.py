@@ -541,6 +541,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         if self.server_args.language_only:
+            if isinstance(obj, GenerateReqInput):
+                # GLM Note: Keep the upstream LB session on the tokenizer-side
+                # request because scheduler Req does not consume encoder affinity.
+                obj._upstream_session_id = (
+                    request.headers.get("Session-Id") if request is not None else None
+                )
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)

@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import itertools
+import json
 import logging
 import pickle
 import random
@@ -10,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -37,6 +39,10 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+# GLM Note: A 64-bit media digest keeps Session-Id headers compact while
+# retaining sufficient collision resistance for encoder load-balancer affinity.
+_ENCODER_MEDIA_HASH_HEX_LENGTH = 16
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -374,6 +380,70 @@ def extract_original_req_id(part_req_id: str) -> str:
     if "_local_part_" in part_req_id:
         return part_req_id.rsplit("_local_part_", 1)[0]
     return part_req_id
+
+
+# GLM Note: Route duplicate URL/base64 media to the same encoder before the
+# encoder-side, feature-based multimodal hash is available.
+def create_encoder_session_id(
+    upstream_session_id: Optional[str], media_identifier
+) -> str:
+    if isinstance(media_identifier, bytes):
+        media_bytes = media_identifier
+    elif isinstance(media_identifier, str):
+        media_bytes = media_identifier.encode("utf-8")
+    else:
+        media_bytes = json.dumps(
+            media_identifier,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+    media_hash = hashlib.sha256(media_bytes).hexdigest()[
+        :_ENCODER_MEDIA_HASH_HEX_LENGTH
+    ]
+    return f"{upstream_session_id}_{media_hash}" if upstream_session_id else media_hash
+
+
+def _encoder_request_headers(req_id: str, encoder_session_id: Optional[str] = None):
+    headers = {"Request-Id": req_id}
+    if encoder_session_id and envs.GLM_ENABLE_ENCODER_SESSION_ID_HEADER.get():
+        headers["Session-Id"] = encoder_session_id
+    return headers
+
+
+def _split_mooncake_encode_requests(
+    req_id: str,
+    grouped_encode_requests: List[Dict],
+    upstream_session_id: Optional[str],
+) -> Tuple[List[Dict], Dict[int, str]]:
+    """Split grouped Mooncake requests into one request per media item."""
+    encode_requests: List[Dict] = []
+    encoder_session_ids = {}
+    session_id_header_enabled = envs.GLM_ENABLE_ENCODER_SESSION_ID_HEADER.get()
+
+    for grouped_request in grouped_encode_requests:
+        for media_identifier in grouped_request["mm_items"]:
+            part_idx = len(encode_requests)
+            encode_request = grouped_request.copy()
+            encode_request.update(
+                {
+                    "mm_items": [media_identifier],
+                    "part_idx": part_idx,
+                    "req_id": create_part_req_id(req_id, part_idx),
+                }
+            )
+            encode_requests.append(encode_request)
+            if session_id_header_enabled:
+                encoder_session_ids[part_idx] = create_encoder_session_id(
+                    upstream_session_id, media_identifier
+                )
+
+    total_num_parts = len(encode_requests)
+    for encode_request in encode_requests:
+        encode_request["num_parts"] = total_num_parts
+
+    return encode_requests, encoder_session_ids
 
 
 def calculate_modality_num_parts(modalities, num_items_assigned):
@@ -764,7 +834,18 @@ class MMReceiverBase(ABC):
             )
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
-                self.encode(req_id, mm_data, embedding_port, "encode", "send")
+                self.encode(
+                    req_id,
+                    mm_data,
+                    embedding_port,
+                    "encode",
+                    "send",
+                    # GLM Note: Forward the upstream session only as far as the
+                    # encoder HTTP client; scheduler request state does not need it.
+                    upstream_session_id=getattr(
+                        request_obj, "_upstream_session_id", None
+                    ),
+                )
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -1163,6 +1244,7 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        upstream_session_id=None,
     ):
         if len(mm_data) == 0:
             return
@@ -1219,18 +1301,46 @@ class MMReceiverHTTP(MMReceiverBase):
                 cum_num_items += assigned_num
             part_idx_offset += num_parts
 
+        encoder_session_ids = {}
+        if self.encoder_transfer_backend == "mooncake":
+            # GLM Note: Give every RDMA media item its own HTTP request and LB
+            # session so independent images/videos can execute on different encoders.
+            encode_requests, encoder_session_ids = _split_mooncake_encode_requests(
+                req_id, encode_requests, upstream_session_id
+            )
+            total_num_parts = len(encode_requests)
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=1800
             )  # Add timeout for request reliability
         ) as session:
-            # Send encode requests
-
-            tasks = [
-                session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
-                    json=encode_request,
+            async def post_encoder_request(payload, endpoint, phase):
+                encoder_idx = payload["encoder_idx"]
+                encoder_session_id = encoder_session_ids.get(payload["part_idx"])
+                url = f"{self.encode_urls[encoder_idx]}/{endpoint}"
+                headers = _encoder_request_headers(payload["req_id"], encoder_session_id)
+                # GLM Note: Log encoder routing metadata so operators can verify
+                # per-media parallel dispatch and Session-Id affinity in production.
+                logger.info(
+                    "Sending request to encoder: phase=%s url=%s req_id=%s "
+                    "part_idx=%s num_parts=%s modality=%s encoder_idx=%s "
+                    "session_id=%s",
+                    phase,
+                    url,
+                    payload["req_id"],
+                    payload["part_idx"],
+                    payload["num_parts"],
+                    payload["modality"],
+                    encoder_idx,
+                    encoder_session_id,
                 )
+                return await session.post(url, json=payload, headers=headers)
+
+            # Send encode requests. Session-Id provides media affinity while
+            # Request-Id retains the unique request/part identity.
+            tasks = [
+                post_encoder_request(encode_request, endpoint_encode, "encode")
                 for encode_request in encode_requests
             ]
 
@@ -1287,10 +1397,9 @@ class MMReceiverHTTP(MMReceiverBase):
                     }
                 )
                 metadata_tasks.append(
-                    session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
-                        json=response_json,
-                    )
+                    # GLM Note: Reuse the media affinity key so /send reaches
+                    # the encoder replica that retained the /encode result.
+                    post_encoder_request(response_json, endpoint_send, "send")
                 )
                 offset += embedding_size_list_sort[idx]
             await asyncio.gather(*metadata_tasks)
@@ -1339,6 +1448,7 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        upstream_session_id=None,
     ):
         if not mm_data:
             return
