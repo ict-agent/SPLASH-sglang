@@ -15,6 +15,7 @@ escaped strings.
 
 import json
 import logging
+import re
 from typing import Optional
 
 from sglang.srt.constrained.glm.escape import (
@@ -27,6 +28,52 @@ from sglang.srt.constrained.glm.escape import (
 logger = logging.getLogger(__name__)
 
 _ESCAPE_FLAG_ATTR = "_sglang_special_token_escape_seed"
+
+
+def escape_chat_template(chat_template: Optional[str], mapping=None) -> Optional[str]:
+    """Rewrite every special token in ``chat_template`` to its escaped form.
+
+    ``mapping`` defaults to the process-global mapping, so this is a no-op when
+    escape is disabled. Replacement is longest-first to keep tokens that are
+    prefixes of other tokens from being partially rewritten.
+
+    Callers that overwrite ``tokenizer.chat_template`` after
+    ``escape_tokenizer_special_tokens`` has run must pipe the new template
+    through here. Assigning a bare template to an escaped tokenizer makes the
+    template's special tokens miss ``added_tokens`` and get split into ordinary
+    BPE pieces, which corrupts the prompt.
+
+    Idempotent: an already-escaped template is returned unchanged. That matters
+    because ``TemplateManager._resolve_hf_chat_template`` falls back to
+    ``tokenizer.chat_template`` when there is no processor, and the tokenizer's
+    own template *has* been escaped. Since ``original`` is a prefix of
+    ``escaped``, a plain ``str.replace`` would append a second suffix
+    (``<|user|><hash><hash>``) and break the ``added_tokens`` match just as
+    badly as leaving it bare.
+    """
+    if not chat_template:
+        return chat_template
+
+    if mapping is None:
+        sp = get_global_escaped_special_tokens()
+        if not sp.enabled:
+            return chat_template
+        mapping = sp.mapping
+
+    for original in sorted(mapping.keys(), key=len, reverse=True):
+        escaped = mapping[original]
+        if escaped == original:
+            continue
+        # Skip occurrences that already carry their suffix. A lambda is used as
+        # the replacement so backslashes in the token are not read as regex
+        # group references.
+        suffix = escaped[len(original) :]
+        chat_template = re.sub(
+            re.escape(original) + r"(?!" + re.escape(suffix) + r")",
+            lambda _m, _e=escaped: _e,
+            chat_template,
+        )
+    return chat_template
 
 
 def escape_tokenizer_special_tokens(tokenizer, seed: int) -> EscapedSpecialTokens:
@@ -92,11 +139,7 @@ def escape_tokenizer_special_tokens(tokenizer, seed: int) -> EscapedSpecialToken
 
     ct = getattr(tokenizer, "chat_template", None)
     if ct:
-        for original in sorted(mapping.keys(), key=len, reverse=True):
-            escaped = mapping[original]
-            if escaped != original:
-                ct = ct.replace(original, escaped)
-        tokenizer.chat_template = ct
+        tokenizer.chat_template = escape_chat_template(ct, mapping=mapping)
 
     try:
         addl = list(getattr(tokenizer, "additional_special_tokens", []) or [])

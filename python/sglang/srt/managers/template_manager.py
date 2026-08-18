@@ -47,6 +47,7 @@ from sglang.srt.parser.conversation import (
     register_conv_template,
 )
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.utils.tokenizer_escape import escape_chat_template
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,13 @@ class TemplateManager:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
                 if hf_template:
+                    # The resolved template comes from the processor or from
+                    # chat_template.jinja on disk, neither of which is touched by
+                    # --glm-special-token-escape-seed. Re-escape before it
+                    # overwrites the tokenizer's own (already escaped) template,
+                    # or its special tokens stop matching added_tokens and get
+                    # split into ordinary BPE pieces.
+                    hf_template = escape_chat_template(hf_template)
                     # override the chat template
                     if tokenizer_manager.tokenizer:
                         tokenizer_manager.tokenizer.chat_template = hf_template
@@ -266,7 +274,11 @@ class TemplateManager:
         """Load a Jinja template file."""
         with open(template_path, "r") as f:
             chat_template = "".join(f.readlines()).strip("\n")
-        tokenizer_manager.tokenizer.chat_template = chat_template.replace("\\n", "\n")
+        # Same escape caveat as the HF-template path in load_chat_template: a
+        # template read off disk carries bare special tokens.
+        tokenizer_manager.tokenizer.chat_template = escape_chat_template(
+            chat_template.replace("\\n", "\n")
+        )
         self._chat_template_name = None
         # Detect content format from the loaded template
         self._jinja_template_content_format = detect_jinja_template_content_format(
