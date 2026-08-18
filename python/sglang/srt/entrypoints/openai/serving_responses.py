@@ -386,9 +386,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=request.stream,
             )
 
-            # Follow SGLang's _process_messages pattern
+            # Template rendering and encode are CPU-bound and must not block
+            # this worker's event loop.
             is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-            processed_messages = self._process_messages(chat_request, is_multimodal)
+            processed_messages = await self.tokenizer_manager.run_tokenizer_offload(
+                self._process_messages, chat_request, is_multimodal
+            )
 
             # Extract the results
             if is_multimodal:
@@ -406,7 +409,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
+            prompt_ids = await self.tokenizer_manager.run_tokenizer_offload(
+                tokenizer.encode, prompt_text
+            )
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
 

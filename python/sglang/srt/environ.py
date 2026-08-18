@@ -619,8 +619,20 @@ class Envs:
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
+    # Run request conversion, chat-template rendering, and blocking tokenizer
+    # calls on one dedicated thread per HTTP worker. This prevents long-prompt
+    # tokenization from blocking the worker's event loop and all SSE streams it
+    # owns. Keep the executor single-threaded because Hugging Face fast
+    # tokenizers mutate shared Rust state while encoding.
+    SGLANG_ENABLE_TOKENIZER_OFFLOAD = EnvBool(True)
+
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+
+    # Give every uvicorn HTTP worker its own SO_REUSEPORT listener instead of
+    # racing to accept connections from one inherited socket. Linux only;
+    # disabled by default for a safe rollout.
+    SGLANG_HTTP_WORKER_REUSE_PORT = EnvBool(False)
 
     # ZBAL, zero buffer accelerate library, currently worked only in npu
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)

@@ -31,6 +31,7 @@ class AsyncDynamicbatchTokenizer:
         tokenizer,
         max_batch_size: int = 32,
         batch_wait_timeout_s: float = 0.002,
+        executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
@@ -40,8 +41,11 @@ class AsyncDynamicbatchTokenizer:
         self._queue: Optional[asyncio.Queue] = None
         self._batcher_task: Optional[asyncio.Task] = None
 
-        # Single-thread executor for blocking tokenizer calls
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # All encode-family calls sharing one tokenizer must be serialized.
+        # Reuse TokenizerManager's executor when provided so dynamic batching
+        # cannot race request conversion on a second tokenizer thread.
+        self._owns_executor = executor is None
+        self._executor = executor or ThreadPoolExecutor(max_workers=1)
         self._initialized = False
 
     def _ensure_initialized(self):
@@ -167,5 +171,5 @@ class AsyncDynamicbatchTokenizer:
         if hasattr(self, "_batcher_task") and self._batcher_task:
             if not self._batcher_task.done():
                 self._batcher_task.cancel()
-        if hasattr(self, "_executor"):
+        if getattr(self, "_owns_executor", False) and hasattr(self, "_executor"):
             self._executor.shutdown(wait=False)

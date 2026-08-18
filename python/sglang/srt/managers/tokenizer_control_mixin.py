@@ -163,9 +163,11 @@ class TokenizerControlMixin:
                 max_tokens = (
                     self.server_args.speculative_ngram_external_corpus_max_tokens
                 )
-                obj.token_chunks = list(
-                    iter_external_corpus_chunks(
-                        obj.file_path, self.tokenizer, max_tokens
+                obj.token_chunks = await self.run_tokenizer_offload(
+                    lambda: list(
+                        iter_external_corpus_chunks(
+                            obj.file_path, self.tokenizer, max_tokens
+                        )
                     )
                 )
             elif obj.documents is not None:
@@ -176,26 +178,32 @@ class TokenizerControlMixin:
                 max_tokens = (
                     self.server_args.speculative_ngram_external_corpus_max_tokens
                 )
-                token_chunks = []
-                total_tokens = 0
-                has_prev = False
-                for doc in obj.documents:
-                    if not doc:
-                        continue
-                    token_ids = list(
-                        self.tokenizer.encode(doc, add_special_tokens=False)
-                    )
-                    if not token_ids:
-                        continue
-                    if has_prev:
-                        token_ids = [SEPARATOR_TOKEN] + token_ids
-                    if total_tokens + len(token_ids) > max_tokens:
-                        truncated = True
-                        break
-                    token_chunks.append(token_ids)
-                    total_tokens += len(token_ids)
-                    has_prev = True
-                obj.token_chunks = token_chunks
+                def _tokenize_documents():
+                    token_chunks = []
+                    total_tokens = 0
+                    has_prev = False
+                    was_truncated = False
+                    for doc in obj.documents:
+                        if not doc:
+                            continue
+                        token_ids = list(
+                            self.tokenizer.encode(doc, add_special_tokens=False)
+                        )
+                        if not token_ids:
+                            continue
+                        if has_prev:
+                            token_ids = [SEPARATOR_TOKEN] + token_ids
+                        if total_tokens + len(token_ids) > max_tokens:
+                            was_truncated = True
+                            break
+                        token_chunks.append(token_ids)
+                        total_tokens += len(token_ids)
+                        has_prev = True
+                    return token_chunks, was_truncated
+
+                obj.token_chunks, truncated = await self.run_tokenizer_offload(
+                    _tokenize_documents
+                )
             else:
                 return AddExternalCorpusReqOutput(
                     success=False,

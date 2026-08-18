@@ -702,6 +702,91 @@ def read_from_shared_memory(name: str) -> Any:
         raise FileNotFoundError(f"Shared memory {name} not found")
 
 
+_reuse_port_parent_patched = False
+_reuse_port_child_patched = False
+
+
+def monkey_patch_uvicorn_parent_reuse_port():
+    """Set SO_REUSEPORT on the supervisor socket before it is bound.
+
+    Uvicorn binds one socket in the supervisor and passes it to every worker.
+    The parent socket must opt into SO_REUSEPORT before the child workers can
+    replace it with their own listeners on the same address.
+    """
+    global _reuse_port_parent_patched
+    if _reuse_port_parent_patched:
+        return
+    _reuse_port_parent_patched = True
+
+    import socket as socket_mod
+
+    import uvicorn
+
+    orig_bind_socket = uvicorn.Config.bind_socket
+
+    def bind_socket_with_reuseport(self):
+        orig_socket_cls = socket_mod.socket
+
+        def socket_with_reuseport(*args, **kwargs):
+            sock = orig_socket_cls(*args, **kwargs)
+            if sock.family in (socket_mod.AF_INET, socket_mod.AF_INET6):
+                sock.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEPORT, 1)
+            return sock
+
+        # Let uvicorn retain ownership of address-family, UDS, and fd handling;
+        # intercept only socket construction while Config.bind_socket runs.
+        socket_mod.socket = socket_with_reuseport
+        try:
+            return orig_bind_socket(self)
+        finally:
+            socket_mod.socket = orig_socket_cls
+
+    uvicorn.Config.bind_socket = bind_socket_with_reuseport
+    logger.info("uvicorn parent bind patched for SO_REUSEPORT")
+
+
+def monkey_patch_uvicorn_child_reuse_port():
+    """Replace the inherited listener with one SO_REUSEPORT socket per worker."""
+    global _reuse_port_child_patched
+    if _reuse_port_child_patched:
+        return
+    _reuse_port_child_patched = True
+
+    import socket as socket_mod
+
+    from uvicorn.server import Server
+
+    orig_startup = Server.startup
+
+    async def startup_with_own_listener(self, sockets=None):
+        config = self.config
+        if (
+            sockets
+            and config.workers > 1
+            and config.uds is None
+            and config.fd is None
+        ):
+            family = (
+                socket_mod.AF_INET6
+                if config.host and ":" in config.host
+                else socket_mod.AF_INET
+            )
+            own_sock = socket_mod.socket(family=family)
+            own_sock.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
+            own_sock.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEPORT, 1)
+            own_sock.bind((config.host, config.port))
+            for sock in sockets:
+                sock.close()
+            sockets = [own_sock]
+            logger.info(
+                "http worker pid=%d listening on its own SO_REUSEPORT socket",
+                os.getpid(),
+            )
+        return await orig_startup(self, sockets=sockets)
+
+    Server.startup = startup_with_own_listener
+
+
 def write_data_for_multi_tokenizer(
     port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
 ):

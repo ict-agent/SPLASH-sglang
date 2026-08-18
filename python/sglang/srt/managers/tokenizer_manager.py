@@ -16,6 +16,7 @@
 import asyncio
 import copy
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import socket
 import sys
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -329,6 +331,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     glm_special_token_escape_seed=server_args.glm_special_token_escape_seed,
                 )
 
+        # Keep all blocking calls that share this tokenizer on one thread. In
+        # addition to preserving tokenizer thread safety, this keeps long
+        # prompt conversion off the HTTP worker's event loop so it cannot
+        # head-of-line block unrelated streaming responses.
+        if (
+            self.tokenizer is not None
+            and envs.SGLANG_ENABLE_TOKENIZER_OFFLOAD.get()
+        ):
+            self.tokenizer_offload_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="tokenizer_offload"
+            )
+        else:
+            self.tokenizer_offload_executor = None
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -338,9 +354,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.tokenizer,
                 max_batch_size=server_args.dynamic_batch_tokenizer_batch_size,
                 batch_wait_timeout_s=server_args.dynamic_batch_tokenizer_batch_timeout,
+                executor=self.tokenizer_offload_executor,
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    async def run_tokenizer_offload(self, fn, *args, **kwargs):
+        """Run blocking tokenizer work without blocking the event loop.
+
+        Calls are serialized on a single thread because fast tokenizers mutate
+        shared truncation/padding state during encode. When tokenization is
+        disabled, or the kill switch is off, preserve the old inline behavior.
+        """
+        if self.tokenizer_offload_executor is None:
+            return fn(*args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.tokenizer_offload_executor,
+            functools.partial(fn, *args, **kwargs),
+        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
@@ -719,10 +752,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
             if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+                input_ids = await self.run_tokenizer_offload(
+                    lambda: [self.tokenizer.encode(t) for t in tokenizer_input]
+                )
                 token_type_ids = None
             else:
-                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+                encoded = await self.run_tokenizer_offload(
+                    self.tokenizer, tokenizer_input, **tokenizer_kwargs
+                )
                 input_ids = encoded["input_ids"]
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
@@ -856,7 +893,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         input_ids = self._validate_one_request_glm(obj, input_ids) # TODO(somefive)
-        return self._create_tokenized_object(
+        return await self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
@@ -1062,7 +1099,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
                 )
 
-    def _create_tokenized_object(
+    async def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
@@ -1080,7 +1117,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
+        stop_strs_need_tokenizer = isinstance(sampling_params.stop_strs, str) or bool(
+            sampling_params.stop_strs
+        )
+        if stop_strs_need_tokenizer and self.tokenizer is not None:
+            await self.run_tokenizer_offload(sampling_params.normalize, self.tokenizer)
+        else:
+            sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object
@@ -1224,7 +1267,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
             tokenized_objs.append(
-                self._create_tokenized_object(
+                await self._create_tokenized_object(
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )

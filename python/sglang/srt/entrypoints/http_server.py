@@ -147,6 +147,8 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
+    monkey_patch_uvicorn_child_reuse_port,
+    monkey_patch_uvicorn_parent_reuse_port,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -405,6 +407,11 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
+# Uvicorn spawn workers import this module in a fresh interpreter, so the
+# child-side Server.startup hook must be installed at module-import time.
+if envs.SGLANG_HTTP_WORKER_REUSE_PORT.get():
+    monkey_patch_uvicorn_child_reuse_port()
+
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
@@ -2287,6 +2294,9 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
+
+            if envs.SGLANG_HTTP_WORKER_REUSE_PORT.get():
+                monkey_patch_uvicorn_parent_reuse_port()
 
             if server_args.enable_ssl_refresh:
                 logger.warning(
