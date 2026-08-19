@@ -47,6 +47,7 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.models.utils import WeightsMapper
 from lmslim import quant_ops
 
 _is_cuda = is_cuda()
@@ -114,6 +115,12 @@ class W8A8Int8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        if self.ignore:
+            self.ignore = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignore))
+            )
 
     def get_quant_method(
         self,

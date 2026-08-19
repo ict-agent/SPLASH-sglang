@@ -73,6 +73,15 @@ _is_npu = is_npu()
 
 class DeepseekModelNextN(nn.Module):
 
+    @staticmethod
+    def _get_nextn_layer_name(config: PretrainedConfig) -> str:
+        if _is_npu and (
+            get_global_server_args().speculative_draft_model_path
+            == get_global_server_args().model_path
+        ):
+            return "layers." + str(config.num_hidden_layers)
+        return "decoder"
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -133,12 +142,7 @@ class DeepseekModelNextN(nn.Module):
             else None
         )
 
-        layer_name = "decoder"
-        if _is_npu and (
-            get_global_server_args().speculative_draft_model_path
-            == get_global_server_args().model_path
-        ):
-            layer_name = "layers." + str(config.num_hidden_layers)
+        layer_name = self._get_nextn_layer_name(config)
 
         self.quant_config = quant_config
         self.decoder = DeepseekV2DecoderLayer(
@@ -320,6 +324,24 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
+        nextn_conf = self._initialize_nextn_conf(is_nextn=True)
+        nextn_layer_prefix = nextn_conf.nextn_layer_prefix
+        runtime_layer_prefix = (
+            f"model.{DeepseekModelNextN._get_nextn_layer_name(config)}"
+        )
+        nextn_name_mapping = {
+            nextn_layer_prefix: runtime_layer_prefix,
+            **{
+                f"{nextn_layer_prefix}.{name}": f"model.{name}"
+                for name in nextn_conf.nextn_spec_weight_names
+            },
+        }
+        self.hf_to_sglang_mapper = self.hf_to_sglang_mapper | WeightsMapper(
+            orig_to_new_substr=nextn_name_mapping
+        )
+        if quant_config is not None:
+            quant_config.apply_weight_name_mapper(self.hf_to_sglang_mapper)
+
         nextn_quant_config = quant_config
         # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
         if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
@@ -327,7 +349,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 should_ignore_layer,
             )
 
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            ckpt_prefix = nextn_layer_prefix
             mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
             if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
                 nextn_quant_config = None
