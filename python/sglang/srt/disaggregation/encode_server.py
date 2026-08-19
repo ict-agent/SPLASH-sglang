@@ -263,7 +263,22 @@ class MMEncoder:
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
+            max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4)),
+            # The current device is thread-local. Pin every preprocessing worker
+            # to this encoder rank's device so GPU-backed processors do not all
+            # fall back to device 0.
+            initializer=lambda gid=self.gpu_id: torch.get_device_module(
+                self.device
+            ).set_device(gid),
+        )
+        # Keep model execution serialized, matching the event-loop behavior it
+        # replaces, while moving ViT forward and the synchronous D2H copy off
+        # the loop so health checks and other requests can keep progressing.
+        self.gpu_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            initializer=lambda gid=self.gpu_id: torch.get_device_module(
+                self.device
+            ).set_device(gid),
         )
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
@@ -743,10 +758,15 @@ class MMEncoder:
             else:
                 mm_item.set(k, val)
 
-        with torch.inference_mode():
-            new_embeddings = get_feature_fn([mm_item]).cpu()
-            if new_embeddings.ndim != 2:
-                new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+        def _run_vit():
+            with torch.inference_mode():
+                embeddings = get_feature_fn([mm_item]).cpu()
+                if embeddings.ndim != 2:
+                    embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+                return embeddings
+
+        loop = asyncio.get_running_loop()
+        new_embeddings = await loop.run_in_executor(self.gpu_executor, _run_vit)
 
         sub_grids = [grid_thw[i] for i in indices]
         return self.slice_embedding(new_embeddings, sub_grids, modality)
@@ -774,8 +794,12 @@ class MMEncoder:
         cache_tic = time.perf_counter()
         if self.rank == 0:
             if hashes is None:
-                mm_hashes = self._calculate_hashes_from_features(
-                    mm_feature, grid_thw, modality
+                loop = asyncio.get_running_loop()
+                mm_hashes = await loop.run_in_executor(
+                    self.io_executor,
+                    lambda: self._calculate_hashes_from_features(
+                        mm_feature, grid_thw, modality
+                    ),
                 )
             else:
                 mm_hashes = hashes
@@ -1066,7 +1090,11 @@ class MMEncoder:
             image_config = self.vision_config.get("image", {})
             if self.model_type in ["kimi_k25", "kimi_vl"]:
                 images = self._normalize_kimi_encoder_images(images)
-            processor_input = self.image_processor(images=images, **image_config)
+            loop = asyncio.get_running_loop()
+            processor_input = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self.image_processor(images=images, **image_config),
+            )
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
             else:
@@ -1075,8 +1103,12 @@ class MMEncoder:
             videos, video_processor_kwargs = await self._flatten_and_load_videos(
                 mm_items
             )
-            processor_input = self.video_processor(
-                videos=videos, **video_processor_kwargs
+            loop = asyncio.get_running_loop()
+            processor_input = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self.video_processor(
+                    videos=videos, **video_processor_kwargs
+                ),
             )
             # Get additional video metadata
             if (
@@ -1210,10 +1242,18 @@ class MMEncoder:
 
             if self.server_args.enable_prefix_mm_cache:
                 cache_tic = time.perf_counter()
-                mm_item.set_pad_value()
-                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+
+                def _hash_mm_item():
+                    mm_item.set_pad_value()
+                    item_hash = mm_item.hash
+                    return item_hash, MultiModalStaticCache.combine_hashes([item_hash])
+
+                loop = asyncio.get_running_loop()
+                item_hash, mm_hash = await loop.run_in_executor(
+                    self.io_executor, _hash_mm_item
+                )
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get([mm_item.hash])
+                    mm_cache = self.mm_cache.get([item_hash])
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                 if self.metrics is not None:
@@ -1226,9 +1266,15 @@ class MMEncoder:
 
             if mm_embedding is None:
                 vit_tic = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
-                    mm_embedding = mm_embedding.cpu()
+
+                def _run_vit():
+                    with torch.inference_mode():
+                        return get_feature_fn([mm_item]).cpu()
+
+                loop = asyncio.get_running_loop()
+                mm_embedding = await loop.run_in_executor(
+                    self.gpu_executor, _run_vit
+                )
                 if self.metrics is not None:
                     self.metrics.observe_vit(
                         modality_name,
@@ -1295,11 +1341,20 @@ class MMEncoder:
         meta_only=False,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake" and not meta_only:
-            self.engine.register(embedding.data_ptr(), embedding.nbytes)
-            self.engine.transfer_sync(
-                session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
-            )
-            self.engine.deregister(embedding.data_ptr())
+            def _transfer_sync():
+                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                try:
+                    self.engine.transfer_sync(
+                        session_id,
+                        embedding.data_ptr(),
+                        buffer_address,
+                        embedding.nbytes,
+                    )
+                finally:
+                    self.engine.deregister(embedding.data_ptr())
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self.executor, _transfer_sync)
 
             mm_data.embedding = None
 
