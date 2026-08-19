@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
@@ -28,6 +29,7 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 
@@ -50,6 +52,45 @@ TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
     _is_cuda or _is_musa
 )  # This kernel is only available for CUDA and MUSA now
+
+
+def record_stream_each(tensors: Iterable[Optional[torch.Tensor]], stream) -> None:
+    """Keep accelerator storage alive until work queued on stream completes."""
+    for tensor in tensors:
+        if tensor is not None and tensor.device.type != "cpu":
+            tensor.record_stream(stream)
+
+
+def record_stream_for_v2_verify(
+    batch: ModelWorkerBatch,
+    verify_input: EagleVerifyInput,
+    forward_stream,
+) -> None:
+    """Protect pre-prepare tensors consumed by the Spec V2 forward stream.
+
+    prepare_for_v2_verify and the following draft-extend preparation rebind
+    fields on batch. Without record_stream, the caching allocator may reuse
+    storage allocated on another stream before the asynchronous forward has
+    finished reading it.
+
+    This covers only values present before verify preparation. The caller must
+    separately record the post-prepare input_ids and out_cache_loc.
+    """
+    record_stream_each(
+        (
+            batch.seq_lens,
+            batch.req_pool_indices,
+            batch.input_ids,
+            batch.out_cache_loc,
+            verify_input.draft_token,
+            verify_input.custom_mask,
+            verify_input.positions,
+            verify_input.retrieve_index,
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+        ),
+        forward_stream,
+    )
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -737,7 +778,12 @@ def generate_token_bitmask(
     assert len(reqs) == retrieve_next_token_cpu.shape[0]
     grammar = None
     for i, req in enumerate(reqs):
-        if req.grammar is not None:
+        # In full-overlap mode a finished req may be re-visited in the extra
+        # iteration; skip its bitmask allocation. Non-full-overlap keeps the
+        # original behavior.
+        if req.grammar is not None and not (
+            verify_input.is_spec_v2_full_overlap and req.finished()
+        ):
             if allocate_token_bitmask is None:
                 allocate_token_bitmask = req.grammar.allocate_vocab_mask(
                     vocab_size=vocab_size,

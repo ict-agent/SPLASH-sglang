@@ -182,6 +182,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # C++ fast path) when present. During thinking the grammar hasn't been
         # advanced, so returning None forces the Python fallback which respects
         # the reasoner state via fill_vocab_mask.
+        _is_thinking = self._is_thinking()
+        _has_grammar = self.grammar is not None
+        _inner_matcher = getattr(self.grammar, "matcher", None) if _has_grammar else None
         if self._is_thinking() or self.grammar is None:
             return None
         return getattr(self.grammar, "matcher", None)

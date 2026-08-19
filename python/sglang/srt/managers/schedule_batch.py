@@ -44,7 +44,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -2362,6 +2362,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    @property
+    def is_spec_v2_full_overlap(self):
+        # FIXME: finally deprecate is_spec_v2_full_overlap
+        return self.is_spec_v2 and envs.SGLANG_SPEC_V2_FULL_OVERLAP.get()
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2377,6 +2382,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
+            self.spec_info.is_spec_v2_full_overlap = self.is_spec_v2_full_overlap
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
@@ -2667,6 +2673,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = (
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
+        if self.spec_info is not None:
+            self.spec_info.is_spec_v2_full_overlap = self.is_spec_v2_full_overlap
 
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
@@ -2705,6 +2713,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            is_spec_v2_full_overlap=self.is_spec_v2_full_overlap,
             hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
@@ -2935,6 +2944,7 @@ class ModelWorkerBatch:
     spec_algorithm: SpeculativeAlgorithm = None
 
     spec_info: Optional[SpecInput] = None
+    is_spec_v2_full_overlap: bool = False
 
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
@@ -2960,6 +2970,7 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    before_generate_token_bitmask: Optional[Callable[[], None]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

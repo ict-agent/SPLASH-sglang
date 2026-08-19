@@ -1038,6 +1038,32 @@ class ServerArgs:
         # Handle any other necessary validations.
         self._handle_other_validations()
 
+        if envs.SGLANG_SPEC_V2_FULL_OVERLAP.get():
+            assert not self.disable_cuda_graph, (
+                "Spec v2 Full Overlap requires CUDA graph to be enabled; "
+                "remove --disable-cuda-graph."
+            )
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
+                raise ValueError(
+                    "Spec v2 Full Overlap is only supported with EAGLE, EAGLE3, "
+                    "or STANDALONE speculative decoding, but got "
+                    f"speculative_algorithm={self.speculative_algorithm!r}."
+                )
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "Spec v2 Full Overlap is only supported on a disaggregated decode server."
+                )
+            if self.attention_backend != "nsa":
+                raise ValueError(
+                    "Spec v2 Full Overlap is only supported with --attention-backend nsa, "
+                    f"but got attention_backend={self.attention_backend!r}."
+                )
+            if self.speculative_draft_attention_backend not in (None, "nsa"):
+                raise ValueError(
+                    "Spec v2 Full Overlap only supports the NSA draft attention backend, "
+                    f"but got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
+                )
+
     def _maybe_download_model_for_runai(self):
         if is_runai_obj_uri(self.model_path):
             ObjectStorageModel.download_and_get_path(self.model_path)

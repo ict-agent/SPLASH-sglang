@@ -53,7 +53,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1600,6 +1600,8 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
+        if not hasattr(self, "full_overlap_pending_release_reqs"):
+            self.full_overlap_pending_release_reqs: List[Req] = []
         self.last_batch: Optional[ScheduleBatch] = None
 
         def pop_and_process():
@@ -1619,12 +1621,14 @@ class SchedulerDisaggregationDecodeMixin:
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_disagg_decode_batch(
+                batch
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            # This is required for spec-v2 + grammar so the current batch's grammar
-            # mask is generated from an up-to-date matcher state.
+            # This is required for spec-v2 + grammar (non-full-overlap) so the
+            # current batch's grammar mask is generated from an up-to-date matcher.
             if disable_overlap_for_batch:
                 pop_and_process()
 
@@ -1648,6 +1652,15 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def is_disable_overlap_for_disagg_decode_batch(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> bool:
+        # Spec-v2 full-overlap has its own grammar-mask synchronization via
+        # `before_generate_token_bitmask`, so it MUST keep overlap enabled.
+        if batch is not None and batch.is_spec_v2_full_overlap:
+            return False
+        return self.is_disable_overlap_for_batch(batch)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

@@ -61,6 +61,8 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     maybe_detect_nan,
     maybe_detect_oob,
+    record_stream_each,
+    record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
@@ -112,6 +114,24 @@ def _get_plan_stream(
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
         return plan_stream, plan_stream_ctx
+    else:
+        return None, contextlib.nullcontext()
+
+
+def _get_grammar_copy_stream(
+    device: str,
+) -> Tuple[any, contextlib.AbstractContextManager]:
+    """A side stream dedicated to grammar-related D->H copies so target verify
+    can start on the main stream without waiting for the copy.
+
+    Only enabled on CUDA / DCU where separate CUDA streams are supported.
+    On other devices returns (None, nullcontext) which makes the caller fall
+    back to the inline pageable copy path.
+    """
+    if _is_cuda or _is_dcu:
+        copy_stream = torch.get_device_module(device).Stream()
+        copy_stream_ctx = torch.get_device_module(device).stream(copy_stream)
+        return copy_stream, copy_stream_ctx
     else:
         return None, contextlib.nullcontext()
 
@@ -229,6 +249,9 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.grammar_copy_stream, self.grammar_copy_stream_ctx = (
+            _get_grammar_copy_stream(self.device)
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -531,6 +554,7 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_sum=None,
             seq_lens_cpu=draft_input.new_seq_lens_cpu,
             seq_lens_cpu_ready=draft_input.new_seq_lens_cpu_ready,
+            spec_info=draft_input,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -933,6 +957,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.grammar_copy_stream, self.grammar_copy_stream_ctx = (
+            _get_grammar_copy_stream(self.device)
+        )
 
         # Build adaptive runtime states (must be after draft worker is fully initialized)
         if self.adaptive_controller is not None:
@@ -1204,15 +1231,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
 
     def verify(self, batch: ModelWorkerBatch):
-        # Since batch.seq_lens is allocated in another stream, we need
+        # Parse args
+        forward_stream = torch.get_device_module(self.device).current_stream()
+        verify_input: EagleVerifyInput = batch.spec_info
+
+        # These tensors are allocated in another stream, so we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        record_stream_for_v2_verify(batch, verify_input, forward_stream)
 
-        # Parse args
-        verify_input: EagleVerifyInput = batch.spec_info
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
@@ -1232,6 +1259,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+
+        # These fields were rebound by prepare_for_v2_verify and are consumed
+        # asynchronously by the verify forward.
+        record_stream_each((batch.input_ids, batch.out_cache_loc), forward_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
@@ -1263,13 +1294,46 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Prepare grammar data on CPU if needed
+        # Prepare grammar data on CPU if needed.
+        # For spec-v2 full-overlap we offload the D->H copies to a dedicated
+        # grammar_copy_stream so target verify can start on the main stream
+        # without waiting for the copy to finish. Otherwise fall back to the
+        # inline pageable copy path.
+        grammar_copy_done = None
         if batch.has_grammar:
-            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-            draft_tokens_cpu = verify_input.draft_token.view(
+            retrieve_next_token_gpu = verify_input.retrieve_next_token
+            retrieve_next_sibling_gpu = verify_input.retrieve_next_sibling
+            draft_tokens_gpu = verify_input.draft_token.view(
                 verify_input.retrieve_next_token.shape
-            ).cpu()
+            )
+
+            if (
+                batch.spec_info.is_spec_v2_full_overlap
+                and self.grammar_copy_stream is not None
+            ):
+                device_module = torch.get_device_module(self.device)
+                current_stream = device_module.current_stream()
+                self.grammar_copy_stream.wait_stream(current_stream)
+                with self.grammar_copy_stream_ctx:
+                    retrieve_next_token_cpu = torch.empty_like(
+                        retrieve_next_token_gpu, device="cpu", pin_memory=True
+                    ).copy_(retrieve_next_token_gpu, non_blocking=True)
+                    retrieve_next_sibling_cpu = torch.empty_like(
+                        retrieve_next_sibling_gpu, device="cpu", pin_memory=True
+                    ).copy_(retrieve_next_sibling_gpu, non_blocking=True)
+                    draft_tokens_cpu = torch.empty_like(
+                        draft_tokens_gpu, device="cpu", pin_memory=True
+                    ).copy_(draft_tokens_gpu, non_blocking=True)
+                    grammar_copy_done = device_module.Event()
+                    grammar_copy_done.record(self.grammar_copy_stream)
+
+                retrieve_next_token_gpu.record_stream(self.grammar_copy_stream)
+                retrieve_next_sibling_gpu.record_stream(self.grammar_copy_stream)
+                draft_tokens_gpu.record_stream(self.grammar_copy_stream)
+            else:
+                retrieve_next_token_cpu = retrieve_next_token_gpu.cpu()
+                retrieve_next_sibling_cpu = retrieve_next_sibling_gpu.cpu()
+                draft_tokens_cpu = draft_tokens_gpu.cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
@@ -1282,7 +1346,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Generate vocab mask for constrained decoding
         vocab_mask = None
+        # For spec-v2 full-overlap: fire the previous batch's output/grammar
+        # accept BEFORE building this batch's bitmask, so the mask reflects
+        # the up-to-date grammar state.
+        if (
+            batch.spec_info.is_spec_v2_full_overlap
+            and batch.before_generate_token_bitmask is not None
+        ):
+            batch.before_generate_token_bitmask()
+
         if batch.has_grammar:
+            if grammar_copy_done is not None:
+                grammar_copy_done.synchronize()
+
             # Generate the logit mask for structured output.
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
@@ -1295,7 +1371,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+                if batch.spec_info.is_spec_v2_full_overlap:
+                    # DCU-specific: pageable H2D copy of the vocab_mask blocks
+                    # the scheduler stream while target verify is still running,
+                    # which serializes generate_token_bitmask with the previous
+                    # forward and kills full-overlap. Pinning the source buffer
+                    # keeps the copy fully async. Gated by an env because it
+                    # only matters on hardware where pageable H2D is blocking.
+                    if (
+                        _is_dcu
+                        and envs.SGLANG_SPEC_V2_FULL_OVERLAP_PIN_GRAMMAR_MASK.get()
+                        and not vocab_mask.is_pinned()
+                    ):
+                        vocab_mask = vocab_mask.pin_memory()
+                    vocab_mask = vocab_mask.to(
+                        verify_input.retrieve_next_token.device, non_blocking=True
+                    )
+                else:
+                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                 # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -1356,6 +1449,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
         )
 
     def _mamba_verify_update(

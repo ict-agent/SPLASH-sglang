@@ -1,6 +1,6 @@
 import logging
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -91,11 +91,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
+    # Init-only: propagate is_spec_v2_full_overlap / max_kv_len from the draft
+    # input so verify-time hooks can read them off spec_info. Follows the
+    # reference implementation's contract for spec-v2 full-overlap.
+    spec_info: InitVar[Optional["SpecInput"]] = None
 
-    def __post_init__(self):
+    def __post_init__(self, spec_info: Optional["SpecInput"]):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        if spec_info is not None:
+            self.is_spec_v2_full_overlap = spec_info.is_spec_v2_full_overlap
+            self.max_kv_len = spec_info.max_kv_len
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num

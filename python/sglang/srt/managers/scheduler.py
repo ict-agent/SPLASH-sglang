@@ -22,6 +22,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -1119,9 +1120,6 @@ class Scheduler(
         # so that host indices stay 1-to-1 between target and draft KV caches.
         primary = self.tree_cache.cache_controller.mem_pool_host
         kw = dict(
-            # HostKVCache aligns upward by one page. Start one slot below the
-            # page-aligned Target size so Draft gets exactly the same index
-            # capacity rather than one extra page outside --hicache-size.
             host_to_device_ratio=(primary.size - 1) / pool.size,
             host_size=0,
             page_size=self.page_size,
@@ -1391,7 +1389,7 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-
+           
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1481,6 +1479,7 @@ class Scheduler(
             # Empty result_queue is needed because idle-check references it
             # when enable_overlap is True.
             self.result_queue: Deque = deque()
+            self.full_overlap_pending_release_reqs: List[Req] = []
             return
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
@@ -1505,6 +1504,7 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+        self.full_overlap_pending_release_reqs: List[Req] = []
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -1719,6 +1719,8 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        if not hasattr(self, "full_overlap_pending_release_reqs"):
+            self.full_overlap_pending_release_reqs: List[Req] = []
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1794,6 +1796,7 @@ class Scheduler(
         need_grammar_sync = (
             batch
             and batch.is_spec_v2
+            and not batch.is_spec_v2_full_overlap
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
@@ -3388,7 +3391,7 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
-        self.batch_record_buf[self.batch_record_ct] = model_worker_batch
+        self.batch_record_buf[self.batch_record_ct] = [model_worker_batch]
 
     def run_batch(
         self,
@@ -3427,6 +3430,19 @@ class Scheduler(
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
+                # For spec-v2 full-overlap: piggyback previous-batch output/grammar
+                # processing onto this forward's `before_generate_token_bitmask`
+                # hook so `grammar.accept_token` runs BEFORE the next bitmask is
+                # generated, without adding a barrier between run_batch and
+                # process_batch_result.
+                if batch.is_spec_v2_full_overlap and self.result_queue:
+                    prev_batch, prev_result = self.result_queue[0]
+                    if prev_batch.is_spec_v2_full_overlap:
+                        model_worker_batch.before_generate_token_bitmask = partial(
+                            self._full_overlap_output_process,
+                            prev_result,
+                            prev_batch,
+                        )
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
@@ -3437,6 +3453,10 @@ class Scheduler(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    if batch_result.extra_keep_alive_refs:
+                        self.batch_record_buf[self.batch_record_ct].extend(
+                            batch_result.extra_keep_alive_refs
+                        )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:

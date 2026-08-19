@@ -509,6 +509,14 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    SGLANG_SPEC_V2_FULL_OVERLAP = EnvBool(False)
+
+    # Pin the grammar vocab mask before the H2D copy in full-overlap mode. On
+    # GB-series GPUs (e.g. GB300 + CUDA 13.0) the pageable H2D copy blocks the
+    # scheduler until target verify finishes, so pinning is required to keep
+    # full overlap. On H-series GPUs the pageable copy is already non-blocking,
+    # so leave this off.
+    SGLANG_SPEC_V2_FULL_OVERLAP_PIN_GRAMMAR_MASK = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
