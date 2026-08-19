@@ -610,7 +610,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
+                self._release_raw_multimodal_payload(state.obj)
                 async for response in self._wait_one_response(obj, request):
                     yield response
             else:
@@ -1367,6 +1369,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    @staticmethod
+    def _release_raw_multimodal_payload(
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ):
+        """Release request payloads no longer needed after scheduler dispatch."""
+        for mm_attr in ("image_data", "video_data", "audio_data", "input_embeds"):
+            if getattr(obj, mm_attr, None) is not None:
+                setattr(obj, mm_attr, None)
+
+    @staticmethod
+    def _release_raw_multimodal_payload_item(
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        index: int,
+    ):
+        for mm_attr in ("image_data", "video_data", "audio_data", "input_embeds"):
+            value = getattr(obj, mm_attr, None)
+            if isinstance(value, list) and index < len(value):
+                value[index] = None
+
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
@@ -1603,6 +1624,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    self._release_raw_multimodal_payload(
+                        self.rid_to_state[tmp_obj.rid].obj
+                    )
+                    self._release_raw_multimodal_payload_item(obj, i)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
@@ -1616,6 +1641,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         self._send_one_request(tokenized_obj)
+                        self._release_raw_multimodal_payload(
+                            self.rid_to_state[tmp_obj.rid].obj
+                        )
+                        self._release_raw_multimodal_payload_item(obj, i)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -1632,6 +1661,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+            self._release_raw_multimodal_payload(obj)
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -1643,6 +1673,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
                 self._send_one_request(tokenized_obj)
+                self._release_raw_multimodal_payload(
+                    self.rid_to_state[tmp_obj.rid].obj
+                )
+                self._release_raw_multimodal_payload(objs[i])
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1654,6 +1688,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                     self._send_one_request(tokenized_obj)
+                    self._release_raw_multimodal_payload(
+                        self.rid_to_state[tmp_obj.rid].obj
+                    )
+                    self._release_raw_multimodal_payload(objs[i])
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
