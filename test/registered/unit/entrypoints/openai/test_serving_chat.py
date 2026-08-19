@@ -31,6 +31,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
 
@@ -45,6 +46,7 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
             stream_response_default_include_usage=False,
+            glm_disable_nothink=False,
         )
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -89,6 +91,76 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
         self.force_reasoning = False
+
+
+class TestGlmDisableNothink(CustomTestCase):
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+
+    @staticmethod
+    def _request(**kwargs) -> ChatCompletionRequest:
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            **kwargs,
+        )
+
+    def test_flag_off_allows_disabling_thinking(self):
+        request = self._request(chat_template_kwargs={"enable_thinking": False})
+
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_rejects_falsy_enable_thinking(self):
+        self.tm.server_args.glm_disable_nothink = True
+
+        for value in (False, 0, 0.0, "", [], {}, None):
+            with self.subTest(enable_thinking=value):
+                request = self._request(
+                    chat_template_kwargs={"enable_thinking": value}
+                )
+                self.assertIn(
+                    "Disabling thinking is not supported by this model",
+                    self.chat._validate_request(request),
+                )
+
+    def test_rejects_falsy_thinking(self):
+        self.tm.server_args.glm_disable_nothink = True
+
+        for value in (False, 0, "", [], None):
+            with self.subTest(thinking=value):
+                request = self._request(chat_template_kwargs={"thinking": value})
+                self.assertIn(
+                    "Disabling thinking is not supported by this model",
+                    self.chat._validate_request(request),
+                )
+
+    def test_rejects_reasoning_effort_none(self):
+        self.tm.server_args.glm_disable_nothink = True
+        request = self._request(reasoning_effort="none")
+
+        self.assertIn(
+            "Disabling thinking is not supported by this model",
+            self.chat._validate_request(request),
+        )
+
+    def test_allows_thinking_requests(self):
+        self.tm.server_args.glm_disable_nothink = True
+
+        for kwargs in (
+            {},
+            {"chat_template_kwargs": {"enable_thinking": True}},
+            {"chat_template_kwargs": {"thinking": True}},
+            {"chat_template_kwargs": {"some_other_key": False}},
+            # Truthy values keep thinking on, including the string "false".
+            {"chat_template_kwargs": {"enable_thinking": "false"}},
+            {"chat_template_kwargs": {"enable_thinking": 1}},
+            {"reasoning_effort": "high"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                self.assertIsNone(
+                    self.chat._validate_request(self._request(**kwargs))
+                )
 
 
 class ServingChatTestCase(unittest.TestCase):

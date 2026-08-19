@@ -855,6 +855,7 @@ class ServerArgs:
     glm_check_chat_prompt_length: bool = False
     glm_check_total_num_tokens: bool = False
     glm_decoding_constraint_module: Optional[str] = None
+    glm_disable_nothink: bool = False
     glm_ignore_decoding_constraint_exception: bool = False
     glm_special_token_escape_seed: Optional[int] = None
 
@@ -7521,6 +7522,16 @@ class ServerArgs:
             default=ServerArgs.glm_decoding_constraint_module,
             help="Module path for EBNF constraint (e.g., 'sglang.srt.constrained.glm'). "
             "Must export 'generation_constraint' and 'get_special_token_config'.",
+        )
+        parser.add_argument(
+            "--glm-disable-nothink",
+            action="store_true",
+            default=ServerArgs.glm_disable_nothink,
+            help="Reject requests that try to disable thinking. When set, a request "
+            "carrying a falsy chat_template_kwargs.enable_thinking / thinking "
+            "(false, 0, \"\", [], null -- including the equivalent "
+            "reasoning_effort='none') is rejected with HTTP 400. Intended for "
+            "thinking-only models such as GLM-5.3.",
         )
         parser.add_argument(
             "--glm-ignore-decoding-constraint-exception",

@@ -39,6 +39,7 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            glm_disable_nothink=False,
         )
         # Mock hf_config for _use_dpsk_v32_encoding check
         mock_hf_config = Mock()

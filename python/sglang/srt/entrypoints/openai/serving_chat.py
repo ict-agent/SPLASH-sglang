@@ -460,6 +460,26 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # GLM NOTE: thinking-only models (e.g. GLM-5.3) reject any attempt to turn
+        # thinking off. reasoning_effort="none" is already expanded into
+        # chat_template_kwargs by ChatCompletionRequest.normalize_reasoning_inputs,
+        # so checking the kwargs covers every equivalent spelling. The test is
+        # truthiness, not "is False", because that is what actually disables
+        # thinking downstream: _get_glm_enable_thinking() does bool(val) and the
+        # jinja chat template does {% if enable_thinking %}, so 0 / "" / [] / null
+        # turn thinking off just as much as false does.
+        if self.tokenizer_manager.server_args.glm_disable_nothink:
+            chat_template_kwargs = request.chat_template_kwargs or {}
+            if any(
+                key in chat_template_kwargs and not chat_template_kwargs[key]
+                for key in ("enable_thinking", "thinking")
+            ):
+                return (
+                    "Disabling thinking is not supported by this model: "
+                    "chat_template_kwargs.enable_thinking / thinking must not be "
+                    "falsy, and reasoning_effort='none' is rejected."
+                )
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
