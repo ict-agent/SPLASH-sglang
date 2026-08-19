@@ -626,6 +626,12 @@ class Envs:
     # tokenizers mutate shared Rust state while encoding.
     SGLANG_ENABLE_TOKENIZER_OFFLOAD = EnvBool(True)
 
+    # Cap torch intra-op parallelism in tokenizer worker processes. Small tensor
+    # operations in multimodal rope-index construction otherwise wake every CPU
+    # thread before ATen applies its grain-size check, wasting cores and adding
+    # event-loop latency. Values <= 0 leave torch's default unchanged.
+    GLM_TOKENIZER_TORCH_NUM_THREADS = EnvInt(4)
+
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 

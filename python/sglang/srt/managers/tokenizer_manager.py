@@ -216,6 +216,18 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
+def cap_torch_intraop_threads() -> None:
+    """Cap torch intra-op parallelism for the calling tokenizer thread."""
+    num_threads = envs.GLM_TOKENIZER_TORCH_NUM_THREADS.get()
+    if num_threads <= 0:
+        return
+
+    # Keep torch out of this module's import graph until the worker starts.
+    import torch
+
+    torch.set_num_threads(num_threads)
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -224,6 +236,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Only HTTP/tokenizer worker processes construct TokenizerManager.
+        cap_torch_intraop_threads()
+
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
@@ -341,7 +356,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and envs.SGLANG_ENABLE_TOKENIZER_OFFLOAD.get()
         ):
             self.tokenizer_offload_executor = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="tokenizer_offload"
+                max_workers=1,
+                thread_name_prefix="tokenizer_offload",
+                # torch's lazy thread initialization is thread-local, so cap the
+                # dedicated apply_chat_template/encode thread explicitly too.
+                initializer=cap_torch_intraop_threads,
             )
         else:
             self.tokenizer_offload_executor = None

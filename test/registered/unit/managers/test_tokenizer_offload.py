@@ -5,13 +5,18 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers import tokenizer_manager as tokenizer_manager_module
+from sglang.srt.managers.tokenizer_manager import (
+    TokenizerManager,
+    cap_torch_intraop_threads,
+)
 
 register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
@@ -127,6 +132,34 @@ class TestTokenizerOffload(CustomTestCase):
         self.assertIsNone(token_type_ids)
         self.assertEqual(len(worker_threads), 1)
         self.assertNotIn(threading.get_ident(), worker_threads)
+
+
+class TestTokenizerTorchThreadCap(CustomTestCase):
+    def test_configured_thread_cap_is_applied(self):
+        with (
+            patch.object(
+                tokenizer_manager_module.envs.GLM_TOKENIZER_TORCH_NUM_THREADS,
+                "get",
+                return_value=4,
+            ),
+            patch("torch.set_num_threads") as set_num_threads,
+        ):
+            cap_torch_intraop_threads()
+
+        set_num_threads.assert_called_once_with(4)
+
+    def test_non_positive_thread_cap_keeps_torch_default(self):
+        with (
+            patch.object(
+                tokenizer_manager_module.envs.GLM_TOKENIZER_TORCH_NUM_THREADS,
+                "get",
+                return_value=0,
+            ),
+            patch("torch.set_num_threads") as set_num_threads,
+        ):
+            cap_torch_intraop_threads()
+
+        set_num_threads.assert_not_called()
 
 
 if __name__ == "__main__":
