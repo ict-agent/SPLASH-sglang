@@ -865,9 +865,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             try:
                 # TODO(somefive): use more accurate truncation strategy
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                # Multimodal processors consume text and tokenize it later.
+                rendered = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=not is_multimodal,
                     add_generation_prompt=True,
                     tools=tools,
                     return_dict=False,
@@ -882,9 +883,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    rendered = self.tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
-                        tokenize=True,
+                        tokenize=not is_multimodal,
                         add_generation_prompt=True,
                         tools=tools,
                         return_dict=False,
@@ -895,14 +896,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
 
-            # Append assistant prefix if continue_final_message is enabled
-            if assistant_prefix:
-                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
-                    prompt_ids, assistant_prefix
-                )
-
             if is_multimodal:
-                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                prompt = rendered
+                if assistant_prefix:
+                    prompt = prompt + assistant_prefix
+                if request.return_token_ids:
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        prompt, add_special_tokens=False
+                    )
+            else:
+                prompt_ids = rendered
+                if assistant_prefix:
+                    prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                        prompt_ids, assistant_prefix
+                    )
 
         stop = request.stop
         if stop is None and not request.ignore_eos:
@@ -977,7 +984,7 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 stop.extend(request.stop)
 
-        if not is_multimodal:
+        if not is_multimodal or request.return_token_ids:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(

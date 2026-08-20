@@ -297,6 +297,30 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_jinja_multimodal_return_token_ids_does_not_add_special_tokens(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered prompt"
+        self.tm.tokenizer.encode.return_value = [11, 12, 13]
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Describe this image"}],
+            return_token_ids=True,
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=True)
+
+        self.assertFalse(
+            self.tm.tokenizer.apply_chat_template.call_args.kwargs["tokenize"]
+        )
+        self.tm.tokenizer.encode.assert_called_once_with(
+            "rendered prompt", add_special_tokens=False
+        )
+        self.tm.tokenizer.decode.assert_not_called()
+        self.assertEqual(result.prompt, "rendered prompt")
+        self.assertEqual(result.prompt_ids, [11, 12, 13])
+
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
 

@@ -105,7 +105,7 @@ class OpenAIServingBase(ABC):
                 # GLM NOTE: validate the request by pre_tokenizing it and cache the result.
                 # Otherwise, fastapi won't response 413 http code in StreamingResponse.
                 await self.tokenizer_manager.tokenize_and_cache_one_chat_request(
-                    adapted_request
+                    adapted_request, raw_request
                 )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client

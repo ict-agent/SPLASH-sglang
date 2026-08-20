@@ -622,6 +622,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def tokenize_and_cache_one_chat_request(
         self,
         obj: GenerateReqInput,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         """Tokenize one request and cache the result in the object.
 
@@ -631,11 +632,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         TODO: Used for /generate API and batch inference. Now only Used for /v1/chat/completions API.
         """
 
+        # Mooncake EPD initializes encoder dispatch later in generate_request.
+        # Set it up here so prompt-length validation sees expanded multimodal
+        # input_ids, then cache the result for the real request to reuse.
+        precompute_mm = (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "mooncake"
+            and not self.server_args.enable_adaptive_dispatch_to_encoder
+            and isinstance(obj, GenerateReqInput)
+            and obj.contains_mm_input()
+            and (
+                not isinstance(obj.sampling_params, dict)
+                or obj.sampling_params.get("n", 1) == 1
+            )
+        )
+        if precompute_mm:
+            obj._upstream_session_id = (
+                request.headers.get("Session-Id") if request is not None else None
+            )
+            self._handle_epd_disaggregation_encode_request(obj)
+
         # tokenize input request and check it validate
         tokenized_obj = await self._tokenize_one_request(obj)
 
         # cache the result in the object
         obj.input_ids = tokenized_obj.input_ids
+        if precompute_mm:
+            obj._precomputed_mm_inputs = tokenized_obj.mm_inputs
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -826,10 +849,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            # For audio-only requests (e.g., Whisper), text may be empty.
-            # The multimodal processor will provide input_ids later.
-            if not input_text and self.mm_processor and obj.contains_mm_input():
-                # Use empty placeholder - multimodal processor will override
+            # The multimodal processor produces the final input_ids below, so
+            # tokenizing the rendered text here would be discarded.
+            if self.mm_processor and obj.contains_mm_input():
                 input_ids = []
             else:
                 tokenization_timing = {}
@@ -869,7 +891,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             mm_inputs = None
 
-            if (
+            if hasattr(obj, "_precomputed_mm_inputs"):
+                # Reuse the encoder result fetched by prompt-length validation.
+                mm_inputs = obj._precomputed_mm_inputs
+            elif (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
@@ -914,6 +939,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
+            elif not input_ids and input_text and self.tokenizer is not None:
+                # Fall back if the multimodal path unexpectedly produced no ids.
+                input_ids, token_type_ids = await self._tokenize_texts(
+                    input_text, is_cross_encoder_request
+                )
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
