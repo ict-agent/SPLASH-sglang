@@ -58,9 +58,9 @@ def interleave_batch_token_id_out(func):
             cached_tokens_details = [] if recv_obj.cached_tokens_details else None
             http_worker_ipcs = [] if recv_obj.http_worker_ipcs else None
             spec_verify_ct = []
-            spec_accepted_tokens = []
-            spec_acceptance_histogram = (
-                [] if recv_obj.spec_acceptance_histogram else None
+            spec_num_correct_drafts = []
+            spec_correct_drafts_histogram = (
+                [] if recv_obj.spec_correct_drafts_histogram else None
             )
             retraction_counts = []
             time_stats = [] if recv_obj.time_stats else None
@@ -92,6 +92,7 @@ def interleave_batch_token_id_out(func):
             output_token_entropy_val = [] if recv_obj.output_token_entropy_val else None
             output_hidden_states = [] if recv_obj.output_hidden_states else None
             routed_experts = [] if recv_obj.routed_experts else None
+            indexer_topk = [] if recv_obj.indexer_topk else None
             token_steps = [] if recv_obj.token_steps else None
             customized_info = {} if recv_obj.customized_info else None
             dp_ranks = [] if recv_obj.dp_ranks else None
@@ -147,13 +148,15 @@ def interleave_batch_token_id_out(func):
                     spec_verify_ct.append(
                         min(recv_obj.spec_verify_ct[request_idx], _completion_tokens)
                     )
-                if request_idx < len(recv_obj.spec_accepted_tokens):
-                    spec_accepted_tokens.append(recv_obj.spec_accepted_tokens[request_idx])
-                if spec_acceptance_histogram is not None and request_idx < len(
-                    recv_obj.spec_acceptance_histogram
+                if request_idx < len(recv_obj.spec_num_correct_drafts):
+                    spec_num_correct_drafts.append(
+                        recv_obj.spec_num_correct_drafts[request_idx]
+                    )
+                if spec_correct_drafts_histogram is not None and request_idx < len(
+                    recv_obj.spec_correct_drafts_histogram
                 ):
-                    spec_acceptance_histogram.append(
-                        recv_obj.spec_acceptance_histogram[request_idx]
+                    spec_correct_drafts_histogram.append(
+                        recv_obj.spec_correct_drafts_histogram[request_idx]
                     )
                 if request_idx < len(recv_obj.retraction_counts):
                     retraction_counts.append(recv_obj.retraction_counts[request_idx])
@@ -170,8 +173,14 @@ def interleave_batch_token_id_out(func):
                     (recv_obj.input_token_ids_logprobs_val, input_token_ids_logprobs_val),
                     (recv_obj.input_token_ids_logprobs_idx, input_token_ids_logprobs_idx),
                 ]:
-                    if src is not None and decode_idx == 0:
-                        dest.append(src[request_idx])
+                    if src is not None:
+                        # Input logprobs are only real on the first split chunk,
+                        # but every chunk must remain request-aligned for demux.
+                        dest.append(
+                            src[request_idx]
+                            if decode_idx == 0 and request_idx < len(src)
+                            else []
+                        )
 
                 for src, dest in [
                     (recv_obj.output_token_logprobs_val, output_token_logprobs_val),
@@ -183,6 +192,7 @@ def interleave_batch_token_id_out(func):
                     (recv_obj.output_token_entropy_val, output_token_entropy_val),
                     (recv_obj.output_hidden_states, output_hidden_states),
                     (recv_obj.routed_experts, routed_experts),
+                    (recv_obj.indexer_topk, indexer_topk),
                     (recv_obj.token_steps, token_steps),
                 ]:
                     if src is not None:
@@ -207,8 +217,8 @@ def interleave_batch_token_id_out(func):
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
-                    spec_accepted_tokens=spec_accepted_tokens,
-                    spec_acceptance_histogram=spec_acceptance_histogram,
+                    spec_num_correct_drafts=spec_num_correct_drafts,
+                    spec_correct_drafts_histogram=spec_correct_drafts_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
@@ -238,6 +248,7 @@ def interleave_batch_token_id_out(func):
                     output_token_entropy_val=output_token_entropy_val,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    indexer_topk=indexer_topk,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

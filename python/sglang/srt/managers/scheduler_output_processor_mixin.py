@@ -1264,10 +1264,16 @@ class SchedulerOutputProcessorMixin:
         spec_num_correct_drafts = []
         spec_correct_drafts_histogram = []
         retraction_counts = []
-        output_hidden_states = None
+
+        # Keep optional per-request fields aligned with rids in mixed batches.
+        return_hidden_states = any(req.return_hidden_states for req in reqs)
+        return_routed_experts = any(req.return_routed_experts for req in reqs)
+        return_indexer_topk = any(req.return_indexer_topk for req in reqs)
+        output_hidden_states = [] if return_hidden_states else None
+        routed_experts = [] if return_routed_experts else None
+        indexer_topk = [] if return_indexer_topk else None
+
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
-        routed_experts = None
-        indexer_topk = None
         customized_info = {}
 
         time_stats = []
@@ -1445,18 +1451,18 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
-                if req.return_hidden_states:
-                    if output_hidden_states is None:
-                        output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
-                if req.return_routed_experts:
-                    if routed_experts is None:
-                        routed_experts = []
-                    routed_experts.append(req.routed_experts)
-                if req.return_indexer_topk:
-                    if indexer_topk is None:
-                        indexer_topk = []
-                    indexer_topk.append(req.indexer_topk)
+                if output_hidden_states is not None:
+                    output_hidden_states.append(
+                        req.hidden_states if req.return_hidden_states else None
+                    )
+                if routed_experts is not None:
+                    routed_experts.append(
+                        req.routed_experts if req.return_routed_experts else None
+                    )
+                if indexer_topk is not None:
+                    indexer_topk.append(
+                        req.indexer_topk if req.return_indexer_topk else None
+                    )
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
