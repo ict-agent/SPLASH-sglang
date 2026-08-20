@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
+    EncoderMetricsCollector,
     SchedulerMetricsCollector,
     TokenizerMetricsCollector,
 )
@@ -159,6 +160,12 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
+    # EPD disaggregation Encode process
+    MM_ENCODE = RequestStageConfig(
+        "mm_encode",
+        level=1,
+    )
+
     # disaggregation prefill
     PREFILL_PREPARE = RequestStageConfig(
         "prefill_prepare",
@@ -237,7 +244,11 @@ class RequestStage:
 class ReqTimeStatsBase:
     enable_metrics: bool = False
     metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ]
     ] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext
@@ -271,7 +282,12 @@ class ReqTimeStatsBase:
             return "unknown"
 
     def set_metrics_collector(
-        self, collector: Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        self,
+        collector: Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ],
     ):
         if collector:
             self.enable_metrics = True
@@ -1244,6 +1260,39 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     @staticmethod
     def format_wallclock(perf_counter_time: float) -> str:
         return f"{convert_time_to_realtime(perf_counter_time):.3f}"
+
+
+@dataclass
+class EncoderReqTimeStats(ReqTimeStatsBase):
+    mm_encode_start_time: float = 0.0
+    mm_encode_end_time: float = 0.0
+    modality: str = "image"
+
+    def set_mm_encode_start_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.mm_encode_start_time = ts
+        if self.trace_ctx.tracing_enable:
+            self.trace_ctx.rebuild_thread_context()
+            self.trace_ctx.trace_slice_start(
+                RequestStage.MM_ENCODE.stage_name,
+                RequestStage.MM_ENCODE.level,
+                convert_time_to_realtime_ns(ts),
+            )
+
+    def set_mm_encode_end_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.mm_encode_end_time = ts
+        if self.trace_ctx.tracing_enable:
+            self.trace_ctx.trace_slice_end(
+                RequestStage.MM_ENCODE.stage_name,
+                RequestStage.MM_ENCODE.level,
+                convert_time_to_realtime_ns(ts),
+                thread_finish_flag=True,
+            )
+        if self.enable_metrics:
+            self.metrics_collector.observe_request_e2e_latency(
+                ts - self.mm_encode_start_time, modality=self.modality
+            )
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):

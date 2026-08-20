@@ -16,6 +16,43 @@ When launching a language-only model, you must additionally specify the encoder 
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 
+### Encoder metrics
+
+Add `--enable-metrics` to an HTTP encoder server to expose `/metrics`. The
+encoder exports request, stage, transfer, cache, batching, and workload
+metrics. The primary EPD encoder metrics follow the upstream SGLang schema:
+
+- `sglang:encoder_requests_total`
+- `sglang:encoder_requests_received_total`
+- `sglang:encoder_request_e2e_latency_seconds`
+- `sglang:encoder_queue_wait_seconds`
+- `sglang:encoder_preprocess_seconds`
+- `sglang:encoder_model_forward_seconds`
+- `sglang:encoder_transfer_seconds`
+- `sglang:encoder_mm_items_per_request`
+- `sglang:encoder_cache_hit_tokens_total`
+- `sglang:encoder_cache_total_tokens_total`
+- `sglang:encoder_cache_hit_files_total`
+- `sglang:encoder_cache_total_files_total`
+- `sglang:encoder_cache_evictions_total`
+- `sglang:encoder_cache_size_mb`
+- `sglang:encoder_cache_entries`
+
+The encoder also exports detailed workload and execution-path metrics:
+
+- `sglang:encoder_requests_in_flight`
+- `sglang:encoder_requests_processed_total`
+- `sglang:encoder_stage_duration_seconds`
+- `sglang:encoder_transfer_bytes_total`
+- `sglang:encoder_embedding_tokens`
+
+Request metrics distinguish the execution path (`single`, `global_cache`, or `meta_only`), outcome, and bounded error stage. Canonical
+metrics use `model_name` and `dp_rank` base labels, plus labels configured through
+`--extra-metric-labels`; transfer latency adds `backend`. `meta_only` traffic is
+reported by the detailed execution-path metrics and is not counted as an
+encoder request in the canonical request, E2E latency, or item distributions.
+Request IDs, URLs, and exception text are intentionally not used as labels.
+
 ### Encoder transfer with Mooncake
 
 `--encoder-transfer-backend mooncake` controls **how encoder outputs are transferred** between encoder and language/prefill services. It is an encoder transfer option and can be used independently of the global multimodal embedding cache.
