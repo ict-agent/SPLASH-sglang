@@ -985,6 +985,8 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
+    if not isinstance(image_file, str):
+        raise NotImplementedError(f"Invalid image: {image_file}")
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
@@ -994,15 +996,16 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         finally:
             response.close()
         return result
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
-    if isinstance(image_file, str) and image_file.startswith("data:"):
+    if image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
-    if isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
-    raise NotImplementedError(f"Invalid image: {image_file}")
+    if image_file.startswith("file://"):
+        with open(unquote(urlparse(image_file).path), "rb") as f:
+            return f.read()
+    if os.path.isfile(image_file):
+        with open(image_file, "rb") as f:
+            return f.read()
+    return pybase64.b64decode(image_file, validate=True)
 
 
 def _normalize_video_input(
