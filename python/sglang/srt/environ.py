@@ -543,6 +543,10 @@ class Envs:
     SGLANG_GLM_VIDEO_PATCH_SIZE = EnvInt(14)
     SGLANG_GLM_VIDEO_MERGE_SIZE = EnvInt(2)
     SGLANG_GLM_VIDEO_PATCH_EXPAND_FACTOR = EnvInt(4)
+    # torchcodec video-decode CUDA backend: "ffmpeg" (default, stable) or "beta"
+    # (NVDEC, faster but can fail at frame-fetch on some pixel formats, e.g.
+    # "Failed to convert NV12 frame.").
+    SGLANG_VIDEO_CUDA_BACKEND = EnvStr("ffmpeg")
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
