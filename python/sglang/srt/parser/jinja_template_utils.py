@@ -160,14 +160,23 @@ def process_content_for_template_format(
                 if chunk_type == "image_url":
                     image_obj = chunk.get("image_url") or {}
                     mdp = image_obj.get("max_dynamic_patch", None)
-                    # Also allow flat style: chunk["max_dynamic_patch"]
-                    image_data.append(
-                        ImageData(
-                            url=image_obj["url"],
-                            detail=image_obj.get("detail", "auto"),
-                            max_dynamic_patch=mdp,
+                    max_image_tokens = image_obj.get("max_image_tokens", None)
+                    if max_image_tokens is not None:
+                        image_data.append(
+                            {
+                                "url": image_obj["url"],
+                                "detail": image_obj.get("detail", "auto"),
+                                "max_image_tokens": max_image_tokens,
+                            }
                         )
-                    )
+                    else:
+                        image_data.append(
+                            ImageData(
+                                url=image_obj["url"],
+                                detail=image_obj.get("detail", "auto"),
+                                max_dynamic_patch=mdp,
+                            )
+                        )
 
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
@@ -176,16 +185,24 @@ def process_content_for_template_format(
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
+                    sampling = {
+                        k: video_obj[k]
+                        for k in (
+                            "fps",
+                            "max_frames",
+                            "max_tokens_per_frame",
+                            "max_image_tokens",
+                        )
+                        if video_obj.get(k) is not None
+                    }
+                    if mdp is None and not sampling:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
-                        )
+                        structured = {"url": video_obj["url"], **sampling}
+                        if mdp is not None:
+                            structured["max_dynamic_patch"] = mdp
+                        video_data.append(structured)
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

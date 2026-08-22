@@ -298,11 +298,14 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        video_urls, video_configs = _split_video_items(request_obj.video_data)
+        video_urls, video_configs = _split_mm_items(
+            request_obj.video_data, _MM_SAMPLING_KEYS
+        )
+        image_urls, image_configs = _split_mm_items(image_data, _MM_SAMPLING_KEYS)
 
         base_output = self.load_mm_data(
             prompt=input_text,
-            image_data=image_data,
+            image_data=image_urls,
             video_data=video_urls,
             multimodal_tokens=self.mm_tokens,
         )
@@ -315,29 +318,33 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
+        combine_kwargs = {}
+        image_processor = getattr(self._processor, "image_processor", None)
+        images_kwargs = glm_budget_kwargs(
+            image_processor,
+            user_max_image_tokens=glm_max_image_tokens_from_configs(image_configs),
+        )
+        if images_kwargs is not None:
+            combine_kwargs["images_kwargs"] = images_kwargs
+
         if video_metadata is not None:
-            combine_kwargs = dict(
-                video_metadata=video_metadata, do_sample_frames=False
-            )
+            combine_kwargs["video_metadata"] = video_metadata
+            combine_kwargs["do_sample_frames"] = False
             video_processor = getattr(self._processor, "video_processor", None)
-            scaled_size = glm_scale_size_for_video_count(
-                dict(video_processor.size)
-                if video_processor is not None
-                and getattr(video_processor, "size", None)
-                else None,
-                len(base_output.videos),
+            videos_kwargs = glm_budget_kwargs(
+                video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+                count=len(base_output.videos),
+                split=True,
             )
-            if scaled_size is not None:
-                combine_kwargs["videos_kwargs"] = {"size": scaled_size}
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
-                **combine_kwargs,
-            )
-        else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
-            )
+            if videos_kwargs is not None:
+                combine_kwargs["videos_kwargs"] = videos_kwargs
+
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output,
+            self.mm_tokens,
+            **combine_kwargs,
+        )
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
@@ -359,16 +366,34 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
 
 
-def glm_scale_size_for_video_count(base_size, video_count):
-    """Split one video pixel budget across all videos in the request."""
-    if not base_size or not video_count or video_count <= 1:
+def glm_budget_kwargs(processor, user_max_image_tokens=None, count=1, split=False):
+    """Resolve an optional per-item GLM image-token budget."""
+    if processor is None:
         return None
-    if "shortest_edge" not in base_size or "longest_edge" not in base_size:
+    count = count or 1
+    default_max = getattr(processor, "max_image_tokens", None)
+    if not default_max:
         return None
-    return {
-        "shortest_edge": max(1, int(base_size["shortest_edge"] / video_count)),
-        "longest_edge": max(1, int(base_size["longest_edge"] / video_count)),
-    }
+    if user_max_image_tokens is not None:
+        budget = int(user_max_image_tokens)
+    elif split:
+        budget = int(default_max)
+    else:
+        return None
+    effective_budget = max(1, budget // count if split and count > 1 else budget)
+    if effective_budget == default_max:
+        return None
+    return {"max_image_tokens": effective_budget}
+
+
+def glm_max_image_tokens_from_configs(configs):
+    """Return the tightest request-provided image-token budget."""
+    values = [
+        int(config["max_image_tokens"])
+        for config in (configs or [])
+        if isinstance(config, dict) and config.get("max_image_tokens") is not None
+    ]
+    return min(values) if values else None
 
 
 def _video_metadata(total_num_frames, fps, duration, frames_indices):
@@ -381,19 +406,19 @@ def _video_metadata(total_num_frames, fps, duration, frames_indices):
     }
 
 
-def _split_video_items(video_data):
-    _SAMPLING_KEYS = ("fps", "max_frames", "max_tokens_per_frame")
-    if video_data is None:
+_MM_SAMPLING_KEYS = ("fps", "max_frames", "max_tokens_per_frame", "max_image_tokens")
+
+
+def _split_mm_items(mm_data, sampling_keys):
+    if mm_data is None:
         return None, []
-    items = video_data if isinstance(video_data, list) else [video_data]
+    items = mm_data if isinstance(mm_data, list) else [mm_data]
 
     urls, configs = [], []
     for item in items:
         if isinstance(item, dict) and "format" not in item and "url" in item:
             urls.append(item["url"])
-            configs.append(
-                {k: item[k] for k in _SAMPLING_KEYS if item.get(k) is not None}
-            )
+            configs.append({k: item[k] for k in sampling_keys if item.get(k) is not None})
         else:
             urls.append(item)
             configs.append({})

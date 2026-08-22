@@ -409,16 +409,22 @@ class Conversation:
         """Append a new message."""
         self.messages.append([role, message])
 
-    def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
-        """Append a new image."""
-        self.image_data.append(ImageData(url=image, detail=detail))
+    def append_image(
+        self,
+        image: str,
+        detail: Literal["auto", "low", "high"],
+        sampling: Optional[dict] = None,
+    ):
+        """Append a new image, optionally with per-image sampling overrides."""
+        if sampling:
+            self.image_data.append({"url": image, "detail": detail, **sampling})
+        else:
+            self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
-        """Append a new video."""
-        if preprocess_kwargs:
-            self.video_data.append(
-                VideoData(video, preprocess_kwargs=preprocess_kwargs)
-            )
+    def append_video(self, video: str, sampling: Optional[Dict] = None):
+        """Append a new video, optionally with per-video sampling overrides."""
+        if sampling:
+            self.video_data.append({"url": video, **sampling})
         else:
             self.video_data.append(video)
 
@@ -665,12 +671,29 @@ def generate_chat_conv(
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
+                        sampling = {
+                            k: getattr(content.image_url, k, None)
+                            for k in ("max_image_tokens",)
+                            if getattr(content.image_url, k, None) is not None
+                        }
                         conv.append_image(
-                            content.image_url.url, content.image_url.detail
+                            content.image_url.url,
+                            content.image_url.detail,
+                            sampling,
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        sampling = {
+                            k: getattr(content.video_url, k, None)
+                            for k in (
+                                "fps",
+                                "max_frames",
+                                "max_tokens_per_frame",
+                                "max_image_tokens",
+                            )
+                            if getattr(content.video_url, k, None) is not None
+                        }
+                        conv.append_video(content.video_url.url, sampling)
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)

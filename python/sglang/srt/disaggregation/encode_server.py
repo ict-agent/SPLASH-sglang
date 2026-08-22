@@ -42,12 +42,14 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.glm4v import (
-    _split_video_items as glm_split_video_items,
+    _MM_SAMPLING_KEYS as glm_mm_sampling_keys,
+    _split_mm_items as glm_split_mm_items,
+    glm_budget_kwargs,
     glm_decode_frames_at,
+    glm_max_image_tokens_from_configs,
     glm_sample_and_decode_sync,
     glm_sample_frame_indices,
-    glm_scale_size_for_video_count,
-    preprocess_video_frames_sync as glm_preprocess_video_frames_sync,
+    preprocess_video_frames_sync,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import (
@@ -706,20 +708,23 @@ class MMEncoder:
         video_processor_kwargs["do_sample_frames"] = False
         video_processor_kwargs["return_metadata"] = True
 
-        # HF smart-resize incorporates the total frame count into its pixel
-        # budget. Scale each local budget so every shard chooses the same H/W
-        # as the unsharded video.
+        # Scale the token budget by shard ratio so every shard selects the same
+        # spatial resolution as the whole video.
         n_global_frames = len(global_indices)
         n_local_frames = len(local_frame_indices)
-        processor_size = getattr(self.video_processor, "size", None)
-        if n_local_frames > 0 and n_global_frames > 0 and processor_size:
-            base_size = dict(processor_size)
-            if "shortest_edge" in base_size and "longest_edge" in base_size:
-                ratio = n_local_frames / n_global_frames
-                video_processor_kwargs["size"] = {
-                    "shortest_edge": int(base_size["shortest_edge"] * ratio),
-                    "longest_edge": int(base_size["longest_edge"] * ratio),
-                }
+        if n_local_frames > 0 and n_global_frames > 0:
+            ratio = n_local_frames / n_global_frames
+            user_budget = (
+                video_config.get("max_image_tokens") if video_config else None
+            )
+            budget = (
+                int(user_budget)
+                if user_budget is not None
+                else self.video_processor.max_image_tokens
+            )
+            video_processor_kwargs["max_image_tokens"] = max(
+                1, int(budget * ratio)
+            )
 
         video_processor_kwargs["_shard_meta"] = {
             "global_indices": global_indices,
@@ -814,7 +819,9 @@ class MMEncoder:
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
-        video_urls, video_configs = glm_split_video_items(mm_items)
+        video_urls, video_configs = glm_split_mm_items(
+            mm_items, glm_mm_sampling_keys
+        )
         if video_urls is not None:
             mm_items = video_urls
 
@@ -840,22 +847,23 @@ class MMEncoder:
                     video_processor_kwargs["video_metadata"] = video_metadata
                 return videos, video_processor_kwargs
             elif "glm" in self.model_type:
-                scaled_size = glm_scale_size_for_video_count(
-                    dict(self.video_processor.size)
-                    if self.video_processor is not None
-                    and getattr(self.video_processor, "size", None)
-                    else None,
-                    len(video_items),
+                budget_kwargs = glm_budget_kwargs(
+                    self.video_processor,
+                    user_max_image_tokens=glm_max_image_tokens_from_configs(
+                        video_configs
+                    ),
+                    count=len(video_items),
+                    split=True,
                 )
-                if scaled_size is not None:
-                    video_processor_kwargs["size"] = scaled_size
+                if budget_kwargs is not None:
+                    video_processor_kwargs.update(budget_kwargs)
                 framed = any(isinstance(video, list) for video in video_items)
                 loop = asyncio.get_running_loop()
                 if framed:
                     tasks = [
                         loop.run_in_executor(
                             self.io_executor,
-                            glm_preprocess_video_frames_sync,
+                            preprocess_video_frames_sync,
                             video,
                         )
                         for video in video_items
@@ -1397,8 +1405,22 @@ class MMEncoder:
 
     async def _process_mm_items(self, mm_items, modality):
         if modality == Modality.IMAGE and self.image_processor:
+            image_urls, image_configs = glm_split_mm_items(
+                mm_items, glm_mm_sampling_keys
+            )
+            if image_urls is not None:
+                mm_items = image_urls
             images = await self._flatten_and_load_images(mm_items)
-            image_config = self.vision_config.get("image", {})
+            image_config = dict(self.vision_config.get("image", {}))
+            if "glm" in self.model_type:
+                budget = glm_budget_kwargs(
+                    self.image_processor,
+                    user_max_image_tokens=glm_max_image_tokens_from_configs(
+                        image_configs
+                    ),
+                )
+                if budget is not None:
+                    image_config.update(budget)
             if self.model_type in ["kimi_k25", "kimi_vl"]:
                 images = self._normalize_kimi_encoder_images(images)
             loop = asyncio.get_running_loop()
