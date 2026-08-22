@@ -250,12 +250,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
         )
         assert all(isinstance(modality, Modality) for modality in modality_list)
-        assert len(set(modality_list)) == 1, (
-            f"GLM-V EPD only supports a single modality per request, "
-            f"got {set(modality_list)}"
-        )
-        modality = modality_list[0]
-
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
             input_ids=input_ids_tensor,
@@ -266,15 +260,24 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
+        image_runs, video_frame_runs = self._group_offsets_by_modality(
+            offsets, modality_list, video_grid_thw
+        )
         mm_items = [
             MultimodalDataItem(
                 modality=modality,
-                offsets=offsets,
+                offsets=runs,
                 precomputed_embeddings=(
                     embeddings.get(modality) if embeddings else None
                 ),
             )
+            for modality, runs in (
+                (Modality.IMAGE, image_runs),
+                (Modality.VIDEO, video_frame_runs),
+            )
+            if runs
         ]
+        mm_items.sort(key=lambda item: item.offsets[0][0])
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,
