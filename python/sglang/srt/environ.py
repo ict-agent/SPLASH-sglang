@@ -746,6 +746,10 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS = EnvInt(4)
+    # Registered Mooncake buffer pool limits. Both values must be positive to
+    # enable the receiver pool and sender-side registration refcounting.
+    SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
+    SGLANG_MC_RDMA_POOL_MAX_BUFFERS = EnvInt(0)
     # A single video is cross-encoder sharded only above these thresholds.
     # A zero size threshold permits any local/in-memory size.
     SGLANG_ENCODER_VIDEO_SHARD_MIN_MB = EnvInt(128)

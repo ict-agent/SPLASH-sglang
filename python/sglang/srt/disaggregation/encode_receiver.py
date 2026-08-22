@@ -46,6 +46,20 @@ logger = logging.getLogger(__name__)
 # retaining sufficient collision resistance for encoder load-balancer affinity.
 _ENCODER_MEDIA_HASH_HEX_LENGTH = 16
 
+
+def _rdma_pool_max_bytes() -> int:
+    return envs.SGLANG_MC_RDMA_POOL_MAX_MB.get() * 1024 * 1024
+
+
+def _rdma_pool_max_buffers() -> int:
+    return envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.get()
+
+
+def rdma_pool_enabled() -> bool:
+    """Return whether both Mooncake RDMA pool limits enable pooling."""
+    return _rdma_pool_max_bytes() > 0 and _rdma_pool_max_buffers() > 0
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -156,6 +170,139 @@ def _log_task_exception(task):
     exc = task.exception()
     if exc is not None:
         logger.warning("encode task failed after embeddings were received: %s", exc)
+
+
+class RdmaBufferPool:
+    """Pool of long-lived, RDMA-registered CPU receive buffers."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._free = {}
+        self._floor = 1 * 1024 * 1024
+        self._max_total_bytes = _rdma_pool_max_bytes()
+        self._max_buffers = _rdma_pool_max_buffers()
+        self._total_bytes = 0
+        self._total_count = 0
+        self._warned_over = False
+
+    def _size_class(self, nbytes: int) -> int:
+        nbytes = max(int(nbytes), self._floor)
+        return 1 << (nbytes - 1).bit_length()
+
+    def acquire(self, nbytes: int) -> torch.Tensor:
+        class_bytes = self._size_class(nbytes)
+        with self._lock:
+            free = self._free.get(class_bytes)
+            if free:
+                return free.pop()
+
+            best_key = None
+            for size, buffers in self._free.items():
+                if (
+                    size > class_bytes
+                    and buffers
+                    and (best_key is None or size < best_key)
+                ):
+                    best_key = size
+            if best_key is not None:
+                return self._free[best_key].pop()
+
+        buffer = torch.empty(class_bytes, dtype=torch.uint8)
+        ret = self._engine.register(buffer.data_ptr(), buffer.nbytes)
+        if ret != 0:
+            raise RuntimeError(
+                f"mooncake register_memory failed (ret={ret}, bytes={class_bytes})"
+            )
+
+        with self._lock:
+            self._total_bytes += class_bytes
+            self._total_count += 1
+            if (
+                self._total_bytes > self._max_total_bytes
+                or self._total_count > self._max_buffers
+            ) and not self._warned_over:
+                self._warned_over = True
+                logger.warning(
+                    "mooncake RDMA buffer pool over budget "
+                    "(bytes=%d/%d, count=%d/%d); released buffers will be "
+                    "deregistered to shrink. Increase "
+                    "SGLANG_MC_RDMA_POOL_MAX_MB or "
+                    "SGLANG_MC_RDMA_POOL_MAX_BUFFERS.",
+                    self._total_bytes,
+                    self._max_total_bytes,
+                    self._total_count,
+                    self._max_buffers,
+                )
+        return buffer
+
+    def release(self, buffer: torch.Tensor) -> None:
+        if buffer is None:
+            return
+        with self._lock:
+            over_budget = (
+                self._total_bytes > self._max_total_bytes
+                or self._total_count > self._max_buffers
+            )
+            if not over_budget:
+                self._free.setdefault(buffer.numel(), []).append(buffer)
+                return
+            self._total_bytes -= buffer.numel()
+            self._total_count -= 1
+        self._engine.deregister(buffer.data_ptr())
+
+    def discard(self, buffer: torch.Tensor) -> None:
+        """Deregister an aborted request's buffer instead of reusing it."""
+        if buffer is None:
+            return
+        with self._lock:
+            self._total_bytes -= buffer.numel()
+            self._total_count -= 1
+            remaining_bytes = self._total_bytes
+            remaining_count = self._total_count
+        logger.warning(
+            "mooncake RDMA pool: discarding buffer (bytes=%d) on abort/timeout; "
+            "pool now bytes=%d count=%d",
+            buffer.numel(),
+            remaining_bytes,
+            remaining_count,
+        )
+        self._engine.deregister(buffer.data_ptr())
+
+
+class RdmaRegRefcount:
+    """Reference-count registrations of a shared Mooncake source tensor."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._refcounts = {}
+        self._pinned_tensors = {}
+
+    def acquire(self, tensor: torch.Tensor) -> int:
+        addr = tensor.data_ptr()
+        with self._lock:
+            refcount = self._refcounts.get(addr, 0)
+            if refcount == 0:
+                ret = self._engine.register(addr, tensor.nbytes)
+                if ret != 0:
+                    raise RuntimeError(
+                        f"mooncake register_memory failed (ret={ret}, "
+                        f"bytes={tensor.nbytes})"
+                    )
+                self._pinned_tensors[addr] = tensor
+            self._refcounts[addr] = refcount + 1
+        return addr
+
+    def release(self, addr: int) -> None:
+        with self._lock:
+            refcount = self._refcounts.get(addr, 0)
+            if refcount <= 1:
+                self._refcounts.pop(addr, None)
+                self._pinned_tensors.pop(addr, None)
+                self._engine.deregister(addr)
+            else:
+                self._refcounts[addr] = refcount - 1
 
 
 class EmbeddingData:
@@ -878,6 +1025,12 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
+            self._use_rdma_pool = rdma_pool_enabled()
+            self._rdma_pool = (
+                RdmaBufferPool(self.embeddings_engine)
+                if self._use_rdma_pool
+                else None
+            )
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
@@ -1051,10 +1204,14 @@ class MMReceiverBase(ABC):
         if embeddings is None:
             return
         try:
-            self.embeddings_engine.deregister(embeddings.data_ptr())
+            if self._use_rdma_pool:
+                self._rdma_pool.discard(embeddings)
+            else:
+                self.embeddings_engine.deregister(embeddings.data_ptr())
         except Exception:
             logger.exception(
-                "mooncake: failed to deregister buffer for req_id=%s", req_id
+                "mooncake: failed to discard/deregister buffer for req_id=%s",
+                req_id,
             )
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
@@ -1121,12 +1278,22 @@ class MMReceiverBase(ABC):
                     )
                     return None
                 raw_buffer = self.embeddings_buffer.pop(req_id)
-                self.embeddings_engine.deregister(raw_buffer.data_ptr())
-                recv_embedding = (
-                    recv_embedding_data.get_embedding_from_contiguous_buffer(
-                        raw_buffer, self.dtype
+                if self._use_rdma_pool:
+                    try:
+                        recv_embedding = (
+                            recv_embedding_data.get_embedding_from_contiguous_buffer(
+                                raw_buffer, self.dtype, clone=True
+                            )
+                        )
+                    finally:
+                        self._rdma_pool.release(raw_buffer)
+                else:
+                    self.embeddings_engine.deregister(raw_buffer.data_ptr())
+                    recv_embedding = (
+                        recv_embedding_data.get_embedding_from_contiguous_buffer(
+                            raw_buffer, self.dtype
+                        )
                     )
-                )
             else:
                 recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
@@ -1296,20 +1463,23 @@ class MMReceiverBase(ABC):
         return req
 
     async def allocate_embedding_buffer(self, req_id, total_bytes):
-        embeddings = torch.empty(total_bytes, dtype=torch.uint8)
-        ret = self.embeddings_engine.register(
-            embeddings.data_ptr(),
-            embeddings.nbytes,
-        )
-        if ret != 0:
-            # Do NOT store the buffer or hand the unregistered address to the
-            # encoder -- its RDMA write would fail anyway and the request
-            # would silently hang for the full recv timeout. Fail fast.
-            raise EncoderError(
-                f"mooncake: receiver register failed for req_id={req_id} "
-                f"(ret={ret}, bytes={total_bytes})",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        if self._use_rdma_pool:
+            embeddings = self._rdma_pool.acquire(total_bytes)
+        else:
+            embeddings = torch.empty(total_bytes, dtype=torch.uint8)
+            ret = self.embeddings_engine.register(
+                embeddings.data_ptr(),
+                embeddings.nbytes,
             )
+            if ret != 0:
+                # Do NOT store the buffer or hand the unregistered address to the
+                # encoder -- its RDMA write would fail anyway and the request
+                # would silently hang for the full recv timeout. Fail fast.
+                raise EncoderError(
+                    f"mooncake: receiver register failed for req_id={req_id} "
+                    f"(ret={ret}, bytes={total_bytes})",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
         self.embeddings_buffer[req_id] = embeddings
         return embeddings.data_ptr()
 

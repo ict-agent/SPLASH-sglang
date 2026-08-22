@@ -10,8 +10,12 @@ Covers the leak fixes for the P-node memory growth issue:
 """
 
 import asyncio
+import concurrent.futures
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -20,6 +24,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.encode_receiver import (  # noqa: E402
     EncoderError,
     MMReceiverHTTP,
+    RdmaBufferPool,
+    RdmaRegRefcount,
+    rdma_pool_enabled,
 )
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -38,7 +45,79 @@ def _make_receiver():
     receiver.embeddings_engine = MagicMock()
     receiver.embeddings_engine.register = MagicMock(return_value=0)
     receiver.embeddings_engine.deregister = MagicMock()
+    receiver._use_rdma_pool = False
+    receiver._rdma_pool = None
     return receiver
+
+
+class _FakeMooncakeEngine:
+    def __init__(self, register_result=0):
+        self.register_result = register_result
+        self.register_calls = []
+        self.deregister_calls = []
+        self._lock = threading.Lock()
+
+    def register(self, addr, nbytes):
+        with self._lock:
+            self.register_calls.append((addr, nbytes))
+        return self.register_result
+
+    def deregister(self, addr):
+        with self._lock:
+            self.deregister_calls.append(addr)
+
+
+class TestRdmaRegistrationLifecycle(unittest.TestCase):
+    def test_pool_requires_both_positive_limits(self):
+        with envs.SGLANG_MC_RDMA_POOL_MAX_MB.override(
+            1
+        ), envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.override(0):
+            self.assertFalse(rdma_pool_enabled())
+        with envs.SGLANG_MC_RDMA_POOL_MAX_MB.override(
+            1
+        ), envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.override(1):
+            self.assertTrue(rdma_pool_enabled())
+
+    def test_shared_tensor_is_registered_once_for_concurrent_users(self):
+        engine = _FakeMooncakeEngine()
+        registry = RdmaRegRefcount(engine)
+        tensor = torch.empty(1024, dtype=torch.uint8)
+        acquired = threading.Barrier(3)
+        release = threading.Event()
+
+        def use_tensor():
+            addr = registry.acquire(tensor)
+            acquired.wait(timeout=5)
+            release.wait(timeout=5)
+            registry.release(addr)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(use_tensor) for _ in range(2)]
+            acquired.wait(timeout=5)
+            self.assertEqual(
+                engine.register_calls, [(tensor.data_ptr(), tensor.nbytes)]
+            )
+            self.assertEqual(engine.deregister_calls, [])
+            release.set()
+            for future in futures:
+                future.result(timeout=5)
+
+        self.assertEqual(engine.deregister_calls, [tensor.data_ptr()])
+
+    def test_receive_pool_reuses_registered_buffer(self):
+        engine = _FakeMooncakeEngine()
+        with envs.SGLANG_MC_RDMA_POOL_MAX_MB.override(
+            2
+        ), envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.override(2):
+            pool = RdmaBufferPool(engine)
+            first = pool.acquire(100)
+            pool.release(first)
+            second = pool.acquire(100)
+
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertEqual(len(engine.register_calls), 1)
+        pool.discard(second)
+        self.assertEqual(engine.deregister_calls, [second.data_ptr()])
 
 
 class TestRecvMMDataCleanup(unittest.IsolatedAsyncioTestCase):

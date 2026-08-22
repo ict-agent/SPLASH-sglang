@@ -27,7 +27,11 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import EmbeddingData
+from sglang.srt.disaggregation.encode_receiver import (
+    EmbeddingData,
+    RdmaRegRefcount,
+    rdma_pool_enabled,
+)
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -374,6 +378,10 @@ class MMEncoder:
                             or self.server_args.mooncake_ib_device
                         ),
                     )
+                self._use_rdma_pool = rdma_pool_enabled()
+                self._rdma_reg = (
+                    RdmaRegRefcount(self.engine) if self._use_rdma_pool else None
+                )
 
             self.embedding_to_send = dict()
 
@@ -1735,6 +1743,23 @@ class MMEncoder:
             if embedding is not None and embedding.nbytes > 0:
 
                 def _transfer_sync():
+                    if self._use_rdma_pool:
+                        transfer_embedding = (
+                            embedding
+                            if embedding.is_contiguous()
+                            else embedding.contiguous()
+                        )
+                        addr = self._rdma_reg.acquire(transfer_embedding)
+                        try:
+                            return 0, self.engine.transfer_sync(
+                                session_id,
+                                addr,
+                                buffer_address,
+                                transfer_embedding.nbytes,
+                            )
+                        finally:
+                            self._rdma_reg.release(addr)
+
                     reg = self.engine.register(embedding.data_ptr(), embedding.nbytes)
                     if reg != 0:
                         return reg, -1
