@@ -316,11 +316,23 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         if video_metadata is not None:
+            combine_kwargs = dict(
+                video_metadata=video_metadata, do_sample_frames=False
+            )
+            video_processor = getattr(self._processor, "video_processor", None)
+            scaled_size = glm_scale_size_for_video_count(
+                dict(video_processor.size)
+                if video_processor is not None
+                and getattr(video_processor, "size", None)
+                else None,
+                len(base_output.videos),
+            )
+            if scaled_size is not None:
+                combine_kwargs["videos_kwargs"] = {"size": scaled_size}
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+                **combine_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
@@ -345,6 +357,18 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+
+def glm_scale_size_for_video_count(base_size, video_count):
+    """Split one video pixel budget across all videos in the request."""
+    if not base_size or not video_count or video_count <= 1:
+        return None
+    if "shortest_edge" not in base_size or "longest_edge" not in base_size:
+        return None
+    return {
+        "shortest_edge": max(1, int(base_size["shortest_edge"] / video_count)),
+        "longest_edge": max(1, int(base_size["longest_edge"] / video_count)),
+    }
 
 
 def _video_metadata(total_num_frames, fps, duration, frames_indices):
@@ -383,25 +407,18 @@ def glm_sample_frame_indices(
     *,
     target_fps=None,
     max_frame_count=None,
-    temporal_patch_size=None,
 ):
-    if temporal_patch_size is None:
-        temporal_patch_size = envs.SGLANG_GLM_VIDEO_TEMPORAL_PATCH_SIZE.get()
     max_frame_idx = total_frames - 1
     if not duration:
         duration = (round(max_frame_idx / fps) + 1) if fps else 0
     if max_frame_count is None:
         max_frame_count = envs.SGLANG_GLM_VIDEO_MAX_FRAMES.get()
 
-    effective_duration = min(duration, envs.SGLANG_GLM_VIDEO_MAX_DURATION.get())
+    max_duration = envs.SGLANG_GLM_VIDEO_MAX_DURATION.get()
+    effective_duration = duration if max_duration <= 0 else min(duration, max_duration)
     if target_fps is None:
-        if effective_duration <= 30:
-            target_fps = envs.SGLANG_GLM_VIDEO_FPS_SHORT.get()
-        elif effective_duration <= 300:
-            target_fps = envs.SGLANG_GLM_VIDEO_FPS_MEDIUM.get()
-        else:
-            target_fps = envs.SGLANG_GLM_VIDEO_FPS_LONG.get()
-    extract_t = int(effective_duration * target_fps * temporal_patch_size)
+        target_fps = envs.SGLANG_GLM_VIDEO_FPS.get()
+    extract_t = int(effective_duration * target_fps)
     extract_t = min(extract_t, max_frame_count)
 
     duration_per_frame = 1 / fps
@@ -413,7 +430,7 @@ def glm_sample_frame_indices(
     else:
         frame_indices = []
         current_second = 0
-        inv_fps = 1 / (temporal_patch_size * target_fps)
+        inv_fps = 1 / target_fps
         for frame_index in range(total_frames):
             if timestamps[frame_index] >= current_second:
                 current_second += inv_fps

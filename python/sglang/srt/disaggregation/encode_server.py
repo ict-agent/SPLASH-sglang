@@ -46,6 +46,7 @@ from sglang.srt.multimodal.processors.glm4v import (
     glm_decode_frames_at,
     glm_sample_and_decode_sync,
     glm_sample_frame_indices,
+    glm_scale_size_for_video_count,
     preprocess_video_frames_sync as glm_preprocess_video_frames_sync,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
@@ -839,6 +840,15 @@ class MMEncoder:
                     video_processor_kwargs["video_metadata"] = video_metadata
                 return videos, video_processor_kwargs
             elif "glm" in self.model_type:
+                scaled_size = glm_scale_size_for_video_count(
+                    dict(self.video_processor.size)
+                    if self.video_processor is not None
+                    and getattr(self.video_processor, "size", None)
+                    else None,
+                    len(video_items),
+                )
+                if scaled_size is not None:
+                    video_processor_kwargs["size"] = scaled_size
                 framed = any(isinstance(video, list) for video in video_items)
                 loop = asyncio.get_running_loop()
                 if framed:

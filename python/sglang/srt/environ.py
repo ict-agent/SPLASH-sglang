@@ -536,12 +536,10 @@ class Envs:
     # Set to disable recovering GLM multimodal item order from template output.
     SGLANG_DISABLE_MM_ORDER_RECOVERY = EnvBool(False)
 
-    # GLM-V video frame-sampling defaults.
-    SGLANG_GLM_VIDEO_FPS_SHORT = EnvFloat(3.0)
-    SGLANG_GLM_VIDEO_FPS_MEDIUM = EnvFloat(1.0)
-    SGLANG_GLM_VIDEO_FPS_LONG = EnvFloat(0.5)
-    SGLANG_GLM_VIDEO_MAX_FRAMES = EnvInt(640)
-    SGLANG_GLM_VIDEO_MAX_DURATION = EnvInt(2400)
+    # GLM-V video frame-sampling defaults. FPS is the raw sampled frame rate.
+    SGLANG_GLM_VIDEO_FPS = EnvFloat(2.0)
+    SGLANG_GLM_VIDEO_MAX_FRAMES = EnvInt(2048)
+    SGLANG_GLM_VIDEO_MAX_DURATION = EnvInt(0)  # 0 means no duration cap.
     SGLANG_GLM_VIDEO_TEMPORAL_PATCH_SIZE = EnvInt(2)
     SGLANG_GLM_VIDEO_PATCH_SIZE = EnvInt(14)
     SGLANG_GLM_VIDEO_MERGE_SIZE = EnvInt(2)
