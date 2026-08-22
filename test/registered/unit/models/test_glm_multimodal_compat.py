@@ -1,3 +1,5 @@
+import base64
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,6 +18,17 @@ from sglang.srt.constrained.glm.escape import (  # noqa: E402
     set_global_escaped_special_tokens,
 )
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+    ChatCompletionMessageContentImageURL,
+    ChatCompletionMessageContentVideoFrameURL,
+    ChatCompletionMessageContentVideoPart,
+    ChatCompletionMessageContentVideoURL,
+)
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.glm4v import swiglu_clamped  # noqa: E402
 from sglang.srt.multimodal.processors.base_processor import (  # noqa: E402
     BaseMultimodalProcessor,
@@ -23,8 +36,10 @@ from sglang.srt.multimodal.processors.base_processor import (  # noqa: E402
 )
 from sglang.srt.multimodal.processors.glm4v import (  # noqa: E402
     Glm4vImageProcessor,
+    glm_budget_kwargs,
+    glm_sample_frame_indices,
 )
-from sglang.srt.utils.common import load_image, smart_to_rgb  # noqa: E402
+from sglang.srt.utils.common import load_image, load_video, smart_to_rgb  # noqa: E402
 from sglang.srt.utils.hf_transformers.processor import (  # noqa: E402
     _escape_processor_special_tokens,
 )
@@ -131,6 +146,134 @@ class TestGlmMultimodalCompatibility(CustomTestCase):
         self.assertTrue(
             processor.glm_image_placeholder_token.startswith("<|placeholder|><")
         )
+
+    def test_mixed_image_video_offsets_are_disambiguated(self):
+        processor = SimpleNamespace(
+            IM_TOKEN_ID=1,
+            VIDEO_START_TOKEN_ID=2,
+            VIDEO_END_TOKEN_ID=3,
+        )
+        image = MultimodalDataItem(modality=Modality.IMAGE)
+        video = MultimodalDataItem(modality=Modality.VIDEO)
+
+        Glm4vImageProcessor.assign_mm_offsets(
+            processor,
+            [video, image],
+            torch.tensor([9, 1, 1, 8, 2, 1, 1, 7, 1, 3, 6]),
+            Mock(),
+        )
+
+        self.assertEqual(image.offsets, [(1, 2)])
+        self.assertEqual(video.offsets, [(5, 6), (8, 8)])
+
+    def test_epd_timestamps_include_fraction_and_unit(self):
+        tokenizer = Mock()
+        tokenizer.encode.side_effect = lambda text, **_: [
+            {"0.5 seconds": 50, "1.0 seconds": 100}[text]
+        ]
+        processor = SimpleNamespace(
+            _tokenizer=tokenizer,
+            IM_TOKEN_ID=1,
+            VIDEO_TOKEN_ID=2,
+            IMAGE_START_TOKEN_ID=3,
+            IMAGE_END_TOKEN_ID=4,
+            spatial_merge_size=1,
+        )
+
+        input_ids, offsets, modalities = (
+            Glm4vImageProcessor.build_input_ids_with_timestamps(
+                processor,
+                [9, 2, 8],
+                embeddings=None,
+                img_grid_thw=None,
+                video_grid_thw=torch.tensor([[2, 1, 1]]),
+                video_timestamps=[[0.5, 1.0]],
+            )
+        )
+
+        self.assertEqual(tokenizer.encode.call_args_list[0].args[0], "0.5 seconds")
+        self.assertEqual(tokenizer.encode.call_args_list[1].args[0], "1.0 seconds")
+        self.assertEqual(offsets, [(2, 2), (6, 6)])
+        self.assertEqual(modalities, [Modality.VIDEO])
+        self.assertIn(50, input_ids)
+        self.assertIn(100, input_ids)
+
+    def test_sampling_defaults_and_multi_video_budget(self):
+        with (
+            envs.SGLANG_GLM_VIDEO_FPS.override(2.0),
+            envs.SGLANG_GLM_VIDEO_MAX_FRAMES.override(2048),
+            envs.SGLANG_GLM_VIDEO_MAX_DURATION.override(0),
+        ):
+            indices = glm_sample_frame_indices(300, fps=30, duration=10)
+
+        self.assertEqual(len(indices), 20)
+        processor = SimpleNamespace(max_image_tokens=1200)
+        self.assertEqual(
+            glm_budget_kwargs(processor, count=3, split=True),
+            {"max_image_tokens": 400},
+        )
+        self.assertEqual(
+            glm_budget_kwargs(
+                processor,
+                user_max_image_tokens=600,
+                count=3,
+                split=True,
+            ),
+            {"max_image_tokens": 200},
+        )
+
+    def test_protocol_accepts_image_and_video_token_budgets(self):
+        image = ChatCompletionMessageContentImageURL(
+            url="image.png", max_image_tokens=512
+        )
+        video = ChatCompletionMessageContentVideoURL(
+            url="video.mp4", fps=2, max_frames=64, max_image_tokens=1536
+        )
+
+        self.assertEqual(image.max_image_tokens, 512)
+        self.assertEqual(video.max_image_tokens, 1536)
+        self.assertEqual(video.fps, 2)
+        self.assertEqual(video.max_frames, 64)
+
+        framed = ChatCompletionMessageContentVideoPart(
+            type="video_url",
+            video_frame_url=[
+                ChatCompletionMessageContentVideoFrameURL(
+                    url="frame.png", timestamp="0.0"
+                )
+            ],
+        )
+        self.assertIsNone(framed.video_url)
+        self.assertEqual(framed.video_frame_url[0].timestamp, "0.0")
+
+    def test_video_frame_data_url_is_loaded(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image_buffer, format="PNG")
+        encoded = base64.b64encode(image_buffer.getvalue()).decode()
+        frames = [
+            {
+                "url": f"data:image/png;base64,{encoded}",
+                "timestamp": "0.0",
+            }
+        ]
+
+        loaded = load_video(frames, use_gpu=False)
+
+        self.assertEqual(loaded[0]["url"], "")
+        self.assertIsInstance(loaded[0]["frame_image"], Image.Image)
+
+    def test_release_features_clears_precomputed_embeddings(self):
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.ones(1),
+            precomputed_embeddings=torch.ones(1),
+        )
+        inputs = MultimodalInputs(mm_items=[item])
+
+        inputs.release_features()
+
+        self.assertIsNone(item.feature)
+        self.assertIsNone(item.precomputed_embeddings)
 
 
 if __name__ == "__main__":
