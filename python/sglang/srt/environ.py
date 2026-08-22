@@ -533,6 +533,8 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Set to disable recovering GLM multimodal item order from template output.
+    SGLANG_DISABLE_MM_ORDER_RECOVERY = EnvBool(False)
 
     # GLM-V video frame-sampling defaults.
     SGLANG_GLM_VIDEO_FPS_SHORT = EnvFloat(3.0)

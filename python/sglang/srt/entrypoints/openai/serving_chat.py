@@ -4,10 +4,11 @@ import copy
 import functools
 import json
 import logging
+import re
 import time
 import uuid
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import jinja2
 import msgspec
@@ -717,6 +718,90 @@ class OpenAIServingChat(OpenAIServingBase):
         result.constraint_string = constraint_string
         return result
 
+    @property
+    def _mm_order_needs_template_recovery(self) -> bool:
+        if envs.SGLANG_DISABLE_MM_ORDER_RECOVERY.get():
+            return False
+        try:
+            model_type = self.tokenizer_manager.model_config.hf_config.model_type
+            return bool(model_type) and "glm" in model_type.lower()
+        except Exception:
+            return False
+
+    _MM_SENTINEL_RE = re.compile("\x1e\x1eMMS([IVA])(\\d+)\x1e\x1e")
+    _MM_MOD_TAG = {"image": "I", "video": "V", "audio": "A"}
+
+    def _recover_mm_order_from_render(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]],
+        extra_template_kwargs: Dict,
+        image_data: List,
+        video_data: List,
+        audio_data: List,
+    ) -> Tuple[List, List, List]:
+        """Reorder media lists to match the actual chat-template rendering."""
+        counters = {"image": 0, "video": 0, "audio": 0}
+        sentinel_messages = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                sentinel_messages.append(message)
+                continue
+
+            new_content = []
+            for chunk in content:
+                if isinstance(chunk, dict) and chunk.get("type") in counters:
+                    modality = chunk["type"]
+                    index = counters[modality]
+                    counters[modality] += 1
+                    new_content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"\x1e\x1eMMS{self._MM_MOD_TAG[modality]}"
+                                f"{index}\x1e\x1e"
+                            ),
+                        }
+                    )
+                else:
+                    new_content.append(chunk)
+            new_message = dict(message)
+            new_message["content"] = new_content
+            sentinel_messages.append(new_message)
+
+        try:
+            rendered = self.tokenizer_manager.tokenizer.apply_chat_template(
+                sentinel_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                tools=tools,
+                **extra_template_kwargs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Multimodal order recovery render failed (%s); using request order.",
+                exc,
+            )
+            return image_data, video_data, audio_data
+
+        permutations = {"I": [], "V": [], "A": []}
+        for tag, index in self._MM_SENTINEL_RE.findall(rendered):
+            permutations[tag].append(int(index))
+
+        def _reorder(data: List, permutation: List[int]) -> List:
+            if not data:
+                return data
+            if sorted(permutation) != list(range(len(data))):
+                return data
+            return [data[index] for index in permutation]
+
+        return (
+            _reorder(image_data, permutations["I"]),
+            _reorder(video_data, permutations["V"]),
+            _reorder(audio_data, permutations["A"]),
+        )
+
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
@@ -895,6 +980,30 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
+
+            has_tool_block = any(
+                message.get("role") in ("tool", "function")
+                for message in openai_compatible_messages
+            )
+            if (
+                self._mm_order_needs_template_recovery
+                and has_tool_block
+                and (
+                    len(image_data) >= 2
+                    or len(video_data) >= 2
+                    or len(audio_data) >= 2
+                )
+            ):
+                image_data, video_data, audio_data = (
+                    self._recover_mm_order_from_render(
+                        openai_compatible_messages,
+                        tools,
+                        extra_template_kwargs,
+                        image_data,
+                        video_data,
+                        audio_data,
+                    )
+                )
 
             if is_multimodal:
                 prompt = rendered

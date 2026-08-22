@@ -1649,5 +1649,51 @@ class TestNormalizeToolContent(unittest.TestCase):
         self.assertEqual(result, "plain rich")
 
 
+class TestMultimodalOrderRecovery(CustomTestCase):
+    def setUp(self):
+        tokenizer_manager = _MockTokenizerManager()
+        tokenizer_manager.model_config.hf_config.model_type = "glm4v"
+        self.chat = OpenAIServingChat(tokenizer_manager, _MockTemplateManager())
+
+    def test_reorders_items_from_rendered_sentinels(self):
+        def render(messages, **_kwargs):
+            return "".join(
+                chunk["text"]
+                for message in reversed(messages)
+                for chunk in message["content"]
+            )
+
+        self.chat.tokenizer_manager.tokenizer.apply_chat_template = render
+        messages = [
+            {"role": "tool", "content": [{"type": "image"}]},
+            {"role": "tool", "content": [{"type": "image"}]},
+        ]
+
+        images, videos, audios = self.chat._recover_mm_order_from_render(
+            messages, None, {}, ["first", "second"], [], []
+        )
+
+        self.assertEqual(images, ["second", "first"])
+        self.assertEqual(videos, [])
+        self.assertEqual(audios, [])
+
+    def test_incomplete_render_falls_back_to_request_order(self):
+        self.chat.tokenizer_manager.tokenizer.apply_chat_template = (
+            lambda *_args, **_kwargs: "\x1e\x1eMMSI0\x1e\x1e"
+        )
+        messages = [
+            {
+                "role": "tool",
+                "content": [{"type": "image"}, {"type": "image"}],
+            }
+        ]
+
+        images, _, _ = self.chat._recover_mm_order_from_render(
+            messages, None, {}, ["first", "second"], [], []
+        )
+
+        self.assertEqual(images, ["first", "second"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
