@@ -2133,16 +2133,15 @@ class Scheduler(
             mm.mrope_positions = mrope_positions
             mm.mrope_position_delta = mrope_position_delta
 
-    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
-        for req in batch.reqs:
+    def _maybe_clear_mm_inputs(self, reqs: List[Req]) -> None:
+        for req in reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                continue
-            # For non-session requests, clear features and mm_inputs
+            # Always release heavyweight feature and embedding tensors. Session
+            # requests keep only the lightweight multimodal metadata.
             mm_inputs.release_features()
-            req.multimodal_inputs = None
+            if req.session is None:
+                req.multimodal_inputs = None
 
     def handle_generate_request(
         self,
@@ -3610,7 +3609,7 @@ class Scheduler(
         if self.enable_fpm:
             self._emit_forward_pass_metrics(batch, result)
 
-        self._maybe_clear_mm_inputs(batch)
+        self._maybe_clear_mm_inputs(batch.reqs)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
 

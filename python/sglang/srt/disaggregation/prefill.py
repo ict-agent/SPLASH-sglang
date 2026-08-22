@@ -366,6 +366,7 @@ class PrefillBootstrapQueue:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 self.scheduler.stream_output([req], req.return_logprob)
+                self.scheduler._maybe_clear_mm_inputs([req])
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
                 if self.scheduler.enable_metrics:
@@ -773,6 +774,8 @@ class SchedulerDisaggregationPrefillMixin:
             release_req_to_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+
+        self._maybe_clear_mm_inputs(done_reqs)
 
         self.disagg_prefill_inflight_queue = undone_reqs
 

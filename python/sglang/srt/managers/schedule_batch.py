@@ -457,6 +457,7 @@ class MultimodalInputs:
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             item.feature = None
+            item.precomputed_embeddings = None
 
     @staticmethod
     def from_processor_output(obj: "MultimodalProcessorOutput"):
