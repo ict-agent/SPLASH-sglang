@@ -1057,7 +1057,8 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
 
 def _normalize_video_input(
     video_file: Union[str, bytes],
-) -> Union[str, bytes, None]:
+    gpu_image_decode: bool = False,
+) -> Union[str, bytes, list, None]:
     """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
 
     Returns a file path or bytes suitable for a decoder, or None on failure.
@@ -1081,6 +1082,18 @@ def _normalize_video_input(
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)
+    elif isinstance(video_file, list):
+        for frame in video_file:
+            url = frame.get("url")
+            if url and url.startswith("data:"):
+                frame_bytes = pybase64.b64decode(url.split(",", 1)[1], validate=True)
+                frame["frame_image"] = _load_image(
+                    image_bytes=frame_bytes, gpu_image_decode=gpu_image_decode
+                )
+                frame["url"] = ""
+            else:
+                raise ValueError(f"Invalid frame url: {url}")
+        return video_file
     else:
         return None
 
@@ -1089,6 +1102,15 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
+
+    if (
+        isinstance(video_file, list)
+        and video_file
+        and isinstance(video_file[0], dict)
+        and "url" in video_file[0]
+        and "timestamp" in video_file[0]
+    ):
+        return _normalize_video_input(video_file, gpu_image_decode=use_gpu)
 
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file

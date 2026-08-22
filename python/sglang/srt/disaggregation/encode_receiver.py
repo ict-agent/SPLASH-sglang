@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import pickle
 import random
@@ -348,8 +349,97 @@ class MultiModalEmbeddingData(EmbeddingData):
                 # fewer temporal units than encoders. It contributes no tokens.
                 if e is not None and e.shape[0] > 0:
                     groups[self.modality_list[i]].append(e)
-            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
+            return {
+                modality: tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+                for modality, tensors in groups.items()
+            }
         return self.embedding_list
+
+    def get_embedding_from_contiguous_buffer(
+        self,
+        raw_buffer: torch.Tensor,
+        dtype: torch.dtype,
+        clone: bool = False,
+    ) -> Dict[Modality, torch.Tensor]:
+        """Build one view per modality over a contiguous Mooncake buffer."""
+        if raw_buffer.device.type != "cpu" or raw_buffer.dtype != torch.uint8:
+            raise ValueError(
+                "Mooncake embedding buffer must be a CPU uint8 tensor, got "
+                f"device={raw_buffer.device}, dtype={raw_buffer.dtype}"
+            )
+
+        element_size = torch.empty((), dtype=dtype).element_size()
+        ranges = OrderedDict()
+        byte_offset = 0
+        current_modality = None
+        closed_modalities = set()
+
+        for index in range(self.num_parts):
+            shape = self.embedding_shape_list[index]
+            modality = self.modality_list[index]
+            if shape is None:
+                continue
+            if modality is None:
+                raise ValueError(f"Missing modality for embedding part {index}")
+            if len(shape) == 0:
+                raise ValueError(f"Invalid scalar embedding shape for part {index}")
+
+            if modality != current_modality:
+                if current_modality is not None:
+                    closed_modalities.add(current_modality)
+                if modality in closed_modalities:
+                    raise ValueError(
+                        "Mooncake embedding parts for a modality must be "
+                        f"contiguous; {modality} appears in multiple ranges"
+                    )
+                current_modality = modality
+
+            part_numel = math.prod(shape)
+            part_bytes = part_numel * element_size
+            next_byte_offset = byte_offset + part_bytes
+            if next_byte_offset > raw_buffer.numel():
+                raise ValueError(
+                    "Mooncake embedding metadata exceeds the received buffer: "
+                    f"part={index}, required_bytes={next_byte_offset}, "
+                    f"buffer_bytes={raw_buffer.numel()}"
+                )
+
+            if shape[0] > 0:
+                tail_shape = tuple(shape[1:])
+                if modality not in ranges:
+                    ranges[modality] = {
+                        "start": byte_offset,
+                        "end": next_byte_offset,
+                        "rows": shape[0],
+                        "tail_shape": tail_shape,
+                    }
+                else:
+                    group = ranges[modality]
+                    if tail_shape != group["tail_shape"]:
+                        raise ValueError(
+                            "Embedding parts for the same modality must have "
+                            "matching trailing shapes, got "
+                            f"{group['tail_shape']} and {tail_shape}"
+                        )
+                    if byte_offset != group["end"]:
+                        raise ValueError(
+                            "Mooncake embedding parts for a modality are not "
+                            f"byte-contiguous: modality={modality}"
+                        )
+                    group["end"] = next_byte_offset
+                    group["rows"] += shape[0]
+
+            byte_offset = next_byte_offset
+
+        result = {}
+        for modality, group in ranges.items():
+            embedding = (
+                raw_buffer[group["start"] : group["end"]]
+                .view(dtype)
+                .reshape(group["rows"], *group["tail_shape"])
+            )
+            result[modality] = embedding.clone() if clone else embedding
+        return result
 
     @property
     def ready(self):
@@ -1032,24 +1122,13 @@ class MMReceiverBase(ABC):
                     return None
                 raw_buffer = self.embeddings_buffer.pop(req_id)
                 self.embeddings_engine.deregister(raw_buffer.data_ptr())
-                byte_offset = 0
-                for i in range(recv_embedding_data.num_parts):
-                    shape = recv_embedding_data.embedding_shape_list[i]
-                    if shape is None:
-                        continue
-                    part_bytes = (
-                        shape[0]
-                        * shape[1]
-                        * torch.tensor([], dtype=self.dtype).element_size()
+                recv_embedding = (
+                    recv_embedding_data.get_embedding_from_contiguous_buffer(
+                        raw_buffer, self.dtype
                     )
-                    recv_embedding_data.embedding_list[i] = (
-                        raw_buffer[byte_offset : byte_offset + part_bytes]
-                        .view(self.dtype)
-                        .reshape(shape)
-                    )
-                    byte_offset += part_bytes
-
-            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+                )
+            else:
+                recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
             mm_inputs = mm_processor.get_mm_data(
                 prompt,
@@ -1341,14 +1420,36 @@ class MMReceiverBase(ABC):
         return True
 
     def _extract_url_data(self, request_obj) -> List[Dict]:
-        def flatten_mm_items(items):
+        def is_video_frame_sequence(items):
+            return (
+                isinstance(items, (list, tuple))
+                and bool(items)
+                and all(
+                    isinstance(item, dict)
+                    and "url" in item
+                    and "timestamp" in item
+                    for item in items
+                )
+            )
+
+        def flatten_mm_items(items, preserve_video_frames=False):
             if not isinstance(items, list):
+                return [items]
+            if preserve_video_frames and is_video_frame_sequence(items):
                 return [items]
 
             flat = []
             for item in items:
                 if isinstance(item, (list, tuple)):
-                    flat.extend(flatten_mm_items(list(item)))
+                    if preserve_video_frames and is_video_frame_sequence(item):
+                        flat.append(item)
+                    else:
+                        flat.extend(
+                            flatten_mm_items(
+                                list(item),
+                                preserve_video_frames=preserve_video_frames,
+                            )
+                        )
                 else:
                     flat.append(item)
             return flat
@@ -1363,7 +1464,7 @@ class MMReceiverBase(ABC):
                     payload.update(preprocess_kwargs)
                 return payload
             if isinstance(mm_item, dict):
-                if modality == Modality.VIDEO:
+                if modality in (Modality.IMAGE, Modality.VIDEO):
                     payload = dict(mm_item)
                     preprocess_kwargs = payload.pop("preprocess_kwargs", None)
                     if isinstance(preprocess_kwargs, dict):
@@ -1381,7 +1482,9 @@ class MMReceiverBase(ABC):
         ]:
             mm_items = getattr(request_obj, attr, None)
             if mm_items:
-                mm_items = flatten_mm_items(mm_items)
+                mm_items = flatten_mm_items(
+                    mm_items, preserve_video_frames=modality == Modality.VIDEO
+                )
                 for mm_item in mm_items:
                     mm_data.append(
                         {

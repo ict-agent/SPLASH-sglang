@@ -196,7 +196,11 @@ def process_content_for_template_format(
                         if video_obj.get(k) is not None
                     }
                     if mdp is None and not sampling:
-                        video_data.append(chunk["video_url"]["url"])
+                        video_frame_url = chunk.get("video_frame_url")
+                        if isinstance(video_frame_url, list):
+                            video_data.append(video_frame_url)
+                        else:
+                            video_data.append(video_obj["url"])
                     else:
                         # Keep structured info for backend, but template only sees {"type":"video"}
                         structured = {"url": video_obj["url"], **sampling}

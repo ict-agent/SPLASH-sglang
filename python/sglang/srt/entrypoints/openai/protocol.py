@@ -451,6 +451,12 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     max_image_tokens: Optional[int] = None
 
 
+class ChatCompletionMessageContentVideoFrameURL(BaseModel):
+    url: str
+    timestamp: str
+    detail: Optional[str] = None
+
+
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
@@ -463,7 +469,8 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
-    video_url: ChatCompletionMessageContentVideoURL
+    video_url: Optional[ChatCompletionMessageContentVideoURL] = None
+    video_frame_url: Optional[List[ChatCompletionMessageContentVideoFrameURL]] = None
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):

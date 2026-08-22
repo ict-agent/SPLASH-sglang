@@ -870,7 +870,7 @@ class MMEncoder:
                     ]
                     video_processed = await asyncio.gather(*tasks)
                     videos, video_metadata = map(list, zip(*video_processed))
-                    video_processor_kwargs["do_sample_frames"] = True
+                    video_processor_kwargs["do_sample_frames"] = False
                     video_processor_kwargs["return_metadata"] = True
                     if video_metadata:
                         video_processor_kwargs["video_metadata"] = video_metadata
@@ -1445,6 +1445,9 @@ class MMEncoder:
                 else:
                     get_feature_method = self.model.get_video_feature
                 return {"_empty_video_shard": True}, get_feature_method
+            video_device = self.vision_config.get("video", {}).get("device")
+            if video_device is not None and "device" not in video_processor_kwargs:
+                video_processor_kwargs["device"] = video_device
             loop = asyncio.get_running_loop()
             processor_input = await loop.run_in_executor(
                 self.io_executor,

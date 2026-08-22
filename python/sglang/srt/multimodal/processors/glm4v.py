@@ -312,10 +312,15 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         video_metadata = None
         if base_output.videos:
-            videos_processed = [
-                await sample_video_sglang(video, video_config=cfg)
-                for video, cfg in zip(base_output.videos, video_configs)
-            ]
+            if any(isinstance(video, list) for video in base_output.videos):
+                videos_processed = [
+                    await preprocess_video_frames(video) for video in base_output.videos
+                ]
+            else:
+                videos_processed = [
+                    await sample_video_sglang(video, video_config=cfg)
+                    for video, cfg in zip(base_output.videos, video_configs)
+                ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         combine_kwargs = {}
@@ -669,7 +674,11 @@ def preprocess_video_frames_sync(frame_list: List[dict]):
         duration = float(frame_list[-1]["timestamp"])
 
     indices = list(range(total_num_frames))
-    images = [np.array(frame["frame_image"]) for frame in frame_list]
+    frame_images = [frame["frame_image"] for frame in frame_list]
+    if frame_images and isinstance(frame_images[0], torch.Tensor):
+        images = torch.stack(frame_images).permute(0, 2, 3, 1).contiguous()
+    else:
+        images = [np.array(image) for image in frame_images]
     fps = total_num_frames / duration if duration else 0
 
     metadata = _video_metadata(total_num_frames, fps, duration, indices)
