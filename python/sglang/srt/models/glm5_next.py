@@ -1820,6 +1820,7 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausal
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
                 text_config=getattr(config, "text_config", None),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
         else:
             self.visual = None

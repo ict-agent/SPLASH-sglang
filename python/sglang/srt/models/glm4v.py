@@ -32,7 +32,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv3dLayer
@@ -66,6 +65,14 @@ logger = logging.getLogger(__name__)
 cached_get_processor = lru_cache(get_processor)
 
 
+@torch.compile
+def swiglu_clamped(y: torch.Tensor, limit: float):
+    gate, up = torch.chunk(y, 2, dim=-1)
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    return F.silu(gate) * up
+
+
 class Glm4vRMSNorm(RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
@@ -84,6 +91,7 @@ class Glm4vVisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        swiglu_limit: float = float("inf"),
     ):
         super().__init__()
         self.tp_size = (
@@ -108,11 +116,12 @@ class Glm4vVisionMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act_fn = SiluAndMul()
+        self.act_fn = swiglu_clamped
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x = self.act_fn(gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
 
@@ -133,6 +142,7 @@ class Glm4vVisionBlock(nn.Module):
         qk_normalization: bool = False,
         qk_normalization_by_head_size: bool = False,
         mlp_linear_bias: bool = False,
+        swiglu_limit: float = float("inf"),
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
@@ -161,6 +171,7 @@ class Glm4vVisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
             use_data_parallel=use_data_parallel,
+            swiglu_limit=swiglu_limit,
         )
 
     def forward(
@@ -243,6 +254,7 @@ class Glm4vPatchMerger(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         layer_norm_eps: float = 1e-5,
+        swiglu_limit: float = float("inf"),
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
@@ -275,13 +287,13 @@ class Glm4vPatchMerger(nn.Module):
             tp_rank=tp_rank,
         )
         self.extra_activation_func = nn.GELU()
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor):
         x, _ = self.proj(x)
         x = self.extra_activation_func(self.post_projection_norm(x))
         gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = F.silu(gate) * up
+        x = swiglu_clamped(gate_up, self.swiglu_limit)
         x, _ = self.down_proj(x)
         return x
 
@@ -385,6 +397,7 @@ class Glm4vVisionModel(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         text_config=None,
+        swiglu_limit: Optional[float] = None,
     ) -> None:
         super().__init__()
 
@@ -400,6 +413,13 @@ class Glm4vVisionModel(nn.Module):
         self.out_hidden_size = vision_config.out_hidden_size
         self.intermediate_dim = vision_config.intermediate_size
         self.use_data_parallel = use_data_parallel
+
+        if swiglu_limit is None:
+            swiglu_limit = getattr(vision_config, "swiglu_limit", None)
+        if swiglu_limit is None and text_config is not None:
+            swiglu_limit = getattr(text_config, "swiglu_limit", None)
+        if swiglu_limit is None:
+            swiglu_limit = float("inf")
 
         self.patch_embed = Glm4vVisionPatchEmbed(
             patch_size=patch_size,
@@ -437,6 +457,7 @@ class Glm4vVisionModel(nn.Module):
                         vision_config, "qk_norm_by_head_size", False
                     ),
                     mlp_linear_bias=getattr(vision_config, "mlp_linear_bias", False),
+                    swiglu_limit=swiglu_limit,
                 )
                 for layer_idx in range(depth)
             ]
@@ -458,6 +479,7 @@ class Glm4vVisionModel(nn.Module):
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
             layer_norm_eps=vision_config.rms_norm_eps,
+            swiglu_limit=swiglu_limit,
         )
 
         self.adapt_position = getattr(vision_config, "adapt_position", True)
@@ -600,6 +622,7 @@ class Glm4vForConditionalGeneration(nn.Module):
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
                 text_config=getattr(config, "text_config", None),
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
         else:
             self.visual = None

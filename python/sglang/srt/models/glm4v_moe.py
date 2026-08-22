@@ -62,6 +62,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
+            swiglu_limit=getattr(config, "swiglu_limit", None),
         )
 
         if self.pp_group.is_last_rank:
