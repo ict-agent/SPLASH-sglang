@@ -82,12 +82,12 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image
+from PIL import Image, ImageOps
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+from torchvision.io import ImageReadMode, decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -903,6 +903,47 @@ class VideoData:
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
+def smart_to_rgb(
+    image: Union[torch.Tensor, Image.Image],
+) -> Union[torch.Tensor, Image.Image]:
+    """Convert PIL images to RGB with a contrast-aware alpha background."""
+    if not isinstance(image, Image.Image):
+        return image
+
+    image = ImageOps.exif_transpose(image)
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        width, height = rgba.size
+        edge_pixels = []
+
+        for x in range(0, width, max(1, width // 20)):
+            for y in (0, height - 1):
+                pixel = rgba.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+        for y in range(0, height, max(1, height // 20)):
+            for x in (0, width - 1):
+                pixel = rgba.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        if edge_pixels:
+            brightness = sum(sum(pixel) for pixel in edge_pixels) / (
+                len(edge_pixels) * 3
+            )
+            background_color = (
+                (32, 32, 32) if brightness > 128 else (240, 240, 240)
+            )
+        else:
+            background_color = (255, 255, 255)
+
+        background = Image.new("RGB", rgba.size, background_color)
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        return background
+
+    return image.convert("RGB")
+
+
 def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
     """
     Check three conditions:
@@ -932,7 +973,9 @@ def _load_image(
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             logger.warning(
@@ -978,6 +1021,10 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
+    if envs.SGLANG_ENABLE_SMART_IMAGE_RGB.get():
+        image = smart_to_rgb(image)
+        if image_size is not None and isinstance(image, Image.Image):
+            image_size = image.size
     return image, image_size
 
 
