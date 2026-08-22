@@ -135,6 +135,53 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _escape_processor_special_tokens(processor) -> None:
+    """Synchronize processor-owned strings after its tokenizer is escaped."""
+    from sglang.srt.constrained.glm.escape import (
+        escape_token,
+        get_global_escaped_special_tokens,
+    )
+    from sglang.srt.utils.tokenizer_escape import escape_chat_template
+
+    processor_template = getattr(processor, "chat_template", None)
+    if isinstance(processor_template, str):
+        processor.chat_template = escape_chat_template(processor_template)
+    elif isinstance(processor_template, dict):
+        processor.chat_template = {
+            key: escape_chat_template(value)
+            for key, value in processor_template.items()
+        }
+
+    escaped_tokens = get_global_escaped_special_tokens()
+    for attr in (
+        "image_token",
+        "video_token",
+        "audio_token",
+        "glm_image_start_token",
+        "glm_image_end_token",
+    ):
+        value = getattr(processor, attr, None)
+        if isinstance(value, str):
+            escaped = escaped_tokens.get(value)
+            if escaped != value:
+                try:
+                    setattr(processor, attr, escaped)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to setattr %s on processor: %s", attr, exc
+                    )
+
+    if escaped_tokens.enabled and hasattr(processor, "glm_image_placeholder_token"):
+        try:
+            processor.glm_image_placeholder_token = escape_token(
+                escaped_tokens.seed, "<|placeholder|>"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to escape glm_image_placeholder_token: %s", exc
+            )
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -301,4 +348,5 @@ def get_processor(
         from sglang.srt.utils.tokenizer_escape import escape_tokenizer_special_tokens
 
         escape_tokenizer_special_tokens(tokenizer, glm_special_token_escape_seed)
+        _escape_processor_special_tokens(processor)
     return processor

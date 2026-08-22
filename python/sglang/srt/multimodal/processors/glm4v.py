@@ -49,13 +49,17 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        # GLM-V specific tokens
-        self.IMAGE_TOKEN = "<|image|>"
-        self.VIDEO_TOKEN = "<|video|>"
-        self.IMAGE_START_TOKEN = "<|begin_of_image|>"
-        self.IMAGE_END_TOKEN = "<|end_of_image|>"
-        self.VIDEO_START_TOKEN = "<|begin_of_video|>"
-        self.VIDEO_END_TOKEN = "<|end_of_video|>"
+        from sglang.srt.constrained.glm.escape import (
+            get_global_escaped_special_tokens,
+        )
+
+        escaped_tokens = get_global_escaped_special_tokens()
+        self.IMAGE_TOKEN = escaped_tokens.get("<|image|>")
+        self.VIDEO_TOKEN = escaped_tokens.get("<|video|>")
+        self.IMAGE_START_TOKEN = escaped_tokens.get("<|begin_of_image|>")
+        self.IMAGE_END_TOKEN = escaped_tokens.get("<|end_of_image|>")
+        self.VIDEO_START_TOKEN = escaped_tokens.get("<|begin_of_video|>")
+        self.VIDEO_END_TOKEN = escaped_tokens.get("<|end_of_video|>")
 
         # Token IDs
         self.IM_TOKEN_ID = hf_config.image_token_id

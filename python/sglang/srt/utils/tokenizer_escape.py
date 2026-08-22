@@ -129,6 +129,9 @@ def escape_tokenizer_special_tokens(tokenizer, seed: int) -> EscapedSpecialToken
         "cls_token",
         "unk_token",
         "mask_token",
+        "image_token",
+        "video_token",
+        "audio_token",
     ):
         val = getattr(tokenizer, attr, None)
         if val and val in mapping and mapping[val] != val:
