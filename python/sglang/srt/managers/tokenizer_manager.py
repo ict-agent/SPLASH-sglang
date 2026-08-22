@@ -2136,7 +2136,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "output_ids": output_token_ids,
                             "meta_info": meta_info,
                         }
-                    elif state.finished:
+                    elif (
+                        state.finished
+                        or self.server_args.glm_stream_speculated_tokens
+                    ):
+                        # GLM speculative streaming forwards every accepted-token
+                        # chunk in _wait_one_response. Keep an immutable cumulative
+                        # snapshot for each chunk, matching the original GLM branch;
+                        # otherwise earlier queued chunks retain text=None and a live
+                        # output_ids reference that advances to the newest chunk.
                         out_dict = {
                             "text": state.get_text(),
                             "output_ids": state.output_ids.copy(),

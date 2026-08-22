@@ -1,5 +1,6 @@
 """Unit tests for GLM speculative-token streaming output handling."""
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,10 +12,11 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.glm_utils import interleave_batch_token_id_out
-from sglang.srt.managers.io_struct import BatchTokenIDOutput
+from sglang.srt.managers.io_struct import BatchStrOutput, BatchTokenIDOutput
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
@@ -121,7 +123,92 @@ def _make_scheduler_req(rid: str, token_id: int, return_optional: bool):
     )
 
 
+def _make_batch_str_output(text: str, token_id: int) -> BatchStrOutput:
+    return BatchStrOutput(
+        rids=["r0"],
+        http_worker_ipcs=None,
+        spec_verify_ct=[],
+        spec_num_correct_drafts=[],
+        spec_correct_drafts_histogram=None,
+        finished_reasons=[None],
+        output_strs=[text],
+        output_ids=[[token_id]],
+        prompt_tokens=[2],
+        completion_tokens=[1],
+        reasoning_tokens=[0],
+        cached_tokens=[0],
+        input_token_logprobs_val=None,
+        input_token_logprobs_idx=None,
+        output_token_logprobs_val=None,
+        output_token_logprobs_idx=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        output_top_logprobs_val=None,
+        output_top_logprobs_idx=None,
+        input_token_ids_logprobs_val=None,
+        input_token_ids_logprobs_idx=None,
+        output_token_ids_logprobs_val=None,
+        output_token_ids_logprobs_idx=None,
+        output_token_entropy_val=None,
+        output_hidden_states=None,
+        routed_experts=None,
+        indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        retraction_counts=[0],
+        token_steps=None,
+        load=None,
+        customized_info=None,
+        cached_tokens_details=None,
+        dp_ranks=None,
+        time_stats=None,
+    )
+
+
 class TestGlmStreamSpeculatedTokens(CustomTestCase):
+    def test_non_incremental_chunks_keep_per_token_snapshots(self):
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=MagicMock(),
+            obj=SimpleNamespace(
+                stream=True,
+                return_logprob=False,
+                log_metrics=False,
+            ),
+            time_stats=SimpleNamespace(first_token_time=1.0),
+        )
+        manager = SimpleNamespace(
+            rid_to_state={"r0": state},
+            enable_metrics=False,
+            dump_requests_folder=None,
+            crash_dump_folder=None,
+            server_args=SimpleNamespace(
+                incremental_streaming_output=False,
+                glm_stream_speculated_tokens=True,
+                speculative_algorithm=None,
+                enable_lora=False,
+                batch_notify_size=64,
+                dp_size=1,
+                weight_version=None,
+            ),
+        )
+
+        async def run_outputs():
+            await TokenizerManager._handle_batch_output(
+                manager, _make_batch_str_output("a", 101)
+            )
+            await TokenizerManager._handle_batch_output(
+                manager, _make_batch_str_output("b", 102)
+            )
+
+        asyncio.run(run_outputs())
+
+        self.assertEqual([out["text"] for out in state.out_list], ["a", "ab"])
+        self.assertEqual(
+            [out["output_ids"] for out in state.out_list], [[101], [101, 102]]
+        )
+
     def test_interleave_uses_current_schema_and_preserves_alignment(self):
         manager = SimpleNamespace(
             glm_stream_speculated_tokens=True,
