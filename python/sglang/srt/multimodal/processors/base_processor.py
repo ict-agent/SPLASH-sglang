@@ -1081,6 +1081,26 @@ class BaseMultimodalProcessor(ABC):
 
         return collected_items, input_ids, ret
 
+    def assign_mm_offsets(
+        self,
+        all_collected_items: List[MultimodalDataItem],
+        input_ids: torch.Tensor,
+        mm_tokens: MultimodalSpecialTokens,
+    ) -> None:
+        """Assign placeholder offsets to each multimodal item.
+
+        Processors whose modalities share a token id can override this method
+        to disambiguate their spans structurally.
+        """
+        for mm_item in all_collected_items:
+            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+            if mm_token_id is None:
+                raise ValueError(f"No token id found for modality: {mm_item.modality}")
+            mm_item.offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=mm_token_id,
+            )
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1160,15 +1180,9 @@ class BaseMultimodalProcessor(ABC):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
-        # Add offsets to all items
-        for mm_item in all_collected_items:
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=mm_token_id,
-            )
+        # Add offsets to all items. Model processors can override this when
+        # multiple modalities collapse to the same placeholder token id.
+        self.assign_mm_offsets(all_collected_items, input_ids, mm_tokens)
 
         # Split bundled items into per-image/video items for better cache granularity
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items

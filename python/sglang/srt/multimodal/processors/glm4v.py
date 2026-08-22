@@ -106,6 +106,46 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    def assign_mm_offsets(self, all_collected_items, input_ids, mm_tokens):
+        """Disambiguate GLM image and video spans that share ``IM_TOKEN_ID``."""
+        ids = (
+            input_ids.tolist()
+            if isinstance(input_ids, torch.Tensor)
+            else list(input_ids)
+        )
+        image_runs, video_runs = [], []
+        in_video = False
+        run_start = None
+        run_end = None
+        for index, token_id in enumerate(ids):
+            if token_id == self.IM_TOKEN_ID:
+                if run_start is None:
+                    run_start = index
+                run_end = index
+                continue
+            if run_start is not None:
+                (video_runs if in_video else image_runs).append((run_start, run_end))
+                run_start = None
+            if token_id == self.VIDEO_START_TOKEN_ID:
+                in_video = True
+            elif token_id == self.VIDEO_END_TOKEN_ID:
+                in_video = False
+        if run_start is not None:
+            (video_runs if in_video else image_runs).append((run_start, run_end))
+
+        for mm_item in all_collected_items:
+            if mm_item.is_image():
+                mm_item.offsets = image_runs
+            elif mm_item.is_video():
+                mm_item.offsets = video_runs
+            else:
+                mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is None:
+                    raise ValueError(
+                        f"No token id found for modality: {mm_item.modality}"
+                    )
+                mm_item.offsets = self.get_mm_items_offset(input_ids, mm_token_id)
+
     def build_input_ids_with_timestamps(
         self,
         prompt: Union[str, List[int]],
@@ -167,7 +207,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                         input_ids.append(image_end_token_id)
                     timestamp_sec = curr_timestamps[frame_idx]
                     timestamp_tokens = self._tokenizer.encode(
-                        f"{int(timestamp_sec)}", add_special_tokens=False
+                        f"{float(timestamp_sec):.1f} seconds",
+                        add_special_tokens=False,
                     )
                     input_ids.extend(timestamp_tokens)
                 video_idx += 1
@@ -179,6 +220,25 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             input_ids.extend(prompt[cur_idx:])
 
         return input_ids, offsets, modality_list
+
+    @staticmethod
+    def _group_offsets_by_modality(offsets, modality_list, video_grid_thw):
+        image_runs = []
+        video_frame_runs = []
+        offset_index = 0
+        video_index = 0
+        for modality in modality_list:
+            if modality == Modality.IMAGE:
+                image_runs.append(offsets[offset_index])
+                offset_index += 1
+            elif modality == Modality.VIDEO:
+                num_frames = int(video_grid_thw[video_index][0])
+                video_frame_runs.extend(
+                    offsets[offset_index : offset_index + num_frames]
+                )
+                offset_index += num_frames
+                video_index += 1
+        return image_runs, video_frame_runs
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         """EPD language side: rebuild mm_inputs from precomputed embeddings."""
