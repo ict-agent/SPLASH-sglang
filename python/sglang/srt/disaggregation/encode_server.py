@@ -7,6 +7,7 @@ import os
 import pickle
 import time
 import traceback
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -16,6 +17,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
+
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
@@ -81,7 +83,6 @@ MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZG
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
-rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
 
@@ -369,6 +370,48 @@ class MMEncoder:
 
         logger.info(f"Global cache embedding dims: {dims}")
         return dims
+
+    async def _sweep_stale_embeddings_loop(self):
+        """Background task: reclaim embeddings that were encoded but never
+        claimed by a /send (prefill LLM timed out / cancelled / crashed).
+
+        In the mooncake backend an entry in embedding_to_send is normally freed
+        the moment its /send arrives. If /send never comes, the entry -- and its
+        host/GPU memory -- would leak until the process restarts. This sweeper
+        drops any entry older than TTL. TTL is derived from the LLM's receive
+        timeout (plus a margin) so it only ever collects true orphans: by the
+        time TTL elapses the LLM has long since given up.
+        """
+        interval = envs.SGLANG_ENCODER_EMBEDDING_SWEEP_INTERVAL.get()
+        ttl = envs.SGLANG_ENCODER_EMBEDDING_TTL.get()
+        if ttl <= 0:
+            # 0 => derive from the LLM recv timeout + one sweep interval margin.
+            ttl = envs.SGLANG_ENCODER_RECV_TIMEOUT.get() + interval
+        if interval <= 0:
+            return  # sweeper disabled
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                deadline = time.perf_counter() - ttl
+                for req_id in list(self.embedding_to_send.keys()):
+                    mm_data = self.embedding_to_send.get(req_id)
+                    if (
+                        mm_data is None
+                        or getattr(mm_data, "created_at", 0) > deadline
+                    ):
+                        continue  # already freed, or still fresh
+                    # Orphan: encoded but not claimed within TTL -> reclaim.
+                    self.embedding_to_send.pop(req_id, None)
+                    mm_data.embedding = None
+                    logger.warning(
+                        f"[embedding-sweeper] reclaimed orphan req_id={req_id} "
+                        f"(no /send within TTL={ttl:.0f}s); "
+                        f"remaining={len(self.embedding_to_send)}"
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[embedding-sweeper] unexpected error; continuing")
 
     def _build_vision_config(self, mm_process_config):
         """
@@ -1341,10 +1384,13 @@ class MMEncoder:
         meta_only=False,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake" and not meta_only:
+
             def _transfer_sync():
-                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                reg = self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                if reg != 0:
+                    return reg, -1
                 try:
-                    self.engine.transfer_sync(
+                    ret = self.engine.transfer_sync(
                         session_id,
                         embedding.data_ptr(),
                         buffer_address,
@@ -1352,11 +1398,28 @@ class MMEncoder:
                     )
                 finally:
                     self.engine.deregister(embedding.data_ptr())
+                return reg, ret
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, _transfer_sync)
+            reg, ret = await loop.run_in_executor(self.executor, _transfer_sync)
 
             mm_data.embedding = None
+
+            # RDMA write not confirmed: turn this into an error frame so the
+            # language side fails the request loudly, instead of reading a
+            # never-/partially-written buffer -> silent garbage output.
+            if reg != 0 or ret != 0:
+                logger.error(
+                    "mooncake RDMA write failed for req_id=%s "
+                    "(register=%s, transfer=%s)",
+                    mm_data.req_id,
+                    reg,
+                    ret,
+                )
+                mm_data.error_msg = (
+                    f"mooncake RDMA write failed (register={reg}, transfer={ret})"
+                )
+                mm_data.error_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         # Send ack/data
         if url is not None:
@@ -1631,7 +1694,29 @@ class EncoderProfiler:
         return True, None
 
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Only rank 0 owns embedding_to_send; run the orphan-embedding sweeper
+    # there to prevent a slow leak when /send never arrives.
+    sweeper_task = None
+    if (
+        encoder is not None
+        and getattr(encoder, "rank", 0) == 0
+        and hasattr(encoder, "embedding_to_send")
+    ):
+        sweeper_task = asyncio.create_task(encoder._sweep_stale_embeddings_loop())
+    try:
+        yield
+    finally:
+        if sweeper_task is not None:
+            sweeper_task.cancel()
+            try:
+                await sweeper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+app = FastAPI(lifespan=_lifespan)
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
 
@@ -1850,7 +1935,6 @@ async def handle_encode_request(request: dict):
         error_stage = "encode"
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
-        rid_to_err_msg[req_id] = error_msg
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={

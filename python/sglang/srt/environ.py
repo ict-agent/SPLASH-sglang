@@ -736,6 +736,12 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    # Orphan-embedding sweeper on the encoder side: entries in
+    # embedding_to_send whose /send never arrives (LLM timed out / cancelled /
+    # crashed). Sweep every INTERVAL seconds (0 = disabled); reclaim entries
+    # older than TTL seconds (0 = derive: RECV_TIMEOUT + INTERVAL).
+    SGLANG_ENCODER_EMBEDDING_SWEEP_INTERVAL = EnvFloat(60.0)
+    SGLANG_ENCODER_EMBEDDING_TTL = EnvFloat(0.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
 
     # Elastic EP Backup Port

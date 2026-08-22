@@ -44,7 +44,7 @@ from fastapi import BackgroundTasks, HTTPException
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.encode_receiver import EncoderError, create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -628,7 +628,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                try:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                except BaseException:
+                    # Tokenization failed before the request was sent to the
+                    # scheduler (e.g. EPD encoder embeddings timeout / encoder
+                    # unreachable). BaseException so that task cancellation
+                    # (client disconnect during tokenize/E) is covered too;
+                    # re-raise to preserve semantics.
+                    await self._cleanup_failed_tokenize([obj])
+                    raise
                 state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
                 self._release_raw_multimodal_payload(state.obj)
@@ -637,6 +646,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 async for response in self._handle_batch_request(obj, request):
                     yield response
+
+    async def _cleanup_failed_tokenize(self, objs):
+        """Cleanup for requests that failed before being sent to the scheduler.
+
+        The scheduler will never send back an output or abort for these rids,
+        so their rid_to_state entries (each holds the full request payload)
+        and the LoRA refs acquired by _validate_and_resolve_lora (normally
+        released on completion) must be cleaned up here.
+        """
+        for o in objs:
+            self.rid_to_state.pop(o.rid, None)
+        if self.server_args.enable_lora:
+            for o in objs:
+                if getattr(o, "lora_path", None) and getattr(o, "lora_id", None):
+                    try:
+                        await self.lora_registry.release(o.lora_id)
+                    except Exception:
+                        logger.warning(
+                            "Failed to release LoRA ref for rid=%s", o.rid
+                        )
 
     async def tokenize_and_cache_one_chat_request(
         self,
@@ -919,12 +948,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
                 if self.server_args.language_only:
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        request_obj=obj,
-                        mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
-                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                    )
+                    try:
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            request_obj=obj,
+                            mm_processor=self.mm_processor,
+                            prompt=(input_text or input_ids),
+                            need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                        )
+                    except EncoderError as e:
+                        # Fail fast with the encoder's real status code (503
+                        # unreachable, 500 RDMA failure, ...) instead of
+                        # waiting out the recv timeout and returning 504.
+                        raise HTTPException(
+                            status_code=e.status_code,
+                            detail=str(e),
+                        ) from e
                     if mm_inputs is None:
                         raise HTTPException(
                             status_code=HTTPStatus.GATEWAY_TIMEOUT,
@@ -1667,7 +1705,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+                try:
+                    tokenized_objs = await self._batch_tokenize_and_process(
+                        batch_size, obj
+                    )
+                except BaseException:
+                    # Tokenization failed before any request was sent to the
+                    # scheduler; clean up all states to avoid leaks.
+                    await self._cleanup_failed_tokenize(
+                        [obj[i] for i in range(batch_size)]
+                    )
+                    raise
                 self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -1688,7 +1736,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
-                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        try:
+                            tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        except BaseException:
+                            # Requests [i:] were never sent to the scheduler,
+                            # so no output/abort will ever come back for them.
+                            # Requests [:i] were already sent and will be
+                            # cleaned up through the normal abort path.
+                            await self._cleanup_failed_tokenize(
+                                [obj[j] for j in range(i, batch_size)]
+                            )
+                            raise
                         self._send_one_request(tokenized_obj)
                         self._release_raw_multimodal_payload(
                             self.rid_to_state[tmp_obj.rid].obj
@@ -1707,9 +1765,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
-            )
+            tokenize_tasks = [
+                asyncio.create_task(self._tokenize_one_request(o)) for o in objs
+            ]
+            try:
+                tokenized_objs = await asyncio.gather(*tokenize_tasks)
+            except BaseException:
+                # asyncio.gather does not cancel sibling tasks on failure --
+                # cancel them explicitly so their encode tasks/buffers are
+                # cleaned up (recv_mm_data handles CancelledError), then drain.
+                for t in tokenize_tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tokenize_tasks, return_exceptions=True)
+                # Nothing was sent to the scheduler yet; clean up all states
+                # to avoid leaks. Note obj.rid may hold batch_size *
+                # parallel_sample_num entries (rids expanded by
+                # _normalize_rid) -- pop the full list, not just objs' rids.
+                if isinstance(obj.rid, list):
+                    all_objs = [obj[i] for i in range(len(obj.rid))]
+                else:
+                    all_objs = [obj]
+                await self._cleanup_failed_tokenize(all_objs)
+                raise
+            # _normalize_rid pre-registered batch_size * parallel_sample_num
+            # states, but only the first batch_size anchors are used below
+            # (per-sample rids are regenerated). Drop the unused pre-created
+            # states so they don't linger in rid_to_state forever.
+            if isinstance(obj.rid, list) and len(obj.rid) > batch_size:
+                for rid in obj.rid[batch_size:]:
+                    self.rid_to_state.pop(rid, None)
             self._release_raw_multimodal_payload(obj)
 
             # Cache the common prefix for parallel sampling
@@ -2688,6 +2773,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
 
+            # GLM NOTE: TODO: fix bug. If the request is in scheduler wait_queue and is interrupted
+            # by client, only marked as finished but won't be deleted from rid_to_state.
+            # Wait only on unfinished requests so such zombie entries do not
+            # stall graceful shutdown forever.
+            remain_rids_without_finished = [
+                k for k, v in self.rid_to_state.items() if not v.finished
+            ]
+            remain_num_req_without_finished = len(remain_rids_without_finished)
+
             if self.server_status == ServerStatus.UnHealthy:
                 # if health check failed, we should exit immediately
                 logger.error(
@@ -2706,9 +2800,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 break
 
             logger.info(
-                f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
+                f"Gracefully exiting... Remaining total requests {remain_num_req} {remaining_rids=}. "
+                f"Remaining unfinished requests {remain_num_req_without_finished} "
+                f"{remain_rids_without_finished=}."
             )
-            if remain_num_req > 0:
+            if remain_num_req_without_finished > 0:
                 await asyncio.sleep(5)
             else:
                 self.dump_requests_before_crash()

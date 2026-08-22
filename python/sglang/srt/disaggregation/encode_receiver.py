@@ -132,6 +132,30 @@ def _grpc_send_request(target, request_json):
         channel.close()
 
 
+class EncoderError(Exception):
+    """Encoder dispatch/transfer failed; embeddings can never arrive.
+
+    Raised by the encode task (connection failure, non-200 encoder response,
+    RDMA buffer registration failure) and by the receive path (encoder error
+    frame). Carries the HTTP status code to propagate to the client instead
+    of letting the request wait out the full recv timeout and return 504.
+    """
+
+    def __init__(self, message: str, status_code: int = 503):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _log_task_exception(task):
+    """Done-callback: retrieve and log a task's exception so asyncio never
+    warns "Task exception was never retrieved"."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("encode task failed after embeddings were received: %s", exc)
+
+
 class EmbeddingData:
     def __init__(
         self,
@@ -153,6 +177,7 @@ class EmbeddingData:
         self.modality = modality
         self.embedding = embedding
         self.send_time = None
+        self.created_at = time.perf_counter()
         self.dtype = embedding.dtype if embedding is not None else None
         if embedding_shape is not None:
             self.shape = embedding_shape
@@ -825,6 +850,8 @@ class MMReceiverBase(ABC):
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
+        encode_task = None
+        recv_task = None
         try:
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
@@ -833,7 +860,7 @@ class MMReceiverBase(ABC):
                 self.context, zmq.PULL, host=self.host
             )
             mm_data = self._extract_url_data(request_obj)
-            asyncio.create_task(
+            encode_task = asyncio.create_task(
                 self.encode(
                     req_id,
                     mm_data,
@@ -847,15 +874,80 @@ class MMReceiverBase(ABC):
                     ),
                 )
             )
-            return await asyncio.wait_for(
-                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
+            recv_task = asyncio.create_task(
+                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt)
+            )
+            result = await asyncio.wait_for(
+                self._race_encode_and_recv(encode_task, recv_task),
                 timeout=envs.SGLANG_ENCODER_RECV_TIMEOUT.get(),
             )
+            # Success: if the encode task is still finishing (e.g. draining
+            # /send responses), make sure its eventual exception is retrieved.
+            if not encode_task.done():
+                encode_task.add_done_callback(_log_task_exception)
+            return result
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
-            if req_id is not None:
-                self._cleanup_mooncake_buffer(req_id)
+            await self._abort_encode_and_cleanup(encode_task, req_id, recv_task)
             return None
+        except asyncio.CancelledError:
+            # The awaiting request was cancelled (e.g. client disconnect during
+            # the encode/E stage). Re-raise to preserve cancellation semantics.
+            await self._abort_encode_and_cleanup(encode_task, req_id, recv_task)
+            raise
+        except BaseException:
+            # EncoderError (fail-fast from the encode task or an encoder error
+            # frame) and any unexpected error (pickle, mm_processor, zmq...):
+            # stop both tasks and discard the buffer, then let the caller
+            # surface the failure immediately instead of waiting out the
+            # full recv timeout.
+            await self._abort_encode_and_cleanup(encode_task, req_id, recv_task)
+            raise
+
+    @staticmethod
+    async def _race_encode_and_recv(encode_task, recv_task):
+        """Wait for recv while failing fast if the encode dispatch fails.
+
+        The encode task normally finishes long before recv (it returns right
+        after posting /send). Its success is a no-op here; its failure means
+        the embeddings can never arrive, so surface the error immediately.
+        """
+        done, _ = await asyncio.wait(
+            {encode_task, recv_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if recv_task in done:
+            # Prefer the recv outcome (data actually arrived or recv failed).
+            return await recv_task
+        # Only the encode task finished: raise its failure now, otherwise
+        # keep waiting for recv.
+        exc = encode_task.exception()
+        if exc is not None:
+            raise exc
+        return await recv_task
+
+    async def _abort_encode_and_cleanup(self, encode_task, req_id, recv_task=None):
+        """Stop the encode/recv tasks, then discard req_id's RDMA buffer.
+
+        The encode task is what allocates and registers the RDMA buffer, so it
+        must be cancelled and drained BEFORE we discard -- otherwise it could
+        allocate a fresh buffer after cleanup (re-leaking it), and a /send
+        could still be in flight when we deregister the MR. Tasks that are
+        already done are drained too, so their exceptions are always
+        retrieved (no "Task exception was never retrieved" warnings).
+        """
+        for task in (encode_task, recv_task):
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # Expected: CancelledError from our cancel(), or the task's
+                # own failure. We only need it to stop touching the buffer.
+                pass
+        if req_id is not None:
+            self._cleanup_mooncake_buffer(req_id)
 
     def _cleanup_mooncake_buffer(self, req_id):
         if self.encoder_transfer_backend != "mooncake":
@@ -887,12 +979,19 @@ class MMReceiverBase(ABC):
                     continue
                 recv_obj: EmbeddingData = pickle.loads(parts[0])
                 if getattr(recv_obj, "error_msg", None) is not None:
+                    error_code = getattr(recv_obj, "error_code", None)
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
-                        f"error_code={getattr(recv_obj, 'error_code', None)}"
+                        f"error_code={error_code}"
                     )
                     self._cleanup_mooncake_buffer(req_id)
-                    return None
+                    # Propagate the encoder's real error code (e.g. 500 for an
+                    # RDMA write failure) instead of collapsing into a generic
+                    # recv-timeout 504.
+                    raise EncoderError(
+                        f"Encoder error: {recv_obj.error_msg}",
+                        status_code=int(error_code) if error_code else 500,
+                    )
                 logger.debug("recv_obj=%s", recv_obj)
                 # Extract original req_id from part_req_id
                 part_req_id = recv_obj.req_id
@@ -1116,10 +1215,19 @@ class MMReceiverBase(ABC):
 
     async def allocate_embedding_buffer(self, req_id, total_bytes):
         embeddings = torch.empty(total_bytes, dtype=torch.uint8)
-        self.embeddings_engine.register(
+        ret = self.embeddings_engine.register(
             embeddings.data_ptr(),
             embeddings.nbytes,
         )
+        if ret != 0:
+            # Do NOT store the buffer or hand the unregistered address to the
+            # encoder -- its RDMA write would fail anyway and the request
+            # would silently hang for the full recv timeout. Fail fast.
+            raise EncoderError(
+                f"mooncake: receiver register failed for req_id={req_id} "
+                f"(ret={ret}, bytes={total_bytes})",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
         self.embeddings_buffer[req_id] = embeddings
         return embeddings.data_ptr()
 
@@ -1347,8 +1455,13 @@ class MMReceiverHTTP(MMReceiverBase):
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             for response in responses:
                 if isinstance(response, Exception):
-                    logger.error(f"Encoder request failed for {req_id}: {response}")
-                    return
+                    # Fail fast: surface the dispatch failure to recv_mm_data
+                    # instead of silently returning and letting the request
+                    # wait out the full recv timeout (180s pile-up).
+                    raise EncoderError(
+                        f"Encoder request failed for {req_id}: {response}",
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    ) from response
                 if response.status != 200:
                     try:
                         err_data = await response.json()
@@ -1356,8 +1469,10 @@ class MMReceiverHTTP(MMReceiverBase):
                     except Exception:
                         msg = await response.text()
 
-                    logger.error(f"Encoder returned error {response.status}: {msg}")
-                    return
+                    raise EncoderError(
+                        f"Encoder returned error {response.status}: {msg}",
+                        status_code=response.status,
+                    )
             response_json_list_unsort = [
                 await response.json() for response in responses
             ]

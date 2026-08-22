@@ -129,7 +129,8 @@ class MooncakeTransferEngine:
             ret_value = -1
 
         if ret_value != 0:
-            logger.debug("Mooncake memory registration %s failed.", ptr)
+            logger.error("Mooncake memory registration %s failed.", ptr)
+        return ret_value
 
     def deregister(self, ptr):
         try:
