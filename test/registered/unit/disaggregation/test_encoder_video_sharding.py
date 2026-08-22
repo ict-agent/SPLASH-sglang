@@ -52,10 +52,19 @@ class _FakeClientSession:
 
 class _FakeVideo:
     avg_fps = 2.0
+    device = "cpu"
     frame_shape = (4, 5)
 
     def __len__(self):
         return 12
+
+
+class _FakeShortVideoWithoutShape:
+    avg_fps = 2.0
+    device = "cpu"
+
+    def __len__(self):
+        return 2
 
 
 class TestEncoderVideoSharding(CustomTestCase):
@@ -335,6 +344,76 @@ class TestEncoderVideoSharding(CustomTestCase):
         self.assertEqual(kwargs["_shard_meta"]["start_unit"], 2)
         self.assertEqual(kwargs["_shard_meta"]["count"], 2)
         self.assertEqual(kwargs["max_image_tokens"], 400)
+        encoder.await_gpu_bytes.assert_not_awaited()
+
+    def test_empty_shard_does_not_require_frame_shape(self):
+        encoder = object.__new__(MMEncoder)
+        encoder.video_processor = SimpleNamespace(max_image_tokens=1200)
+        encoder.io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        encoder.await_gpu_bytes = AsyncMock(return_value=(None, 0))
+        encoder._release_admit_bytes = Mock()
+        video = _FakeShortVideoWithoutShape()
+
+        try:
+            with patch(
+                "sglang.srt.disaggregation.encode_server.glm_decode_frames_at"
+            ) as decode:
+                videos, kwargs = asyncio.run(
+                    encoder._shard_decode_single_video(
+                        video,
+                        {},
+                        1,
+                        shard_idx=1,
+                        num_shards=2,
+                        video_processor_kwargs={},
+                        precomputed_indices=[0, 1],
+                    )
+                )
+        finally:
+            encoder.io_executor.shutdown(wait=True)
+
+        self.assertEqual(videos, [])
+        self.assertEqual(kwargs["_shard_meta"]["count"], 0)
+        decode.assert_not_called()
+        encoder.await_gpu_bytes.assert_not_awaited()
+
+    def test_gpu_admission_is_used_only_for_real_cuda_decode(self):
+        encoder = object.__new__(MMEncoder)
+        encoder.video_processor = SimpleNamespace(max_image_tokens=1200)
+        encoder.io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        encoder.await_gpu_bytes = AsyncMock(return_value=(None, 123))
+        encoder._release_admit_bytes = Mock()
+        video = _FakeVideo()
+        video.device = "cuda"
+        decoded = np.zeros((4, 4, 5, 3), dtype=np.uint8)
+
+        try:
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encode_server.is_cuda",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encode_server.glm_decode_frames_at",
+                    return_value=decoded,
+                ),
+            ):
+                asyncio.run(
+                    encoder._shard_decode_single_video(
+                        video,
+                        {},
+                        1,
+                        shard_idx=1,
+                        num_shards=4,
+                        video_processor_kwargs={},
+                        precomputed_indices=list(range(12)),
+                    )
+                )
+        finally:
+            encoder.io_executor.shutdown(wait=True)
+
+        encoder.await_gpu_bytes.assert_awaited_once_with(4 * 4 * 5 * 3)
+        encoder._release_admit_bytes.assert_called_once_with(123)
 
 
 if __name__ == "__main__":

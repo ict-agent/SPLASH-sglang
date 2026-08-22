@@ -63,6 +63,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import (
     add_prometheus_middleware,
+    is_cuda,
     load_audio,
     load_image,
     load_video,
@@ -677,16 +678,14 @@ class MMEncoder:
         reserved = 0
         try:
             if local_frame_indices:
-                try:
+                if self._video_decode_uses_cuda(vr):
                     height, width = vr.frame_shape
                     estimate = len(local_frame_indices) * height * width * 3
-                except Exception:
-                    estimate = 0
-                admit_error, reserved = await self.await_gpu_bytes(estimate)
-                if admit_error is not None:
-                    raise MMError(
-                        admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE
-                    )
+                    admit_error, reserved = await self.await_gpu_bytes(estimate)
+                    if admit_error is not None:
+                        raise MMError(
+                            admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE
+                        )
                 loop = asyncio.get_running_loop()
                 frames = await loop.run_in_executor(
                     self.io_executor,
@@ -702,8 +701,9 @@ class MMEncoder:
         if frames is not None:
             videos = [frames]
         else:
-            height, width = vr.frame_shape
-            videos = [np.zeros((0, height, width, 3), dtype=np.uint8)]
+            # _process_mm_items consumes the empty-shard marker before invoking
+            # the HF processor, so no synthetic frame tensor is necessary.
+            videos = []
 
         video_processor_kwargs["do_sample_frames"] = False
         video_processor_kwargs["return_metadata"] = True
@@ -736,10 +736,17 @@ class MMEncoder:
         }
         return videos, video_processor_kwargs
 
+    @staticmethod
+    def _video_decode_uses_cuda(video) -> bool:
+        device = getattr(video, "device", getattr(video, "_device", "cpu"))
+        return is_cuda() and str(device).startswith("cuda")
+
     def _estimate_video_decode_bytes(self, video_items, video_configs) -> int:
         """Estimate the native RGB frame footprint for a video request."""
         total = 0
         for idx, video in enumerate(video_items):
+            if not self._video_decode_uses_cuda(video):
+                continue
             config = video_configs[idx] if idx < len(video_configs) else {}
             try:
                 frame_count = len(video)
@@ -764,7 +771,7 @@ class MMEncoder:
 
     async def await_gpu_bytes(self, need_bytes: int) -> Tuple[Optional[str], int]:
         """Wait until the current device can admit a parallel video decode."""
-        if need_bytes <= 0:
+        if not is_cuda() or need_bytes <= 0:
             return None, 0
         need = int(need_bytes * _VIDEO_ADMIT_BYTES_FACTOR)
         idle_ceiling = self._admit_baseline_bytes * _GPU_ADMIT_IDLE_SLACK

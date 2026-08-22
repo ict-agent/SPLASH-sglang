@@ -1119,7 +1119,10 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
-    device = "cuda" if use_gpu else "cpu"
+    # torch.cuda is also exposed by PyTorch on HIP, but torchcodec's CUDA
+    # decoder requires the NVIDIA video stack (NVDEC/libnvcuvid).  Keep video
+    # decoding on CPU unless this is a real CUDA runtime.
+    device = "cuda" if use_gpu and is_cuda() else "cpu"
     return VideoDecoderWrapper(source, device=device)
 
 

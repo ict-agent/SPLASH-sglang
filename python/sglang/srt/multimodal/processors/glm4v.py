@@ -611,7 +611,7 @@ def glm_sample_and_decode_sync(vr, num_decode_workers=4, video_config=None):
     if num_decode_workers and num_decode_workers > 1:
         frames = _decode_indices_parallel(
             vr._source,
-            device=vr._device,
+            device=vr.device,
             indices=indices,
             num_workers=num_decode_workers,
         )
@@ -635,7 +635,7 @@ def glm_decode_frames_at(vr, indices, num_decode_workers=4, video_config=None):
     if num_decode_workers and num_decode_workers > 1 and len(indices) > 1:
         frames = _decode_indices_parallel(
             vr._source,
-            device=vr._device,
+            device=vr.device,
             indices=indices,
             num_workers=num_decode_workers,
         )

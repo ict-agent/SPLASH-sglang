@@ -48,21 +48,26 @@ class VideoDecoderWrapper:
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
         self._source = source
-        self._device = device
+        self._device = "cpu"
+        self._frame_shape = None
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
             from torchcodec.decoders import set_cuda_backend
+
             try:
                 # set_cuda_backend is a no-op unless kwargs sets device="cuda".
                 with set_cuda_backend(envs.SGLANG_VIDEO_CUDA_BACKEND.get()):
                     self._decoder = VideoDecoder(source, **kwargs)
+                if "device" in kwargs:
+                    self._device = "cuda"
             except RuntimeError:
                 if "device" in kwargs:
                     logger.warning("CUDA video decoding failed, falling back to CPU.")
                     kwargs.pop("device")
                     self._decoder = VideoDecoder(source, **kwargs)
+                    self._device = "cpu"
                 else:
                     raise
         else:
@@ -84,6 +89,37 @@ class VideoDecoderWrapper:
 
     def __len__(self):
         return len(self._decoder)
+
+    @property
+    def device(self) -> str:
+        """The device actually used by the decoder after any fallback."""
+        return self._device
+
+    @property
+    def frame_shape(self) -> tuple[int, int]:
+        """Return decoded frame height and width without retaining a frame."""
+        if self._frame_shape is not None:
+            return self._frame_shape
+
+        height = width = None
+        if _BACKEND == "torchcodec":
+            metadata = self._decoder.metadata
+            height = getattr(metadata, "height", None)
+            width = getattr(metadata, "width", None)
+
+        if height is None or width is None:
+            frame = self._decoder[0]
+            data = (
+                frame.data
+                if _BACKEND == "torchcodec" and hasattr(frame, "data")
+                else frame
+            )
+            if len(data.shape) < 2:
+                raise ValueError(f"Invalid decoded video frame shape: {data.shape}")
+            height, width = data.shape[0], data.shape[1]
+
+        self._frame_shape = (int(height), int(width))
+        return self._frame_shape
 
     def __getitem__(self, idx):
         """Return single frame as NHWC uint8. numpy on CPU, torch tensor on CUDA."""
