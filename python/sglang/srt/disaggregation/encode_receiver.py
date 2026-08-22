@@ -45,12 +45,6 @@ logger = logging.getLogger(__name__)
 # retaining sufficient collision resistance for encoder load-balancer affinity.
 _ENCODER_MEDIA_HASH_HEX_LENGTH = 16
 
-# Only cross-encoder-shard videos at least this large; smaller videos go whole
-# to one encoder.
-_VIDEO_SHARD_MIN_BYTES = 128 * 1024 * 1024
-# Avoid shards with too few sampled frames to use the encoders effectively.
-_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER = 80
-
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -1330,15 +1324,19 @@ class MMReceiverBase(ABC):
         if self._video_is_framed(url):
             return False
 
+        min_frames_per_encoder = (
+            envs.SGLANG_ENCODER_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER.get()
+        )
         max_frames = self._video_max_frames(video_item)
         if (
             max_frames is not None
-            and max_frames < num_encoders * _VIDEO_SHARD_MIN_FRAMES_PER_ENCODER
+            and max_frames < num_encoders * min_frames_per_encoder
         ):
             return False
 
+        min_bytes = envs.SGLANG_ENCODER_VIDEO_SHARD_MIN_MB.get() * 1024 * 1024
         size_bytes = self._video_size_bytes(url)
-        if size_bytes is not None and size_bytes < _VIDEO_SHARD_MIN_BYTES:
+        if size_bytes is not None and size_bytes < min_bytes:
             return False
         return True
 
