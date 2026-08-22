@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 import logging
+import os
 import pickle
 import random
 import threading
@@ -43,6 +44,12 @@ logger = logging.getLogger(__name__)
 # GLM Note: A 64-bit media digest keeps Session-Id headers compact while
 # retaining sufficient collision resistance for encoder load-balancer affinity.
 _ENCODER_MEDIA_HASH_HEX_LENGTH = 16
+
+# Only cross-encoder-shard videos at least this large; smaller videos go whole
+# to one encoder.
+_VIDEO_SHARD_MIN_BYTES = 128 * 1024 * 1024
+# Avoid shards with too few sampled frames to use the encoders effectively.
+_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER = 80
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -343,7 +350,9 @@ class MultiModalEmbeddingData(EmbeddingData):
         if is_concat:
             groups = defaultdict(list)
             for i, e in enumerate(self.embedding_list):
-                if e is not None:
+                # A cross-encoder video shard can be empty when the video has
+                # fewer temporal units than encoders. It contributes no tokens.
+                if e is not None and e.shape[0] > 0:
                     groups[self.modality_list[i]].append(e)
             return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
@@ -1277,6 +1286,62 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
+    @staticmethod
+    def _video_max_frames(video_item) -> Optional[int]:
+        """Return a request-provided sampled-frame cap, if present."""
+        url = video_item.get("url")
+        if isinstance(url, dict):
+            max_frames = url.get("max_frames")
+            if max_frames is not None:
+                try:
+                    return int(max_frames)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
+    def _video_is_framed(url) -> bool:
+        """Whether the source is already a list of decoded video frames."""
+        if isinstance(url, dict):
+            url = url.get("url")
+        return isinstance(url, (list, tuple))
+
+    @staticmethod
+    def _video_size_bytes(url) -> Optional[int]:
+        """Return a local/in-memory video's size without doing network IO."""
+        if isinstance(url, dict):
+            url = url.get("url")
+        try:
+            if isinstance(url, (bytes, bytearray)):
+                return len(url)
+            if isinstance(url, str):
+                if url.startswith("data:"):
+                    return len(url)
+                path = url[len("file://") :] if url.startswith("file://") else url
+                if os.path.isfile(path):
+                    return os.path.getsize(path)
+        except Exception:
+            pass
+        return None
+
+    def _should_shard_video(self, video_item, num_encoders) -> bool:
+        """Whether one video is large enough to split across all encoders."""
+        url = video_item.get("url")
+        if self._video_is_framed(url):
+            return False
+
+        max_frames = self._video_max_frames(video_item)
+        if (
+            max_frames is not None
+            and max_frames < num_encoders * _VIDEO_SHARD_MIN_FRAMES_PER_ENCODER
+        ):
+            return False
+
+        size_bytes = self._video_size_bytes(url)
+        if size_bytes is not None and size_bytes < _VIDEO_SHARD_MIN_BYTES:
+            return False
+        return True
+
     def _extract_url_data(self, request_obj) -> List[Dict]:
         def flatten_mm_items(items):
             if not isinstance(items, list):
@@ -1290,11 +1355,23 @@ class MMReceiverBase(ABC):
                     flat.append(item)
             return flat
 
-        def to_raw_url(mm_item):
+        def to_raw_url(mm_item, modality):
             if isinstance(mm_item, ImageData):
                 return mm_item.url
+            if modality == Modality.VIDEO and hasattr(mm_item, "url"):
+                payload = {"url": mm_item.url}
+                preprocess_kwargs = getattr(mm_item, "preprocess_kwargs", None)
+                if isinstance(preprocess_kwargs, dict):
+                    payload.update(preprocess_kwargs)
+                return payload
             if isinstance(mm_item, dict):
-                # tolerate {"url": ...} shaped payloads
+                if modality == Modality.VIDEO:
+                    payload = dict(mm_item)
+                    preprocess_kwargs = payload.pop("preprocess_kwargs", None)
+                    if isinstance(preprocess_kwargs, dict):
+                        payload.update(preprocess_kwargs)
+                    return payload
+                # tolerate {"url": ...} shaped image/audio payloads
                 return mm_item.get("url", mm_item)
             return mm_item
 
@@ -1310,7 +1387,7 @@ class MMReceiverBase(ABC):
                 for mm_item in mm_items:
                     mm_data.append(
                         {
-                            "url": to_raw_url(mm_item),
+                            "url": to_raw_url(mm_item, modality),
                             "modality": modality,
                         }
                     )
@@ -1367,47 +1444,63 @@ class MMReceiverHTTP(MMReceiverBase):
                 mm_data, len(self.encode_urls)
             )
 
-        # Calculate total num_parts across all modalities
-        total_num_parts, modality_num_parts = calculate_modality_num_parts(
-            modalities, num_items_assigned
+        # A single sufficiently large video is split into contiguous temporal
+        # shards, one per Encoder service. Other modalities retain item-based
+        # distribution.
+        num_encoders = len(self.encode_urls)
+        video_items = [m for m in mm_data if m.get("modality") == Modality.VIDEO]
+        shard_video = (
+            len(video_items) == 1
+            and num_encoders > 1
+            and self._should_shard_video(video_items[0], num_encoders)
         )
 
-        part_idx_offset = 0
+        def _base_payload(part_idx, encoder_idx, mm_items, modality):
+            return {
+                "encoder_idx": encoder_idx,
+                "mm_items": mm_items,
+                "part_idx": part_idx,
+                "req_id": create_part_req_id(req_id, part_idx),
+                "modality": modality.name,
+                "prefill_host": self.host,
+                "embedding_port": embedding_port,
+                "role": "decode" if self.meta_only else "prefill",
+            }
+
+        part_idx = 0
         for modality in modalities:
-            num_items_assigned_modality = num_items_assigned.get(modality)
             mm_data_modality = [
                 mm_item for mm_item in mm_data if mm_item.get("modality") == modality
             ]
+            if modality == Modality.VIDEO and shard_video:
+                url = mm_data_modality[0].get("url")
+                for shard_idx in range(num_encoders):
+                    payload = _base_payload(part_idx, shard_idx, [url], modality)
+                    payload["video_num_shards"] = num_encoders
+                    payload["video_shard_idx"] = shard_idx
+                    encode_requests.append(payload)
+                    part_idx += 1
+            else:
+                assigned = num_items_assigned.get(modality)
+                cum_num_items = 0
+                for encoder_idx, assigned_num in enumerate(assigned):
+                    if assigned_num == 0:
+                        continue
+                    items = [
+                        mm_item.get("url")
+                        for mm_item in mm_data_modality[
+                            cum_num_items : cum_num_items + assigned_num
+                        ]
+                    ]
+                    encode_requests.append(
+                        _base_payload(part_idx, encoder_idx, items, modality)
+                    )
+                    part_idx += 1
+                    cum_num_items += assigned_num
 
-            num_parts = modality_num_parts[modality]
-            cum_num_items = 0
-            cum_idx = 0
-            for idx, assigned_num in enumerate(num_items_assigned_modality):
-                if assigned_num == 0:
-                    continue
-                part_idx = part_idx_offset + cum_idx
-                part_req_id = create_part_req_id(req_id, part_idx)
-                encode_requests.append(
-                    {
-                        "encoder_idx": idx,
-                        "mm_items": [
-                            mm_item.get("url")
-                            for mm_item in mm_data_modality[
-                                cum_num_items : cum_num_items + assigned_num
-                            ]
-                        ],
-                        "num_parts": total_num_parts,
-                        "part_idx": part_idx,
-                        "req_id": part_req_id,  # use part_req_id to avoid key collision
-                        "modality": modality.name,  # convert enum to string for json serialization
-                        "prefill_host": self.host,
-                        "embedding_port": embedding_port,
-                        "role": "decode" if self.meta_only else "prefill",
-                    }
-                )
-                cum_idx += 1
-                cum_num_items += assigned_num
-            part_idx_offset += num_parts
+        total_num_parts = len(encode_requests)
+        for encode_request in encode_requests:
+            encode_request["num_parts"] = total_num_parts
 
         encoder_session_ids = {}
         if self.encoder_transfer_backend == "mooncake":

@@ -462,7 +462,19 @@ def _decode_indices_parallel(source, device, indices, num_workers):
             vr.close()
         return bucket_positions, frames
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as ex:
+    initializer = None
+    if str(device).startswith("cuda"):
+        device_module = torch.get_device_module("cuda")
+        current_device = device_module.current_device()
+
+        def set_decode_device():
+            device_module.set_device(current_device)
+
+        initializer = set_decode_device
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_workers, initializer=initializer
+    ) as ex:
         for bucket_positions, frames in ex.map(_work, buckets):
             for local_i, global_pos in enumerate(bucket_positions):
                 out[global_pos] = frames[local_i]
@@ -502,6 +514,28 @@ def glm_sample_and_decode_sync(vr, num_decode_workers=4, video_config=None):
 
     metadata = _video_metadata(total_num_frames, video_fps, duration, indices)
     return frames, metadata
+
+
+def glm_decode_frames_at(vr, indices, num_decode_workers=4, video_config=None):
+    """Decode only explicitly sampled frame indices for one video shard."""
+    indices = list(indices)
+    if not indices:
+        return None
+    video_config = video_config or {}
+    if num_decode_workers and num_decode_workers > 1 and len(indices) > 1:
+        frames = _decode_indices_parallel(
+            vr._source,
+            device=vr._device,
+            indices=indices,
+            num_workers=num_decode_workers,
+        )
+    else:
+        frames = vr.get_frames_at(indices)
+
+    max_tokens_per_frame = video_config.get("max_tokens_per_frame")
+    if max_tokens_per_frame is not None:
+        frames = _resize_frames_to_max_tokens(frames, max_tokens_per_frame)
+    return frames
 
 
 def preprocess_video_sync(vr):
