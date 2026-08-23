@@ -2332,21 +2332,37 @@ def _setup_and_run_http_server(
                     "SSL refresh will be disabled."
                 )
 
-            uvicorn.run(
-                "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
-                loop="uvloop",
-                workers=server_args.tokenizer_worker_num,
-                ssl_keyfile=server_args.ssl_keyfile,
-                ssl_certfile=server_args.ssl_certfile,
-                ssl_ca_certs=server_args.ssl_ca_certs,
-                ssl_keyfile_password=server_args.ssl_keyfile_password,
+            # Uvicorn uses multiprocessing spawn for replacement workers. Make
+            # the interpreter execute a stdlib-only bootstrap before entering
+            # Uvicorn's child target, independent of the server entrypoint.
+            from sglang.srt.entrypoints.multiprocessing_spawn import (
+                use_multiprocessing_spawn_bootstrap,
+                use_uvicorn_worker_startup_wait,
             )
+
+            with (
+                use_multiprocessing_spawn_bootstrap(),
+                use_uvicorn_worker_startup_wait(
+                    envs.SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT.get()
+                ),
+            ):
+                uvicorn.run(
+                    "sglang.srt.entrypoints.http_server:app",
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    timeout_worker_healthcheck=(
+                        envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get()
+                    ),
+                    loop="uvloop",
+                    workers=server_args.tokenizer_worker_num,
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
     finally:
         if server_args.tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

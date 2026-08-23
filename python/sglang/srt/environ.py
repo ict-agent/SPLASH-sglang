@@ -592,6 +592,10 @@ class Envs:
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(15)
+    # Initial workers may spend substantially longer importing native backends. This
+    # bound applies only until all workers are ready; runtime health checks still use
+    # SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.
+    SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT = EnvInt(300)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
