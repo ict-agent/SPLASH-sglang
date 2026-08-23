@@ -193,7 +193,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1218,6 +1218,7 @@ class Scheduler(
             and self.chunked_prefill_size is not None
             and self.disaggregation_mode == DisaggregationMode.PREFILL
         )
+        self._auto_chunk_prefix_probe_warned = False
         if (
             self.server_args.prefill_short_req_reserve
             and not self.enable_prefill_short_req_reserve
@@ -2613,26 +2614,79 @@ class Scheduler(
             slots += req_pool.mamba_ping_pong_track_buffer_size
         return slots
 
+    def _estimate_auto_chunk_prefix_len(self, req: Req) -> int:
+        """Estimate reusable prefix length without mutating cache or request state."""
+        fill_ids = req.origin_input_ids + req.output_ids
+        max_prefix_len = max(len(fill_ids) - 1, 0)
+        if getattr(req, "return_logprob", False) and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        if getattr(req, "positional_embed_overrides", None) is not None:
+            max_prefix_len = 0
+
+        existing_len = min(
+            len(req.prefix_indices) if req.prefix_indices is not None else 0,
+            max_prefix_len,
+        )
+        if (
+            not self.server_args.prefill_short_req_match_prefix
+            or max_prefix_len <= existing_len
+        ):
+            return existing_len
+
+        probe = getattr(self.tree_cache, "probe_prefix_len", None)
+        if probe is None or getattr(self.tree_cache, "disable", False):
+            return existing_len
+
+        try:
+            probed_len = probe(
+                RadixKey(
+                    token_ids=fill_ids[:max_prefix_len],
+                    extra_key=getattr(req, "extra_key", None),
+                )
+            )
+        except Exception as exc:
+            if not getattr(self, "_auto_chunk_prefix_probe_warned", False):
+                logger.warning(
+                    "GLM5-Next auto chunk prefix probe failed; falling back to "
+                    "the request's existing prefix: %s",
+                    exc,
+                )
+                self._auto_chunk_prefix_probe_warned = True
+            return existing_len
+
+        if probed_len is None:
+            if not getattr(self, "_auto_chunk_prefix_probe_warned", False):
+                logger.warning(
+                    "GLM5-Next auto chunk prefix probe is unsupported by %s; "
+                    "falling back to the request's existing prefix.",
+                    type(self.tree_cache).__name__,
+                )
+                self._auto_chunk_prefix_probe_warned = True
+            return existing_len
+
+        return max(existing_len, min(max(int(probed_len), 0), max_prefix_len))
+
     def _select_auto_chunk_short_reqs(
         self,
         adder: PrefillAdder,
         max_short_reqs: int,
         max_reserve: int,
         full_chunk: int,
-    ) -> List[Req]:
+    ) -> Tuple[List[Req], int]:
         """Select short requests using conservative token and Mamba budgets.
 
-        GLM5-Next uses a Mamba radix cache whose prefix match can mutate cache
-        state.  This dry run therefore only consumes prefix information already
-        present on the request; the normal admission path remains authoritative.
+        GLM5-Next uses a Mamba radix cache whose authoritative prefix match can
+        mutate cache state. This dry run therefore uses either prefix information
+        already present on the request or the cache's side-effect-free probe;
+        the normal admission path remains authoritative.
         """
         if max_short_reqs <= 0 or max_reserve <= 0:
-            return []
+            return [], 0
 
         req_pool = self.req_to_token_pool
         mamba_pool = getattr(req_pool, "mamba_pool", None)
         if mamba_pool is None:
-            return []
+            return [], 0
 
         page_size = adder.page_size
         # Reserving input tokens merely moves them from the long request to the
@@ -2640,7 +2694,7 @@ class Scheduler(
         # reserve and page overhead, plus the long request's own page overhead.
         kv_headroom = int(adder.rem_total_tokens) - full_chunk - page_size
         if kv_headroom <= 0:
-            return []
+            return [], 0
 
         mamba_slots_left = int(mamba_pool.available_size())
         selected: List[Req] = []
@@ -2658,9 +2712,7 @@ class Scheduler(
             if req.sampling_params.ignore_eos:
                 continue
 
-            prefix_len = (
-                len(req.prefix_indices) if req.prefix_indices is not None else 0
-            )
+            prefix_len = self._estimate_auto_chunk_prefix_len(req)
             effective_len = req.seqlen - prefix_len
             if not (0 < effective_len <= self.server_args.prefill_short_req_threshold):
                 continue
@@ -2694,7 +2746,7 @@ class Scheduler(
             extra_kv_cost += candidate_extra_kv
             mamba_slots_left -= mamba_slots
 
-        return selected
+        return selected, reserved
 
     def _plan_auto_chunk(
         self, adder: PrefillAdder, max_short_reqs: int
@@ -2731,15 +2783,8 @@ class Scheduler(
             full_chunk - page_size,
         )
         max_reserve = max_reserve // page_size * page_size
-        short_reqs = self._select_auto_chunk_short_reqs(
+        short_reqs, short_input_tokens = self._select_auto_chunk_short_reqs(
             adder, max_short_reqs, max_reserve, full_chunk
-        )
-        short_input_tokens = sum(
-            adder.ceil_paged_tokens(
-                req.seqlen
-                - (len(req.prefix_indices) if req.prefix_indices is not None else 0)
-            )
-            for req in short_reqs
         )
         reserved = short_input_tokens + page_size if short_reqs else 0
         chunk_cap = full_chunk - reserved

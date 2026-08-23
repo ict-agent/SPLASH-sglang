@@ -11,6 +11,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
@@ -38,6 +41,9 @@ def _make_req(
     req.mamba_pool_idx = None
     req.mamba_ping_pong_track_buffer = None
     req.chunk_starved_rounds = 0
+    req.return_logprob = False
+    req.positional_embed_overrides = None
+    req.extra_key = None
     req.sampling_params = SimpleNamespace(
         max_new_tokens=max_new_tokens,
         ignore_eos=ignore_eos,
@@ -52,6 +58,7 @@ def _make_scheduler(waiting_queue, long_req, *, mamba_available=32) -> Scheduler
         prefill_short_req_max_reserve_ratio=0.5,
         prefill_short_req_scan_depth=4,
         prefill_long_req_starve_threshold=2,
+        prefill_short_req_match_prefix=False,
         prefill_short_req_max_total_len=4096,
     )
     scheduler.enable_prefill_short_req_reserve = True
@@ -148,6 +155,25 @@ class TestGlm5NextAutoChunkPlan(CustomTestCase):
             scheduler.waiting_queue,
             [short_a, short_b, skipped_long, tail],
         )
+
+    def test_readonly_prefix_probe_can_discover_short_request(self):
+        long_req = _make_req("long", 4096)
+        cached_req = _make_req("cached", 512)
+        scheduler = _make_scheduler([cached_req], long_req)
+        scheduler.server_args.prefill_short_req_match_prefix = True
+        scheduler.tree_cache = SimpleNamespace(
+            disable=False,
+            probe_prefix_len=MagicMock(return_value=320),
+        )
+
+        plan = scheduler._plan_auto_chunk(_make_plan_adder(), max_short_reqs=1)
+
+        self.assertEqual(plan.short_reqs, [cached_req])
+        self.assertEqual(plan.reserved_tokens, 256)
+        self.assertEqual(plan.chunk_cap, 768)
+        self.assertEqual(cached_req.prefix_indices, [])
+        probed_key = scheduler.tree_cache.probe_prefix_len.call_args.args[0]
+        self.assertEqual(len(probed_key), 511)
 
     def test_kv_budget_includes_max_new_tokens_and_page_overhead(self):
         long_req = _make_req("long", 4096)
@@ -310,6 +336,69 @@ class TestPrefillAdderAutoChunkGuards(CustomTestCase):
         self.assertEqual(result, AddReqResult.OTHER)
         self.assertNotIn(candidate, adder.can_run_list)
 
+
+class TestMambaReadonlyPrefixProbe(CustomTestCase):
+    def test_probe_stops_at_mamba_boundary_without_splitting(self):
+        tree = MambaRadixCache.__new__(MambaRadixCache)
+        tree.disable = False
+        tree.page_size = 2
+        tree.root_node = root = TreeNode()
+        root.key = RadixKey([])
+
+        prefix = TreeNode()
+        prefix.parent = root
+        prefix.key = RadixKey([1, 2])
+        prefix.value = [10, 11]
+        prefix.mamba_value = object()
+        root.children[prefix.key.child_key(tree.page_size)] = prefix
+
+        suffix = TreeNode()
+        suffix.parent = prefix
+        suffix.key = RadixKey([3, 4, 5, 6])
+        suffix.value = [12, 13, 14, 15]
+        suffix.mamba_value = object()
+        prefix.children[suffix.key.child_key(tree.page_size)] = suffix
+
+        root_access_time = root.last_access_time
+        prefix_access_time = prefix.last_access_time
+        suffix_access_time = suffix.last_access_time
+
+        self.assertEqual(
+            tree.probe_prefix_len(RadixKey([1, 2, 3, 4, 5, 9])), 2
+        )
+        self.assertEqual(prefix.key.token_ids, [1, 2])
+        self.assertEqual(suffix.key.token_ids, [3, 4, 5, 6])
+        self.assertIs(
+            prefix.children[suffix.key.child_key(tree.page_size)], suffix
+        )
+        self.assertEqual(root.last_access_time, root_access_time)
+        self.assertEqual(prefix.last_access_time, prefix_access_time)
+        self.assertEqual(suffix.last_access_time, suffix_access_time)
+
+    def test_hi_mamba_probe_counts_only_reusable_device_prefix(self):
+        tree = HiMambaRadixCache.__new__(HiMambaRadixCache)
+        tree.disable = False
+        tree.page_size = 1
+        tree.root_node = root = TreeNode()
+        root.key = RadixKey([])
+
+        device_node = TreeNode()
+        device_node.parent = root
+        device_node.key = RadixKey([1, 2])
+        device_node.value = [10, 11]
+        device_node.mamba_value = object()
+        root.children[device_node.key.child_key(1)] = device_node
+
+        host_node = TreeNode()
+        host_node.parent = device_node
+        host_node.key = RadixKey([3, 4])
+        host_node.value = None
+        host_node.host_value = [12, 13]
+        host_node.mamba_host_value = object()
+        device_node.children[host_node.key.child_key(1)] = host_node
+
+        self.assertEqual(tree.probe_prefix_len(RadixKey([1, 2, 3, 4])), 2)
+        self.assertEqual(host_node.key.token_ids, [3, 4])
 
 if __name__ == "__main__":
     unittest.main()

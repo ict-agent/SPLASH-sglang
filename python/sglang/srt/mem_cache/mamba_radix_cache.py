@@ -497,6 +497,37 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Return the reusable Mamba prefix length without touching the tree."""
+        if self.disable or len(key) == 0:
+            return 0
+
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        matched_len = 0
+        best_match_len = 0
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = child.key.match(key, page_size=self.page_size)
+
+            # A partial match would make match_prefix split the node.  The new
+            # parent has no Mamba state, so it cannot extend the reusable Mamba
+            # boundary; stop without performing that structural mutation.
+            if prefix_len < len(child.key):
+                break
+
+            matched_len += len(child.value)
+            node = child
+            if node.mamba_value is not None:
+                best_match_len = matched_len
+
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        return best_match_len
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0, mamba_exist=False)

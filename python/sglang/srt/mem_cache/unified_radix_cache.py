@@ -368,6 +368,23 @@ class UnifiedRadixCache(BasePrefixCache):
             best_match_device_value_len,
         )
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Return a reusable device-prefix length without mutating the tree."""
+        if self.disable or len(key) == 0:
+            return 0
+
+        # maybe_to_bigram_view mutates its RadixKey, so probe a private copy.
+        key = RadixKey(
+            key.token_ids,
+            key.extra_key,
+            is_bigram=key.is_bigram or self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(key) == 0:
+            return 0
+
+        value, _, _, best_device_value_len = self._match_prefix_helper_readonly(key)
+        return sum(len(chunk) for chunk in value[:best_device_value_len])
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -596,6 +613,69 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     # ---- Internal Helpers ----
+
+    def _match_prefix_helper_readonly(
+        self, key: RadixKey
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+        """Traverse fully matched nodes without splitting or updating LRU state."""
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        value: list[torch.Tensor] = []
+        best_match_node = node
+        best_match_device_node = node
+        best_match_device_value_len = 0
+        separate_device_match = self.cache_controller is not None
+        if separate_device_match:
+            validators = tuple(
+                comp.create_match_validator() for comp in self._components_tuple
+            )
+            device_validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self._components_tuple
+            )
+        else:
+            validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self._components_tuple
+            )
+
+        def _all_valid(match_validators, match_node):
+            return all(validator(match_node) for validator in match_validators)
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted and not child.backuped:
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                break
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+            node = child
+
+            matched = _all_valid(validators, node)
+            if matched:
+                best_match_node = node
+            if not separate_device_match:
+                if matched:
+                    best_match_device_value_len = len(value)
+                    best_match_device_node = node
+            elif _all_valid(device_validators, node):
+                best_match_device_value_len = len(value)
+                best_match_device_node = node
+
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        return (
+            value,
+            best_match_node,
+            best_match_device_node,
+            best_match_device_value_len,
+        )
 
     def _match_prefix_helper(
         self, key: RadixKey

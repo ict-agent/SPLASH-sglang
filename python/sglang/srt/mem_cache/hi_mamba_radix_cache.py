@@ -1236,6 +1236,38 @@ class HiMambaRadixCache(MambaRadixCache):
         value, best_last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, best_last_node, best_value_len)
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Return the reusable device prefix without mutating HiCache state."""
+        if self.disable or len(key) == 0:
+            return 0
+
+        key = key.page_aligned(self.page_size)
+        node = self.root_node
+        child_key = key.child_key(self.page_size) if len(key) else None
+        device_value_lens: List[int] = []
+        best_device_value_count = 0
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted and not child.backuped:
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                break
+
+            if not child.evicted:
+                device_value_lens.append(len(child.value))
+            node = child
+            if node.mamba_value is not None or node.mamba_backuped:
+                best_device_value_count = len(device_value_lens)
+
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        return sum(device_value_lens[:best_device_value_count])
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:

@@ -951,6 +951,29 @@ class UnifiedRadixCacheSuite:
 
         tree.sanity_check()
 
+    def test_public_probe_respects_mamba_boundary_without_splitting(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        sequence = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, sequence)
+
+        node = next(iter(tree.root_node.children.values()))
+        child_key = node.key.child_key(tree.page_size)
+        access_time = node.last_access_time
+
+        # A regular match would split the node here. The split parent has no
+        # Mamba state, so the reusable prefix remains at the root boundary.
+        partial = sequence[: self.cfg.page_size]
+        self.assertEqual(tree.probe_prefix_len(RadixKey(partial)), 0)
+        self.assertIs(tree.root_node.children[child_key], node)
+        self.assertEqual(node.key.token_ids, sequence)
+        self.assertEqual(node.last_access_time, access_time)
+
+        self.assertEqual(tree.probe_prefix_len(RadixKey(sequence)), len(sequence))
+        self.assertEqual(node.last_access_time, access_time)
+        tree.sanity_check()
+
     # ================================================================
     # Evict chain tests covering demotion, cascade, and tombstone cleanup.
     # ================================================================

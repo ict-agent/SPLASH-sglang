@@ -21,6 +21,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 logger = logging.getLogger(__name__)
@@ -627,6 +628,14 @@ class StreamingSession(BasePrefixCache):
         if self.any_holding_kv():
             return
         self.inner.sanity_check()
+
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Forward side-effect-free tree probes to the wrapped cache.
+
+        Session-slot reuse is request-specific and is intentionally excluded;
+        the scheduler probe only estimates reusable radix-tree state.
+        """
+        return self.inner.probe_prefix_len(key)
 
     # Forward attribute access for cache-specific methods (e.g.
     # sliding_window_size, all_values_flatten, etc.)

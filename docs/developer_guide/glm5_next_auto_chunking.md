@@ -33,13 +33,19 @@ The feature is off by default. Its tuning arguments are:
 | `--prefill-short-req-max-reserve-ratio` | 0.5 | Maximum fraction of one chunk reserved for short requests. |
 | `--prefill-short-req-scan-depth` | 8 | Number of requests inspected at the FCFS queue head. |
 | `--prefill-long-req-starve-threshold` | 8 | Compressed rounds before the long request receives a full-budget round. |
+| `--prefill-short-req-match-prefix` | off | Use a read-only radix-cache probe to estimate the reusable device prefix of scanned requests. |
 | `--prefill-short-req-max-total-len` | 262144 | Requests longer than this are skipped; `0` disables the limit. |
 
 ## Admission and safety rules
 
-The planner uses only prefix information already stored on each request. It
-does not run an additional prefix match because GLM5-Next's Mamba radix-cache
-match can update cache state.
+By default, the planner uses only prefix information already stored on each
+request. With `--prefill-short-req-match-prefix`, it additionally runs a
+length-only radix-cache probe. Unlike the authoritative match performed during
+admission, the probe does not split tree nodes, refresh LRU state, allocate a
+Mamba slot, or mutate the request. Admission still performs a fresh match and
+remains authoritative if the cache changes after the probe. The option adds at
+most one CPU-side tree traversal per request in the configured scan window; it
+does not launch model or GPU work.
 
 Reservations are aligned to the configured KV page size. A short request is
 promoted only when all of the following fit conservatively:

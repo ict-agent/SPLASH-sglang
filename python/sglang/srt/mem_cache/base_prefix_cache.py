@@ -224,6 +224,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Return a reusable device-prefix length without mutating cache state.
+
+        Cache implementations that cannot provide a side-effect-free probe
+        return ``None``.  Unlike :meth:`match_prefix`, this method must not
+        split tree nodes, update eviction metadata, allocate cache slots, or
+        mutate request state.
+        """
+        return None
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass

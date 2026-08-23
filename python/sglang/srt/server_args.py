@@ -438,6 +438,7 @@ class ServerArgs:
     prefill_short_req_max_reserve_ratio: float = 0.5
     prefill_short_req_scan_depth: int = 8
     prefill_long_req_starve_threshold: int = 8
+    prefill_short_req_match_prefix: bool = False
     prefill_short_req_max_total_len: int = 262144
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -5316,6 +5317,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.prefill_long_req_starve_threshold,
             help="Number of consecutive compressed rounds before forcing one full-budget round for the long request.",
+        )
+        parser.add_argument(
+            "--prefill-short-req-match-prefix",
+            action="store_true",
+            default=ServerArgs.prefill_short_req_match_prefix,
+            help="Use a side-effect-free radix-cache probe when estimating short-request input lengths. This does not split cache nodes, update LRU state, or allocate Mamba state.",
         )
         parser.add_argument(
             "--prefill-short-req-max-total-len",
