@@ -615,7 +615,20 @@ def kpool_build_ragged_layout(
     return concat_page_table, q_ks, q_ke
 
 
-@triton.jit
+# GLM NOTE: the planner tensors are slices of the shared i32 H2D channel, so
+# their data-pointer alignment (and MAX_POOL_PAGES divisibility) changes per
+# batch. Each new combination is a new Triton specialization = a full DCU JIT
+# recompile on every rank, leaking native heap per compile until cgroup OOM.
+@triton.jit(
+    do_not_specialize=["MAX_POOL_PAGES"],
+    do_not_specialize_on_alignment=[
+        "cu_pages_excl_ptr",
+        "ragged_pool_pages_ptr",
+        "cu_q_len_excl_ptr",
+        "ragged_q_len_ptr",
+        "pooled_seq_lens_ptr",
+    ],
+)
 def _kpool_build_ragged_layout_kernel(
     full_page_table_ptr,
     cu_pages_excl_ptr,
@@ -1692,7 +1705,16 @@ def scatter_kpool_tail_updates(
     )
 
 
-@triton.jit
+# GLM NOTE: the per-row metadata tensors are H2D-channel slices with
+# batch-dependent alignment; see _kpool_build_ragged_layout_kernel.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "req_pool_idx_ptr",
+        "dst_logical_start_ptr",
+        "chunk_src_start_ptr",
+        "n_write_ptr",
+    ],
+)
 def _scatter_kpool_tail_updates_kernel(
     chunk_k_ptr,
     chunk_score_ptr,

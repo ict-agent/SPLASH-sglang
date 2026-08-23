@@ -13,7 +13,24 @@ def transform_index_page_table_decode(**kwargs):
     return transform_index_page_table_decode_fast(**kwargs)
 
 
-@triton.jit
+# GLM NOTE: topk_indices / page_table_row_indices / result can be views with
+# batch-dependent alignment, and the numel argument changes per batch; each
+# new specialization combo forces a full DCU JIT recompile on every rank
+# (native-heap residue per compile), so keep these out of the cache key.
+@triton.jit(
+    do_not_specialize=[
+        "page_table_stride_0",
+        "page_table_num_rows",
+        "page_table_num_cols",
+        "page_table_row_indices_numel",
+    ],
+    do_not_specialize_on_alignment=[
+        "page_table_ptr",
+        "topk_indices_ptr",
+        "page_table_row_indices_ptr",
+        "result_ptr",
+    ],
+)
 def transform_index_page_table_batched_kernel(
     page_table_ptr,
     topk_indices_ptr,

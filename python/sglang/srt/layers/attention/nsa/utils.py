@@ -234,12 +234,19 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
         return False
 
 
-@triton.jit
+# GLM NOTE: tokens is the per-batch sequence count; as a constexpr it baked a
+# new kernel variant per batch size, and in_seqs is a view with batch-dependent
+# alignment. Each variant is a full DCU JIT recompile on every rank (native
+# heap residue per compile), so keep both out of the specialization key.
+@triton.jit(
+    do_not_specialize=["tokens"],
+    do_not_specialize_on_alignment=["in_seqs_ptr"],
+)
 def nsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
-    tokens: tl.constexpr,
+    tokens,
     cp_size: tl.constexpr,
     cp_rank: tl.constexpr,
 ):
