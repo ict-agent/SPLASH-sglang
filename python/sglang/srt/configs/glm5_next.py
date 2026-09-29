@@ -231,13 +231,48 @@ class Glm5NextConfig(PretrainedConfig):
             self.image_start_token_id = image_start_token_id
             self.image_end_token_id = image_end_token_id
 
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        # Transformers 5.6 captures its base layer-type validator in @strict,
+        # so overriding validate_layer_type here cannot extend its vocabulary.
+        # Project only the known GLM spelling while that validator runs, keeping
+        # all other entries and the length unchanged. Restore the original list
+        # before any model code observes this config; never edit the model JSON.
+        layer_types = kwargs.get("layer_types", getattr(self, "layer_types", None))
+        transformers_layer_types = self._transformers_layer_types(layer_types)
+        if transformers_layer_types is not layer_types:
+            kwargs["layer_types"] = transformers_layer_types
+        try:
+            super().__init__(
+                pad_token_id=pad_token_id,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
+                tie_word_embeddings=tie_word_embeddings,
+                **kwargs,
+            )
+        finally:
+            if transformers_layer_types is not layer_types:
+                self.layer_types = layer_types
+
+    @staticmethod
+    def _transformers_layer_types(layer_types):
+        if isinstance(layer_types, (list, tuple)) and "deepseek_sparse_attention" in layer_types:
+            return [
+                "sparse" if kind == "deepseek_sparse_attention" else kind
+                for kind in layer_types
+            ]
+        return layer_types
+
+    def validate(self):
+        # Keep explicit revalidation as strict as construction without exposing
+        # the compatibility spelling in the stored configuration.
+        layer_types = getattr(self, "layer_types", None)
+        transformers_layer_types = self._transformers_layer_types(layer_types)
+        if transformers_layer_types is layer_types:
+            return super().validate()
+        self.layer_types = transformers_layer_types
+        try:
+            return super().validate()
+        finally:
+            self.layer_types = layer_types
 
     @property
     def is_mla(self):
@@ -306,6 +341,11 @@ class Glm5NextConfig(PretrainedConfig):
 
 class Glm5NextTextConfig(Glm5NextConfig):
     model_type = "glm5next_text"
+
+    def __init__(self, **kwargs):
+        # Transformers 5.6 otherwise generates a dataclass initializer here,
+        # skipping Glm5NextConfig defaults and its compatibility validation.
+        super().__init__(**kwargs)
 
 
 # Registered after definition: Glm5NextTextConfig subclasses Glm5NextConfig, so it can't be referenced inside the class body above.

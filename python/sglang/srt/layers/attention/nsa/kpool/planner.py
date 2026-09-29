@@ -29,6 +29,9 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.kpool.paged_mqa_compat import (
+    get_kpool_paged_mqa_logits_metadata,
+)
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
     INDEX_HEAD_DIM,
     kpool_build_ragged_layout,
@@ -778,7 +781,7 @@ def init_pooled_paged_mqa_metadata(
         import deep_gemm
 
         slots_per_page = real_page_size // pool_size
-        pooled_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        pooled_schedule = get_kpool_paged_mqa_logits_metadata(
             pooled_cache_seqlens.unsqueeze(-1),
             slots_per_page,
             deep_gemm.get_num_sms(),
@@ -826,12 +829,13 @@ def update_pooled_paged_mqa_metadata(
     try:
         import deep_gemm
 
-        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        new_schedule = get_kpool_paged_mqa_logits_metadata(
             pool_seqlens.unsqueeze(-1),
             real_page_size // pool_size,
             deep_gemm.get_num_sms(),
         )
-        metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
+        if new_schedule is not None:
+            metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
     except (ImportError, ModuleNotFoundError):
         # capture saw deep_gemm absent -> schedule buffer is None already
         pass
@@ -889,7 +893,7 @@ def _compute_pool_schedule_metadata(
     try:
         import deep_gemm
 
-        return deep_gemm.get_paged_mqa_logits_metadata(
+        return get_kpool_paged_mqa_logits_metadata(
             pool_seqlens_per_q.unsqueeze(-1),
             slots_per_page,
             deep_gemm.get_num_sms(),

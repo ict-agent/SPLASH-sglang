@@ -10,6 +10,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_nsa_index_kpool
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.kpool.paged_mqa_compat import (
+    get_kpool_paged_mqa_logits_metadata,
+    kpool_fp8_paged_mqa_logits,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.kpool.kernels import (
     INDEX_HEAD_DIM,
@@ -605,7 +609,7 @@ class IndexerKPool(Indexer):
         pool_block_tables = block_tables
 
         if pool_schedule_metadata is None:
-            pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            pool_schedule_metadata = get_kpool_paged_mqa_logits_metadata(
                 pool_seqlens.unsqueeze(-1), block_kv, self.sm_count
             )
 
@@ -661,7 +665,7 @@ class IndexerKPool(Indexer):
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * block_kv
-        logits = deep_gemm.fp8_paged_mqa_logits(
+        logits = kpool_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
             weights,
@@ -1099,7 +1103,7 @@ class IndexerKPool(Indexer):
         weights = weights.squeeze(2)
 
         pool_max_seq_len = plan.paged_page_table.shape[1] * block_kv
-        logits = deep_gemm.fp8_paged_mqa_logits(
+        logits = kpool_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache_fp8,
             weights,
