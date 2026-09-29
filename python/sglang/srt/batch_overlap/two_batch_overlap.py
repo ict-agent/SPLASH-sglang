@@ -393,21 +393,34 @@ class TboDPAttentionPreparer:
                 num_tokens = 0
             else:
                 num_tokens = local_batch.extend_num_tokens
-            self.local_tbo_split_seq_index = compute_split_seq_index(
-                forward_mode=local_batch.forward_mode,
-                num_tokens=num_tokens,
-                extend_lens=local_batch.extend_lens,
-                token_num_per_seq=token_num_per_seq,
-            )
-            resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
-            local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
-                (
-                    local_batch.forward_mode.is_extend()
-                    and not local_batch.forward_mode.is_target_verify()
+            if local_batch.forward_mode.is_mixed():
+                # Mixed chunked-prefill batches include both a long extend chunk
+                # and one-token decode rows. The current TBO child-batch split
+                # can corrupt the subsequent decode allocator state, so keep
+                # the overlap scheduler active but run these mixed batches as a
+                # single forward.
+                self.local_tbo_split_seq_index = None
+                local_can_run_tbo = False
+            else:
+                self.local_tbo_split_seq_index = compute_split_seq_index(
+                    forward_mode=local_batch.forward_mode,
+                    num_tokens=num_tokens,
+                    extend_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
                 )
-                and enable_a2a_moe
-                and (resolved_deepep_mode.is_low_latency())
-            )
+                resolved_deepep_mode = deepep_mode.resolve(
+                    local_batch.is_extend_in_batch
+                )
+                local_can_run_tbo = (
+                    self.local_tbo_split_seq_index is not None
+                ) and not (
+                    (
+                        local_batch.forward_mode.is_extend()
+                        and not local_batch.forward_mode.is_target_verify()
+                    )
+                    and enable_a2a_moe
+                    and (resolved_deepep_mode.is_low_latency())
+                )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
