@@ -62,7 +62,10 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import get_spec_v2_full_overlap_max_kv_len
 from sglang.srt.utils import is_cuda, is_hip
@@ -388,6 +391,10 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.mla_only_dp = bool(
+            getattr(model_runner.server_args, "mla_only_dp", False)
+            and is_dp_attention_enabled()
+        )
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -2603,6 +2610,13 @@ class NativeSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
                 and (forward_batch.hisparse_coordinator is None)
+                # Model dispatch forces absorbed MLA for this
+                # layout; metadata and kernel dispatch must agree.
+                and not (
+                    self.mla_only_dp
+                    and forward_batch.global_num_tokens_cpu is not None
+                    and forward_batch.global_dp_buffer_len is not None
+                )
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA

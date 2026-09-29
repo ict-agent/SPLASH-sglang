@@ -168,7 +168,7 @@ def get_topk_sigmoid_kernel(
                                 origin_var = origin_score_local[v]
                                 scores_local[v] = -T.infinity(T.float32)
 
-                    origin_var = T.shfl_sync(origin_var, win_lane_idx_var)
+                    origin_var = T.shfl_sync(origin_var, win_lane_idx_var, mask=0xFFFFFFFF)
 
                     if lane_idx == 0:
                         topk_ids_shared[warp_idx, k] = max_idx_var

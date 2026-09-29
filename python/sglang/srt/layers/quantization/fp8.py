@@ -674,11 +674,25 @@ class Fp8LinearMethod(LinearMethodBase):
         """Whether `apply(x=(fp8, scale))` will route through DeepGEMM directly
         without re-quantizing the input. Callers may then feed a `(fp8, scale)`
         tuple produced by an upstream fused kernel."""
+        import importlib.util
+
         from sglang.srt.layers.quantization.fp8_utils import (
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
+        try:
+            has_fused_swiglu_prequant = (
+                importlib.util.find_spec(
+                    "tile_kernels.quant.swiglu_forward_and_per_token_cast_kernel"
+                )
+                is not None
+            )
+        except ModuleNotFoundError:
+            has_fused_swiglu_prequant = False
+
         return (
+            has_fused_swiglu_prequant
+            and
             self.block_quant
             and self.w8a8_block_fp8_linear
             is deepgemm_w8a8_block_fp8_linear_with_fallback

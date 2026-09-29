@@ -610,6 +610,21 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+            if getattr(self_attn, "mla_only_dp", False) and get_bool_env_var(
+                "SGLANG_MLA_ONLY_DP_MOVE_MLA_BMM", "false"
+            ):
+                from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+                    _get_mla_only_dp_full_q_b_proj_weight,
+                    _get_mla_only_dp_full_mla_bmm_weights,
+                    _use_mla_only_dp_move_q_b_proj,
+                    _use_mla_only_dp_move_mla_bmm,
+                )
+
+                if _use_mla_only_dp_move_mla_bmm(self_attn, True, False):
+                    _get_mla_only_dp_full_mla_bmm_weights(self_attn)
+                if _use_mla_only_dp_move_q_b_proj(self_attn, True, False):
+                    _get_mla_only_dp_full_q_b_proj_weight(self_attn)
+
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
         """

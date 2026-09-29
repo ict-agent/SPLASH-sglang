@@ -216,7 +216,10 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
         self.allow_neg_eigval = config.linear_allow_neg_eigval
-        self.safe_gate = config.linear_attn_config.get("safe_gate", False)
+        self.safe_gate = config.linear_attn_config.get(
+            "safe_gate",
+            config.linear_attn_config.get("gate_lower_bound") is not None,
+        )
 
         # Attention is never quantized in Glm5Next; always fuse.
         self.do_fuse_qkvbfg = envs.SGLANG_GLM5_NEXT_FUSE_QKVBFG.get()
@@ -426,7 +429,9 @@ class Glm5NextLinearAttention(nn.Module):
             else KDA_DEFAULT_BETA_SCALE
         )
         self.attn.safe_gate = self.safe_gate
-        self.attn.safe_gate_lower_bound = KDA_SAFE_GATE_LOWER_BOUND
+        self.attn.safe_gate_lower_bound = config.linear_attn_config.get(
+            "gate_lower_bound", KDA_SAFE_GATE_LOWER_BOUND
+        )
 
         self._cp_fuse_symm_mem = envs.SGLANG_NSA_CP_FUSE_SYMM_MEM.get()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
@@ -1884,7 +1889,7 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, Glm5NextForCausalL
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
