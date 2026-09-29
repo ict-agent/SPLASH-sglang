@@ -76,6 +76,38 @@ logger = logging.getLogger(__name__)
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+
+
+def _resolve_mla_only_dp_size(
+    *,
+    tp_size: int,
+    dp_size: int,
+    attn_cp_size: int,
+) -> int:
+    if tp_size <= 1:
+        raise ValueError("--mla-only-dp requires --tp-size > 1.")
+    if attn_cp_size <= 0:
+        raise ValueError("--attn-cp-size must be positive.")
+    if tp_size % attn_cp_size != 0:
+        raise ValueError(
+            "--mla-only-dp requires tp_size to be divisible by attn_cp_size; "
+            f"got tp_size={tp_size}, attn_cp_size={attn_cp_size}."
+        )
+
+    inferred_dp_size = tp_size // attn_cp_size
+    if inferred_dp_size <= 1:
+        raise ValueError(
+            "--mla-only-dp leaves no data-parallel attention replica with the "
+            f"current topology (tp_size={tp_size}, attn_cp_size={attn_cp_size})."
+        )
+    if dp_size not in (1, inferred_dp_size):
+        raise ValueError(
+            "--mla-only-dp owns the attention-DP degree. Use the default "
+            f"dp_size=1 or set dp_size={inferred_dp_size}; got dp_size={dp_size}."
+        )
+    return inferred_dp_size
+
+
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -635,6 +667,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
+    mla_only_dp: bool = False
     enable_dp_lm_head: bool = False
     # GLM5-Next:lightweight KDA-TP that ONLY shards qkv_proj across
     # the full tp_group. AllGather hidden (A) + qkv_proj + AllToAll head→token
@@ -827,6 +860,10 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Configure MLA request-level attention DP before generic DP handling
+        # adjusts chunked prefill and validates dependent DP features.
+        self._handle_mla_only_dp()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -2799,18 +2836,62 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+    def _handle_mla_only_dp(self):
+        if not self.mla_only_dp:
+            return
+
+        if not self.use_mla_backend():
+            raise ValueError(
+                "--mla-only-dp is only supported for MLA-family models."
+            )
+
+        inferred_dp_size = _resolve_mla_only_dp_size(
+            tp_size=self.tp_size,
+            dp_size=self.dp_size,
+            attn_cp_size=self.attn_cp_size,
+        )
+
+        if self.dp_size == 1:
+            logger.info(
+                "--mla-only-dp: setting dp_size=%d from tp_size=%d and "
+                "attn_cp_size=%d.",
+                inferred_dp_size,
+                self.tp_size,
+                self.attn_cp_size,
+            )
+            self.dp_size = inferred_dp_size
+
+        self.enable_dp_attention = True
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
-            logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+            keep_mla_only_dp_prefill_schedule = (
+                self.mla_only_dp
+                and self.disaggregation_mode == "prefill"
+                and get_bool_env_var(
+                    "SGLANG_MLA_ONLY_DP_KEEP_SCHEDULE_CONSERVATIVENESS"
+                )
             )
+            if not keep_mla_only_dp_prefill_schedule:
+                self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            assert self.tp_size % self.dp_size == 0
+            if self.mla_only_dp and get_bool_env_var(
+                "SGLANG_MLA_ONLY_DP_KEEP_CHUNKED_PREFILL"
+            ):
+                logger.warning(
+                    "--mla-only-dp is keeping chunked prefill size at %d because "
+                    "SGLANG_MLA_ONLY_DP_KEEP_CHUNKED_PREFILL=1.",
+                    self.chunked_prefill_size,
+                )
+            else:
+                self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
+                logger.warning(
+                    f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                )
 
         if self.enable_dp_lm_head:
             assert (
@@ -5720,6 +5801,13 @@ class ServerArgs:
             "--enable-dp-attention",
             action="store_true",
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+        )
+        parser.add_argument(
+            "--mla-only-dp",
+            action="store_true",
+            help="Shortcut for MLA-family models that enables request-level DP "
+            "attention inside the TP group, inferring dp_size from "
+            "tp_size / attn_cp_size.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",

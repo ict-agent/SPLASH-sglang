@@ -344,6 +344,10 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
+            # A wildcard bind address is not a valid outbound HTTP target.
+            # Register through loopback while the bootstrap service keeps
+            # listening on the wildcard address for remote decode workers.
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -365,18 +369,29 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": self.server_args.load_balance_method,
         }
 
-        try:
-            response = requests.put(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                logger.debug("Prefill successfully registered to bootstrap server.")
-            else:
-                logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+        max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        for attempt in range(max_retries):
+            try:
+                response = requests.put(url, json=payload, timeout=5)
+                if response.status_code == 200:
+                    logger.debug("Prefill successfully registered to bootstrap server.")
+                    return
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: "
+                    f"status {response.status_code}, {response.text}"
                 )
-        except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
-            )
+            except Exception as e:
+                cause = e
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
+                logger.warning(
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
+                )
+            if attempt < max_retries - 1:
+                time.sleep(min(initial_delay * (2**attempt), max_delay))
+        logger.error(
+            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        )
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
