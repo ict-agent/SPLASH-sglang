@@ -114,6 +114,30 @@ SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
+
+def _resolve_mla_only_dp_size(
+    *,
+    tp_size: int,
+    dp_size: int,
+    attn_cp_size: int,
+) -> int:
+    if tp_size <= 1:
+        raise ValueError("--mla-only-dp requires --tp-size > 1.")
+    if attn_cp_size != 1:
+        raise ValueError(
+            "--mla-only-dp currently requires --attn-cp-size 1; combining its "
+            "TP-head/DP-token all-to-all with context parallelism is not yet "
+            f"implemented (got attn_cp_size={attn_cp_size})."
+        )
+
+    inferred_dp_size = tp_size
+    if dp_size not in (1, inferred_dp_size):
+        raise ValueError(
+            "--mla-only-dp owns the attention-DP degree. Use the default "
+            f"dp_size=1 or set dp_size={inferred_dp_size}; got dp_size={dp_size}."
+        )
+    return inferred_dp_size
+
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -1149,6 +1173,14 @@ class ServerArgs:
         bool,
         Arg(
             help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = False
+    mla_only_dp: A[
+        bool,
+        Arg(
+            help="Run MLA/DSA attention with DP-owned tokens and non-replicated KV cache while retaining TP-sharded projections. The attention boundary uses TP-head/DP-token all-to-all transfers. Currently requires dp_size == tp_size and attn_cp_size == 1.",
             resolvable=True,
         ),
         NS("parallel"),
@@ -3711,6 +3743,10 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Configure MLA request-level attention DP before the generic DP handler
+        # adjusts chunked prefill and validates dependent DP features.
+        self._handle_mla_only_dp()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -6650,6 +6686,41 @@ class ServerArgs:
             f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
             f"disable_cuda_graph=True"
         )
+
+    def _handle_mla_only_dp(self):
+        if not self.mla_only_dp:
+            return
+
+        from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+
+        model_config = self.get_model_config()
+        if model_config.attention_arch != AttentionArch.MLA and not is_deepseek_dsa(
+            model_config.hf_config
+        ):
+            raise ValueError(
+                "--mla-only-dp is only supported for MLA-family models, including "
+                "DeepSeek-style DSA models."
+            )
+
+        view = self._resolved()
+        inferred_dp_size = _resolve_mla_only_dp_size(
+            tp_size=self.tp_size,
+            dp_size=self.dp_size,
+            attn_cp_size=view.attn_cp_size,
+        )
+
+        if self.dp_size == 1:
+            logger.info(
+                "--mla-only-dp: setting dp_size=%d from tp_size=%d and "
+                "attn_cp_size=%d.",
+                inferred_dp_size,
+                self.tp_size,
+                view.attn_cp_size,
+            )
+            self.dp_size = inferred_dp_size
+
+        self.enable_dp_attention = True
+        self.enable_dp_attention_local_control_broadcast = True
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline

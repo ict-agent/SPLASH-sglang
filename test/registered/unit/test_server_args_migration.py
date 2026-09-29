@@ -7,7 +7,7 @@ translates field annotations into argparse arguments.
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, _resolve_mla_only_dp_size
 from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,6 +42,27 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 sa_long = self._parse([long, "4"])
                 self.assertEqual(getattr(sa_short, field), 4)
                 self.assertEqual(getattr(sa_long, field), 4)
+
+    def test_mla_only_dp_cli_flag(self):
+        sa = self._parse(["--mla-only-dp"])
+        self.assertTrue(sa.mla_only_dp)
+
+    def test_mla_only_dp_size_resolution(self):
+        self.assertEqual(
+            _resolve_mla_only_dp_size(tp_size=8, dp_size=1, attn_cp_size=1),
+            8,
+        )
+        self.assertEqual(
+            _resolve_mla_only_dp_size(tp_size=8, dp_size=8, attn_cp_size=1),
+            8,
+        )
+
+        with self.assertRaises(ValueError):
+            _resolve_mla_only_dp_size(tp_size=8, dp_size=2, attn_cp_size=1)
+        with self.assertRaises(ValueError):
+            _resolve_mla_only_dp_size(tp_size=8, dp_size=4, attn_cp_size=2)
+        with self.assertRaises(ValueError):
+            _resolve_mla_only_dp_size(tp_size=1, dp_size=1, attn_cp_size=1)
 
     def test_cli_name_differs_from_field_name(self):
         """cli_name maps a different CLI flag to the dataclass field via dest."""

@@ -82,6 +82,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     maybe_prefetch_next_full_attention_kv,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
@@ -1751,6 +1752,23 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
+        self.mla_only_dp = bool(
+            getattr(get_parallel(), "mla_only_dp", False)
+            and is_dp_attention_enabled()
+        )
+        if self.mla_only_dp and attn_tp_size != 1:
+            raise NotImplementedError(
+                "true --mla-only-dp currently supports tp_size == dp_size "
+                "(attention TP size 1). Partial attention TP needs an additional "
+                "head-layout redistribution between full-TP projection shards and "
+                "attention-TP head shards."
+            )
+        if self.mla_only_dp:
+            proj_tp_rank = get_parallel().tp_rank
+            proj_tp_size = get_parallel().tp_size
+        else:
+            proj_tp_rank = attn_tp_rank
+            proj_tp_size = attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -1763,7 +1781,9 @@ class DeepseekV2AttentionMLA(
             self.cp_size = get_parallel().attn_cp_size
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        assert num_heads % proj_tp_size == 0
+        self.num_local_heads = num_heads // proj_tp_size
+        self.mla_only_dp_attention_heads = num_heads // attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1789,8 +1809,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1799,8 +1819,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1852,8 +1872,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -1863,8 +1883,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1887,7 +1907,9 @@ class DeepseekV2AttentionMLA(
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.mla_only_dp_attention_heads
+            if self.mla_only_dp
+            else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -2016,6 +2038,13 @@ class DeepseekV2AttentionMLA(
             attention_backend = prefill_backend_str
         self.current_attention_backend = attention_backend
 
+        if (
+            self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        ):
+            return AttnForwardMethod.MLA
+
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         return resolve_rocm_forward_method(handler(self, forward_batch))
 
@@ -2068,6 +2097,11 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        mla_only_dp_sync = bool(
+            self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        )
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
@@ -2076,6 +2110,7 @@ class DeepseekV2AttentionMLA(
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
+                and not mla_only_dp_sync
             ):
                 assert (
                     not self.o_proj.reduce_results
@@ -2085,6 +2120,7 @@ class DeepseekV2AttentionMLA(
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
+                and not mla_only_dp_sync
             ):
                 assert (
                     not self.o_proj.reduce_results

@@ -26,7 +26,12 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dp_attention import dp_gather_replicate, dp_scatter
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.layers.mla_only_dp_transfer import (
+    dp_rows_to_tp_head_shard,
+    tp_two_head_shards_to_dp_rows,
+)
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -75,6 +80,46 @@ _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+
+def _use_true_mla_only_dp(
+    self: "DeepseekV2AttentionMLA", forward_batch: ForwardBatch
+) -> bool:
+    return bool(
+        getattr(self, "mla_only_dp", False)
+        and forward_batch.global_num_tokens_cpu is not None
+        and forward_batch.global_dp_buffer_len is not None
+    )
+
+
+def _dp_gather_rows_like(
+    local_rows: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Replicate owner-local DP rows in global token order on every TP rank."""
+    global_rows = local_rows.new_empty(
+        (forward_batch.global_dp_buffer_len, *local_rows.shape[1:])
+    )
+    dp_gather_replicate(
+        global_rows.flatten(1),
+        local_rows.contiguous().flatten(1),
+        forward_batch,
+    )
+    return global_rows
+
+
+def _dp_scatter_rows_like(
+    global_rows: torch.Tensor,
+    local_rows: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Select this DP rank's owner-local rows from a global token buffer."""
+    scattered = global_rows.new_empty((local_rows.shape[0], *global_rows.shape[1:]))
+    dp_scatter(
+        scattered.flatten(1),
+        global_rows.contiguous().flatten(1),
+        forward_batch,
+    )
+    return scattered
 
 
 @dataclass(frozen=True)
@@ -285,6 +330,12 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        mla_only_dp_state = _use_true_mla_only_dp(self, forward_batch)
+        if mla_only_dp_state and self.q_lora_rank is None:
+            raise NotImplementedError(
+                "true --mla-only-dp currently requires MLA q_lora_rank."
+            )
+
         # Q8KV8 q-prep/indexer overlap handshake (see the fork site below):
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.
@@ -292,6 +343,7 @@ class DeepseekMLAForwardMixin:
 
         fuse_bmm_attention = (
             self.q_lora_rank is not None
+            and not mla_only_dp_state
             and self._can_fuse_bmm_into_attention(forward_batch)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
@@ -343,6 +395,7 @@ class DeepseekMLAForwardMixin:
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
+                and not mla_only_dp_state
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
@@ -378,7 +431,12 @@ class DeepseekMLAForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    q_proj_input = (
+                        _dp_gather_rows_like(q, forward_batch)
+                        if mla_only_dp_state
+                        else q
+                    )
+                    q = self.q_b_proj_forward(q_proj_input)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -464,6 +522,7 @@ class DeepseekMLAForwardMixin:
         born_q_backend = None
         if (
             _ENABLE_DSA_Q8KV8_BORN_FP8_Q
+            and not mla_only_dp_state
             and fusion_plan is None
             and q_nope.dtype == torch.bfloat16
         ):
@@ -555,11 +614,25 @@ class DeepseekMLAForwardMixin:
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
             self.rotary_emb is not None
-            and not fuse_rope_for_trtllm_mla
+            and (mla_only_dp_state or not fuse_rope_for_trtllm_mla)
             # Already applied at the q-prep/indexer overlap fork.
             and not self._q8kv8_qprep_overlap_pending
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if mla_only_dp_state:
+                global_positions = _dp_gather_rows_like(
+                    positions.reshape(-1, 1), forward_batch
+                ).reshape(-1)
+                dummy_k_for_q = torch.empty_strided(
+                    q_pe.shape, q_pe.stride(), dtype=q_pe.dtype, device=q_pe.device
+                )
+                q_pe, _ = self.rotary_emb(global_positions, q_pe, dummy_k_for_q)
+                if k_pe.shape[0] > 0:
+                    dummy_q_for_k = torch.empty_strided(
+                        k_pe.shape, k_pe.stride(), dtype=k_pe.dtype, device=k_pe.device
+                    )
+                    _, k_pe = self.rotary_emb(positions, dummy_q_for_k, k_pe)
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if born_q_backend is not None:
             # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
@@ -593,6 +666,10 @@ class DeepseekMLAForwardMixin:
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        if mla_only_dp_state and (dsa_prefill_cp or mla_prefill_cp):
+            raise NotImplementedError(
+                "true --mla-only-dp does not yet support prefill context parallelism."
+            )
         defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
@@ -654,6 +731,7 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
             fusion_plan,
+            mla_only_dp_state,
         )
 
     def forward_absorb_core(
@@ -668,10 +746,38 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        mla_only_dp_state: bool = False,
     ):
         save_kv_cache = True
 
-        if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        if mla_only_dp_state:
+            local_q_nope, local_q_pe = tp_two_head_shards_to_dp_rows(
+                q_nope_out, q_pe, k_nope, forward_batch
+            )
+            if local_q_nope.shape[0] == 0:
+                attn_output = torch.empty_like(local_q_nope)
+            else:
+                attn_output = self.attn_mqa(
+                    local_q_nope,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=local_q_pe,
+                    k_rope=k_pe,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            attn_output = dp_rows_to_tp_head_shard(
+                attn_output.view(
+                    attn_output.shape[0], self.num_heads, self.kv_lora_rank
+                ),
+                forward_batch,
+                self.num_local_heads,
+            )
+        elif self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args = {
@@ -885,6 +991,8 @@ class DeepseekMLAForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         output, _ = self.o_proj(attn_bmm_output)
+        if mla_only_dp_state:
+            output = _dp_scatter_rows_like(output, k_nope, forward_batch)
 
         if self.next_skip_topk is None:
             return output

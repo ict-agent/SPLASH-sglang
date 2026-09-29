@@ -156,6 +156,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.transfer_tp_rank = getattr(scheduler, "attn_tp_rank", tp_rank)
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -191,7 +192,10 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
-        kv_args.engine_rank = self.tp_rank
+        # The disaggregation bootstrap server keys workers by attention TP rank.
+        # Under DP attention / MLA-DP, raw TP rank encodes the DP dimension and
+        # would not match the decode-side target rank.
+        kv_args.engine_rank = self.transfer_tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.kv_cache_dtype_str = (
@@ -309,7 +313,7 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [self.tp_rank]
+        dest_tp_ranks = [self.transfer_tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
