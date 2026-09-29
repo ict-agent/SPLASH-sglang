@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.shm_monitor import ShmUsage
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -67,6 +68,8 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_grammar_queue_reqs: int = 0
+    num_grammar_cache_entries: int = 0
+    grammar_backend_cache_bytes: int = 0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     decode_sum_seq_lens: int = 0
@@ -222,6 +225,21 @@ class SchedulerMetricsCollector:
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_grammar_cache_entries = Gauge(
+            name="sglang:num_grammar_cache_entries",
+            documentation="Entries in the per-rank grammar object cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.grammar_backend_cache_bytes = Gauge(
+            name="sglang:grammar_backend_cache_bytes",
+            documentation=(
+                "Bytes held by the xgrammar compiler caches "
+                "(grammar-level + rule-level)."
+            ),
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -437,6 +455,11 @@ class SchedulerMetricsCollector:
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_prealloc_failed_reqs = Counter(
+            name="sglang:num_prealloc_failed_reqs_total",
+            documentation="The number of prealloc failed requests.",
             labelnames=labels.keys(),
         )
         self.num_transfer_failed_reqs = Counter(
@@ -776,6 +799,39 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=tree_traversal_time_buckets,
         )
+        self.grammar_first_mask_fill_time = Histogram(
+            name="sglang:grammar_first_mask_fill_seconds",
+            documentation="Duration of a request's first grammar vocab-mask fill "
+            "(where the deferred cost of dynamic compilation lands).",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                5,
+            ],
+        )
+        self.num_grammar_overlap_hidden = Counter(
+            name="sglang:num_grammar_overlap_hidden_total",
+            documentation="Overlap-queued grammar requests whose compile finished "
+            "within the prealloc/transfer window.",
+            labelnames=labels.keys(),
+        )
+        self.num_grammar_overlap_exposed = Counter(
+            name="sglang:num_grammar_overlap_exposed_total",
+            documentation="Overlap-queued grammar requests that were held at batch "
+            "admission because the compile outlasted the transfer.",
+            labelnames=labels.keys(),
+        )
 
         # =================================================================
         # Execution
@@ -970,6 +1026,9 @@ class SchedulerMetricsCollector:
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
 
+    def increment_prealloc_failed_reqs(self) -> None:
+        self.num_prealloc_failed_reqs.labels(**self.labels).inc(1)
+
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
@@ -1116,6 +1175,10 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
+        self._log_gauge(self.num_grammar_cache_entries, stats.num_grammar_cache_entries)
+        self._log_gauge(
+            self.grammar_backend_cache_bytes, stats.grammar_backend_cache_bytes
+        )
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
@@ -1163,9 +1226,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
-        self._log_gauge(
-            self.pre_allocated_token_usage, stats.pre_allocated_token_usage
-        )
+        self._log_gauge(self.pre_allocated_token_usage, stats.pre_allocated_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1237,6 +1298,15 @@ class SchedulerMetricsCollector:
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
+    def observe_grammar_first_mask_fill(self, duration: float) -> None:
+        self._log_histogram(self.grammar_first_mask_fill_time, duration)
+
+    def increment_grammar_overlap(self, exposed: bool) -> None:
+        if exposed:
+            self.num_grammar_overlap_exposed.labels(**self.labels).inc(1)
+        else:
+            self.num_grammar_overlap_hidden.labels(**self.labels).inc(1)
+
     def emit_constants(
         self,
         max_total_num_tokens: int,
@@ -1273,9 +1343,34 @@ class TokenizerMetricsCollector:
         bucket_e2e_request_latency: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels or {}
+
+        self.shm_total_bytes = Gauge(
+            name="sglang:shm_total_bytes",
+            documentation="Total capacity of the /dev/shm filesystem in bytes.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.shm_used_bytes = Gauge(
+            name="sglang:shm_used_bytes",
+            documentation="Used capacity of the /dev/shm filesystem in bytes.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.shm_available_bytes = Gauge(
+            name="sglang:shm_available_bytes",
+            documentation="Available capacity of the /dev/shm filesystem in bytes.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.shm_usage_ratio = Gauge(
+            name="sglang:shm_usage_ratio",
+            documentation="Used ratio of the /dev/shm filesystem.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1505,6 +1600,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_e2e_request_latency,
         )
+
+    def update_shm_usage(self, usage: ShmUsage) -> None:
+        self.shm_total_bytes.labels(**self.labels).set(usage.total_bytes)
+        self.shm_used_bytes.labels(**self.labels).set(usage.used_bytes)
+        self.shm_available_bytes.labels(**self.labels).set(usage.available_bytes)
+        self.shm_usage_ratio.labels(**self.labels).set(usage.usage_ratio)
 
     def observe_one_finished_request(
         self,
@@ -1906,6 +2007,13 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.pending_requests = Gauge(
+            name="sglang:encoder_pending_requests",
+            documentation="Current number of requests holding the ViT semaphore "
+            "permit (preprocessing or waiting for the ViT forward).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.cache_hit_tokens_total = Counter(
             name="sglang:encoder_cache_hit_tokens_total",
             documentation="Total tokens served from cache (cache hits).",
@@ -1940,6 +2048,35 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
             name="sglang:encoder_requests_received_total",
             documentation="Total requests received by encoder (at receive time), per DP rank.",
             labelnames=list(labels.keys()) + ["modality"],
+        )
+
+        # RDMA write failures (mooncake register or transfer_sync != 0).
+        # Without this, a failed transfer is counted as a successful one with
+        # full byte count -- the remote-access-error storm signature would be
+        # invisible in monitoring.
+        self.rdma_write_failures_total = Counter(
+            name="sglang:encoder_rdma_write_failures_total",
+            documentation="Total mooncake RDMA write failures "
+            "(register != 0 or transfer_sync != 0), by stage.",
+            labelnames=list(labels.keys()) + ["stage"],
+        )
+
+        # Embeddings reclaimed by the orphan sweeper (encoded but no /send
+        # within TTL) -- each reclaim is a potentially lost part.
+        self.embeddings_reclaimed_total = Counter(
+            name="sglang:encoder_embeddings_reclaimed_total",
+            documentation="Total embeddings reclaimed by the orphan sweeper "
+            "(no /send within TTL).",
+            labelnames=list(labels.keys()),
+        )
+
+        # /send (or decode-role push) rejected with 410/NOT_FOUND because the
+        # embedding was already reclaimed.
+        self.send_reclaimed_total = Counter(
+            name="sglang:encoder_send_reclaimed_total",
+            documentation="Total /send requests rejected (410/NOT_FOUND) because "
+            "the embedding was already reclaimed.",
+            labelnames=list(labels.keys()),
         )
 
         # Multimodal items per batch histogram
@@ -2087,6 +2224,9 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         self.cache_size_mb.labels(**self.labels).set(current_size / (1024 * 1024))
         self.cache_entries.labels(**self.labels).set(num_entries)
 
+    def set_pending_requests(self, count: int) -> None:
+        self.pending_requests.labels(**self.labels).set(count)
+
     def observe_queue_wait(
         self, latency_seconds: float, modality: str = "image"
     ) -> None:
@@ -2139,6 +2279,18 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         dp_rank is supplied via self.labels (set per process at construction).
         """
         self.requests_received_total.labels(**self.labels, modality=modality).inc()
+
+    def inc_rdma_write_failures(self, stage: str) -> None:
+        """Increment the RDMA write-failure counter. stage: 'register'|'transfer'."""
+        self.rdma_write_failures_total.labels(**self.labels, stage=stage).inc()
+
+    def inc_embeddings_reclaimed(self) -> None:
+        """Increment when the orphan sweeper reclaims an unclaimed embedding."""
+        self.embeddings_reclaimed_total.labels(**self.labels).inc()
+
+    def inc_send_reclaimed(self) -> None:
+        """Increment when /send is rejected (410/NOT_FOUND) as already reclaimed."""
+        self.send_reclaimed_total.labels(**self.labels).inc()
 
     def observe_request_e2e_latency(
         self, latency_seconds: float, modality: str = "image"

@@ -50,6 +50,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    use_mla_dp_min_one_padding,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -345,6 +346,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
     topk_indices: Optional[torch.Tensor] = None
     reuse_mtp_topk_indices: Optional[bool] = False
+    # True when an incoming PD MTP seed was remapped to this worker's physical
+    # KV slots. This distinguishes it from a logical wire seed.
+    mtp_topk_indices_are_physical: Optional[bool] = None
     # For NSA MTP index share: when True, deepseek_nextn writes the freshly
     # computed topk_indices back to forward_batch.topk_indices so eagle_worker
     # can extract per-request seed indices for the next draft iteration.
@@ -577,6 +581,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
+            mtp_topk_indices_are_physical=getattr(
+                batch.spec_info, "mtp_topk_indices_are_physical", None
+            ),
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
@@ -1023,7 +1030,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
+            lifted_zero_rank = False
         else:
+            # RCCL cannot keep collective sequences symmetric when a rank
+            # contributes zero rows, so lift zeros to one: every rank then
+            # joins each collective with >=1 row and its idle batch is padded
+            # below exactly like a MAX_LEN padded row (num_token_non_padded
+            # marks the pad row for the backends).
+            lifted_zero_rank = False
+            if use_mla_dp_min_one_padding() and any(c == 0 for c in global_num_tokens):
+                lifted_zero_rank = True
+                global_num_tokens = [
+                    c if c > 0 else 1 for c in global_num_tokens
+                ]
+                if self.global_num_tokens_for_logprob_cpu is not None:
+                    self.global_num_tokens_for_logprob_cpu = [
+                        c if c > 0 else 1
+                        for c in self.global_num_tokens_for_logprob_cpu
+                    ]
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
@@ -1045,7 +1069,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if self.is_extend_in_batch and (
+                dp_padding_mode.is_max_len()
+                # A lifted idle rank carries one padded token and must run the
+                # same extend code path as a MAX_LEN padded row.
+                or (lifted_zero_rank and num_tokens > 0)
+            ):
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs

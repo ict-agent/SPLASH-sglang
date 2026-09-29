@@ -439,6 +439,8 @@ def causal_conv1d_fn(
         activation = "silu"
 
     out = torch.empty_like(x)
+    if len(seq_lens_cpu) == 0:
+        return out
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape

@@ -1,10 +1,11 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -16,8 +17,109 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_dcu, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+
+def should_remap_pd_nsa_seed_to_local_slots(
+    server_args: "ServerArgs", model_config=None
+) -> bool:
+    """Whether a PD IndexShare seed can be localized for fused TopK.
+
+    Prefill transfers request-relative positions.  A decode worker can safely
+    turn those positions into its own allocator slots only when it owns the
+    complete, non-CP page table and does not need a HiSparse page swap.
+    """
+    dcu_glm5_no_kpool = (
+        is_dcu()
+        and getattr(model_config, "hf_config", None) is not None
+        and getattr(model_config.hf_config, "model_type", None) == "glm5_next"
+        and getattr(model_config, "nsa_index_kpool", 1) <= 1
+    )
+    return (
+        (is_cuda() or is_dcu())
+        and envs.SGLANG_NSA_FUSE_TOPK.get()
+        and server_args.disaggregation_mode == "decode"
+        and not server_args.enable_hisparse
+        and server_args.attn_cp_size == 1
+        and not dcu_glm5_no_kpool
+    )
+
+
+def should_use_nsa_fused_topk(
+    server_args: "ServerArgs",
+    seed_nsa_topk_from_draft_extend: bool,
+    model_config=None,
+) -> bool:
+    """Choose the index domain emitted by an NSA backend.
+
+    The draft-extend backend on a PD prefill worker must emit logical
+    request-relative positions for the wire.  On decode, those positions are
+    remapped once at batch assembly, so the draft and target backends may use
+    physical fused-TopK indices thereafter.
+    """
+    pd_index_share_seed = (
+        seed_nsa_topk_from_draft_extend and server_args.disaggregation_mode != "null"
+    )
+    return envs.SGLANG_NSA_FUSE_TOPK.get() and (
+        not pd_index_share_seed
+        or should_remap_pd_nsa_seed_to_local_slots(server_args, model_config)
+    )
+
+
+def remap_pd_nsa_seed_to_local_slots(
+    relative_positions: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Map request-relative PD seeds to decode-local physical KV slots.
+
+    ``-1`` is the wire sentinel.  Any malformed active row invalidates the
+    complete batch seed so callers can fall back to recomputing TopK instead
+    of accidentally consuming allocator padding slot 0.
+    """
+    if relative_positions.ndim != 2 or req_pool_indices.ndim != 1:
+        return None
+    if relative_positions.shape[0] != req_pool_indices.shape[0]:
+        return None
+    if seq_lens.shape[0] != req_pool_indices.shape[0]:
+        return None
+    table_width = req_to_token.shape[1]
+    if table_width == 0:
+        return None
+
+    # Reuse the existing batched Triton page-table transform so PD remap and
+    # the regular unfused attention path share exactly the same logical→slot
+    # semantics (including the int32 output contract).
+    valid_positions = relative_positions >= 0
+    gather_positions = relative_positions.clamp(min=0, max=table_width - 1).to(
+        torch.int64
+    )
+    from sglang.srt.layers.attention.nsa.transform_index import (
+        transform_index_page_table_decode,
+    )
+
+    local_page_table = req_to_token.index_select(
+        0, req_pool_indices.to(dtype=torch.int64)
+    )
+    local_slots = transform_index_page_table_decode(
+        page_table=local_page_table,
+        topk_indices=gather_positions.to(dtype=torch.int32),
+        page_size=1,
+    )
+    invalid_rows = torch.any(
+        (relative_positions < -1)
+        | (relative_positions >= seq_lens[:, None])
+        | (relative_positions >= table_width)
+        | (valid_positions & (local_slots <= 0)),
+        dim=1,
+    )
+    local_slots.masked_fill_(~valid_positions, -1)
+    local_slots.masked_fill_(invalid_rows[:, None], -1)
+    if torch.any(torch.all(local_slots < 0, dim=1)).item():
+        return None
+    return local_slots
 
 
 @lru_cache(maxsize=1)
@@ -60,6 +162,7 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.server_args import ServerArgs
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int, index_kpool: int = 1):

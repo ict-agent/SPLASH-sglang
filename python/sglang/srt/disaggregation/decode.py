@@ -21,8 +21,10 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
+from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -65,8 +67,8 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
-    HybridReqToTokenPool,
     HybridLinearKVPool,
+    HybridReqToTokenPool,
     KVCache,
     ReqToTokenPool,
 )
@@ -87,6 +89,22 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+
+def get_decode_prealloc_size(max_num_reqs: int) -> int:
+    pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+    return max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
+
+
+def get_decode_mamba_pool_size(
+    size: int,
+    pre_alloc_size: int,
+    enable_mamba_extra_buffer: bool,
+    enable_overlap_schedule: bool,
+) -> int:
+    ping_pong_slots = 2 if enable_overlap_schedule else 1
+    slots_per_req = 1 + (ping_pong_slots if enable_mamba_extra_buffer else 0)
+    return (size + pre_alloc_size) * slots_per_req
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -193,6 +211,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
+        enable_kda_replayssm_spec: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -206,26 +225,25 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
-        # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
-        slots_per_req = 1 + (
-            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
+        required_mamba_size = get_decode_mamba_pool_size(
+            size=size,
+            pre_alloc_size=pre_alloc_size,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            enable_overlap_schedule=enable_overlap_schedule,
         )
-        max_slots_needed = (size + pre_alloc_size) * slots_per_req
-        if mamba_size is not None:
-            effective_mamba_size = max(mamba_size, max_slots_needed)
-            if mamba_size < max_slots_needed:
-                logger.warning(
-                    "mamba_size (%d) is less than decode side's max_slots_needed (%d = %d reqs * %d slots/req), "
-                    "raising effective_mamba_size to %d",
-                    mamba_size,
-                    max_slots_needed,
-                    size + pre_alloc_size,
-                    slots_per_req,
-                    effective_mamba_size,
-                )
-        else:
-            effective_mamba_size = max_slots_needed
+        if (
+            enable_kda_replayssm_spec
+            and mamba_size is not None
+            and mamba_size < required_mamba_size
+        ):
+            raise ValueError(
+                "The profiled Mamba pool is smaller than the PD decode requirement: "
+                f"{mamba_size=} {required_mamba_size=}."
+            )
+        effective_mamba_size = max(
+            required_mamba_size,
+            mamba_size if mamba_size is not None else 0,
+        )
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
@@ -239,6 +257,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_kda_replayssm_spec=enable_kda_replayssm_spec,
         )
 
     def clear(self):
@@ -252,6 +271,7 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    timeout_cancel_issued: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -294,10 +314,7 @@ class DecodePreallocQueue:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.is_hybrid_mla_backend = is_hybrid_mla_backend(self.token_to_kv_pool)
-        if (
-            self.is_hybrid_mla_backend
-            and transfer_backend != TransferBackend.MOONCAKE
-        ):
+        if self.is_hybrid_mla_backend and transfer_backend != TransferBackend.MOONCAKE:
             # Hybrid state-aware rank fan-in is currently implemented by
             # Mooncake only. Preserve the existing behavior for other backends.
             self.is_mla_backend = True
@@ -325,9 +342,7 @@ class DecodePreallocQueue:
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.enable_staging and (
-            self.is_mla_backend or self.is_hybrid_mla_backend
-        ):
+        if self.enable_staging and (self.is_mla_backend or self.is_hybrid_mla_backend):
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -348,10 +363,13 @@ class DecodePreallocQueue:
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
+        token_to_kv_pool = getattr(self, "token_to_kv_pool", None)
+        token_to_kv_pool_allocator = getattr(self, "token_to_kv_pool_allocator", None)
         return (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
-            and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+            isinstance(token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            and token_to_kv_pool_allocator is not None
+            and token_to_kv_pool_allocator.page_size > 1
+            and hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
     def _swa_tail_len(self, seq_len: int) -> int:
@@ -639,12 +657,37 @@ class DecodePreallocQueue:
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
+        # Bootstrap timeout: if a request has been stuck in Bootstrapping for too long, treat it as failed.
+        bootstrap_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", "600")
+        )
+        now = time.perf_counter()
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Bootstrapping:
-                pass
+                # Check for bootstrap timeout.
+                entry_time = getattr(
+                    decode_req.req.time_stats,
+                    "decode_prealloc_queue_entry_time",
+                    None,
+                )
+                if entry_time is not None and (now - entry_time) > bootstrap_timeout:
+                    error_message = (
+                        f"Decode bootstrap timed out after {now - entry_time:.1f}s "
+                        f"for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
@@ -699,7 +742,8 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    if decode_req.kv_receiver is not None:
+                        decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -762,6 +806,93 @@ class DecodePreallocQueue:
         preallocated_reqs = []
         indices_to_remove = set()
 
+        # Enforce decode prealloc timeout independently from bootstrap. Once a
+        # request reaches WaitingForInput, bootstrap has completed; the remaining
+        # time in this queue is waiting for KV/staging resources before transfer.
+        prealloc_timeout = float(
+            os.environ.get("SGLANG_DISAGGREGATION_PREALLOC_TIMEOUT", "0")
+        )
+        now = time.perf_counter()
+
+        # Sort by priority before any index-based bookkeeping so that both the
+        # abort-scan loop and the preallocation loop operate on the same order.
+        if getattr(self.scheduler, "enable_priority_scheduling", False):
+            priority_sign = (
+                1 if self.scheduler.schedule_low_priority_values_first else -1
+            )
+            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
+
+        # First, remove all failed requests from the queue
+        for i, decode_req in enumerate(self.queue):
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
+
+            # Measure prealloc queue residence from queue entry so requests that
+            # never obtain resources are eventually aborted instead of staying in
+            # WaitingForInput indefinitely.
+            if prealloc_timeout > 0:
+                req_time_stats = getattr(decode_req.req, "time_stats", None)
+                entry_time = getattr(
+                    req_time_stats, "decode_prealloc_queue_entry_time", None
+                )
+                if entry_time is not None and (now - entry_time) > prealloc_timeout:
+                    error_message = (
+                        f"Decode prealloc timed out after {now - entry_time:.1f}s "
+                        f"(timeout={prealloc_timeout:.1f}s, "
+                        f"waiting_for_input={decode_req.waiting_for_input}) "
+                        f"for request rank={self.tp_rank} "
+                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_prealloc_failed_reqs()
+
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+        # DecodeRequest objects on the slow bootstrap path are shared between
+        # queue and pending_reqs. Keep both containers in sync when cleanup
+        # clears the receiver and removes a failed request from queue. Compare
+        # by identity because receiver equality may involve tensors.
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
+            for decode_req in failed_reqs:
+                if decode_req.kv_receiver is not None and hasattr(
+                    decode_req.kv_receiver, "clear"
+                ):
+                    decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+
+            self.queue = [
+                entry
+                for i, entry in enumerate(self.queue)
+                if i not in indices_to_remove
+            ]
+            indices_to_remove.clear()
+            if not self.queue:
+                return preallocated_reqs, failed_reqs
+
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
@@ -787,25 +918,6 @@ class DecodePreallocQueue:
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
-
-        # Sort by priority before any index-based bookkeeping so that both the
-        # abort-scan loop and the preallocation loop operate on the same order.
-        if self.scheduler.enable_priority_scheduling:
-            priority_sign = (
-                1 if self.scheduler.schedule_low_priority_values_first else -1
-            )
-            self.queue.sort(key=lambda r: r.req.priority * priority_sign)
-
-        # First, remove all failed requests from the queue
-        for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
-                continue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
-                )
-                failed_reqs.append(decode_req)
-                indices_to_remove.add(i)
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs padded_buffer_size from hisparse device pool.
@@ -931,23 +1043,13 @@ class DecodePreallocQueue:
             decode_req.req.cache_protected_len = prefix_len
 
             if self.scheduler.enable_hisparse:
-                # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
-                    .cpu()
-                    .numpy()
-                    .astype(np.int32)
-                )
+                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
                 page_size = 1  # host pool page_size
             else:
                 # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = (
-                    self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                        prefix_len:origin_input_len
-                    ]
-                    .cpu()
-                    .numpy()
-                )
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx
+                ][prefix_len:origin_input_len]
                 page_size = self.token_to_kv_pool_allocator.page_size
 
             # Build state_indices in component order, matching
@@ -981,7 +1083,8 @@ class DecodePreallocQueue:
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
+            page_indices = kv_to_page_indices(kv_indices, page_size).astype(np.int32)
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -1031,10 +1134,14 @@ class DecodePreallocQueue:
         return need_space_for_single_req
 
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        running_reqs = getattr(running_batch, "reqs", [])
+        transfer_queue = getattr(getattr(self, "transfer_queue", None), "queue", [])
+        waiting_queue = getattr(self.scheduler, "waiting_queue", [])
         return (
-            len(self.scheduler.running_batch.reqs)
-            + len(self.transfer_queue.queue)
-            + len(self.scheduler.waiting_queue)
+            len(running_reqs)
+            + len(transfer_queue)
+            + len(waiting_queue)
             + extra_reserved_reqs
         )
 
@@ -1493,10 +1600,76 @@ class DecodeTransferQueue:
                 [dr.kv_receiver for dr in self.queue], self.gloo_group
             )
 
+        transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
+        now = time.perf_counter()
+
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+
+            if not hasattr(decode_req, "timeout_cancel_issued"):
+                decode_req.timeout_cancel_issued = False
+            req_time_stats = getattr(decode_req.req, "time_stats", None)
+            entry_time = getattr(
+                req_time_stats, "decode_transfer_queue_entry_time", None
+            )
+
+            if (
+                not decode_req.timeout_cancel_issued
+                and entry_time is not None
+                and now - entry_time >= transfer_timeout
+            ):
+                error_message = (
+                    f"Decode transfer timed out after {now - entry_time:.1f}s and issued cancel transfer to prefill "
+                    f"for request rank={self.tp_rank} "
+                    f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                )
+                logger.error(error_message)
+                decode_req.kv_receiver.cancel_transfer()
+                decode_req.timeout_cancel_issued = True
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                continue
+            if poll == KVPoll.StoppedSafe and not decode_req.timeout_cancel_issued:
+                # A peer rank may have issued the cancel that stopped prefill.
+                # Adopt that terminal state locally so all ranks discard the
+                # request instead of treating StoppedSafe as an unknown poll.
+                decode_req.timeout_cancel_issued = True
+                prepare_abort(
+                    decode_req.req,
+                    f"Decode transfer stopped safely by prefill after a peer-rank cancel "
+                    f"rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}",
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+            if decode_req.timeout_cancel_issued and poll in [
+                KVPoll.Failed,
+                KVPoll.Success,
+                KVPoll.StoppedSafe,
+            ]:
+                finished_reason = (
+                    decode_req.req.finished_reason
+                    if decode_req.req.finished_reason
+                    else f"Decode transfer finished since cancel transfer issued {decode_req.req.bootstrap_room=}"
+                )
+                logger.info(f"{finished_reason}, and poll status is {poll}")
+
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                if decode_req.kv_receiver is not None and hasattr(
+                    decode_req.kv_receiver, "clear"
+                ):
+                    decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                indices_to_remove.add(i)
                 continue
 
             if poll == KVPoll.Failed:
@@ -1516,8 +1689,12 @@ class DecodeTransferQueue:
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if decode_req.kv_receiver is not None and hasattr(
+                    decode_req.kv_receiver, "clear"
+                ):
+                    decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1526,7 +1703,6 @@ class DecodeTransferQueue:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
-                    # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
@@ -1560,6 +1736,10 @@ class DecodeTransferQueue:
                 )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
+            # Reset so the next owner sees actual_room == 0 ("not yet written")
+            # instead of the stale value, avoiding a false-positive mismatch.
+            if hasattr(self, "metadata_buffers"):
+                self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -1710,7 +1890,10 @@ class SchedulerDisaggregationDecodeMixin:
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+                # GLM NOTE: overlap-queued requests already entered the disagg
+                # pipeline at arrival; re-adding would duplicate prealloc entries.
+                if not req.grammar_overlap_queued:
+                    self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
             return None
@@ -1730,8 +1913,31 @@ class SchedulerDisaggregationDecodeMixin:
 
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
+            if req.grammar_overlap_queued:
+                if req.finished():
+                    # Grammar compile failed or timed out (the future may stay
+                    # cancelled, so check finished first); notify the client and
+                    # release its transferred KV like abort_request does for
+                    # decode waiting-queue requests.
+                    self.stream_output([req], req.return_logprob)
+                    release_kv_cache(req, self.tree_cache)
+                    continue
+                if isinstance(req.grammar, futures.Future):
+                    # GLM NOTE: KV transfer finished before the grammar compile;
+                    # hold the request until grammar_manager resolves the future.
+                    # Resolution is all_gather-synced, so every rank skips the
+                    # same requests and batch composition stays identical.
+                    req.grammar_overlap_exposed = True
+                    waiting_queue.append(req)
+                    continue
+                if self.enable_metrics:
+                    self.metrics_collector.increment_grammar_overlap(
+                        exposed=req.grammar_overlap_exposed
+                    )
+                # Count once per request: admission clears the overlap mark.
+                req.grammar_overlap_queued = False
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # Decode-radix path: do NOT re-match prefix here.
                 # `pop_preallocated` already took a tree snapshot and used it

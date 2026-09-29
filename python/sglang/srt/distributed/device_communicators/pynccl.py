@@ -201,6 +201,13 @@ class PyNcclCommunicator:
             self.nccl.ncclGroupStart()
             for root, split_size in enumerate(sizes):
                 dst_slice = output_tensor[split_offset : split_offset + split_size]
+                split_offset += split_size
+                # `sizes` is identical on every rank, so all ranks skip the
+                # same zero-count entries and the collective sequence stays
+                # consistent. RCCL (DCU) can wedge on count=0 broadcast
+                # inside a group, so never enqueue those.
+                if split_size == 0:
+                    continue
                 self.nccl.ncclBroadcast(
                     buffer_type(input_tensor.data_ptr()),
                     buffer_type(dst_slice.data_ptr()),
@@ -210,7 +217,6 @@ class PyNcclCommunicator:
                     self.comm,
                     cudaStream_t(stream.cuda_stream),
                 )
-                split_offset += split_size
             self.nccl.ncclGroupEnd()
         else:
             self.nccl.ncclAllGather(
@@ -272,6 +278,11 @@ class PyNcclCommunicator:
             self.nccl.ncclGroupStart()
             for root, split_size in enumerate(sizes):
                 chunk = input_tensor[split_offset : split_offset + split_size, ...]
+                split_offset += split_size
+                # See all_gather: skip zero-count entries consistently on
+                # every rank; RCCL count=0 reduce inside a group can wedge.
+                if split_size == 0:
+                    continue
 
                 self.nccl.ncclReduce(
                     buffer_type(chunk.data_ptr()),
@@ -283,7 +294,6 @@ class PyNcclCommunicator:
                     self.comm,
                     cudaStream_t(stream.cuda_stream),
                 )
-                split_offset += split_size
             self.nccl.ncclGroupEnd()
         else:
             self.nccl.ncclReduceScatter(

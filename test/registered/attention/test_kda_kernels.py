@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
+from sglang.srt.layers.attention.fla.kda_replayssm_spec_decode import (
+    commit_kda_replayssm_spec_all_layers,
+)
 from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -143,6 +146,209 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
             torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
         )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA or ROCm")
+class TestKDAReplaySSMSpecVerify(unittest.TestCase):
+    def test_fused_input_staging_and_accepted_prefix_commit(self):
+        torch.manual_seed(7)
+        device = get_device()
+        layers, batch, spec_len = 2, 2, 4
+        value_heads, key_heads, dim = 2, 1, 64
+        slots = 4
+        slot_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
+        query_start_loc = torch.arange(
+            0,
+            (batch + 1) * spec_len,
+            spec_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        checkpoint = (
+            torch.randn(
+                layers,
+                slots,
+                value_heads,
+                dim,
+                dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.02
+        )
+        reference = checkpoint.clone()
+        rawv_cache = torch.zeros(
+            layers,
+            slots,
+            value_heads,
+            spec_len,
+            dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        rawk_cache = torch.zeros(
+            layers,
+            slots,
+            key_heads,
+            spec_len,
+            dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        g_cache = torch.zeros(
+            layers,
+            slots,
+            value_heads,
+            spec_len,
+            dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        beta_cache = torch.zeros(
+            layers,
+            slots,
+            value_heads,
+            spec_len,
+            dtype=torch.float32,
+            device=device,
+        )
+        A_log = torch.full(
+            (value_heads,), -1.5, dtype=torch.float32, device=device
+        )
+        dt_bias = torch.randn(
+            value_heads * dim, dtype=torch.bfloat16, device=device
+        )
+        accepted_by_step = ([3, 2], [1, 4], [2, 3])
+
+        for step, accepted_values in enumerate(accepted_by_step):
+            accepted = torch.tensor(
+                accepted_values, dtype=torch.int32, device=device
+            )
+            track_indices = None
+            track_steps = None
+            expected_track = None
+            for layer_idx in range(layers):
+                total = batch * spec_len
+                q = torch.randn(
+                    1, total, key_heads, dim, dtype=torch.bfloat16, device=device
+                )
+                k = torch.randn_like(q)
+                v = torch.randn(
+                    1,
+                    total,
+                    value_heads,
+                    dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                a = torch.randn(
+                    1,
+                    total,
+                    value_heads * dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                beta = torch.randn(
+                    1, total, value_heads, dtype=torch.bfloat16, device=device
+                )
+                intermediate = torch.empty(
+                    batch,
+                    spec_len,
+                    value_heads,
+                    dim,
+                    dim,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                reference_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=beta,
+                    initial_state_source=reference[layer_idx],
+                    initial_state_indices=slot_indices,
+                    scale=dim**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=query_start_loc,
+                    is_kda=True,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate,
+                    intermediate_state_indices=torch.arange(
+                        batch, dtype=torch.int32, device=device
+                    ),
+                    cache_steps=spec_len,
+                    beta_scale=2.0,
+                    lower_bound=-5.0,
+                )
+                replay_out = fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=q,
+                    k=k,
+                    v=v,
+                    b=beta,
+                    initial_state_source=checkpoint[layer_idx],
+                    initial_state_indices=slot_indices,
+                    scale=dim**-0.5,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=query_start_loc,
+                    is_kda=True,
+                    disable_state_update=True,
+                    beta_scale=2.0,
+                    lower_bound=-5.0,
+                    cache_replayssm_inputs=True,
+                    replayssm_rawv=rawv_cache[layer_idx],
+                    replayssm_rawk=rawk_cache[layer_idx],
+                    replayssm_g=g_cache[layer_idx],
+                    replayssm_beta=beta_cache[layer_idx],
+                )
+                torch.testing.assert_close(replay_out, reference_out, rtol=0, atol=0)
+
+                if step == 0:
+                    if expected_track is None:
+                        expected_track = torch.empty_like(checkpoint[:, 3])
+                    expected_track[layer_idx].copy_(intermediate[0, 1])
+                for row, slot in enumerate(slot_indices.tolist()):
+                    reference[layer_idx, slot].copy_(
+                        intermediate[row, accepted_values[row] - 1]
+                    )
+
+            if step == 0:
+                track_indices = torch.tensor([3, -1], device=device)
+                track_steps = torch.tensor([1, -1], device=device)
+            commit_kda_replayssm_spec_all_layers(
+                checkpoint_state=checkpoint,
+                rawv_cache=rawv_cache,
+                rawk_cache=rawk_cache,
+                g_cache=g_cache,
+                beta_cache=beta_cache,
+                ssm_state_indices=slot_indices,
+                accept_lens=accepted,
+                mamba_track_indices=track_indices,
+                mamba_steps_to_track=track_steps,
+            )
+            torch.testing.assert_close(
+                checkpoint[:, slot_indices],
+                reference[:, slot_indices],
+                rtol=0,
+                atol=0,
+            )
+            if expected_track is not None:
+                torch.testing.assert_close(
+                    checkpoint[:, 3], expected_track, rtol=0, atol=0
+                )
+
+        self.assertEqual(rawv_cache.shape[-2], spec_len)
+        self.assertEqual(rawk_cache.dtype, torch.bfloat16)
+        self.assertEqual(g_cache.dtype, torch.float32)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

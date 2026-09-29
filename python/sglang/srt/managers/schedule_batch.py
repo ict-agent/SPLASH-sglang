@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    flatten_arrays_to_int64_tensor,
+    is_pin_memory_available,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,11 +43,11 @@ import copy
 import dataclasses
 import logging
 import re
+from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
-from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -285,6 +289,9 @@ class MultimodalDataItem:
         """
         if self.pad_value is not None:
             return
+        if self.hash is not None:
+            self.pad_value = _compute_pad_value(self.hash)
+            return
 
         from sglang.srt.managers.mm_utils import hash_feature
 
@@ -294,12 +301,11 @@ class MultimodalDataItem:
             self.hash = uuid.uuid4().int
             self.pad_value = _compute_pad_value(self.hash)
             return
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+        if self.feature is not None:
+            hashed_feature = self.feature
+        else:
+            hashed_feature = self.precomputed_embeddings
+        self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
 
@@ -472,7 +478,19 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+        # Items whose hash was already provided (e.g. propagated from the EPD
+        # encoder) need no feature hashing here, so they don't have to be moved
+        # to the GPU staging buffer either.
+        items_requiring_hash = (
+            []
+            if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+            else [
+                item
+                for item in ret.mm_items
+                if item.pad_value is None and item.hash is None
+            ]
+        )
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0 and items_requiring_hash:
             # Multi-modal feature hashing optimization:
             # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
             # for faster hash computation, while avoiding OOM issues.
@@ -487,7 +505,7 @@ class MultimodalInputs:
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
+            for item in items_requiring_hash:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
@@ -583,14 +601,14 @@ class Req(ReqDllmMixin):
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: List[int],
+        origin_input_ids: array[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
-        origin_input_ids_unpadded: Optional[Tuple[int]] = None,
+        origin_input_ids_unpadded: Optional[array[int]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
         positional_embed_overrides: Optional[PositionalEmbeds] = None,
@@ -632,9 +650,10 @@ class Req(ReqDllmMixin):
         )
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
-        self.output_ids = []
+        self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = []
+        self.fill_ids = array("q")
+
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
@@ -853,6 +872,12 @@ class Req(ReqDllmMixin):
             None
         )
         self.grammar_wait_ct = 0
+        # GLM NOTE: True when a disagg-decode request entered the prealloc
+        # pipeline while its grammar future is still compiling (overlap mode).
+        self.grammar_overlap_queued = False
+        # True if batch admission ever held this request because its grammar
+        # compile outlasted the KV transfer.
+        self.grammar_overlap_exposed = False
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -947,7 +972,7 @@ class Req(ReqDllmMixin):
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
-    def output_ids_through_stop(self) -> List[int]:
+    def output_ids_through_stop(self) -> array[int]:
         """Get the output ids through the stop condition. Stop position is included."""
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
@@ -1042,7 +1067,7 @@ class Req(ReqDllmMixin):
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             max_prefix_len = 0
-            token_ids = []
+            token_ids = array("q")
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1302,7 +1327,7 @@ class Req(ReqDllmMixin):
         # Therefore, we discard the generated output_ids and restart prefill and generation
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
-            self.output_ids = []
+            self.output_ids = array("q")
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1367,7 +1392,9 @@ class Req(ReqDllmMixin):
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.origin_input_ids = array(
+            "q", [0]
+        )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
         self.to_finish = FINISH_ABORT(
@@ -1618,7 +1645,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_dllm(self):
         return self.dllm_config is not None
 
-    def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
+    def prepare_encoder_info_extend(
+        self, input_ids: List[array[int]], seq_lens: List[int]
+    ):
         _pin = is_pin_memory_available(self.device)
         self.encoder_lens_cpu = []
         self.encoder_cached = []
@@ -1667,9 +1696,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             pt += req.extend_input_len
 
         # Reassign
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        self.input_ids = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1772,22 +1799,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
-            list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).pin_memory().to(self.device, non_blocking=True)
+        input_ids_tensor = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).pin_memory().to(self.device, non_blocking=True)
+        orig_seq_lens_tensor = (
+            torch.tensor(orig_seq_lens, dtype=torch.int32, pin_memory=_pin)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
-            token_type_ids_tensor = torch.tensor(
-                sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
-            ).pin_memory().to(self.device, non_blocking=True)
+            token_type_ids_tensor = (
+                torch.tensor(
+                    sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
+                )
+                .pin_memory()
+                .to(self.device, non_blocking=True)
+            )
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -1795,7 +1826,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
-        self.loc_tensor = torch.tensor([-1], device=self.device) 
+        self.loc_tensor = torch.tensor([-1], device=self.device)
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
@@ -1965,9 +1996,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
-            torch.tensor(input_embeds, pin_memory=_pin).pin_memory().to(
-                self.device, non_blocking=True
-            )
+            torch.tensor(input_embeds, pin_memory=_pin)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
             if input_embeds
             else None
         )

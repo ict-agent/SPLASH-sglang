@@ -45,6 +45,7 @@ import traceback
 import types
 import uuid
 import warnings
+from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -99,6 +100,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor.
+
+    Uses NumPy here to speed up the conversion by using memcpy
+    instead of a per-element PyLong-to-int64 walk.
+    """
+    combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
+    cpu_t = torch.from_numpy(combined)
+    if pin:
+        cpu_t = cpu_t.pin_memory()
+    return cpu_t.to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -1049,10 +1065,24 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if image_file.startswith("file://"):
         with open(unquote(urlparse(image_file).path), "rb") as f:
             return f.read()
-    if os.path.isfile(image_file):
-        with open(image_file, "rb") as f:
-            return f.read()
-    return pybase64.b64decode(image_file, validate=True)
+    # Avoid passing a potentially multi-megabyte base64 payload to filesystem
+    # APIs. On some platforms this raises ENAMETOOLONG before base64 decoding.
+    if len(image_file) <= 4096:
+        try:
+            if os.path.isfile(image_file):
+                with open(image_file, "rb") as f:
+                    return f.read()
+        except OSError:
+            # It is not a usable local path; handle it as raw base64 below.
+            pass
+
+    try:
+        return pybase64.b64decode(image_file, validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Invalid image data: expected a URL, file path, data URI, "
+            "or base64-encoded image"
+        ) from exc
 
 
 def _normalize_video_input(

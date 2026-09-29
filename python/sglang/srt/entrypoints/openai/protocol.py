@@ -455,6 +455,9 @@ class ChatCompletionMessageContentVideoFrameURL(BaseModel):
     url: str
     timestamp: str
     detail: Optional[str] = None
+    sampled_index: Optional[int] = None
+    source_fps: Optional[float] = None
+    source_total_num_frames: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):

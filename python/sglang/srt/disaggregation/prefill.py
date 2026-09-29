@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_attn_cp_tp_group,
     build_state_indices,
     get_kv_class,
     is_hybrid_mla_backend,
@@ -148,6 +150,7 @@ class PrefillBootstrapQueue:
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
+        self.transfer_tp_rank = getattr(scheduler, "attn_tp_rank", tp_rank)
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -160,7 +163,10 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
-        kv_args.engine_rank = self.tp_rank
+        # The disaggregation bootstrap server keys workers by attention TP rank.
+        # Under DP attention / MLA-DP, raw TP rank encodes the DP dimension and
+        # would not match the decode-side target rank.
+        kv_args.engine_rank = self.transfer_tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         layer_shard_enabled = getattr(
@@ -286,7 +292,7 @@ class PrefillBootstrapQueue:
         )
         kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
 
-        dest_tp_ranks = [self.tp_rank]
+        dest_tp_ranks = [self.transfer_tp_rank]
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
@@ -417,6 +423,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
+        # GLM NOTE: the prefill engine samples exactly one token per request,
+        # so this is the per-request cost of one (possibly JIT) mask fill.
+        stats = req.grammar.grammar_stats
+        if (
+            self.enable_metrics
+            and stats is not None
+            and stats.first_mask_fill_time is not None
+        ):
+            self.metrics_collector.observe_grammar_first_mask_fill(
+                stats.first_mask_fill_time
+            )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -428,14 +447,65 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
+        """Abort waiting prefill requests if their decode peer died."""
+        candidates = [req for req in self.waiting_queue if not req.finished()]
+        if not candidates:
+            return
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in candidates],
+            self.attn_cp_cpu_group,
+            self.attn_tp_cpu_group,
+        )
+
+        failed = []
+        for req, poll in zip(candidates, polls):
+            if poll != KVPoll.Failed:
+                continue
+
+            error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message += f" with exception {e}"
+            logger.error(error_message)
+            req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+            self.stream_output([req], req.return_logprob)
+            failed.append(req)
+            if self.enable_metrics:
+                self.metrics_collector.increment_bootstrap_failed_reqs()
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+
+        if failed:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in failed
+            ]
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
+        # Transfer workers only publish completion. Page allocator mutations
+        # stay on the scheduler thread so a completed layer-transfer chunk can
+        # safely release pages that RadixCache tried to free while RDMA was
+        # still reading them.
+        self._drain_pipelined_kv_page_leases()
+        self.process_pending_chunked_abort()
+
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         self.running_batch.batch_is_full = False
 
         self.process_prefill_chunk()
+
+        self.resolve_waiting_queue_bootstrap()
 
         batch = self.get_new_batch_prefill()
         batch = self.maybe_prepare_mlp_sync_batch(batch)
@@ -445,12 +515,220 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
+    def _get_pipeline_group_size(self: Scheduler, batch: ScheduleBatch) -> int:
+        """Return a GLM layer group size, or zero for the exact mainline path."""
+        if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
+            return 0
+        if not batch.forward_mode.is_extend() or not batch.reqs:
+            return 0
+        if any(mm is not None for mm in (batch.multimodal_inputs or [])):
+            return 0
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() or self.server_args.enable_hisparse:
+            return 0
+        if self.pp_size != 1:
+            return 0
+        if batch.input_embeds is not None or batch.replace_embeds is not None:
+            return 0
+        if batch.return_routed_experts or batch.return_indexer_topk:
+            return 0
+        if self.enable_overlap and batch.has_grammar:
+            return 0
+        if (
+            self.server_args.enable_eplb
+            or self.server_args.expert_distribution_recorder_mode is not None
+            or self.server_args.enable_expert_distribution_metrics
+            or self.server_args.elastic_ep_backend is not None
+        ):
+            return 0
+
+        if not self.spec_algorithm.is_none():
+            if (
+                not self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_eagle3()
+                or self.spec_algorithm.is_frozen_kv_mtp()
+                or not batch.is_spec_v2
+                or self.server_args.enable_multi_layer_eagle
+            ):
+                return 0
+        if batch.is_spec_v2_full_overlap:
+            return 0
+
+        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        if not getattr(kv_manager, "is_hybrid_mla_backend", False):
+            return 0
+
+        if any(
+            not callable(getattr(self.token_to_kv_pool_allocator, method, None))
+            for method in ("pin_pages", "unpin_pages")
+        ):
+            return 0
+
+        required_sender_methods = (
+            "begin_layer_transfer_chunk",
+            "send_layers",
+            "seal_layer_transfer_chunk",
+            "drain_completed_layer_transfer_chunks",
+            "complete_layer_transfer_chunk",
+            "finalize_layer_transfer",
+        )
+        if any(
+            not callable(getattr(req.disagg_kv_sender, method, None))
+            for req in batch.reqs
+            for method in required_sender_methods
+        ):
+            return 0
+
+        model = getattr(getattr(self.tp_worker, "model_runner", None), "model", None)
+        if type(model).__name__ not in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ) or not callable(getattr(model, "forward_split_prefill", None)):
+            return 0
+
+        explicit = envs.SGLANG_PIPELINE_GROUP_SIZE.get()
+        if explicit is not None:
+            if explicit <= 0:
+                logger.warning_once(
+                    "SGLANG_PIPELINE_GROUP_SIZE must be positive; using the "
+                    "mainline prefill path."
+                )
+                return 0
+            logger.info_once(
+                "GLM5 layer-pipelined KV transfer is enabled with "
+                f"group size {explicit}."
+            )
+            return explicit
+
+        avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
+        target_iterations = 10 if avg_tokens < 4096 else 8 if avg_tokens < 8192 else 6
+        group_size = max(1, self.model_config.num_hidden_layers // target_iterations)
+        logger.info_once(
+            "GLM5 layer-pipelined KV transfer is enabled with "
+            f"group size {group_size}."
+        )
+        return group_size
+
+    def _begin_pipelined_kv_page_lease(self: Scheduler, req: Req, page_indices):
+        """Pin one logical source-page chunk until all layer sends complete."""
+        # run_batch_pipelined executes the producer under forward_stream_ctx
+        # when overlap scheduling is enabled.  Allocator free/evict operations
+        # remain schedule-stream owned, so establish the pin on that same
+        # stream.  Otherwise the next scheduler iteration could read the pin
+        # counters before a forward-stream update becomes visible.
+        with self.device_module.StreamContext(self.schedule_stream):
+            pinned_pages = self.token_to_kv_pool_allocator.pin_pages(page_indices)
+        try:
+            token = req.disagg_kv_sender.begin_layer_transfer_chunk(page_indices)
+        except Exception:
+            with self.device_module.StreamContext(self.schedule_stream):
+                self.token_to_kv_pool_allocator.unpin_pages(pinned_pages)
+            raise
+
+        pending = getattr(self, "_pipelined_kv_page_leases", None)
+        if pending is None:
+            pending = self._pipelined_kv_page_leases = {}
+        if token in pending:
+            with self.device_module.StreamContext(self.schedule_stream):
+                self.token_to_kv_pool_allocator.unpin_pages(pinned_pages)
+            raise RuntimeError(f"Duplicate layer-transfer chunk token: {token}")
+        pending[token] = (req.disagg_kv_sender, pinned_pages, req.rid)
+        return token
+
+    def _drain_pipelined_kv_page_leases(self: Scheduler) -> None:
+        """Release completed RDMA source-page leases on the scheduler thread."""
+        kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+        raise_worker_error = getattr(
+            kv_manager, "raise_if_transfer_worker_failed", None
+        )
+        if callable(raise_worker_error):
+            # Fatal worker errors take precedence over unpinning. The transfer
+            # engine may still own a source pointer after an arbitrary
+            # exception, so only process teardown may reclaim those pages.
+            raise_worker_error()
+
+        pending = getattr(self, "_pipelined_kv_page_leases", None)
+        if not pending:
+            return
+
+        # Every sender owned by this scheduler shares one manager-wide
+        # completion queue. Drain it once rather than once per request.
+        sender = next(iter(pending.values()))[0]
+        completions = sender.drain_completed_layer_transfer_chunks()
+        with self.device_module.StreamContext(self.schedule_stream):
+            for completion in completions:
+                token = completion.token
+                entry = pending.get(token)
+                if entry is None:
+                    logger.warning(
+                        "Ignoring unknown layer-transfer chunk completion: %s",
+                        token,
+                    )
+                    continue
+                _, pinned_pages, _ = entry
+                self.token_to_kv_pool_allocator.unpin_pages(pinned_pages)
+                del pending[token]
+
+    def _build_pipelined_state_indices(self: Scheduler, req: Req) -> List:
+        """Build final sidecar state indices after split forward completes."""
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        draft_token_to_kv_pool = (
+            self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+        )
+        if draft_token_to_kv_pool is not None:
+            layer_shard_enabled = getattr(
+                token_to_kv_pool, "layer_shard_enabled", False
+            )
+            transfer_draft_cache = not layer_shard_enabled or (
+                token_to_kv_pool.layer_shard_rank
+                == token_to_kv_pool.layer_shard_size - 1
+            )
+            draft_pool = getattr(
+                draft_token_to_kv_pool,
+                "full_kv_pool",
+                draft_token_to_kv_pool,
+            )
+            if getattr(draft_pool, "layer_shard_enabled", False):
+                draft_owner_rank = draft_pool._get_layer_owner_rank(
+                    draft_pool.start_layer
+                )
+                transfer_draft_cache = draft_pool.layer_shard_rank == draft_owner_rank
+            if not transfer_draft_cache:
+                draft_token_to_kv_pool = None
+        mamba_index = None
+        if isinstance(token_to_kv_pool, HybridLinearKVPool):
+            mamba_index = int(
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ].item()
+            )
+        return build_state_indices(
+            token_to_kv_pool=token_to_kv_pool,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_pool_idx=req.req_pool_idx,
+            seq_len=min(len(req.fill_ids), len(req.origin_input_ids)),
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            mamba_index=mamba_index,
+            swa_window_size=self.sliding_window_size,
+            swa_translate_loc=getattr(
+                self.token_to_kv_pool_allocator,
+                "translate_loc_from_full_to_swa",
+                None,
+            ),
+        )
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
+            # Drain before handling control requests such as flush_cache. A
+            # transfer may have completed after the previous loop removed its
+            # request from the inflight queue, while its allocator unpin is
+            # still waiting in the manager completion queue.
+            self._drain_pipelined_kv_page_leases()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -468,7 +746,12 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                pipeline_group_size = self._get_pipeline_group_size(batch)
+                result = (
+                    self.run_batch_pipelined(batch, pipeline_group_size)
+                    if pipeline_group_size > 0
+                    else self.run_batch(batch)
+                )
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -484,6 +767,8 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
+            self._drain_pipelined_kv_page_leases()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -501,7 +786,12 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                pipeline_group_size = self._get_pipeline_group_size(batch)
+                batch_result = (
+                    self.run_batch_pipelined(batch, pipeline_group_size)
+                    if pipeline_group_size > 0
+                    else self.run_batch(batch)
+                )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -617,8 +907,30 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                finalize_infos = getattr(result, "pipelined_kv_finalize_infos", {})
+                if req.rid in getattr(result, "pipelined_kv_rids", ()):
+                    finalize_info = finalize_infos.get(req.rid)
+                    if finalize_info is None:
+                        raise RuntimeError(
+                            "Missing final layer-pipelined KV metadata for "
+                            f"request {req.rid}"
+                        )
+                    page_indices, cuda_event = finalize_info
+                    self.disagg_metadata_buffers.set_buf(req)
+                    req.disagg_kv_sender.finalize_layer_transfer(
+                        page_indices,
+                        cuda_event=cuda_event,
+                        state_indices=self._build_pipelined_state_indices(req),
+                    )
+                else:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+
+                # The final prefill forward has consumed all multimodal
+                # features. KV transfer only needs the generated KV/state
+                # buffers, so retaining per-TP CPU embeddings until transfer
+                # completion needlessly multiplies host memory by TP size.
+                self._release_req_mm_inputs(req)
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -628,16 +940,27 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        release_kv_cache(req, self.tree_cache)
                         prepare_abort(
                             req,
                             error_message,
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                     req.grammar.finished = req.finished()
+                    self._observe_grammar_first_mask_fill(req)
             else:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
+
+                # A chunked request may have been aborted after this chunk was
+                # launched. Drain accounting, but do not send KV to decode.
+                if req.finished():
+                    if req.return_logprob:
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+                        if extend_logprob_start_len < extend_input_len:
+                            logprob_pt += extend_input_len - extend_logprob_start_len
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    continue
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -655,7 +978,10 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
-                if self.enable_overlap:
+                if (
+                    req.rid not in getattr(result, "pipelined_kv_rids", ())
+                    and self.enable_overlap
+                ):
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -685,9 +1011,49 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        # Transfer timeout: if a request has been in the inflight queue for too long
+        # (e.g., stuck in WaitingForInput/Transferring), treat it as failed.
+        transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
+        now = time.perf_counter()
+        transfer_elapsed = []
+        local_timeout_flags = []
+        has_inflight_transfer = False
+        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            req_time_stats = getattr(req, "time_stats", None)
+            entry_time = getattr(
+                req_time_stats, "prefill_transfer_queue_entry_time", None
+            )
+            elapsed = (now - entry_time) if entry_time is not None else 0.0
+            transfer_elapsed.append(elapsed)
+
+            is_inflight_transfer = poll in [
+                KVPoll.WaitingForInput,
+                KVPoll.Transferring,
+            ]
+            has_inflight_transfer |= is_inflight_transfer
+            local_timeout_flags.append(
+                int(
+                    is_inflight_transfer
+                    and entry_time is not None
+                    and elapsed > transfer_timeout
+                )
+            )
+
+        # GLM NOTE: Timeout is based on each scheduler's local elapsed time.
+        # Synchronize the timeout decision so CP/TP ranks abort and release the
+        # same inflight requests before their local queues diverge.
+        global_timeout_flags = local_timeout_flags
+        if has_inflight_transfer:
+            global_timeout_flags = all_reduce_attn_cp_tp_group(
+                local_timeout_flags,
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for i, (req, poll) in enumerate(zip(self.disagg_prefill_inflight_queue, polls)):
 
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
@@ -695,12 +1061,13 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
+                # state (Success/Failed/StoppedSafe) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
                 # Treat non-terminal states as undone instead of crashing.
                 if poll not in (
                     KVPoll.Success,
                     KVPoll.Failed,
+                    KVPoll.StoppedSafe,
                 ):
                     logger.warning_once(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
@@ -710,49 +1077,74 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                undone_reqs.append(req)
+                if global_timeout_flags[i]:
+                    error_message = (
+                        f"Prefill transfer timed out after {transfer_elapsed[i]:.3f}s "
+                        f"(local_timeout={bool(local_timeout_flags[i])}, "
+                        f"global_timeout=True, state={poll}) for request rank={self.tp_rank} "
+                        f"{req.rid=} {req.bootstrap_room=}"
+                    )
+                    logger.error(error_message)
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    if not isinstance(req.finished_reason, FINISH_ABORT):
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                        )
+                    req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    if self.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                else:
+                    undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                req.finished_reason = FINISH_LENGTH(length=0)
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
-                if hasattr(req.disagg_kv_sender, "clear"):
-                    req.disagg_kv_sender.clear()
+                req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
-            elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.warning(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            elif poll == KVPoll.StoppedSafe:
+                error_message = (
+                    f"Prefill transfer stopped safe for request rank={self.tp_rank} "
+                    f"{req.rid=} {req.bootstrap_room=}"
                 )
+                logger.error(error_message)
+                release_kv_cache(req, self.tree_cache)
+                if not isinstance(req.finished_reason, FINISH_ABORT):
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                req.disagg_kv_sender.clear()
                 done_reqs.append(req)
-                if self.enable_metrics:
-                    self.metrics_collector.increment_transfer_failed_reqs()
+
+            elif poll == KVPoll.Failed:
+                self.handle_inflight_transfer_failure(req)
+                done_reqs.append(req)
             else:
-                logger.warning_once(
-                    f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
-                    f"treating as undone",
+                raise RuntimeError(
+                    f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
-                undone_reqs.append(req)
 
         for req in done_reqs:
-            req.time_stats.set_completion_time()
+            req_time_stats = getattr(req, "time_stats", None)
+            if req_time_stats is not None:
+                req_time_stats.set_completion_time()
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            if getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST:
                 continue
             kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
             if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
                 continue
-            metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
+            req_time_stats = getattr(req, "time_stats", None)
+            if req_time_stats is None or not hasattr(
+                req_time_stats, "compute_and_observe_kv_transfer_metrics"
+            ):
+                continue
+            metrics = req_time_stats.compute_and_observe_kv_transfer_metrics(
                 req.disagg_kv_sender.get_transfer_metric()
             )
             if metrics:
@@ -781,6 +1173,37 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
+    def handle_inflight_transfer_failure(
+        self: Scheduler, req: Req
+    ) -> Optional[Exception]:
+        """Conclude an inflight request whose KV transfer failed."""
+        error_message = (
+            f"Prefill transfer failed for request rank={self.tp_rank} "
+            f"{req.rid=} {req.bootstrap_room=}"
+        )
+        exc: Optional[Exception] = None
+        try:
+            req.disagg_kv_sender.failure_exception()
+        except Exception as e:
+            exc = e
+            error_message += f" with exception {e}"
+
+        # Mute propagated exceptions to avoid duplicate logging.
+        if getattr(exc, "is_from_another_rank", False):
+            logger.debug(error_message)
+        else:
+            logger.warning(error_message)
+
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        if not isinstance(req.finished_reason, FINISH_ABORT):
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+        if self.enable_metrics:
+            self.metrics_collector.increment_transfer_failed_reqs()
+        return exc
+
     def get_transferred_rids(self: Scheduler) -> List[str]:
         """
         Used by PP, get the transferred rids but **do not pop**
@@ -794,7 +1217,7 @@ class SchedulerDisaggregationPrefillMixin:
         transferred_rids: List[str] = []
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
+            if poll in (KVPoll.Success, KVPoll.Failed, KVPoll.StoppedSafe):
                 transferred_rids.append(req.rid)
 
         return transferred_rids
@@ -857,11 +1280,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
-        kv_indices = (
-            self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
-            .cpu()
-            .numpy()
-        )
+        if hasattr(req.disagg_kv_sender, "should_skip_transfer"):
+            if req.disagg_kv_sender.should_skip_transfer():
+                return
+
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, start_idx:end_idx
+        ]
+        req.start_send_idx = end_idx
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -902,4 +1328,3 @@ class SchedulerDisaggregationPrefillMixin:
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
-        req.start_send_idx = end_idx

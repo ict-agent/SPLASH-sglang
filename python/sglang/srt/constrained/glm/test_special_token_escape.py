@@ -17,6 +17,21 @@ REFERENCE_TOKENIZER = (
 )
 SEED = 0xC0DECAFE
 
+# Multimodal special tokens that the GLM-V processor (multimodal/processors/glm4v.py)
+# routes through get_global_escaped_special_tokens().get(...). They are ordinary
+# added_tokens, so escape rewrites their string while keeping the id, which is why
+# the processor must use the escaped form for the strings it re-inserts into the
+# prompt before HF re-tokenization (otherwise the image/video placeholder would no
+# longer round-trip back to its token id).
+MULTIMODAL_TOKENS = [
+    "<|image|>",
+    "<|video|>",
+    "<|begin_of_image|>",
+    "<|end_of_image|>",
+    "<|begin_of_video|>",
+    "<|end_of_video|>",
+]
+
 
 def _ensure_package(name: str) -> None:
     if name in sys.modules:
@@ -136,6 +151,47 @@ def test_escaped_token_encodes_to_original_id(loaded, tokenizer):
 
 def test_eos_token_id_unchanged(tokenizer):
     assert tokenizer.eos_token_id == 154820
+
+
+def test_multimodal_tokens_escaped_in_mapping(loaded, tokenizer):
+    """The GLM-V processor routes IMAGE_TOKEN / VIDEO_TOKEN and the begin/end
+    markers through sp.get(...). Verify those tokens are actually rewritten
+    (they are added_tokens), so the routing is load-bearing, not a silent no-op.
+    """
+    escape_mod, _, _ = loaded
+    sp = escape_mod.get_global_escaped_special_tokens()
+    present = [t for t in MULTIMODAL_TOKENS if t in sp.mapping]
+    if not present:
+        pytest.skip("reference tokenizer exposes no multimodal special tokens")
+    for tok in present:
+        escaped = sp.get(tok)
+        assert escaped != tok
+        assert escaped.startswith(tok + "<")
+        assert escaped.endswith(">")
+        assert len(escaped) == len(tok) + 1 + 8 + 1
+
+
+def test_escaped_multimodal_token_roundtrips_to_single_id(loaded, tokenizer):
+    """Core invariant glm4v.py relies on: under escape the PLAIN mm-token string
+    no longer tokenizes to its single added-token id (which would break the image
+    placeholder round-trip), while the ESCAPED string does. This is exactly why
+    the processor must use sp.get(...) for the strings it re-inserts into the
+    prompt before the HF processor re-tokenizes it.
+    """
+    escape_mod, _, _ = loaded
+    sp = escape_mod.get_global_escaped_special_tokens()
+    present = [t for t in MULTIMODAL_TOKENS if t in sp.mapping]
+    if not present:
+        pytest.skip("reference tokenizer exposes no multimodal special tokens")
+    for tok in present:
+        plain_ids = tokenizer.encode(tok, add_special_tokens=False)
+        escaped_ids = tokenizer.encode(sp.get(tok), add_special_tokens=False)
+        # escaped string round-trips to exactly the single added-token id
+        assert len(escaped_ids) == 1
+        assert tokenizer.decode(escaped_ids) == sp.get(tok)
+        # plain string no longer resolves to that single id under escape
+        assert plain_ids != escaped_ids
+        assert len(plain_ids) > 1
 
 
 def test_chat_template_contains_escaped_tokens(loaded, tokenizer):

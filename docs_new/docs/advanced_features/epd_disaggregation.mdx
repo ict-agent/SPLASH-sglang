@@ -195,3 +195,15 @@ python -m sglang_router.launch_router \
   --decode http://$DECODE_HOST:30003 \
   --port 8000
 ```
+
+### Environment variables (Mooncake transfer, ops-critical)
+
+| Variable | Default | Scope | Meaning |
+|---|---|---|---|
+| `MC_TRANSFER_TIMEOUT` | `30` | **encoder AND prefill/decode, same value** | Seconds before a stalled in-flight RDMA write (`transfer_sync`) gives up. The timeout that actually bounds the write is read from the **encoder's** environment; a mismatch silently breaks the receiver's cleanup-window math (deregister-while-writing race). Set it explicitly on every process. |
+| `SGLANG_ENCODER_RECV_TIMEOUT` | `180` | prefill/decode | Receiver-side timeout waiting for embeddings. Failure cleanup holds one write window (`max(5, MC_TRANSFER_TIMEOUT)+5s`) before deregistering RDMA buffers, so a timed-out request answers in roughly `RECV_TIMEOUT + 2 x window` worst case. |
+| `SGLANG_ENCODER_SEND_TIMEOUT` | `180` | encoder | Encoder-side ZMQ send timeout for embedding frames. |
+| `SGLANG_ENCODER_EMBEDDING_TTL` | `0` (derive: RECV_TIMEOUT + sweep interval) | encoder | Orphan sweeper TTL: embeddings encoded but never claimed by a `/send` are reclaimed after this. Keep it above RECV_TIMEOUT. |
+| `SGLANG_ENCODER_EMBEDDING_SWEEP_INTERVAL` | `60` | encoder | Orphan sweeper period. `0` disables the sweeper. |
+| `SGLANG_ENCODER_MAX_INFLIGHT_SENDS` | `10` | prefill/decode | Per-encoder concurrent in-flight `/send` cap. Must stay <= the encoder's transfer executor workers (10): the cap keeps executor queue wait inside the cleanup window budget. When scaling to N prefill pods per encoder, keep the SUM of receiver caps <= 10 (i.e. ~10/N each) or raise the encoder executor size to match. |
+| `SGLANG_MC_RDMA_POOL_MAX_MB` / `SGLANG_MC_RDMA_POOL_MAX_BUFFERS` | off / `0` | encoder/prefill/decode | Idle RDMA buffer retention limits (per-part buffers reuse MRs instead of re-registering). In-flight and quiesced buffers do not consume this retention budget. A single 40-image request uses ~40 buffers, so retaining the complete working set still requires enough capacity (verified: 12288 MB / 48 buffers eliminates the RDMA error storm under 160-256 concurrency; 4096/16 retains only part of the working set). |

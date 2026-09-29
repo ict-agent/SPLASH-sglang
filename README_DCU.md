@@ -227,6 +227,15 @@ curl -X POST http://localhost:30002/v1/completions \
   }'
 ```
 
+## EPD 多模态分离运维要点（Mooncake 传输）
+
+- **`MC_TRANSFER_TIMEOUT` 必须在 encoder 与 prefill/decode 进程设同一值**（默认 30）：真正 bound 在途 RDMA 写的是 encoder 侧 `transfer_sync`，单侧覆盖会静默破坏接收端清理窗口的计算（复活 deregister-while-writing 竞态）。建议所有容器显式 `export MC_TRANSFER_TIMEOUT=30`。
+- **RDMA 池参数**：`SGLANG_MC_RDMA_POOL_MAX_MB/BUFFERS` 是空闲注册缓冲的保留上限，建议 **12288/48**。在途及 quiesce 缓冲不计入收缩判断，避免失败风暴将池退化成逐请求 register/deregister；单个 40 图请求会使用约 40 个 part 缓冲，4096/16 只能保留其中一部分供下一波请求复用，而 12288/48 可覆盖该工作集。
+- **在途 /send 限流**：`SGLANG_ENCODER_MAX_INFLIGHT_SENDS`（默认 10，勿超 encoder transfer executor 的 10 workers）。扩容到 N 个 prefill pod 共用一个 encoder 时，保持 Σ(各接收者限流) ≤ 10（约 10/N），或同比例调大 encoder executor；单方面调大只是把队列推回 encoder 端并重开竞态窗口。
+- **失败/超时清理延迟（有意设计）**：缓冲已分配的失败请求在注销前持有一个写超时窗口（`max(5, MC)+5s`，默认 ~35s）防 RAE。recv 超时（`SGLANG_ENCODER_RECV_TIMEOUT`，默认 180，线上常用 600）的 504 最坏 ≈ RECV_TIMEOUT+70s；上游超时需相应调大。
+- **监控**：`sglang:encoder_rdma_write_failures_total{stage=register|transfer}`（RAE 风暴签名）、`sglang:encoder_embeddings_reclaimed_total`、`sglang:encoder_send_reclaimed_total`。
+- 更多 env 说明见 `docs_new/docs/advanced_features/epd_disaggregation.mdx`。
+
 ## Known Issue
 - 无
 

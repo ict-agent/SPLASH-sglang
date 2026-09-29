@@ -115,18 +115,21 @@ if _DCU_MQA_LOGITS_WORKSPACE_GB <= 0:
 _DCU_MQA_LOGITS_MAX_ELEMENTS = (
     int(_DCU_MQA_LOGITS_WORKSPACE_GB * (1 << 30)) // 4
 )
-_dcu_mqa_logits_workspaces: Dict[torch.device, torch.Tensor] = {}
 
 
 def _is_dcu_mqa_logits_fp8_dtype(dtype: torch.dtype) -> bool:
     return dtype == torch.float8_e4m3fn
 
 
+def _is_dcu_mqa_logits_compact_dtype(dtype: torch.dtype) -> bool:
+    return _is_dcu_mqa_logits_fp8_dtype(dtype) or dtype == torch.int8
+
+
 def reserve_dcu_mqa_logits_workspace(
     device: Union[str, torch.device],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Reserve the shared bounded FP32 LightOp D_out buffer for one DCU device."""
+    """Allocate a bounded FP32 LightOp D_out buffer for the current forward."""
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError(
@@ -135,30 +138,30 @@ def reserve_dcu_mqa_logits_workspace(
     if device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
 
-    if dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+    if dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.int8,
+    ):
         raise ValueError(f"Unsupported DCU mqa_logits input dtype: {dtype}")
-    required_numel = _DCU_MQA_LOGITS_MAX_ELEMENTS
-
-    workspace = _dcu_mqa_logits_workspaces.get(device)
-    if workspace is None or workspace.numel() < required_numel:
-        workspace = torch.empty(required_numel, dtype=torch.float32, device=device)
-        _dcu_mqa_logits_workspaces[device] = workspace
-        logger.info(
-            "Reserved %.2f GiB DCU mqa_logits workspace on %s for input dtype %s",
-            workspace.numel() * workspace.element_size() / (1 << 30),
-            device,
-            dtype,
-        )
-    return workspace
+    return torch.empty(
+        _DCU_MQA_LOGITS_MAX_ELEMENTS, dtype=torch.float32, device=device
+    )
 
 
 def _get_dcu_mqa_logits_output_shape(
     num_q: int, num_k: int, dtype: torch.dtype
 ) -> Tuple[int, int]:
     """Return the physical D_out shape required by the LightOp kernel."""
-    if dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+    if dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.int8,
+    ):
         raise ValueError(f"Unsupported DCU mqa_logits input dtype: {dtype}")
-    if _is_dcu_mqa_logits_fp8_dtype(dtype) or num_q < _DCU_MQA_LOGITS_ALIGNMENT:
+    if _is_dcu_mqa_logits_compact_dtype(dtype) or num_q < _DCU_MQA_LOGITS_ALIGNMENT:
         return num_q, num_k
     return (
         ceil_align(num_q, _DCU_MQA_LOGITS_ALIGNMENT),
@@ -176,7 +179,7 @@ def _get_dcu_mqa_logits_max_rows(
             f"{workspace_numel=}, {num_q=}, {num_k=}"
         )
 
-    if _is_dcu_mqa_logits_fp8_dtype(dtype):
+    if _is_dcu_mqa_logits_compact_dtype(dtype):
         max_rows = workspace_numel // num_k
     elif dtype in (torch.float16, torch.bfloat16):
         aligned_k = ceil_align(num_k, _DCU_MQA_LOGITS_ALIGNMENT)
@@ -225,9 +228,11 @@ def _run_dcu_mqa_logits_with_workspace(
             f"q device={q.device}"
         )
 
-    if _is_dcu_mqa_logits_fp8_dtype(q.dtype):
+    if _is_dcu_mqa_logits_compact_dtype(q.dtype):
         if kv_scale is None:
-            raise ValueError("FP8 DCU mqa_logits requires a KV scale tensor")
+            raise ValueError(
+                f"{q.dtype} DCU mqa_logits requires a KV scale tensor"
+            )
         kv_scale = kv_scale.to(torch.float32).flatten().contiguous()
     elif q.dtype in (torch.float16, torch.bfloat16):
         if kv_scale is not None:
@@ -434,7 +439,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16,
+            params_dtype=torch.float32,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(
@@ -524,13 +529,14 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
+        # Project in FP32: promoting BF16 logits afterwards cannot recover
+        # the precision lost before head scaling and sparse token selection.
+        if x.dtype != self.weights_proj.weight.dtype:
+            x = x.to(self.weights_proj.weight.dtype)
         if _is_cuda:
-            return torch.mm(x, self.weights_proj.weight.t(), out_dtype=torch.float32)
+            return torch.mm(x, self.weights_proj.weight.t())
 
         weights, _ = self.weights_proj(x)
-        if _is_hip:
-            # Return bf16; multiplying with q_scale promotes back to fp32.
-            return weights
         return weights.float()
 
     @torch.compile(dynamic=True)
@@ -1639,6 +1645,12 @@ class Indexer(MultiPlatformOp):
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
+
+        if (
+            forward_batch.seq_lens_cpu is not None
+            and (len(forward_batch.seq_lens_cpu) == 0 or x_meta.shape[0] == 0)
+        ):
+            return None
 
         metadata = forward_batch.attn_backend.get_indexer_metadata(
             layer_id, forward_batch

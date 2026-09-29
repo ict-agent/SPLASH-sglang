@@ -8,6 +8,7 @@ import os
 import pickle
 import time
 import traceback
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -29,7 +30,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
-    RdmaRegRefcount,
+    RdmaBufferPool,
     rdma_pool_enabled,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -104,6 +105,9 @@ use_image_processor_gpu = (
 _GPU_ADMIT_POLL_S = 0.2
 _GPU_ADMIT_IDLE_SLACK = 1.1
 _VIDEO_ADMIT_BYTES_FACTOR = 2.0
+
+ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
+ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 # Request-local cross-Encoder video shard coordinates. Each Encoder service
 # decodes its own contiguous temporal slice without a distributed collective.
@@ -182,6 +186,11 @@ _mm_feature_attrs = {
 def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
     if modality == Modality.VIDEO and "_reported_grid" in mm_inputs:
         return mm_inputs["_reported_grid"]
+    return _get_mm_local_grid_dim(mm_inputs, modality, model_type)
+
+
+def _get_mm_local_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    """Return the grid matching the local feature tensor on this encoder."""
     # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
     # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
     attrs = _mm_grid_attrs[modality]
@@ -216,6 +225,31 @@ def _build_mm_aux_data(mm_inputs):
     return aux_data
 
 
+def _is_mooncake_metadata_only(request: dict, server_args: ServerArgs) -> bool:
+    return (
+        request.get("role") == "decode"
+        and server_args.encoder_transfer_backend == "mooncake"
+    )
+
+
+def _rdma_source_quiesce_s() -> float:
+    """How long to keep a FAILED transfer's source MR registered.
+
+    transfer_sync returning non-zero only means the waiter gave up: posted
+    slices can still be in flight and DMA-read from the source memory region
+    for a short while after (observed ~5s). Deregistering (or letting the
+    pool reuse) the source MR immediately re-opens the same race the receiver
+    side already quiesces for -- just mirrored onto the encoder's source MR.
+    Mirrors _encode_drain_timeout_s() on the receiver: one write-timeout
+    window plus a margin.
+    """
+    try:
+        mc_timeout = int(float(os.environ.get("MC_TRANSFER_TIMEOUT", "30")))
+    except (TypeError, ValueError):
+        mc_timeout = 30
+    return max(5, mc_timeout) + 5.0
+
+
 def _set_video_shard_context(request: dict, modality: Modality) -> bool:
     """Install this request's video shard coordinates in the current task."""
     num_shards = request.get("video_num_shards")
@@ -223,9 +257,7 @@ def _set_video_shard_context(request: dict, modality: Modality) -> bool:
         num_shards = int(num_shards)
         shard_idx = int(request.get("video_shard_idx", 0))
         if num_shards <= 0 or shard_idx < 0 or shard_idx >= num_shards:
-            raise BadRequestError(
-                f"Invalid video shard {shard_idx}/{num_shards}"
-            )
+            raise BadRequestError(f"Invalid video shard {shard_idx}/{num_shards}")
         _video_shard_ctx.set((shard_idx, num_shards))
         return True
     _video_shard_ctx.set(None)
@@ -309,6 +341,14 @@ class MMEncoder:
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # RDMA transfer_sync calls can each block for up to MC_TRANSFER_TIMEOUT
+        # (default 30s). If they share `executor` with the ZMQ ack sends, >=10
+        # stalled writes starve every subsequent /send's ack past the
+        # receiver's drain bound -> force-cancel -> deregister-while-writing
+        # (the exact storm this pipeline fixes). Isolate them.
+        self.transfer_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="mc-transfer"
+        )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -333,6 +373,10 @@ class MMEncoder:
             ).set_device(gid),
         )
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+        self._vit_semaphore = asyncio.BoundedSemaphore(
+            max(1, envs.SGLANG_ENCODER_MAX_PENDING_VIT.get())
+        )
+        self._pending_vit = 0
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -378,10 +422,24 @@ class MMEncoder:
                             or self.server_args.mooncake_ib_device
                         ),
                     )
+                # Sender side of the pool (enabled via
+                # SGLANG_MC_RDMA_POOL_MAX_MB): copy each
+                # embedding into a registered-once RdmaBufferPool buffer, so
+                # no per-send register/deregister. GLM NOTE: with verbs fork
+                # protection active (ibv_fork_init / NCCL), every ibv_reg_mr
+                # madvise(MADV_DONTFORK)s the registered range and
+                # deregister never restores it -- the previous zero-copy
+                # mode (register each embedding in place) left one
+                # permanently unmergeable VMA per send and exhausted
+                # vm.max_map_count after ~days of traffic (register/QP
+                # ENOMEM + crash loop). Pool off -> per-request register.
                 self._use_rdma_pool = rdma_pool_enabled()
-                self._rdma_reg = (
-                    RdmaRegRefcount(self.engine) if self._use_rdma_pool else None
+                self._rdma_pool = (
+                    RdmaBufferPool(self.engine) if self._use_rdma_pool else None
                 )
+                # addr -> pinned source tensor for failed transfers whose MR
+                # release is deferred by _schedule_source_mr_quiesce.
+                self._source_mr_pins = {}
 
             self.embedding_to_send = dict()
 
@@ -450,14 +508,13 @@ class MMEncoder:
                 deadline = time.perf_counter() - ttl
                 for req_id in list(self.embedding_to_send.keys()):
                     mm_data = self.embedding_to_send.get(req_id)
-                    if (
-                        mm_data is None
-                        or getattr(mm_data, "created_at", 0) > deadline
-                    ):
+                    if mm_data is None or getattr(mm_data, "created_at", 0) > deadline:
                         continue  # already freed, or still fresh
                     # Orphan: encoded but not claimed within TTL -> reclaim.
                     self.embedding_to_send.pop(req_id, None)
                     mm_data.embedding = None
+                    if self.metrics is not None:
+                        self.metrics.inc_embeddings_reclaimed()
                     logger.warning(
                         f"[embedding-sweeper] reclaimed orphan req_id={req_id} "
                         f"(no /send within TTL={ttl:.0f}s); "
@@ -597,9 +654,7 @@ class MMEncoder:
                 description = f"{type(data).__name__}(len={len(data)})"
             else:
                 description = type(data).__name__
-            raise RuntimeError(
-                f"Error while loading data [{description}]: {e}"
-            ) from e
+            raise RuntimeError(f"Error while loading data [{description}]: {e}") from e
 
     def submit_data_loading_tasks(self, items, modalities):
         futures = []
@@ -678,9 +733,7 @@ class MMEncoder:
         ]
         start = sum(shard_counts[:shard_idx])
         count = shard_counts[shard_idx]
-        local_frame_indices = list(
-            global_indices[2 * start : 2 * (start + count)]
-        )
+        local_frame_indices = list(global_indices[2 * start : 2 * (start + count)])
 
         frames = None
         reserved = 0
@@ -691,9 +744,7 @@ class MMEncoder:
                     estimate = len(local_frame_indices) * height * width * 3
                     admit_error, reserved = await self.await_gpu_bytes(estimate)
                     if admit_error is not None:
-                        raise MMError(
-                            admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE
-                        )
+                        raise MMError(admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE)
                 loop = asyncio.get_running_loop()
                 frames = await loop.run_in_executor(
                     self.io_executor,
@@ -722,17 +773,13 @@ class MMEncoder:
         n_local_frames = len(local_frame_indices)
         if n_local_frames > 0 and n_global_frames > 0:
             ratio = n_local_frames / n_global_frames
-            user_budget = (
-                video_config.get("max_image_tokens") if video_config else None
-            )
+            user_budget = video_config.get("max_image_tokens") if video_config else None
             budget = (
                 int(user_budget)
                 if user_budget is not None
                 else self.video_processor.max_image_tokens
             )
-            video_processor_kwargs["max_image_tokens"] = max(
-                1, int(budget * ratio)
-            )
+            video_processor_kwargs["max_image_tokens"] = max(1, int(budget * ratio))
 
         video_processor_kwargs["_shard_meta"] = {
             "global_indices": global_indices,
@@ -795,12 +842,8 @@ class MMEncoder:
                     # Devices without CUDA-style memory accounting keep the
                     # pre-existing unrestricted decode behavior.
                     return None, 0
-                available = (
-                    (cached - allocated) + free - self._admit_reserved_bytes
-                )
-                idle = (
-                    allocated <= idle_ceiling and self._admit_reserved_bytes == 0
-                )
+                available = (cached - allocated) + free - self._admit_reserved_bytes
+                idle = allocated <= idle_ceiling and self._admit_reserved_bytes == 0
                 if total <= 0 or available >= need or idle:
                     self._admit_reserved_bytes += need
                     return None, need
@@ -816,9 +859,7 @@ class MMEncoder:
 
     def _release_admit_bytes(self, reserved: int) -> None:
         if reserved:
-            self._admit_reserved_bytes = max(
-                0, self._admit_reserved_bytes - reserved
-            )
+            self._admit_reserved_bytes = max(0, self._admit_reserved_bytes - reserved)
 
     @staticmethod
     def _close_video_decoders(video_items):
@@ -834,9 +875,7 @@ class MMEncoder:
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
 
-        video_urls, video_configs = glm_split_mm_items(
-            mm_items, glm_mm_sampling_keys
-        )
+        video_urls, video_configs = glm_split_mm_items(mm_items, glm_mm_sampling_keys)
         if video_urls is not None:
             mm_items = video_urls
 
@@ -886,14 +925,14 @@ class MMEncoder:
                     video_processed = await asyncio.gather(*tasks)
                     videos, video_metadata = map(list, zip(*video_processed))
                     video_processor_kwargs["do_sample_frames"] = False
+                    if envs.SGLANG_SKIP_VIDEO_PREPROCESS.get():
+                        video_processor_kwargs["do_resize"] = False
                     video_processor_kwargs["return_metadata"] = True
                     if video_metadata:
                         video_processor_kwargs["video_metadata"] = video_metadata
                     return videos, video_processor_kwargs
 
-                num_decode_workers = (
-                    envs.SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS.get()
-                )
+                num_decode_workers = envs.SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS.get()
                 shard = _video_shard_ctx.get()
                 if shard is not None and len(video_items) == 1:
                     shard_idx, num_shards = shard
@@ -906,15 +945,11 @@ class MMEncoder:
                         video_processor_kwargs=video_processor_kwargs,
                     )
 
-                estimate = self._estimate_video_decode_bytes(
-                    video_items, video_configs
-                )
+                estimate = self._estimate_video_decode_bytes(video_items, video_configs)
                 admit_error, reserved = await self.await_gpu_bytes(estimate)
                 if admit_error is not None:
                     logger.warning("[video-admit] rejected: %s", admit_error)
-                    raise MMError(
-                        admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE
-                    )
+                    raise MMError(admit_error, code=HTTPStatus.SERVICE_UNAVAILABLE)
                 tasks = [
                     loop.run_in_executor(
                         self.io_executor,
@@ -1037,7 +1072,7 @@ class MMEncoder:
 
     def _calculate_hashes_from_features(
         self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
-    ) -> List[str]:
+    ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
         hashes, offset = [], 0
         logger.info(f"{mm_feature.shape=} with {modality=}")
@@ -1050,6 +1085,37 @@ class MMEncoder:
             offset += num_patches
         return hashes
 
+    async def _compute_encoder_item_hashes(
+        self,
+        mm_feature: torch.Tensor,
+        grid_thw: List,
+        modality: Modality,
+        *,
+        known_single_item_hash: Optional[int] = None,
+        required_for_cache: bool = False,
+    ) -> Optional[List[int]]:
+        """Return encoder feature hashes needed by cache and receiver paths.
+
+        Audio features cannot be split along dim 0 using their frame-count grid,
+        so the receiver must keep using its local hash fallback for audio. Other
+        modalities need hashes on rank 0 for transport; TP workers only need
+        them when their local prefix multimodal cache is enabled.
+        """
+        if modality == Modality.AUDIO:
+            return None
+        if self.rank != 0 and not required_for_cache:
+            return None
+        if len(grid_thw) == 1 and known_single_item_hash is not None:
+            return [known_single_item_hash]
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.io_executor,
+            lambda: self._calculate_hashes_from_features(
+                mm_feature, grid_thw, modality
+            ),
+        )
+
     async def _encode_missing(
         self,
         mm_feature: torch.Tensor,
@@ -1057,40 +1123,49 @@ class MMEncoder:
         indices: List[int],
         modality: Modality = Modality.IMAGE,
         get_feature_fn=None,
+        release_fn=None,
     ) -> List[torch.Tensor]:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        try:
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
-        # 1. Slice mm_feature to get only the patches for missing mm items
-        sub_feature_list = []
-        offsets = [0]
-        curr = 0
-        for g in grid_thw:
-            curr += self.get_num_patches(g, modality)
-            offsets.append(curr)
+            # 1. Slice mm_feature to get only the patches for missing mm items
+            sub_feature_list = []
+            offsets = [0]
+            curr = 0
+            for g in grid_thw:
+                curr += self.get_num_patches(g, modality)
+                offsets.append(curr)
 
-        for idx in indices:
-            sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
+            for idx in indices:
+                sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
 
-        sub_feature = torch.cat(sub_feature_list, dim=0)
+            sub_feature = torch.cat(sub_feature_list, dim=0)
 
-        mm_item = MultimodalDataItem.from_dict(
-            {
-                "modality": modality,
-                "feature": _convert(sub_feature),
-            }
-        )
+            mm_item = MultimodalDataItem.from_dict(
+                {
+                    "modality": modality,
+                    "feature": _convert(sub_feature),
+                }
+            )
 
-        for k, v in mm_inputs.items():
-            if k in _mm_feature_attrs.get(modality, []):
-                continue
-            val = _convert(v)
-            if k in _mm_grid_attrs.get(modality, []):
-                mm_item.set(k, val[indices])
-            else:
-                mm_item.set(k, val)
+            for k, v in mm_inputs.items():
+                if k in _mm_feature_attrs.get(modality, []):
+                    continue
+                val = _convert(v)
+                if k in _mm_grid_attrs.get(modality, []):
+                    mm_item.set(k, val[indices])
+                else:
+                    mm_item.set(k, val)
+        except BaseException:
+            # The caller transfers ownership of release_fn before awaiting, so
+            # release here if we fail before the ViT future is bound, otherwise
+            # the permit leaks.
+            if release_fn is not None:
+                release_fn()
+            raise
 
         def _run_vit():
             with torch.inference_mode():
@@ -1100,7 +1175,12 @@ class MMEncoder:
                 return embeddings
 
         loop = asyncio.get_running_loop()
-        new_embeddings = await loop.run_in_executor(self.gpu_executor, _run_vit)
+        vit_future = self.gpu_executor.submit(_run_vit)
+        if release_fn is not None:
+            vit_future.add_done_callback(
+                lambda _, r=release_fn: loop.call_soon_threadsafe(r)
+            )
+        new_embeddings = await asyncio.wrap_future(vit_future)
 
         sub_grids = [grid_thw[i] for i in indices]
         return self.slice_embedding(new_embeddings, sub_grids, modality)
@@ -1115,211 +1195,237 @@ class MMEncoder:
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
         # mm_inputs: dict
-        mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
-        mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
-        num_items = len(grid_thw)
-        modality_name = modality.name.lower()
-        execution_path = "global_cache"
-        if self.metrics is not None:
-            self.metrics.observe_mm_items_per_request(num_items, modality_name)
+        mm_inputs, get_feature_fn, release_fn = await self._process_mm_items(
+            mm_items, modality
+        )
+        try:
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            num_items = len(grid_thw)
+            modality_name = modality.name.lower()
+            execution_path = "global_cache"
+            if self.metrics is not None:
+                self.metrics.observe_mm_items_per_request(num_items, modality_name)
 
-        # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
-        cache_tic = time.perf_counter()
-        if self.rank == 0:
-            if hashes is None:
-                loop = asyncio.get_running_loop()
-                mm_hashes = await loop.run_in_executor(
-                    self.io_executor,
-                    lambda: self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality
-                    ),
+            # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
+            cache_tic = time.perf_counter()
+            if self.rank == 0:
+                if hashes is None:
+                    loop = asyncio.get_running_loop()
+                    mm_hashes = await loop.run_in_executor(
+                        self.io_executor,
+                        lambda: self._calculate_hashes_from_features(
+                            mm_feature, grid_thw, modality
+                        ),
+                    )
+                else:
+                    mm_hashes = hashes
+                exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
+                mask_tensor = torch.tensor(
+                    [1 if e else 0 for e in exist_mask], dtype=torch.int32
                 )
             else:
-                mm_hashes = hashes
-            exist_mask = await self.mm_global_cache.batch_is_exist(mm_hashes)
-            mask_tensor = torch.tensor(
-                [1 if e else 0 for e in exist_mask], dtype=torch.int32
-            )
-        else:
-            mm_hashes = None
-            mask_tensor = torch.zeros(num_items, dtype=torch.int32)
+                mm_hashes = None
+                mask_tensor = torch.zeros(num_items, dtype=torch.int32)
 
-        if self.server_args.tp_size > 1:
-            torch.distributed.broadcast(
-                mask_tensor,
-                src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
-            )
-
-        exist_mask = [m.item() == 1 for m in mask_tensor]
-        missing_indices = [i for i, e in enumerate(exist_mask) if not e]
-        hit_indices = [i for i, e in enumerate(exist_mask) if e]
-        if self.metrics is not None:
-            item_tokens = [self.get_num_tokens(grid, modality) for grid in grid_thw]
-            self.metrics.record_cache_tokens(
-                sum(item_tokens[i] for i in hit_indices),
-                sum(item_tokens),
-                modality=modality_name,
-            )
-            self.metrics.record_cache_files(len(hit_indices), num_items, modality_name)
-            self.metrics.observe_stage(
-                modality_name,
-                execution_path,
-                "cache_lookup",
-                time.perf_counter() - cache_tic,
-            )
-
-        # Step 2: All ranks run ViT together on cache-miss images.
-        new_slices = []
-        if missing_indices:
-            vit_tic = time.perf_counter()
-            new_slices = await self._encode_missing(
-                mm_feature, mm_inputs, missing_indices, modality, get_feature_fn
-            )
-            if self.metrics is not None:
-                self.metrics.observe_vit(
-                    modality_name,
-                    execution_path,
-                    time.perf_counter() - vit_tic,
+            if self.server_args.tp_size > 1:
+                torch.distributed.broadcast(
+                    mask_tensor,
+                    src=0,
+                    group=self.mm_global_cache.prefetch_tp_group,
                 )
 
-        # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
-        prefetch_status = torch.tensor([1], dtype=torch.int32)
+            exist_mask = [m.item() == 1 for m in mask_tensor]
+            missing_indices = [i for i, e in enumerate(exist_mask) if not e]
+            hit_indices = [i for i, e in enumerate(exist_mask) if e]
+            if self.metrics is not None:
+                item_tokens = [self.get_num_tokens(grid, modality) for grid in grid_thw]
+                self.metrics.record_cache_tokens(
+                    sum(item_tokens[i] for i in hit_indices),
+                    sum(item_tokens),
+                    modality=modality_name,
+                )
+                self.metrics.record_cache_files(
+                    len(hit_indices), num_items, modality_name
+                )
+                self.metrics.observe_stage(
+                    modality_name,
+                    execution_path,
+                    "cache_lookup",
+                    time.perf_counter() - cache_tic,
+                )
 
-        if self.rank == 0:
-            if hit_indices:
-                prefetch_tic = time.perf_counter()
-                hit_hashes = [mm_hashes[i] for i in hit_indices]
-                hit_tokens = [
-                    self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
-                ]
-                self.mm_global_cache.prefetch(req_id, hit_hashes, hit_tokens, modality)
-
-                try:
-
-                    async def _wait_prefetch():
-                        while not self.mm_global_cache.check_prefetch_progress(req_id):
-                            await asyncio.sleep(0.005)
-
-                    await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.error(
-                        f"Prefetch failed for req {req_id}: {e}. "
-                        f"Falling back to ViT for {len(hit_indices)} hit items."
+            # Step 2: All ranks run ViT together on cache-miss images.
+            new_slices = []
+            if missing_indices:
+                vit_tic = time.perf_counter()
+                missing_release = release_fn
+                release_fn = None
+                new_slices = await self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    missing_indices,
+                    modality,
+                    get_feature_fn,
+                    release_fn=missing_release,
+                )
+                if self.metrics is not None:
+                    self.metrics.observe_vit(
+                        modality_name,
+                        execution_path,
+                        time.perf_counter() - vit_tic,
                     )
-                    prefetch_status[0] = 0
-                finally:
-                    if self.metrics is not None:
-                        self.metrics.observe_stage(
-                            modality_name,
-                            execution_path,
-                            "cache_prefetch",
-                            time.perf_counter() - prefetch_tic,
-                        )
 
-        # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
-        if self.server_args.tp_size > 1:
-            torch.distributed.broadcast(
-                prefetch_status,
-                src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
-            )
+            # Step 3: Rank 0 prefetches cache-hit embeddings from global cache.
+            prefetch_status = torch.tensor([1], dtype=torch.int32)
 
-        # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
-        if prefetch_status.item() == 0 and hit_indices:
-            logger.info(
-                f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
-                f"for {len(hit_indices)} mm items."
-            )
-            fallback_tic = time.perf_counter()
-            fallback_slices = await self._encode_missing(
-                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn
-            )
-            if self.metrics is not None:
-                self.metrics.observe_vit(
-                    modality_name,
-                    execution_path,
-                    time.perf_counter() - fallback_tic,
-                    stage="vit_fallback",
-                )
-        else:
-            fallback_slices = None
+            if self.rank == 0:
+                if hit_indices:
+                    prefetch_tic = time.perf_counter()
+                    hit_hashes = [mm_hashes[i] for i in hit_indices]
+                    hit_tokens = [
+                        self.get_num_tokens(grid_thw[i], modality) for i in hit_indices
+                    ]
+                    self.mm_global_cache.prefetch(
+                        req_id, hit_hashes, hit_tokens, modality
+                    )
 
-        # Step 6: Rank 0 assembles final embedding and prepares for sending.
-        if self.rank == 0:
-            final_slices = [None] * num_items
-
-            for i, idx in enumerate(missing_indices):
-                final_slices[idx] = new_slices[i]
-
-            # Fill in cache-hit embeddings (from prefetch or fallback)
-            if prefetch_status.item() == 1 and hit_indices:
-                cached_slices = self.mm_global_cache.get_embeddings(
-                    [mm_hashes[i] for i in hit_indices]
-                )
-                for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = cached_slices[i]
-            elif fallback_slices is not None:
-                for i, idx in enumerate(hit_indices):
-                    final_slices[idx] = fallback_slices[i]
-
-            mm_embedding = torch.cat(final_slices, dim=0)
-            if self.metrics is not None:
-                self.metrics.observe_embedding(
-                    modality_name, execution_path, int(mm_embedding.shape[0])
-                )
-
-            # Background insert: store newly computed embeddings into global cache.
-            # Includes both original misses and fallback-recomputed hits.
-            all_new_hashes = [mm_hashes[i] for i in missing_indices]
-            all_new_slices = list(new_slices)
-            if fallback_slices is not None:
-                all_new_hashes += [mm_hashes[i] for i in hit_indices]
-                all_new_slices += list(fallback_slices)
-
-            if all_new_hashes:
-
-                async def _background_insert():
-                    insert_tic = time.perf_counter()
                     try:
-                        await asyncio.to_thread(
-                            self.mm_global_cache.insert_batch,
-                            all_new_hashes,
-                            all_new_slices,
+
+                        async def _wait_prefetch():
+                            while not self.mm_global_cache.check_prefetch_progress(
+                                req_id
+                            ):
+                                await asyncio.sleep(0.005)
+
+                        await asyncio.wait_for(_wait_prefetch(), timeout=60.0)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.error(
+                            f"Prefetch failed for req {req_id}: {e}. "
+                            f"Falling back to ViT for {len(hit_indices)} hit items."
                         )
+                        prefetch_status[0] = 0
                     finally:
                         if self.metrics is not None:
                             self.metrics.observe_stage(
                                 modality_name,
                                 execution_path,
-                                "cache_store",
-                                time.perf_counter() - insert_tic,
+                                "cache_prefetch",
+                                time.perf_counter() - prefetch_tic,
                             )
 
-                task = asyncio.create_task(_background_insert())
-                self.background_tasks.add(task)
-                task.add_done_callback(self.background_tasks.discard)
+            # Step 4: Broadcast prefetch result to all ranks so they stay in sync.
+            if self.server_args.tp_size > 1:
+                torch.distributed.broadcast(
+                    prefetch_status,
+                    src=0,
+                    group=self.mm_global_cache.prefetch_tp_group,
+                )
 
-            aux_data = _build_mm_aux_data(mm_inputs)
-            self.embedding_to_send[req_id] = EmbeddingData(
-                req_id,
-                num_parts,
-                part_idx,
-                grid_thw,
-                modality,
-                mm_embedding,
-                **aux_data,
-            )
-            return (
-                mm_embedding.nbytes,
-                mm_embedding.shape[0],
-                mm_embedding.shape[1],
-                None,
-                None,
-            )
-        else:
-            return (0, 0, 0, None, None)
+            # Step 5: If prefetch failed, all ranks fallback to ViT for the hit mm items.
+            if prefetch_status.item() == 0 and hit_indices:
+                logger.info(
+                    f"Req {req_id}: Prefetch failed, all ranks running ViT fallback "
+                    f"for {len(hit_indices)} mm items."
+                )
+                fallback_tic = time.perf_counter()
+                fallback_release = release_fn
+                release_fn = None
+                fallback_slices = await self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    hit_indices,
+                    modality,
+                    get_feature_fn,
+                    release_fn=fallback_release,
+                )
+                if self.metrics is not None:
+                    self.metrics.observe_vit(
+                        modality_name,
+                        execution_path,
+                        time.perf_counter() - fallback_tic,
+                        stage="vit_fallback",
+                    )
+            else:
+                fallback_slices = None
+
+            # Step 6: Rank 0 assembles final embedding and prepares for sending.
+            if self.rank == 0:
+                final_slices = [None] * num_items
+
+                for i, idx in enumerate(missing_indices):
+                    final_slices[idx] = new_slices[i]
+
+                # Fill in cache-hit embeddings (from prefetch or fallback)
+                if prefetch_status.item() == 1 and hit_indices:
+                    cached_slices = self.mm_global_cache.get_embeddings(
+                        [mm_hashes[i] for i in hit_indices]
+                    )
+                    for i, idx in enumerate(hit_indices):
+                        final_slices[idx] = cached_slices[i]
+                elif fallback_slices is not None:
+                    for i, idx in enumerate(hit_indices):
+                        final_slices[idx] = fallback_slices[i]
+
+                mm_embedding = torch.cat(final_slices, dim=0)
+                if self.metrics is not None:
+                    self.metrics.observe_embedding(
+                        modality_name, execution_path, int(mm_embedding.shape[0])
+                    )
+
+                # Background insert: store newly computed embeddings into global cache.
+                # Includes both original misses and fallback-recomputed hits.
+                all_new_hashes = [mm_hashes[i] for i in missing_indices]
+                all_new_slices = list(new_slices)
+                if fallback_slices is not None:
+                    all_new_hashes += [mm_hashes[i] for i in hit_indices]
+                    all_new_slices += list(fallback_slices)
+
+                if all_new_hashes:
+
+                    async def _background_insert():
+                        insert_tic = time.perf_counter()
+                        try:
+                            await asyncio.to_thread(
+                                self.mm_global_cache.insert_batch,
+                                all_new_hashes,
+                                all_new_slices,
+                            )
+                        finally:
+                            if self.metrics is not None:
+                                self.metrics.observe_stage(
+                                    modality_name,
+                                    execution_path,
+                                    "cache_store",
+                                    time.perf_counter() - insert_tic,
+                                )
+
+                    task = asyncio.create_task(_background_insert())
+                    self.background_tasks.add(task)
+                    task.add_done_callback(self.background_tasks.discard)
+
+                aux_data = _build_mm_aux_data(mm_inputs)
+                self.embedding_to_send[req_id] = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    grid_thw,
+                    modality,
+                    mm_embedding,
+                    **aux_data,
+                )
+                return (
+                    mm_embedding.nbytes,
+                    mm_embedding.shape[0],
+                    mm_embedding.shape[1],
+                    None,
+                    None,
+                )
+            else:
+                return (0, 0, 0, None, None)
+        finally:
+            if release_fn is not None:
+                release_fn()
 
     async def _flatten_and_load_audios(self, mm_items):
         """
@@ -1363,6 +1469,22 @@ class MMEncoder:
             else:
                 flat.append(item)
         return flat
+
+    def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
+        """Return the number of processor grids produced by each input leaf."""
+        if modality != Modality.IMAGE:
+            return [1] * len(leaves)
+
+        def count(leaf):
+            if (
+                isinstance(leaf, dict)
+                and leaf.get("type") == "image"
+                and isinstance(leaf.get("image"), (list, tuple))
+            ):
+                return len(self._flatten_nested_items(leaf["image"]))
+            return 1
+
+        return [count(leaf) for leaf in leaves]
 
     def _normalize_kimi_encoder_images(self, images):
         """Normalize Kimi image inputs for the image processor call."""
@@ -1418,148 +1540,187 @@ class MMEncoder:
 
         return normalized
 
+    def _note_vit_acquired(self):
+        self._pending_vit += 1
+        if self.metrics is not None:
+            self.metrics.set_pending_requests(self._pending_vit)
+
+    def _release_vit_permit(self):
+        self._pending_vit -= 1
+        if self.metrics is not None:
+            self.metrics.set_pending_requests(self._pending_vit)
+        self._vit_semaphore.release()
+
     async def _process_mm_items(self, mm_items, modality):
+        release_fn = None
         if modality == Modality.IMAGE and self.image_processor:
             image_urls, image_configs = glm_split_mm_items(
                 mm_items, glm_mm_sampling_keys
             )
             if image_urls is not None:
                 mm_items = image_urls
-            images = await self._flatten_and_load_images(mm_items)
-            image_config = dict(self.vision_config.get("image", {}))
-            if "glm" in self.model_type:
-                budget = glm_budget_kwargs(
-                    self.image_processor,
-                    user_max_image_tokens=glm_max_image_tokens_from_configs(
-                        image_configs
+            loop = asyncio.get_running_loop()
+            await self._vit_semaphore.acquire()
+            self._note_vit_acquired()
+            try:
+                images = await self._flatten_and_load_images(mm_items)
+                image_config = dict(self.vision_config.get("image", {}))
+                if "glm" in self.model_type:
+                    budget = glm_budget_kwargs(
+                        self.image_processor,
+                        user_max_image_tokens=glm_max_image_tokens_from_configs(
+                            image_configs
+                        ),
+                    )
+                    if budget is not None:
+                        image_config.update(budget)
+                if self.model_type in ["kimi_k25", "kimi_vl"]:
+                    images = self._normalize_kimi_encoder_images(images)
+                processor_input = await loop.run_in_executor(
+                    self.io_executor,
+                    lambda: self.image_processor(images=images, **image_config),
+                )
+            except BaseException:
+                self._release_vit_permit()
+                raise
+            release_fn = self._release_vit_permit
+            try:
+                if hasattr(self.model, "thinker"):  # for omni models
+                    get_feature_method = self.model.thinker.get_image_feature
+                else:
+                    get_feature_method = self.model.get_image_feature
+            except BaseException:
+                release_fn()
+                raise
+        elif modality == Modality.VIDEO and self.video_processor:
+            loop = asyncio.get_running_loop()
+            await self._vit_semaphore.acquire()
+            self._note_vit_acquired()
+            try:
+                videos, video_processor_kwargs = await self._flatten_and_load_videos(
+                    mm_items
+                )
+                # Internal shard metadata is consumed here and must not be passed
+                # to the Hugging Face processor.
+                shard_meta = video_processor_kwargs.pop("_shard_meta", None)
+                if shard_meta is not None and shard_meta.get("count", 0) == 0:
+                    if hasattr(self.model, "thinker"):
+                        get_feature_method = self.model.thinker.get_video_feature
+                    else:
+                        get_feature_method = self.model.get_video_feature
+                    self._release_vit_permit()
+                    return {"_empty_video_shard": True}, get_feature_method, None
+                video_device = self.vision_config.get("video", {}).get("device")
+                if video_device is not None and "device" not in video_processor_kwargs:
+                    video_processor_kwargs["device"] = video_device
+                processor_input = await loop.run_in_executor(
+                    self.io_executor,
+                    lambda: self.video_processor(
+                        videos=videos, **video_processor_kwargs
                     ),
                 )
-                if budget is not None:
-                    image_config.update(budget)
-            if self.model_type in ["kimi_k25", "kimi_vl"]:
-                images = self._normalize_kimi_encoder_images(images)
-            loop = asyncio.get_running_loop()
-            processor_input = await loop.run_in_executor(
-                self.io_executor,
-                lambda: self.image_processor(images=images, **image_config),
-            )
-            if hasattr(self.model, "thinker"):  # for omni models
-                get_feature_method = self.model.thinker.get_image_feature
-            else:
-                get_feature_method = self.model.get_image_feature
-        elif modality == Modality.VIDEO and self.video_processor:
-            videos, video_processor_kwargs = await self._flatten_and_load_videos(
-                mm_items
-            )
-            # Internal shard metadata is consumed here and must not be passed
-            # to the Hugging Face processor.
-            shard_meta = video_processor_kwargs.pop("_shard_meta", None)
-            if shard_meta is not None and shard_meta.get("count", 0) == 0:
-                if hasattr(self.model, "thinker"):
+            except BaseException:
+                self._release_vit_permit()
+                raise
+            release_fn = self._release_vit_permit
+            try:
+                # Get additional video metadata
+                if (
+                    self.model_type
+                    in [
+                        "qwen3_vl",
+                        "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
+                        "intern_s2_preview",
+                    ]
+                    and video_processor_kwargs.get("video_metadata", None) is not None
+                ):
+                    # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
+                    video_metadata = video_processor_kwargs["video_metadata"]
+                    try:
+                        merge_size = (
+                            self.model_config.hf_config.vision_config.spatial_merge_size
+                        )
+                    except (AttributeError, KeyError):
+                        merge_size = 2  # Default merge_size
+
+                    video_timestamps = []
+                    for metadata in video_metadata:
+                        video_fps = (
+                            metadata.get("fps", None) or 24
+                        )  # original video fps
+                        frames_indices = metadata.get("frames_indices", None)
+                        timestamps = self._calculate_timestamps(
+                            frames_indices, video_fps, merge_size
+                        )
+                        video_timestamps.append(timestamps)
+                    processor_input["video_timestamps"] = video_timestamps
+                elif "glm" in self.model_type:
+                    if shard_meta is not None:
+                        # Shard 0 reports whole-video metadata once. Every Encoder
+                        # still feeds its local grid into the ViT.
+                        processor_input.pop("video_metadata", None)
+                        local_grid = processor_input.get("video_grid_thw")
+                        if shard_meta["shard_idx"] == 0:
+                            global_indices = shard_meta["global_indices"]
+                            fps = shard_meta["fps"]
+                            global_timestamps = [i / fps for i in global_indices][::2]
+                            processor_input["video_timestamps"] = [global_timestamps]
+                            if local_grid is not None and len(local_grid) > 0:
+                                height = int(local_grid[0][1])
+                                width = int(local_grid[0][2])
+                                processor_input["_reported_grid"] = torch.tensor(
+                                    [[shard_meta["n_units"], height, width]]
+                                )
+                        else:
+                            processor_input["video_timestamps"] = None
+                            processor_input["_reported_grid"] = None
+                    else:
+                        video_metadata = processor_input.get("video_metadata", None)
+                        video_timestamps = []
+                        if video_metadata is not None:
+                            for metadata in video_metadata:
+                                ts = getattr(metadata, "timestamps", None)
+                                if ts is None and isinstance(metadata, dict):
+                                    ts = metadata.get("timestamps", None)
+                                if ts is None:
+                                    raise InternalError(
+                                        "GLM-V video metadata missing timestamps: "
+                                        f"{metadata}"
+                                    )
+                                video_timestamps.append(list(ts)[::2])
+                        processor_input["video_timestamps"] = video_timestamps
+                        processor_input.pop("video_metadata", None)
+                elif (
+                    self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
+                    and processor_input.get("video_grid_thw", None) is not None
+                ):
+                    # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
+                    video_grid_thw = processor_input["video_grid_thw"]
+                    try:
+                        temporal_patch_size = self.video_processor.temporal_patch_size
+                    except AttributeError:
+                        temporal_patch_size = 2  # Default temporal_patch_size
+                    # get sampled fps, default: 2
+                    fps_list = [
+                        self.vision_config.get("video", {}).get("fps", None) or 2
+                    ] * len(video_grid_thw)
+                    second_per_grid_ts = [
+                        (temporal_patch_size / fps) for fps in fps_list
+                    ]
+                    second_per_grid_ts_tensor = torch.tensor(
+                        second_per_grid_ts, dtype=torch.float32
+                    )
+                    processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
+
+                if hasattr(self.model, "thinker"):  # for omni models
                     get_feature_method = self.model.thinker.get_video_feature
                 else:
                     get_feature_method = self.model.get_video_feature
-                return {"_empty_video_shard": True}, get_feature_method
-            video_device = self.vision_config.get("video", {}).get("device")
-            if video_device is not None and "device" not in video_processor_kwargs:
-                video_processor_kwargs["device"] = video_device
-            loop = asyncio.get_running_loop()
-            processor_input = await loop.run_in_executor(
-                self.io_executor,
-                lambda: self.video_processor(
-                    videos=videos, **video_processor_kwargs
-                ),
-            )
-            # Get additional video metadata
-            if (
-                self.model_type
-                in [
-                    "qwen3_vl",
-                    "qwen3_vl_moe",
-                    "qwen3_5",
-                    "qwen3_5_moe",
-                    "intern_s2_preview",
-                ]
-                and video_processor_kwargs.get("video_metadata", None) is not None
-            ):
-                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
-                video_metadata = video_processor_kwargs["video_metadata"]
-                try:
-                    merge_size = (
-                        self.model_config.hf_config.vision_config.spatial_merge_size
-                    )
-                except (AttributeError, KeyError):
-                    merge_size = 2  # Default merge_size
-
-                video_timestamps = []
-                for metadata in video_metadata:
-                    video_fps = metadata.get("fps", None) or 24  # original video fps
-                    frames_indices = metadata.get("frames_indices", None)
-                    timestamps = self._calculate_timestamps(
-                        frames_indices, video_fps, merge_size
-                    )
-                    video_timestamps.append(timestamps)
-                processor_input["video_timestamps"] = video_timestamps
-            elif "glm" in self.model_type:
-                if shard_meta is not None:
-                    # Shard 0 reports whole-video metadata once. Every Encoder
-                    # still feeds its local grid into the ViT.
-                    processor_input.pop("video_metadata", None)
-                    local_grid = processor_input.get("video_grid_thw")
-                    if shard_meta["shard_idx"] == 0:
-                        global_indices = shard_meta["global_indices"]
-                        fps = shard_meta["fps"]
-                        global_timestamps = [i / fps for i in global_indices][::2]
-                        processor_input["video_timestamps"] = [global_timestamps]
-                        if local_grid is not None and len(local_grid) > 0:
-                            height = int(local_grid[0][1])
-                            width = int(local_grid[0][2])
-                            processor_input["_reported_grid"] = torch.tensor(
-                                [[shard_meta["n_units"], height, width]]
-                            )
-                    else:
-                        processor_input["video_timestamps"] = None
-                        processor_input["_reported_grid"] = None
-                else:
-                    video_metadata = processor_input.get("video_metadata", None)
-                    video_timestamps = []
-                    if video_metadata is not None:
-                        for metadata in video_metadata:
-                            ts = getattr(metadata, "timestamps", None)
-                            if ts is None and isinstance(metadata, dict):
-                                ts = metadata.get("timestamps", None)
-                            if ts is None:
-                                raise InternalError(
-                                    "GLM-V video metadata missing timestamps: "
-                                    f"{metadata}"
-                                )
-                            video_timestamps.append(list(ts)[::2])
-                    processor_input["video_timestamps"] = video_timestamps
-                    processor_input.pop("video_metadata", None)
-            elif (
-                self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
-                and processor_input.get("video_grid_thw", None) is not None
-            ):
-                # For omni/qwen2_5_vl models, calculate second_per_grid_ts for rotary embedding
-                video_grid_thw = processor_input["video_grid_thw"]
-                try:
-                    temporal_patch_size = self.video_processor.temporal_patch_size
-                except AttributeError:
-                    temporal_patch_size = 2  # Default temporal_patch_size
-                # get sampled fps, default: 2
-                fps_list = [
-                    self.vision_config.get("video", {}).get("fps", None) or 2
-                ] * len(video_grid_thw)
-                second_per_grid_ts = [(temporal_patch_size / fps) for fps in fps_list]
-                second_per_grid_ts_tensor = torch.tensor(
-                    second_per_grid_ts, dtype=torch.float32
-                )
-                processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
-
-            if hasattr(self.model, "thinker"):  # for omni models
-                get_feature_method = self.model.thinker.get_video_feature
-            else:
-                get_feature_method = self.model.get_video_feature
+            except BaseException:
+                release_fn()
+                raise
         elif modality == Modality.AUDIO and self.audio_processor:
             audios = await self._flatten_and_load_audios(mm_items)
             audio_config = self.vision_config.get("audio", {})
@@ -1585,22 +1746,16 @@ class MMEncoder:
                 f"Currently only support image, video and audio modalities, {modality} modality has no processor available."
             )
 
-        return processor_input, get_feature_method
+        return processor_input, get_feature_method, release_fn
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
         modality_name = modality.name.lower()
         execution_path = "single"
         try:
             preprocess_tic = time.perf_counter()
-            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-            if self.metrics is not None:
-                self.metrics.observe_stage(
-                    modality_name,
-                    execution_path,
-                    "preprocess",
-                    time.perf_counter() - preprocess_tic,
-                )
-                self.metrics.observe_mm_items_per_request(len(mm_items), modality_name)
+            mm_inputs, get_feature_fn, release_fn = await self._process_mm_items(
+                mm_items, modality
+            )
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except MMError:
@@ -1610,24 +1765,44 @@ class MMEncoder:
         except Exception as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
 
-        if isinstance(mm_inputs, dict) and mm_inputs.get("_empty_video_shard"):
-            hidden_size = int(
-                getattr(self.model_config.hf_config, "hidden_size", 1) or 1
-            )
-            empty = torch.zeros((0, hidden_size), dtype=torch.bfloat16)
-            if self.metrics is not None:
-                self.metrics.observe_embedding(modality_name, execution_path, 0)
-            return None, empty, _build_mm_aux_data({})
-
         try:
+            if self.metrics is not None:
+                self.metrics.observe_stage(
+                    modality_name,
+                    execution_path,
+                    "preprocess",
+                    time.perf_counter() - preprocess_tic,
+                )
+                self.metrics.observe_mm_items_per_request(len(mm_items), modality_name)
+
+            if isinstance(mm_inputs, dict) and mm_inputs.get("_empty_video_shard"):
+                hidden_size = int(
+                    getattr(self.model_config.hf_config, "hidden_size", 1) or 1
+                )
+                # Use the model dtype (not a hardcoded one): the receiver's
+                # dtype cross-check is exempted for empty shards, but keeping
+                # the placeholder consistent avoids surprising any future
+                # consumer of frame metadata.
+                empty = torch.zeros((0, hidden_size), dtype=self.model_config.dtype)
+                if self.metrics is not None:
+                    self.metrics.observe_embedding(modality_name, execution_path, 0)
+                return None, empty, _build_mm_aux_data({}), []
+
             # support mm_cache
             mm_embedding = None
             mm_hash = None
+            item_hash = None
+            item_hashes = None
+            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            local_grid_dim = _get_mm_local_grid_dim(
+                mm_inputs, modality, self.model_type
+            )
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
 
             mm_item = MultimodalDataItem.from_dict(
                 {
                     "modality": modality,
-                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+                    "feature": mm_feature,
                 }
             )
             internal_keys = {"_reported_grid"}
@@ -1662,6 +1837,13 @@ class MMEncoder:
                         time.perf_counter() - cache_tic,
                     )
 
+            item_hashes = await self._compute_encoder_item_hashes(
+                mm_feature,
+                local_grid_dim,
+                modality,
+                known_single_item_hash=item_hash,
+            )
+
             if mm_embedding is None:
                 vit_tic = time.perf_counter()
 
@@ -1670,9 +1852,18 @@ class MMEncoder:
                         return get_feature_fn([mm_item]).cpu()
 
                 loop = asyncio.get_running_loop()
-                mm_embedding = await loop.run_in_executor(
-                    self.gpu_executor, _run_vit
-                )
+                vit_future = self.gpu_executor.submit(_run_vit)
+                if release_fn is not None:
+                    # Release the permit only after the ViT thread actually
+                    # finishes, so a cancelled await does not hand it back
+                    # while the ViT still holds GPU tensors.
+                    # call_soon_threadsafe keeps the release on the event loop,
+                    # since asyncio primitives are not thread-safe.
+                    vit_future.add_done_callback(
+                        lambda _, r=release_fn: loop.call_soon_threadsafe(r)
+                    )
+                    release_fn = None
+                mm_embedding = await asyncio.wrap_future(vit_future)
                 if self.metrics is not None:
                     self.metrics.observe_vit(
                         modality_name,
@@ -1717,15 +1908,120 @@ class MMEncoder:
                 self.profiler.step()
 
             aux_data = _build_mm_aux_data(mm_inputs)
-            return (
-                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
-                mm_embedding,
-                aux_data,
-            )
+            return grid_dim, mm_embedding, aux_data, item_hashes
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
+        finally:
+            if release_fn is not None:
+                release_fn()
+
+    def _release_source_mr(self, addr: int, source_buffer=None):
+        """Release a quiesced source MR (pool release / engine deregister).
+
+        Called inline from a worker thread (shutdown race) or via the ack
+        executor. Pops the pin first so the source is dropped even if the
+        engine call fails. ``source_buffer`` covers the shutdown race where
+        the event loop closes before the buffer can be added to the pin map.
+        """
+        pins = getattr(self, "_source_mr_pins", None)
+        pinned_source = None
+        if pins is not None:
+            pinned_source = pins.pop(addr, None)
+        if pinned_source is not None:
+            source_buffer = pinned_source
+        try:
+            if self._use_rdma_pool:
+                self._rdma_pool.release(source_buffer)
+            else:
+                self.engine.deregister(addr)
+        except Exception:
+            logger.exception(
+                "failed to release source MR after quiesce (addr=%s)", addr
+            )
+
+    def _schedule_source_mr_quiesce(self, addr: int, tensor):
+        """Hold a FAILED transfer's source MR for one more write-timeout
+        window before releasing it (pool) / deregistering it (non-pool).
+
+        transferSync returning non-zero only means the waiter gave up; posted
+        slices can still DMA-read from the source MR for a short while. The
+        source tensor/buffer is PINNED in _source_mr_pins so the registered VA
+        stays mapped and a pooled buffer cannot be reused for the whole
+        window. Without the pin, the source may be unmapped or overwritten by
+        another request while residual DMA reads are still in flight.
+        """
+        # Lazily created so test doubles built via __new__ keep working.
+        if not hasattr(self, "_source_mr_pins"):
+            self._source_mr_pins = {}
+        self._source_mr_pins[addr] = tensor
+        window = _rdma_source_quiesce_s()
+
+        def _release():
+            self._release_source_mr(addr)
+
+        async def _release_via_executor():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _release()
+                return
+            try:
+                await loop.run_in_executor(self.executor, _release)
+            except RuntimeError:
+                # Executor already shut down (process exit race): release
+                # inline rather than dying with an unretrieved exception and
+                # leaking the pin/MR.
+                _release()
+
+        async def _detached_hold_then_release():
+            # Full window again (conservative -- the cancelled parent lost
+            # track of how much of the hold elapsed), then release.
+            try:
+                await asyncio.sleep(window)
+            except asyncio.CancelledError:
+                pass  # shutdown: release below anyway
+            except Exception:
+                logger.exception("source-MR quiesce sleep failed")
+            await _release_via_executor()
+
+        async def _hold_then_release():
+            try:
+                await asyncio.sleep(window)
+            except asyncio.CancelledError:
+                # Releasing NOW would skip the very window that keeps
+                # residual posted slices off a torn source MR. We cannot keep
+                # awaiting here (we may be cancelled again), so hand the FULL
+                # window + release to a detached task, then propagate.
+                logger.warning(
+                    "source-MR quiesce cancelled; deferring full %.0fs hold + "
+                    "release to a detached task (addr=%s)",
+                    window,
+                    addr,
+                )
+                detached = asyncio.create_task(_detached_hold_then_release())
+                self.background_tasks.add(detached)
+                detached.add_done_callback(self.background_tasks.discard)
+                raise
+            except Exception:
+                logger.exception("source-MR quiesce sleep failed")
+            await _release_via_executor()
+
+        try:
+            task = asyncio.create_task(_hold_then_release())
+        except RuntimeError:
+            # No running loop (shutdown race): release inline, best effort.
+            self._release_source_mr(addr)
+            return
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        logger.info(
+            "mooncake: deferring source-MR release by %.0fs after failed "
+            "transfer (addr=%s, req_id may have residual posted slices)",
+            window,
+            addr,
+        )
 
     async def _send(
         self,
@@ -1738,44 +2034,131 @@ class MMEncoder:
         url=None,
         meta_only=False,
     ):
+        # Optional NaN/Inf guard on the ViT embedding before it leaves the
+        # encoder (env: SGLANG_ENCODER_CHECK_NAN). Single choke point covering
+        # the single / global-cache / batch send paths. Read-only; does not
+        # modify the embedding.
+        if (
+            not meta_only
+            and envs.SGLANG_ENCODER_CHECK_NAN.get()
+            and isinstance(embedding, torch.Tensor)
+            and embedding.numel()
+        ):
+            _ef = embedding.detach().float()
+            _nan = int(torch.isnan(_ef).sum())
+            _inf = int(torch.isinf(_ef).sum())
+            if _nan or _inf:
+                logger.error(
+                    "[encoder-nan] non-finite embedding for req_id=%s modality=%s "
+                    "shape=%s dtype=%s nan=%d inf=%d",
+                    getattr(mm_data, "req_id", None),
+                    getattr(getattr(mm_data, "modality", None), "name", None),
+                    tuple(embedding.shape),
+                    embedding.dtype,
+                    _nan,
+                    _inf,
+                )
         if self.server_args.encoder_transfer_backend == "mooncake" and not meta_only:
             reg, ret = 0, 0
             if embedding is not None and embedding.nbytes > 0:
+                # The decision to hold a FAILED transfer's source MR is made
+                # INSIDE the worker (cancel-immune) and scheduled back onto
+                # the loop thread-safely. If it were made after the await,
+                # a cancellation of the awaiting /send task (client disconnect)
+                # would discard the worker's result and leak the hold forever
+                # (pool buffer reused / source MR deregistered too early).
+                loop = asyncio.get_running_loop()
+
+                def _schedule_quiesce_threadsafe(addr, tensor):
+                    try:
+                        loop.call_soon_threadsafe(
+                            self._schedule_source_mr_quiesce, addr, tensor
+                        )
+                    except RuntimeError:
+                        # Loop already closed (shutdown): release inline.
+                        self._release_source_mr(addr, tensor)
 
                 def _transfer_sync():
+                    # Returns (reg, ret). On a failed transfer (ret != 0, or
+                    # transfer_sync raising) the source MR is NOT released
+                    # here: posted slices may still be in flight and
+                    # DMA-reading from it. The quiesce + release is scheduled
+                    # from within this worker so it happens even if the
+                    # awaiting coroutine is cancelled.
                     if self._use_rdma_pool:
-                        transfer_embedding = (
+                        # Copy into a registered-once pool buffer.
+                        emb = (
                             embedding
                             if embedding.is_contiguous()
                             else embedding.contiguous()
                         )
-                        addr = self._rdma_reg.acquire(transfer_embedding)
                         try:
-                            return 0, self.engine.transfer_sync(
+                            buf = self._rdma_pool.acquire(emb.nbytes)
+                        except Exception:
+                            # Pool register failures escape as exceptions
+                            # (RuntimeError), not return codes -- count them
+                            # here or they are invisible in metrics.
+                            if self.metrics is not None:
+                                self.metrics.inc_rdma_write_failures("register")
+                            raise
+                        try:
+                            buf.narrow(0, 0, emb.nbytes).copy_(
+                                emb.view(-1).view(torch.uint8)
+                            )
+                        except Exception:
+                            # No RDMA operation was posted, so this buffer is
+                            # immediately safe to reuse.
+                            self._rdma_pool.release(buf)
+                            raise
+                        addr = buf.data_ptr()
+                        try:
+                            t_ret = self.engine.transfer_sync(
                                 session_id,
                                 addr,
                                 buffer_address,
-                                transfer_embedding.nbytes,
+                                emb.nbytes,
                             )
-                        finally:
-                            self._rdma_reg.release(addr)
+                        except Exception:
+                            # A raised error does not prove no slice was
+                            # posted: treat like ret != 0 (hold one window)
+                            # rather than releasing immediately.
+                            if self.metrics is not None:
+                                self.metrics.inc_rdma_write_failures("transfer")
+                            _schedule_quiesce_threadsafe(addr, buf)
+                            raise
+                        if t_ret == 0:
+                            self._rdma_pool.release(buf)
+                            return 0, t_ret
+                        # Keep the registered buffer checked out so the pool
+                        # cannot hand this MR to another
+                        # request while residual slices are in flight.
+                        _schedule_quiesce_threadsafe(addr, buf)
+                        return 0, t_ret
 
                     reg = self.engine.register(embedding.data_ptr(), embedding.nbytes)
                     if reg != 0:
                         return reg, -1
                     try:
-                        ret = self.engine.transfer_sync(
+                        t_ret = self.engine.transfer_sync(
                             session_id,
                             embedding.data_ptr(),
                             buffer_address,
                             embedding.nbytes,
                         )
-                    finally:
+                    except Exception:
+                        if self.metrics is not None:
+                            self.metrics.inc_rdma_write_failures("transfer")
+                        _schedule_quiesce_threadsafe(embedding.data_ptr(), embedding)
+                        raise
+                    if t_ret == 0:
                         self.engine.deregister(embedding.data_ptr())
-                    return reg, ret
+                        return reg, t_ret
+                    _schedule_quiesce_threadsafe(embedding.data_ptr(), embedding)
+                    return reg, t_ret
 
-                loop = asyncio.get_running_loop()
-                reg, ret = await loop.run_in_executor(self.executor, _transfer_sync)
+                reg, ret = await loop.run_in_executor(
+                    self.transfer_executor, _transfer_sync
+                )
 
             mm_data.embedding = None
 
@@ -1794,6 +2177,10 @@ class MMEncoder:
                     f"mooncake RDMA write failed (register={reg}, transfer={ret})"
                 )
                 mm_data.error_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                if self.metrics is not None:
+                    self.metrics.inc_rdma_write_failures(
+                        "register" if reg != 0 else "transfer"
+                    )
 
         # Send ack/data
         if url is not None:
@@ -1823,6 +2210,9 @@ class MMEncoder:
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
+            send_timeout_ms = max(1, int(self.send_timeout * 1000))
+            sock.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
+            sock.setsockopt(zmq.LINGER, send_timeout_ms)
             try:
                 sock.connect(endpoint)
                 if buffer is not None:
@@ -1834,14 +2224,28 @@ class MMEncoder:
 
         transfer_tic = time.perf_counter()
         outcome = "success"
+        if (
+            self.server_args.encoder_transfer_backend == "mooncake"
+            and not meta_only
+            and (reg != 0 or ret != 0)
+        ):
+            # The ZMQ frame below still "succeeds" (it carries the error_msg),
+            # so without this the transfer would be counted as a success with
+            # full byte count -- the RAE signature would be invisible in
+            # monitoring.
+            outcome = "rdma_write_error"
         try:
-            await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+            await asyncio.get_event_loop().run_in_executor(
+                self.executor, send_with_socket
+            )
         except Exception:
             outcome = "error"
             raise
         finally:
             if self.metrics is not None and not meta_only:
-                modality_name = getattr(mm_data.modality, "name", str(mm_data.modality)).lower()
+                modality_name = getattr(
+                    mm_data.modality, "name", str(mm_data.modality)
+                ).lower()
                 num_bytes = int(embedding.nbytes) if embedding is not None else 0
                 self.metrics.observe_transfer_attempt(
                     modality_name,
@@ -1850,9 +2254,192 @@ class MMEncoder:
                     num_bytes,
                 )
 
+    async def batch_encode(
+        self, requests: List[dict], modality: Modality
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Fuse image items from concurrent /encode requests into one ViT run."""
+        batch_tic = time.perf_counter()
+        modality_name = modality.name.lower()
+        release_fn = None
+
+        flat_items, items_per_req = [], []
+        for req in requests:
+            leaves = self._flatten_nested_items(req["mm_items"])
+            flat_items.extend(leaves)
+            items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
+        total = sum(items_per_req)
+
+        if self.metrics is not None:
+            self.metrics.observe_mm_items_per_batch(total, modality_name)
+            for count in items_per_req:
+                self.metrics.observe_mm_items_per_request(count, modality_name)
+
+        try:
+            preprocess_tic = time.perf_counter()
+            try:
+                mm_inputs, get_feature_fn, release_fn = await self._process_mm_items(
+                    flat_items, modality
+                )
+            except NotImplementedError as exc:
+                raise InternalError(f"Not implemented error: {exc}") from exc
+            except Exception as exc:
+                # Preprocess failures are client-data problems (bad URL,
+                # undecodable image, ...) -- report 400, not 500, like the
+                # per-request _encode path.
+                raise BadRequestError(f"Failed to process mm items: {exc}") from exc
+            finally:
+                if self.metrics is not None:
+                    self.metrics.observe_stage(
+                        modality_name,
+                        "batch",
+                        "preprocess",
+                        time.perf_counter() - preprocess_tic,
+                    )
+
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            if len(grid_dim) != total:
+                raise InternalError(
+                    f"Grid count mismatch for {self.model_type}/{modality.name}: "
+                    f"expected {total} grids (per request {items_per_req}), "
+                    f"processor produced {len(grid_dim)}"
+                )
+
+            final_slices: List[Optional[torch.Tensor]] = [None] * total
+            missing_indices = list(range(total))
+            item_hashes: Optional[List[int]] = None
+
+            item_hashes = await self._compute_encoder_item_hashes(
+                mm_feature,
+                grid_dim,
+                modality,
+                required_for_cache=self.server_args.enable_prefix_mm_cache,
+            )
+
+            if self.server_args.enable_prefix_mm_cache:
+                if item_hashes is None:
+                    raise InternalError(
+                        "Prefix multimodal cache requires encoder item hashes "
+                        f"for {modality.name}"
+                    )
+                missing_indices = []
+                async with self.mm_cache_lock:
+                    for idx, item_hash in enumerate(item_hashes):
+                        cached = self.mm_cache.get([item_hash])
+                        if cached is None:
+                            missing_indices.append(idx)
+                        else:
+                            final_slices[idx] = cached.embedding
+
+            if missing_indices:
+                vit_tic = time.perf_counter()
+                owned_release = release_fn
+                release_fn = None
+                new_slices = await self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    missing_indices,
+                    modality,
+                    get_feature_fn,
+                    release_fn=owned_release,
+                )
+                if self.metrics is not None:
+                    self.metrics.observe_vit(
+                        modality_name, "batch", time.perf_counter() - vit_tic
+                    )
+                for slot, embedding in zip(missing_indices, new_slices):
+                    final_slices[slot] = embedding
+
+                if self.server_args.enable_prefix_mm_cache:
+                    async with self.mm_cache_lock:
+                        for slot, embedding in zip(missing_indices, new_slices):
+                            mm_hash = MultiModalStaticCache.combine_hashes(
+                                [item_hashes[slot]]
+                            )
+                            self.mm_cache.set(
+                                mm_hash, EmbeddingResult(embedding=embedding)
+                            )
+
+            results = []
+            offset = 0
+            for req, count in zip(requests, items_per_req):
+                slices = final_slices[offset : offset + count]
+                if any(item is None for item in slices):
+                    raise InternalError(
+                        f"Missing embedding slice for req_id={req.get('req_id')}"
+                    )
+                embedding = slices[0] if count == 1 else torch.cat(slices, dim=0)
+                if self.rank == 0:
+                    request_item_hashes = (
+                        item_hashes[offset : offset + count]
+                        if item_hashes is not None
+                        else None
+                    )
+                    self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                        req["req_id"],
+                        req["num_parts"],
+                        req["part_idx"],
+                        grid_dim[offset : offset + count],
+                        modality,
+                        embedding,
+                        item_hashes=request_item_hashes,
+                    )
+                results.append(
+                    (
+                        embedding.nbytes,
+                        embedding.shape[0],
+                        embedding.shape[1],
+                        None,
+                        None,
+                    )
+                )
+                if self.metrics is not None:
+                    self.metrics.observe_embedding(
+                        modality_name, "batch", int(embedding.shape[0])
+                    )
+                offset += count
+
+            if self.profiler is not None:
+                for _ in requests:
+                    self.profiler.step()
+            if self.metrics is not None:
+                self.metrics.observe_batch_duration(
+                    modality_name, time.perf_counter() - batch_tic
+                )
+            return results
+        except Exception as exc:
+            return self._batch_set_error(requests, modality, exc)
+        finally:
+            if release_fn is not None:
+                release_fn()
+
+    def _batch_set_error(
+        self, requests: List[dict], modality: Modality, exc: Exception
+    ) -> List[Tuple[int, int, int, str, int]]:
+        error_code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+        error_msg = str(exc)
+        logger.error(
+            f"Rank {self.rank} batch_encode failed: {error_msg} "
+            f"error_code={error_code}"
+        )
+        if self.rank == 0:
+            for req in requests:
+                self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    None,
+                    modality,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
+        return [(0, 0, 0, error_msg, error_code)] * len(requests)
+
     async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
         try:
-            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
+            grid_dim, mm_embedding, aux_data, item_hashes = await self._encode(
+                mm_items, modality
+            )
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
@@ -1862,6 +2449,7 @@ class MMEncoder:
                     grid_dim,
                     modality,
                     mm_embedding,
+                    item_hashes=item_hashes,
                     **aux_data,
                 )
                 self.embedding_to_send[req_id] = mm_data
@@ -1890,6 +2478,72 @@ class MMEncoder:
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
+    async def encode_metadata(
+        self, mm_items, modality: Modality, req_id, num_parts, part_idx
+    ):
+        """Build decoder-side multimodal metadata without running the ViT."""
+        try:
+            preprocess_tic = time.perf_counter()
+            try:
+                mm_inputs, _, release_fn = await self._process_mm_items(
+                    mm_items, modality
+                )
+            except NotImplementedError as e:
+                raise InternalError(f"Not implemented error: {str(e)}") from e
+            except MMError:
+                raise
+            except TimeoutError as e:
+                raise MMError(str(e), code=HTTPStatus.SERVICE_UNAVAILABLE) from e
+            except Exception as e:
+                raise BadRequestError(f"Failed to process mm items: {str(e)}") from e
+            try:
+                if isinstance(mm_inputs, dict) and mm_inputs.get("_empty_video_shard"):
+                    grid_dim = None
+                    aux_data = _build_mm_aux_data({})
+                else:
+                    grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+                    aux_data = _build_mm_aux_data(mm_inputs)
+                if self.metrics is not None:
+                    self.metrics.observe_stage(
+                        modality.name.lower(),
+                        "meta_only",
+                        "preprocess",
+                        time.perf_counter() - preprocess_tic,
+                    )
+
+                if self.rank == 0:
+                    self.embedding_to_send[req_id] = EmbeddingData(
+                        req_id,
+                        num_parts,
+                        part_idx,
+                        grid_dim,
+                        modality,
+                        embedding=None,
+                        **aux_data,
+                    )
+                return 0, 0, 0, None, None
+            finally:
+                if release_fn is not None:
+                    release_fn()
+        except Exception as e:
+            error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+            error_msg = str(e)
+            logger.error(
+                f"Rank {self.rank} metadata encode failed: {error_msg} "
+                f"{error_code = }"
+            )
+            if self.rank == 0:
+                self.embedding_to_send[req_id] = EmbeddingData(
+                    req_id,
+                    num_parts,
+                    part_idx,
+                    None,
+                    modality,
+                    error_msg=error_msg,
+                    error_code=error_code,
+                )
+            return 0, 0, 0, error_msg, error_code
+
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
         self,
@@ -1900,7 +2554,17 @@ class MMEncoder:
         buffer_address=None,
         meta_only=False,
     ):
-        mm_data: EmbeddingData = self.embedding_to_send[req_id]
+        """Transfer one embedding. Returns the EmbeddingData (truthy) on a
+        completed attempt -- check `.error_msg` for an RDMA write failure --
+        or None (falsy) when the entry was already reclaimed by the sweeper.
+        """
+        mm_data = self.embedding_to_send.get(req_id)
+        if mm_data is None:
+            logger.warning(
+                f"Encoder send: embedding already reclaimed for req_id={req_id} "
+                f"(no /send within TTL); skipping transfer"
+            )
+            return None
         await self._send(
             mm_data.embedding,
             mm_data,
@@ -1910,6 +2574,7 @@ class MMEncoder:
             embedding_port=embedding_port,
             meta_only=meta_only,
         )
+        return mm_data
 
     # For zmq_to_scheduler
     async def send_with_url(
@@ -2068,11 +2733,172 @@ class EncoderProfiler:
         return True, None
 
 
+class PendingRequest:
+    __slots__ = ("request", "future", "submit_time")
+
+    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
+        self.request = request
+        self.future = loop.create_future()
+        self.submit_time = time.time()
+
+
+_BATCHABLE_MODALITIES = {Modality.IMAGE}
+
+
+class EncoderScheduler:
+    """Aggregate concurrent image /encode calls into bounded request batches."""
+
+    def __init__(
+        self,
+        encoder: MMEncoder,
+        worker_sockets: List[zmq.Socket],
+        max_batch_size: int,
+        request_timeout: float = ENCODER_REQ_TIMEOUT,
+    ):
+        self.encoder = encoder
+        self.worker_sockets = worker_sockets
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.request_timeout = max(1.0, float(request_timeout))
+        self.pending_queue = asyncio.Queue()
+        self._worker_task = None
+
+    def start(self):
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._batch_worker())
+            logger.info(
+                "EncoderScheduler started with max_batch_size=%d",
+                self.max_batch_size,
+            )
+
+    async def stop(self):
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+        while True:
+            try:
+                pending = self.pending_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+        if self.encoder.metrics is not None:
+            self.encoder.metrics.set_queue_depth(0)
+
+    async def submit(self, request: dict):
+        pending = PendingRequest(request, asyncio.get_running_loop())
+        await self.pending_queue.put(pending)
+        if self.encoder.metrics is not None:
+            self.encoder.metrics.set_queue_depth(self.pending_queue.qsize())
+        return await asyncio.wait_for(
+            pending.future, timeout=self.request_timeout
+        )
+
+    async def _collect_batch(self):
+        batch = [await self.pending_queue.get()]
+        while len(batch) < self.max_batch_size:
+            try:
+                batch.append(self.pending_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if self.encoder.metrics is not None:
+            self.encoder.metrics.set_queue_depth(self.pending_queue.qsize())
+        return batch
+
+    @staticmethod
+    def _validate_request(request):
+        if not isinstance(request, dict):
+            return f"request is not a dict: {type(request).__name__}"
+        if not request.get("req_id"):
+            return "missing req_id"
+        if not request.get("mm_items"):
+            return "missing or empty mm_items"
+        if "num_parts" not in request or "part_idx" not in request:
+            return "missing num_parts / part_idx"
+        return None
+
+    async def _batch_worker(self):
+        while True:
+            batch = []
+            try:
+                batch = await self._collect_batch()
+                groups = defaultdict(list)
+                for pending in batch:
+                    modality = Modality.from_str(
+                        pending.request.get("modality", "image")
+                    )
+                    groups[modality].append(pending)
+                for modality, group in groups.items():
+                    await self._dispatch_group(group, modality)
+            except asyncio.CancelledError:
+                for pending in batch:
+                    if not pending.future.done():
+                        pending.future.set_exception(
+                            RuntimeError("EncoderScheduler stopped")
+                        )
+                raise
+            except Exception as exc:
+                logger.exception("EncoderScheduler worker failed")
+                for pending in batch:
+                    if not pending.future.done():
+                        pending.future.set_exception(exc)
+
+    async def _dispatch_group(self, group, modality):
+        valid = []
+        now = time.time()
+        for pending in group:
+            if pending.future.done():
+                continue
+            error = self._validate_request(pending.request)
+            if error is not None:
+                pending.future.set_exception(BadRequestError(error))
+                continue
+            valid.append(pending)
+            if self.encoder.metrics is not None:
+                self.encoder.metrics.observe_queue_wait(
+                    max(0.0, now - pending.submit_time),
+                    modality=modality.name.lower(),
+                )
+        if not valid:
+            return
+
+        requests = [pending.request for pending in valid]
+        for socket in self.worker_sockets:
+            socket.send_pyobj(
+                {
+                    "type": "batch_encode",
+                    "modality": modality.name,
+                    "requests": requests,
+                }
+            )
+        results = await self.encoder.batch_encode(requests, modality)
+        if len(results) != len(valid):
+            raise RuntimeError(
+                f"batch_encode returned {len(results)} results for "
+                f"{len(valid)} requests"
+            )
+        for pending, result in zip(valid, results):
+            if not pending.future.done():
+                pending.future.set_result(result)
+
+
+encoder_scheduler: Optional[EncoderScheduler] = None
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # Only rank 0 owns embedding_to_send; run the orphan-embedding sweeper
     # there to prevent a slow leak when /send never arrives.
+    global encoder_scheduler
     sweeper_task = None
+    if encoder is not None:
+        encoder_scheduler = EncoderScheduler(
+            encoder, send_sockets, max_batch_size=ENCODER_MAX_BATCH_SIZE
+        )
+        encoder_scheduler.start()
     if (
         encoder is not None
         and getattr(encoder, "rank", 0) == 0
@@ -2082,6 +2908,9 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if encoder_scheduler is not None:
+            await encoder_scheduler.stop()
+            encoder_scheduler = None
         if sweeper_task is not None:
             sweeper_task.cancel()
             try:
@@ -2108,7 +2937,13 @@ async def run_encoder(
                 encoder.profiler.start(request)
             else:
                 encoder.profiler.stop()
+        elif isinstance(request, dict) and request.get("type") == "batch_encode":
+            await encoder.batch_encode(
+                request["requests"], Modality.from_str(request["modality"])
+            )
         else:
+            if _is_mooncake_metadata_only(request, server_args):
+                continue
             modality = Modality.from_str(request["modality"])
             is_video_shard = _set_video_shard_context(request, modality)
             if encoder.mm_global_cache is not None and not is_video_shard:
@@ -2199,15 +3034,14 @@ async def handle_encode_request(request: dict):
         modality = Modality.from_str(request["modality"])
         is_video_shard = _set_video_shard_context(request, modality)
         modality_name = modality.name.lower()
-        meta_only = (
-            request.get("role") == "decode"
-            and encoder.server_args.encoder_transfer_backend == "mooncake"
-        )
+        meta_only = _is_mooncake_metadata_only(request, encoder.server_args)
         include_canonical_metrics = not meta_only
         if meta_only:
             execution_path = "meta_only"
         elif encoder.mm_global_cache is not None and not is_video_shard:
             execution_path = "global_cache"
+        elif encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
+            execution_path = "batch"
         if encoder.metrics is not None:
             encoder.metrics.request_started(
                 modality_name,
@@ -2219,33 +3053,66 @@ async def handle_encode_request(request: dict):
                 encoder_time_stats = EncoderReqTimeStats(modality=modality_name)
                 encoder_time_stats.set_metrics_collector(encoder.metrics)
                 encoder_time_stats.set_mm_encode_start_time(req_tic)
-        for socket in send_sockets:
-            socket.send_pyobj(request)
-        if encoder.mm_global_cache is not None and not is_video_shard:
+        if meta_only:
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_with_global_cache(
+                await encoder.encode_metadata(
                     mm_items=request["mm_items"],
                     modality=modality,
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
-                    hashes=request.get("hashes", None),
                 )
             )
+        elif (
+            encoder_scheduler is not None
+            and encoder.mm_global_cache is None
+            and modality in _BATCHABLE_MODALITIES
+        ):
+            error_stage = "queue"
+            try:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder_scheduler.submit(request)
+                )
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+                return ORJSONResponse(
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    content={
+                        "status": "error",
+                        "message": "encoder batch timed out",
+                        "req_id": req_id,
+                    },
+                )
         else:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=modality,
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
+            for socket in send_sockets:
+                socket.send_pyobj(request)
+            if encoder.mm_global_cache is not None and not is_video_shard:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder.encode_with_global_cache(
+                        mm_items=request["mm_items"],
+                        modality=modality,
+                        req_id=request["req_id"],
+                        num_parts=request["num_parts"],
+                        part_idx=request["part_idx"],
+                        hashes=request.get("hashes", None),
+                    )
                 )
-            )
+            else:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder.encode(
+                        mm_items=request["mm_items"],
+                        modality=modality,
+                        req_id=request["req_id"],
+                        num_parts=request["num_parts"],
+                        part_idx=request["part_idx"],
+                    )
+                )
 
         if error_msg:
             outcome = "error"
             error_stage = "encode"
+            if encoder.server_args.encoder_transfer_backend == "mooncake":
+                encoder.embedding_to_send.pop(req_id, None)
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
                 if request["embedding_port"] is None:
                     start_background_send(req_id)
@@ -2262,13 +3129,29 @@ async def handle_encode_request(request: dict):
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             if request.get("role") == "decode":
-                await encoder.send(
-                    req_id=req_id,
-                    prefill_host=request["prefill_host"],
-                    embedding_port=request["embedding_port"],
-                    meta_only=True,
-                )
-                encoder.embedding_to_send.pop(req_id, None)
+                try:
+                    transferred = await encoder.send(
+                        req_id=req_id,
+                        prefill_host=request["prefill_host"],
+                        embedding_port=request["embedding_port"],
+                        meta_only=True,
+                    )
+                finally:
+                    encoder.embedding_to_send.pop(req_id, None)
+                if not transferred:
+                    # Sweeper already reclaimed the entry: no metadata frame
+                    # was pushed, so fail the decode request fast (410) instead
+                    # of letting it hang out the full recv timeout.
+                    if encoder.metrics is not None:
+                        encoder.metrics.inc_send_reclaimed()
+                    return ORJSONResponse(
+                        status_code=HTTPStatus.GONE,
+                        content={
+                            "status": "error",
+                            "message": "embedding already reclaimed (no /send within TTL)",
+                            "req_id": req_id,
+                        },
+                    )
                 return ORJSONResponse(content=None)
             del request["mm_items"]
             request.update(
@@ -2337,7 +3220,7 @@ async def handle_encode_request(request: dict):
 @app.post("/send")
 async def handle_send_request(request: dict):
     # mooncake backend
-    await encoder.send(
+    mm_data = await encoder.send(
         req_id=request["req_id"],
         prefill_host=request["prefill_host"],
         embedding_port=request["embedding_port"],
@@ -2345,6 +3228,34 @@ async def handle_send_request(request: dict):
         buffer_address=request["buffer_address"],
     )
     encoder.embedding_to_send.pop(request["req_id"], None)
+    if not mm_data:
+        if encoder.metrics is not None:
+            encoder.metrics.inc_send_reclaimed()
+        return ORJSONResponse(
+            status_code=HTTPStatus.GONE,
+            content={
+                "status": "error",
+                "message": "embedding already reclaimed (no /send within TTL)",
+                "req_id": request["req_id"],
+            },
+        )
+    if getattr(mm_data, "error_msg", None) is not None:
+        # The RDMA write failed: the error frame has been pushed via ZMQ, but
+        # the /send response must ALSO carry the failure. Otherwise, when the
+        # receiver's recv task is already gone (timeout / client disconnect --
+        # the only consumer of that ZMQ frame), the failure signal is lost
+        # entirely and the receiver treats this part as successfully sent.
+        error_code = (
+            getattr(mm_data, "error_code", None) or HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        return ORJSONResponse(
+            status_code=int(error_code),
+            content={
+                "status": "error",
+                "message": mm_data.error_msg,
+                "req_id": request["req_id"],
+            },
+        )
     return ORJSONResponse(content=None)
 
 

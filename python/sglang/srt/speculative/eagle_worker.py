@@ -254,6 +254,9 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_nsa_topk_from_draft_extend=is_mtp_index_share_enabled(
+                self.model_config.hf_config
+            ),
         )
 
         # Initialize decode attention backend
@@ -1390,6 +1393,7 @@ class EAGLEWorker(TpModelWorker):
             return
 
         draft_input.mtp_topk_indices = None
+        draft_input.mtp_topk_indices_are_physical = None
         if forward_batch is None:
             return
 
@@ -1405,6 +1409,9 @@ class EAGLEWorker(TpModelWorker):
             return
 
         draft_input.mtp_topk_indices = seed.clone()
+        draft_input.mtp_topk_indices_are_physical = (
+            forward_batch.mtp_topk_indices_are_physical
+        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

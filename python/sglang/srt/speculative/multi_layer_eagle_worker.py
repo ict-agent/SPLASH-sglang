@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -216,6 +217,9 @@ class MultiLayerEagleWorker(TpModelWorker):
                 self.mtp_model_runner(step),
                 self.topk,
                 self.speculative_num_steps,
+                seed_nsa_topk_from_draft_extend=is_mtp_index_share_enabled(
+                    self.mtp_model_runner(step).model_config.hf_config
+                ),
             )
 
             # Initialize draft extend attention backend (respects speculative_attention_mode setting)

@@ -19,6 +19,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.common.utils import ZMQSocketCache
     from sglang.srt.disaggregation.decode import DecodeRequest
 
 
@@ -50,7 +51,6 @@ class PrefillStagingContext:
     # Rooms that have already had their full prefetch fan-out triggered. Used
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
-    prefetch_sockets: dict = dataclasses.field(default_factory=dict)
 
 
 class DecodeStagingHandler:
@@ -80,6 +80,9 @@ class DecodeStagingHandler:
         self.scheduler = scheduler
         self._room_to_decode_req: dict = {}
         self._wm_subscribers: dict = {}
+        # Rooms that hit an unrecoverable chunk error (e.g. mixed SKIP/READY
+        # writers), which must be marked Failed instead of Success.
+        self._chunk_error_rooms: set = set()
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
@@ -137,6 +140,9 @@ class DecodeStagingHandler:
 
     def unregister_decode_req(self, room: int) -> None:
         self._room_to_decode_req.pop(room, None)
+        # Drop any chunk-error flag so a reused bootstrap_room id does not
+        # inherit a stale mixed-SKIP/READY failure from an earlier request.
+        self._chunk_error_rooms.discard(room)
 
     # ------------------------------------------------------------------
     # Scatter submission: called from decode_thread (background)
@@ -203,7 +209,32 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
+        chunk_writer_counts[room][chunk_idx].append(
+            (page_start, num_pages, writer_id, False)
+        )
+        return self._maybe_finish_chunk(room, chunk_idx, chunk_writer_counts)
+
+    def handle_chunk_skip(
+        self,
+        room: int,
+        chunk_idx: int,
+        writer_id: str,
+        chunk_writer_counts: dict,
+    ) -> bool:
+        """Process a STAGING_SKIP: a writer fell back to the per-token slice path,
+        so this chunk's staging allocation will never be scattered.
+
+        Accumulates skips alongside CHUNK_READY arrivals in *chunk_writer_counts*
+        and, once all writers have reported, releases the staging allocation if
+        every writer skipped (the data went straight to KV via the slice path).
+        This keeps ``missing_chunks`` from mistaking a slice-fallback chunk for a
+        lost CHUNK_READY notification.
+        """
+        chunk_writer_counts[room][chunk_idx].append((0, 0, writer_id, True))
+        return self._maybe_finish_chunk(room, chunk_idx, chunk_writer_counts)
+
+    def _maybe_finish_chunk(self, room: int, chunk_idx: int, chunk_writer_counts) -> bool:
+        """Finalize a chunk once all its writers (ready or skip) have reported."""
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -212,13 +243,62 @@ class DecodeStagingHandler:
                 chunk_idx,
             )
             return False
-        writers_arrived = len(chunk_writer_counts[room][chunk_idx])
+        entries = chunk_writer_counts[room][chunk_idx]
         num_writers = self.num_writers_for(decode_req)
-        if writers_arrived >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            del chunk_writer_counts[room][chunk_idx]
-            return True
-        return False
+        if len(entries) < num_writers:
+            return False
+
+        if all(e[3] for e in entries):
+            # Every writer fell back to slice: the staging allocation is unused.
+            self._release_staging(decode_req, chunk_idx)
+        elif any(e[3] for e in entries):
+            # Mixed ready/skip must not happen under a symmetric topology, but
+            # if it does the staging region is corrupt in a way that can NOT be
+            # recovered: READY writers only wrote staging (not scattered), while
+            # SKIP writers wrote straight to KV. Neither scatter (would overwrite
+            # SKIP data with garbage) nor release (would drop READY data) is
+            # correct. Mark the room failed so the Success aggregation refuses to
+            # commit it — otherwise we silently return a room with missing KV.
+            logger.error(
+                "Staging chunk %d of room %s has mixed SKIP/READY writers; "
+                "marking room failed (data incomplete)",
+                chunk_idx,
+                room,
+            )
+            self._chunk_error_rooms.add(room)
+            self._release_staging(decode_req, chunk_idx)
+        else:
+            # All writers ready: scatter the staging region into KV.
+            self.submit_chunk_scatter(
+                room, chunk_idx, entries[-1][0], entries[-1][1]
+            )
+
+        del chunk_writer_counts[room][chunk_idx]
+        return True
+
+    def has_chunk_errors(self, room: int) -> bool:
+        """True if this room hit an unrecoverable chunk error (mixed SKIP/READY),
+        so the Success aggregation must mark it Failed instead of Success."""
+        return room in self._chunk_error_rooms
+
+    def _release_staging(self, decode_req, chunk_idx: int) -> None:
+        """Free a chunk's staging allocation without scattering it (slice fallback).
+
+        Also broadcasts the watermark so prefill learns this region is reusable:
+        without it, a slice-fallback chunk's freed space stays invisible to
+        prefill until the next scatter-driven watermark, which can stall
+        (or livelock) subsequent staging chunks waiting on that space.
+        """
+        infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+        if chunk_idx >= len(infos):
+            return
+        alloc_id, staging_offset, _, _, _ = infos[chunk_idx]
+        if alloc_id < 0 or staging_offset < 0:
+            # Already consumed / never allocated / ALLOC_OVERSIZED: nothing to free.
+            return
+        self.staging_allocator.free(alloc_id)
+        infos[chunk_idx] = (-1, -1, 0, -1, 0)
+        self._broadcast_watermark(decode_req)
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Submit scatter for the last chunk when all ranks report Success.
@@ -246,6 +326,28 @@ class DecodeStagingHandler:
         else:
             decode_req._staging_scatter_done = True
         return True
+
+    def missing_chunks(self, room: int) -> List[int]:
+        """Return indices of intermediate chunks whose staging data was
+        allocated but never scattered into KV — i.e. their CHUNK_READY / RDMA
+        notification never arrived. The last chunk is excluded (it is scattered
+        by submit_last_scatter_async, not via a per-chunk notification).
+
+        This is the safety net for a lost notification: without it, a missing
+        intermediate chunk is invisible to is_done() (its scatter event was
+        never recorded), so the request would commit with a missing KV region
+        while still reporting Success.
+        """
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return []
+        infos = getattr(decode_req.kv_receiver, "chunk_staging_infos", [])
+        missing = []
+        for idx in range(len(infos) - 1):
+            alloc_id, staging_offset, _, _, _ = infos[idx]
+            if alloc_id >= 0 and staging_offset >= 0:
+                missing.append(idx)
+        return missing
 
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
@@ -374,6 +476,10 @@ class DecodeStagingHandler:
     ) -> None:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
+        self._broadcast_watermark(decode_req)
+
+    def _broadcast_watermark(self, decode_req: "DecodeRequest") -> None:
+        """Broadcast the current staging watermark to all subscribed prefills."""
         post_wm = self.staging_allocator.get_watermark()
         room = decode_req.req.bootstrap_room
         wm_round, wm_tail = post_wm
@@ -383,13 +489,17 @@ class DecodeStagingHandler:
             sid_b = session_id.encode("ascii")
             for bootstrap_info in receiver.bootstrap_infos:
                 try:
-                    sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                    with lock:
+                    with receiver._connect_to_bootstrap_server(bootstrap_info) as sock:
                         sock.send_multipart(
                             [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        "[STAGING] WATERMARK send failed for room=%s session=%s: %s",
+                        room,
+                        session_id,
+                        e,
+                    )
 
 
 def is_watermark_ready(
@@ -758,8 +868,7 @@ def handle_staging_req(
     if bootstrap_infos:
         for bi in bootstrap_infos:
             try:
-                sock, lock = receiver._connect_to_bootstrap_server(bi)
-                with lock:
+                with receiver._connect_to_bootstrap_server(bi) as sock:
                     sock.send_multipart(
                         [
                             b"STAGING_RSP",
@@ -771,8 +880,15 @@ def handle_staging_req(
                             session_id.encode("ascii"),
                         ]
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "[STAGING] STAGING_RSP send failed for room=%s chunk=%s "
+                    "session=%s: %s",
+                    room,
+                    chunk_idx,
+                    session_id,
+                    e,
+                )
 
 
 def prefetch_staging_reqs(
@@ -781,12 +897,16 @@ def prefetch_staging_reqs(
     kv_buffer_tensors: dict,
     chunked_prefill_size: int,
     staging_requested: set,
-    prefetch_sockets: dict,
-) -> None:
+    socket_cache: "ZMQSocketCache",
+) -> bool:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
     allocates staging during the GPU forward pass.
+
+    Returns True if every chunk was sent (or nothing needed sending), False if
+    any send failed and its key was discarded — the caller can then retry the
+    fan-out instead of permanently marking the room as prefetched.
     """
     import zmq
 
@@ -795,6 +915,8 @@ def prefetch_staging_reqs(
     page_size = kv_buffer_tensors["page_size"]
     cps = chunked_prefill_size or 8192
     full_chunk_pages = max(1, cps // page_size)
+
+    failed = False
 
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
@@ -820,21 +942,33 @@ def prefetch_staging_reqs(
             chunk_pages = min(full_chunk_pages, remaining)
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
-                ep = na.to_tcp()
-                if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
-                    [
-                        b"STAGING_REQ",
-                        str(room).encode("ascii"),
-                        str(chunk_idx).encode("ascii"),
-                        str(chunk_pages).encode("ascii"),
-                        session_id.encode("ascii"),
-                    ]
-                )
-            except Exception:
+                # Non-blocking lease (timeout=0): this runs on the scheduler
+                # thread right after batch formation, so it must never block on
+                # backpressure (up to LEASE_TIMEOUT_S otherwise) and stall the
+                # whole engine. If the socket can't be acquired immediately,
+                # skip this chunk and retry on the next batch.
+                with socket_cache.lease(
+                    zmq.PUSH, na.to_tcp(), is_ipv6=na.is_ipv6, timeout=0.0
+                ) as sock:
+                    sock.send_multipart(
+                        [
+                            b"STAGING_REQ",
+                            str(room).encode("ascii"),
+                            str(chunk_idx).encode("ascii"),
+                            str(chunk_pages).encode("ascii"),
+                            session_id.encode("ascii"),
+                        ]
+                    )
+            except Exception as e:
+                failed = True
                 staging_requested.discard(stg_key)
+                logger.warning(
+                    "[STAGING] STAGING_REQ send failed for room=%s chunk=%s "
+                    "session=%s (will retry on next batch): %s",
+                    room,
+                    chunk_idx,
+                    session_id,
+                    e,
+                )
+
+    return not failed

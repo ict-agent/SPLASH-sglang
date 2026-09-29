@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from array import array
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -2020,7 +2021,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self,
         req_id: str,
         last_host_node: TreeNode,
-        new_input_tokens: List[int],
+        new_input_tokens: array[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
@@ -2324,7 +2325,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def mamba_prefetch_alloc(
         self,
-        token_ids: List[int],
+        token_ids: array[int],
         last_hash: Optional[str],
     ) -> Optional[list[PoolTransfer]]:
         # allocate a mamba host slot and build Storage→H transfer descriptor

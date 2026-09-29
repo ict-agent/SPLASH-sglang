@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -51,6 +52,53 @@ _is_dcu = is_dcu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
+def _use_dp_gatherv() -> bool:
+    """Enable variable-length DP gather/combine for MLA-DP by default.
+
+    The normal DP-attention path keeps its historical env-gated behavior. In
+    MLA-only-DP, each TP rank is also one attention-DP owner, so SUM_LEN
+    all_gatherv/reduce_scatterv avoids moving zero-padded rows during long
+    prefill bursts. Zero-size entries are now skipped consistently inside the
+    pynccl grouped calls, so DCU no longer needs the all-reduce fallback.
+    An explicit environment variable overrides this default.
+    """
+
+    if "SGLANG_DP_USE_GATHERV" in os.environ:
+        return get_bool_env_var("SGLANG_DP_USE_GATHERV")
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return bool(getattr(get_global_server_args(), "mla_only_dp", False))
+    except Exception:
+        return False
+
+
+def _use_mla_only_dp() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return bool(getattr(get_global_server_args(), "mla_only_dp", False))
+    except Exception:
+        return False
+
+
+def use_mla_dp_min_one_padding() -> bool:
+    """Lift zero per-rank token counts to one under SUM_LEN MLA-only-DP.
+
+    RCCL (unlike NCCL) cannot keep collective sequences symmetric when a rank
+    contributes zero rows: the zero-row fast paths sprinkled through the layer
+    (attention skips, count-0 collectives) desynchronize the TP group and
+    wedge it non-deterministically. Lifting zeros to one lets every rank join
+    every collective with at least one (zero-padded) row; the padded row is
+    marked via num_token_non_padded exactly like a MAX_LEN padded row.
+    Default-on for DCU MLA-only-DP; SGLANG_MLA_ONLY_DP_MIN_ONE_PAD overrides.
+    """
+
+    if "SGLANG_MLA_ONLY_DP_MIN_ONE_PAD" in os.environ:
+        return get_bool_env_var("SGLANG_MLA_ONLY_DP_MIN_ONE_PAD")
+    return _is_dcu and _use_mla_only_dp()
+
+
 class DpPaddingMode(IntEnum):
 
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
@@ -72,9 +120,18 @@ class DpPaddingMode(IntEnum):
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
+        #
+        # Under SUM_LEN, empty DP ranks stay shape-symmetric through
+        # use_mla_dp_min_one_padding(): their zero counts are lifted to one and
+        # the idle batch is padded/converted exactly like a MAX_LEN padded row,
+        # so every rank joins every collective with >=1 row.
+        # SGLANG_MLA_ONLY_DP_USE_MAX_LEN_MLP=1 restores the fully padded
+        # MAX_LEN handoff for A/B tests.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for NSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            if get_bool_env_var("SGLANG_MLA_ONLY_DP_USE_MAX_LEN_MLP"):
+                return cls.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
@@ -474,9 +531,10 @@ def _dp_gather_via_all_reduce(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            assert (
+                local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+            ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -516,12 +574,70 @@ def _dp_gather_via_all_gather(
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
+def is_dp_gatherv_active() -> bool:
+    return (
+        _use_dp_gatherv()
+        and get_attention_tp_size() == 1
+        and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and not is_dp_max_padding()
+    )
+
+
+def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
+    sizes = getattr(forward_batch, "global_num_tokens_for_logprob_cpu", None)
+    if sizes is None:
+        sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if sizes is None:
+        return None
+    try:
+        return [int(size) for size in sizes]
+    except (TypeError, ValueError):
+        return None
+
+
+def _dp_gather_via_all_gatherv(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    sizes: List[int],
+):
+    dp_rank = get_attention_dp_rank()
+    local_rows = sizes[dp_rank]
+    if local_tokens.shape[0] == local_rows:
+        local_real = local_tokens
+    elif local_tokens.shape[0] > local_rows:
+        local_real = local_tokens[:local_rows]
+    else:
+        local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
+        local_real[: local_tokens.shape[0]].copy_(local_tokens)
+
+    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    if (
+        is_dp_gatherv_active()
+        and forward_batch.dp_padding_mode is not None
+        and not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        gatherv_sizes = get_dp_global_num_tokens()
+        if gatherv_sizes is None or sum(gatherv_sizes) != global_tokens.shape[0]:
+            gatherv_sizes = _dp_gatherv_sizes(forward_batch)
+        if (
+            gatherv_sizes is not None
+            and len(gatherv_sizes) == get_tensor_model_parallel_world_size()
+            and sum(gatherv_sizes) == global_tokens.shape[0]
+        ):
+            _dp_gather_via_all_gatherv(
+                global_tokens, local_tokens, forward_batch, gatherv_sizes
+            )
+            return
+
     if forward_batch.dp_padding_mode.is_max_len():
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
@@ -561,9 +677,10 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        if not torch.compiler.is_compiling():
+            assert (
+                local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+            ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True

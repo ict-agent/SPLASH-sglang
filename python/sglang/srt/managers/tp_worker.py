@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -43,7 +44,12 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj,
+    require_gathered_buffer,
+    set_random_seed,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -543,6 +549,77 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    def forward_batch_generation_split_init(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> ForwardBatch:
+        """Initialize an eager EXTEND forward for opt-in layer pipelining."""
+        self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch.split_index = 0
+
+        # Mirror ModelRunner's existing eager preparation without refactoring
+        # or changing the regular forward path.
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self.model_runner)
+        else:
+            forward_batch.prepare_attn_tp_scatter_input(self.model_runner)
+        if (
+            forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
+            and require_gathered_buffer(self.model_runner.server_args)
+            and not is_nsa_enable_prefill_cp()
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.model_runner.server_args,
+            )
+        if forward_batch.out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(
+                forward_batch.out_cache_loc_swa
+            )
+        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
+        return forward_batch
+
+    def forward_batch_generation_split_layer(
+        self,
+        forward_batch: ForwardBatch,
+        forward_count: int = 1,
+    ) -> tuple:
+        """Run one layer group and record the event that produces its KV."""
+        logits_output = self.model_runner.forward_split_prefill(
+            forward_batch,
+            reinit_attn_backend=(forward_batch.split_index == 0),
+            forward_count=forward_count,
+        )
+        if (
+            logits_output is not None
+            and forward_batch.global_num_tokens_cpu is not None
+            and self.model_runner.pp_group.is_last_rank
+        ):
+            forward_batch.post_forward_mlp_sync_batch(logits_output)
+        event = torch.cuda.Event()
+        event.record()
+        return logits_output, event
+
+    def forward_batch_generation_split_sample(
+        self,
+        logits_output,
+        forward_batch: ForwardBatch,
+    ):
+        if forward_batch.is_prefill_only:
+            next_token_ids = torch.zeros(
+                len(forward_batch.seq_lens),
+                dtype=torch.long,
+                device=forward_batch.input_ids.device,
+            )
+            if (
+                forward_batch.return_logprob
+                and logits_output.next_token_logits is not None
+            ):
+                self.model_runner.compute_logprobs_only(logits_output, forward_batch)
+            return next_token_ids
+        return self.model_runner.sample(logits_output, forward_batch)
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

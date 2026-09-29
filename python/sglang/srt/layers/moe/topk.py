@@ -211,35 +211,65 @@ if _use_lightop:
     from lightop import op as op
 
 
-def moe_fused_gate_dcu(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
+def moe_fused_gate_dcu(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pass SGLang's scaling ownership decision to LightOP explicitly.
+
+    LightOP defaults this flag to True for legacy callers. Omitting it would
+    also scale the weights on paths where the MoE runner owns scaling.
+    """
     topk_weights, topk_ids = op.moe_fused_gate(
-            gating_output,
-            correction_bias,
-            num_expert_group,
-            topk_group,
-            topk,
-            num_fused_shared_experts,
-            routed_scaling_factor,
-        )
+        gating_output,
+        correction_bias,
+        num_expert_group,
+        topk_group,
+        topk,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
     return topk_weights, topk_ids
 
-def moe_fused_gate_fake(gating_output: torch.Tensor, correction_bias: torch.Tensor, num_expert_group: int,
-                                   topk_group: int, topk: int,
-                                   num_fused_shared_experts: int, routed_scaling_factor: float) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device), \
-                    torch.empty((gating_output.size(0), topk),
-                           dtype=gating_output.dtype,
-                           device=gating_output.device)
-direct_register_custom_op(
-        op_name="moe_fused_gate_dcu",
-        op_func=moe_fused_gate_dcu,
-        mutates_args=[],
-        fake_impl=moe_fused_gate_fake,
+
+def moe_fused_gate_fake(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+    apply_routed_scaling_factor_on_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # LightOP returns these dtypes regardless of the router input dtype.
+    return (
+        torch.empty(
+            (gating_output.size(0), topk),
+            dtype=torch.float32,
+            device=gating_output.device,
+        ),
+        torch.empty(
+            (gating_output.size(0), topk),
+            dtype=torch.int32,
+            device=gating_output.device,
+        ),
     )
+
+
+direct_register_custom_op(
+    op_name="moe_fused_gate_dcu",
+    op_func=moe_fused_gate_dcu,
+    mutates_args=[],
+    fake_impl=moe_fused_gate_fake,
+)
 
 
 # -------------------------------- TopKConfig ---------------------------------------
@@ -1258,15 +1288,20 @@ def biased_grouped_topk_gpu(
             apply_routed_scaling_factor_on_output,
         )
     elif _use_lightop:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        # The currently supported DCU W8A8 path applies the scale in the runner.
+        assert not apply_routed_scaling_factor_on_output, (
+            "LightOP TopK currently requires runner-owned routed scaling "
+            "(apply_routed_scaling_factor_on_output=False)."
+        )
         topk_weights, topk_ids = torch.ops.sglang.moe_fused_gate_dcu(
             gating_output,
             correction_bias,
             num_expert_group,
             topk_group,
             topk,
-            num_fused_shared_experts, 
-            routed_scaling_factor,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            apply_routed_scaling_factor_on_output,
         )
         # if (expert_location_dispatch_info is not None) or (
         #     num_token_non_padded is not None

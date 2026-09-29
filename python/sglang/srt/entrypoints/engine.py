@@ -700,6 +700,7 @@ class Engine(EngineScoreMixin, EngineBase):
         names: List[str] = []
 
         if server_args.detokenizer_worker_num <= 1:
+            port_args.detokenizer_ack_ipc_name = None
             proc = mp.Process(
                 target=run_detokenizer_process_func,
                 args=(server_args, port_args),
@@ -710,6 +711,9 @@ class Engine(EngineScoreMixin, EngineBase):
             return processes, names
 
         router_ipc_name = port_args.detokenizer_ipc_name
+        port_args.detokenizer_ack_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
         worker_ipc_names: List[str] = []
         try:
             for i in range(server_args.detokenizer_worker_num):

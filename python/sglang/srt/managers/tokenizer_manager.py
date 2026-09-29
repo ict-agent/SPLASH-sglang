@@ -13,6 +13,8 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import dataclasses
@@ -26,6 +28,7 @@ import socket
 import sys
 import threading
 import time
+from array import array
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -75,7 +78,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    ShmOwnerTable,
+    TensorTransportMode,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
@@ -86,6 +93,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.shm_monitor import start_shm_monitor_thread
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -145,6 +153,7 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    shm_owner_handle: Optional[int] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -235,12 +244,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
+        *,
+        start_disaggregation_service: bool = True,
     ):
         # Only HTTP/tokenizer worker processes construct TokenizerManager.
         cap_torch_intraop_threads()
 
         # Parse args
         self.server_args = server_args
+        self._start_disaggregation_service = start_disaggregation_service
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
@@ -365,6 +377,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             self.tokenizer_offload_executor = None
 
+        # uvicorn pauses socket reads for bodies >64 KiB (base64 images), so
+        # Request.is_disconnected() misses the client FIN and a doomed forward
+        # runs. Enable the resume+recheck (see _client_disconnected) only when
+        # opted in via env AND a multimodal model in EPD (language_only) mode.
+        self.enable_epd_reliable_disconnect = (
+            envs.SGLANG_EPD_RELIABLE_DISCONNECT_CHECK.get()
+            and self.model_config.is_multimodal
+            and self.server_args.language_only
+        )
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
@@ -431,6 +453,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        self.shm_owner_table = ShmOwnerTable()
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -512,7 +535,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.bootstrap_server = start_disagg_service(self.server_args)
+        self.bootstrap_server = (
+            start_disagg_service(self.server_args)
+            if self._start_disaggregation_service
+            else None
+        )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -553,6 +580,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             start_cpu_monitor_thread("tokenizer")
+            start_shm_monitor_thread(self.metrics_collector.update_shm_usage)
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
@@ -605,6 +633,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             if isinstance(obj, GenerateReqInput):
@@ -614,9 +644,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     request.headers.get("Session-Id") if request is not None else None
                 )
             self._handle_epd_disaggregation_encode_request(obj)
-        if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
-
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
 
@@ -639,6 +666,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await self._cleanup_failed_tokenize([obj])
                     raise
                 state = self.rid_to_state[obj.rid]
+                # Non-streaming requests are not cancelled on disconnect and are
+                # not polled until _wait_one_response -- by then the request has
+                # been dispatched and a doomed forward has already begun. Check
+                # once before dispatch so a client that left during tokenize/E
+                # neither triggers that forward nor leaks rid_to_state.
+                if await self._epd_mm_client_disconnected(obj, request):
+                    await self._cleanup_failed_tokenize([obj])
+                    raise ValueError(
+                        f"Request is disconnected from the client side (type 0). Abort request {obj.rid=}"
+                    )
                 self._send_one_request(tokenized_obj)
                 self._release_raw_multimodal_payload(state.obj)
                 async for response in self._wait_one_response(obj, request):
@@ -656,7 +693,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         released on completion) must be cleaned up here.
         """
         for o in objs:
-            self.rid_to_state.pop(o.rid, None)
+            state = self.rid_to_state.get(o.rid)
+            if state is not None:
+                self._release_shm_owner(state)
+                del self.rid_to_state[o.rid]
         if self.server_args.enable_lora:
             for o in objs:
                 if getattr(o, "lora_path", None) and getattr(o, "lora_id", None):
@@ -942,6 +982,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if hasattr(obj, "_precomputed_mm_inputs"):
                 # Reuse the encoder result fetched by prompt-length validation.
                 mm_inputs = obj._precomputed_mm_inputs
+                # Drop the tokenizer-side reference to the heap clone now that
+                # it is consumed. The SHM copy made in _send_one_request is
+                # the surviving transport, so keeping this cache pins E bytes
+                # per in-flight mm request for the whole request lifetime.
+                obj._precomputed_mm_inputs = None
             elif (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
@@ -1227,12 +1272,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
-        input_ids: List[int],
+        input_ids: Optional[List[int]],
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        input_ids_arr: Optional[array[int]] = (
+            array("q", input_ids) if input_ids is not None else None
+        )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1266,7 +1314,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 sampling_params,
                 obj.return_logprob,
@@ -1308,12 +1356,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and obj.embed_override_token_id is not None
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
-                    input_ids, obj.embed_override_token_id, obj.embed_overrides
+                    input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
@@ -1348,7 +1396,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     @staticmethod
     def _resolve_embed_overrides(
-        input_ids: List[int],
+        input_ids: array[int],
         token_id: int,
         embeds: List[torch.Tensor],
     ) -> PositionalEmbeds:
@@ -1475,13 +1523,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if isinstance(value, list) and index < len(value):
                 value[index] = None
 
+    def _release_shm_owner(self, state: ReqState) -> None:
+        owner_handle = state.shm_owner_handle
+        self.shm_owner_table.release(owner_handle)
+        state.shm_owner_handle = None
+
+    def _register_shm_owner(self, state: ReqState, wrapped_obj) -> None:
+        if state.shm_owner_handle is not None:
+            raise RuntimeError("SHM owner is already attached to request state")
+        state.shm_owner_handle = self.shm_owner_table.register(wrapped_obj)
+
     def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
-        tokenized_obj = wrap_shm_features(tokenized_obj)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        wrapped_obj = wrap_shm_features(tokenized_obj)
+        state = self.rid_to_state[tokenized_obj.rid]
+        self._register_shm_owner(state, wrapped_obj)
+        try:
+            self.send_to_scheduler.send_pyobj(wrapped_obj)
+        except BaseException:
+            self._release_shm_owner(state)
+            raise
+        tokenized_obj.mm_inputs = None
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
@@ -1497,7 +1562,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-        self.send_to_scheduler.send_pyobj(batch_req)
+        batch_req = wrap_shm_features(batch_req)
+        registered_states = []
+        try:
+            for tokenized_obj, wrapped_obj in zip(tokenized_objs, batch_req.batch):
+                state = self.rid_to_state[tokenized_obj.rid]
+                self._register_shm_owner(state, wrapped_obj)
+                registered_states.append(state)
+            self.send_to_scheduler.send_pyobj(batch_req)
+        except BaseException:
+            for state in registered_states:
+                self._release_shm_owner(state)
+            raise
+        for tokenized_obj in tokenized_objs:
+            tokenized_obj.mm_inputs = None
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
     def _coalesce_streaming_chunks(
@@ -1563,6 +1641,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
             if state.obj.rid in self.rid_to_state:
+                self._release_shm_owner(state)
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
@@ -1709,6 +1788,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_objs = await self._batch_tokenize_and_process(
                         batch_size, obj
                     )
+                    # Client may have disconnected during batch tokenize/encode
+                    # (E stage); skip dispatching a doomed forward for the batch.
+                    if await self._epd_mm_client_disconnected(obj, request):
+                        raise ValueError(
+                            "Request is disconnected from the client side "
+                            "(type 0). Abort batch request."
+                        )
                 except BaseException:
                     # Tokenization failed before any request was sent to the
                     # scheduler; clean up all states to avoid leaks.
@@ -1738,6 +1824,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tmp_obj = obj[i]
                         try:
                             tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                            # Client gone during this item's tokenize/E: stop
+                            # dispatching the rest of the batch.
+                            if await self._epd_mm_client_disconnected(
+                                tmp_obj, request
+                            ):
+                                raise ValueError(
+                                    "Request is disconnected from the client "
+                                    f"side (type 0). Abort request {tmp_obj.rid=}"
+                                )
                         except BaseException:
                             # Requests [i:] were never sent to the scheduler,
                             # so no output/abort will ever come back for them.
@@ -1754,6 +1849,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self._release_raw_multimodal_payload_item(obj, i)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
+
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -1770,6 +1866,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
             try:
                 tokenized_objs = await asyncio.gather(*tokenize_tasks)
+                if await self._epd_mm_client_disconnected(obj, request):
+                    raise ValueError(
+                        "Request is disconnected from the client side "
+                        "(type 0). Abort batch request."
+                    )
             except BaseException:
                 # asyncio.gather does not cancel sibling tasks on failure --
                 # cancel them explicitly so their encode tasks/buffers are
@@ -1855,6 +1956,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         task_map[new_task] = gen
                     except StopAsyncIteration:
                         pass
+
+    async def _epd_mm_client_disconnected(self, obj, request) -> bool:
+        """Type-0 pre-dispatch guard: whether to cancel a doomed prefill because
+        an EPD multimodal client already disconnected.
+
+        Only fires for opted-in EPD multimodal servers on requests carrying mm
+        input, and uses the large-body-safe ``_client_disconnected`` check.
+        """
+        return (
+            request is not None
+            and self.enable_epd_reliable_disconnect
+            and obj.contains_mm_input()
+            and not getattr(obj, "background", False)
+            and await self._client_disconnected(request)
+        )
+
+    async def _client_disconnected(self, request) -> bool:
+        """Detect a client disconnect, reliably even for large request bodies.
+
+        uvicorn pauses socket reads once a body exceeds HIGH_WATER_LIMIT
+        (64 KiB); while paused, asyncio never sees the client's FIN, so the
+        first ``is_disconnected()`` returns False (its peek runs in a
+        pre-cancelled scope, aborting at the first ``await``). That peek's one
+        side effect is ``resume_reading()``, so we call it, yield one event-loop
+        turn to let asyncio process the FIN, then re-check. Only bodies >64 KiB
+        pay the extra turn.
+        """
+        if request is None:
+            return False
+        if await request.is_disconnected():
+            return True
+        body = getattr(request, "_body", None)
+        if body is not None and len(body) > 65536:
+            await asyncio.sleep(0.001)
+            return await request.is_disconnected()
+        return False
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
@@ -2121,7 +2258,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.server_args.incremental_streaming_output and is_stream
                 )
                 delta_text = recv_obj.output_strs[i]
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -2172,7 +2309,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
@@ -2246,6 +2383,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
+                self._release_shm_owner(state)
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
@@ -2828,9 +2966,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # A normal finish and an abort echo can arrive for the same request.
+        # If the finish won, the request state has already been released.
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.debug(
+                "Abort request for rid=%s was already removed.",
+                recv_obj.rid,
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
+        self._release_shm_owner(state)
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -2865,6 +3012,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        del self.rid_to_state[recv_obj.rid]
         state.out_list.append(out)
         state.event.set()
 

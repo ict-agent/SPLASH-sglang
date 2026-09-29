@@ -257,6 +257,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # caller sees the [N_pad, ...] shape it expects.
         n_total = mixed_qkv.shape[0]
         n_valid = forward_batch.extend_num_valid_tokens
+        if n_total == 0 or n_valid == 0:
+            num_v_heads = layer.v_dim // layer.head_v_dim
+            return mixed_qkv.new_zeros(
+                (1, n_total, num_v_heads, layer.head_v_dim)
+            )
         needs_repad = n_valid is not None and n_valid < n_total
         if needs_repad:
             mixed_qkv = mixed_qkv[:n_valid]
@@ -372,6 +377,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
 
         if is_target_verify:
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            replayssm_on = mamba_pool.enable_kda_replayssm_spec
+            if not replayssm_on:
+                assert mamba_cache_params.intermediate_ssm is not None
+            replayssm_kwargs = {}
+            if replayssm_on:
+                replayssm_kwargs = dict(
+                    cache_replayssm_inputs=True,
+                    replayssm_rawv=mamba_cache_params.replayssm_rawv,
+                    replayssm_rawk=mamba_cache_params.replayssm_rawk,
+                    replayssm_g=mamba_cache_params.replayssm_g,
+                    replayssm_beta=mamba_cache_params.replayssm_beta,
+                )
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -393,6 +411,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     if getattr(layer, "safe_gate", False)
                     else None
                 ),
+                **replayssm_kwargs,
             )
         else:
             core_attn_out = self.kernel_dispatcher.extend(

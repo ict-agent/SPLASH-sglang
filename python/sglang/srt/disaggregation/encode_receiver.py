@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import hashlib
 import itertools
 import json
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
@@ -42,22 +44,65 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+
+def _check_recv_embedding_nan(req_id, recv_embedding) -> None:
+    """Env-gated (SGLANG_ENCODER_CHECK_NAN) read-only NaN/Inf check on the
+    embedding P read from the encoder, before it is scattered into input_embeds.
+    Catches whole-segment NaN from an unwritten/stale buffer -- which the size
+    checks and the encoder-side check do not (size is right, values are stale).
+    ``recv_embedding`` is a {modality: tensor} dict (mooncake) or a tensor."""
+    items = (
+        recv_embedding.items()
+        if isinstance(recv_embedding, dict)
+        else [(None, recv_embedding)]
+    )
+    for modality, emb in items:
+        if not (isinstance(emb, torch.Tensor) and emb.numel()):
+            continue
+        f = emb.detach().float()
+        nan, inf = int(torch.isnan(f).sum()), int(torch.isinf(f).sum())
+        if nan or inf:
+            logger.error(
+                "[recv-nan] req_id=%s modality=%s shape=%s nan=%d inf=%d all_nan=%s",
+                req_id,
+                modality,
+                tuple(emb.shape),
+                nan,
+                inf,
+                nan == emb.numel(),
+            )
+
+
 # GLM Note: A 64-bit media digest keeps Session-Id headers compact while
 # retaining sufficient collision resistance for encoder load-balancer affinity.
 _ENCODER_MEDIA_HASH_HEX_LENGTH = 16
+_encoder_affinity_invalid_shards_warned = False
 
 
 def _rdma_pool_max_bytes() -> int:
     return envs.SGLANG_MC_RDMA_POOL_MAX_MB.get() * 1024 * 1024
 
 
-def _rdma_pool_max_buffers() -> int:
-    return envs.SGLANG_MC_RDMA_POOL_MAX_BUFFERS.get()
+def _rdma_pool_acquire_timeout_secs() -> float:
+    """Max seconds ``RdmaBufferPool.acquire`` blocks waiting for budget before
+    it allocates over the limit anyway. This is the admission control that
+    turns SGLANG_MC_RDMA_POOL_MAX_MB into a real cap on peak
+    live buffers (previously it only bounded the idle free list, so a burst
+    of concurrent large multimodal receives could allocate unbounded and OOM
+    the prefill pod). 0 disables the wait (legacy unbounded behavior)."""
+    return envs.SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS.get()
 
 
 def rdma_pool_enabled() -> bool:
-    """Return whether both Mooncake RDMA pool limits enable pooling."""
-    return _rdma_pool_max_bytes() > 0 and _rdma_pool_max_buffers() > 0
+    """Whether to use the Mooncake RDMA registered-buffer pools.
+
+    Controlled by the byte cap that sizes the pool:
+      * SGLANG_MC_RDMA_POOL_MAX_MB (default 0)
+    > 0 ENABLES the pool: the receiver and the sender both use
+    RdmaBufferPool. 0 (the default) DISABLES it -- the receiver and sender
+    fall back to the original per-request register + deregister logic.
+    """
+    return _rdma_pool_max_bytes() > 0
 
 
 if TYPE_CHECKING:
@@ -122,6 +167,20 @@ def _grpc_encode_request(target, encode_request):
             timeout=timeout_secs,
         )
         return response
+    except grpc.RpcError as e:
+        # Map RpcError to EncoderError so encoder-side encode failures carry a
+        # status code (INTERNAL -> 500 with the encoder's details, anything
+        # else -> 503) instead of leaking a raw grpc error to the tokenizer.
+        status_code = (
+            HTTPStatus.INTERNAL_SERVER_ERROR
+            if e.code() == grpc.StatusCode.INTERNAL
+            else HTTPStatus.SERVICE_UNAVAILABLE
+        )
+        raise EncoderError(
+            f"Encoder /encode request failed for {encode_request['req_id']}: "
+            f"{e.code()} {e.details()}",
+            status_code=status_code,
+        ) from e
     finally:
         channel.close()
 
@@ -144,6 +203,20 @@ def _grpc_send_request(target, request_json):
             ),
             timeout=timeout_secs,
         )
+    except grpc.RpcError as e:
+        # The server signals a reclaimed embedding with NOT_FOUND; map it to the
+        # same 410 GONE the HTTP path returns, otherwise surface a generic
+        # failure instead of leaking a raw grpc error.
+        if e.code() == grpc.StatusCode.NOT_FOUND:
+            raise EncoderError(
+                f"Encoder returned NOT_FOUND on /send for {request_json['req_id']}: "
+                f"{e.details()}",
+                status_code=HTTPStatus.GONE,
+            ) from e
+        raise EncoderError(
+            f"Encoder /send request failed for {request_json['req_id']}: {e}",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        ) from e
     finally:
         channel.close()
 
@@ -172,19 +245,116 @@ def _log_task_exception(task):
         logger.warning("encode task failed after embeddings were received: %s", exc)
 
 
+# Bound on how long _abort_encode_and_cleanup waits for the encode task to
+# drain before force-cancelling it. A part's /send completes (or times out) at
+# mooncake's MC_TRANSFER_TIMEOUT (seconds, default 30, min 5); the extra
+# margin covers HTTP and ZMQ ack latency. This is only ever reached by a stuck
+# /encode, never on the happy path.
+#
+# NOTE: mooncake reads MC_TRANSFER_TIMEOUT per process, and the timeout that
+# actually bounds an in-flight RDMA write lives on the ENCODER (it calls
+# transfer_sync). Deployments must set MC_TRANSFER_TIMEOUT to the same value
+# on the prefill/decode and encoder processes; otherwise this receiver-side
+# bound can expire while E's write is legitimately still in flight and
+# reintroduce the deregister-while-writing race. On the gRPC receiver path,
+# MC_TRANSFER_TIMEOUT plus this margin must also stay under
+# SGLANG_ENCODER_GRPC_TIMEOUT_SECS (default 60s), or the client-side RPC
+# deadline fires before the write bound does.
+def _encode_drain_timeout_s() -> float:
+    try:
+        # float() accepts "30" and "30.5" alike; int() would silently reject
+        # float strings and fall back, mis-aligning the bound with the
+        # encoder's actual write timeout.
+        mc_timeout = int(float(os.environ.get("MC_TRANSFER_TIMEOUT", "30")))
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid MC_TRANSFER_TIMEOUT=%r (not a number); falling back to 30s "
+            "for the encode drain bound. The bound can expire while an "
+            "encoder's RDMA write is still in flight and reintroduce the "
+            "deregister-while-writing race.",
+            os.environ.get("MC_TRANSFER_TIMEOUT"),
+        )
+        mc_timeout = 30
+    return max(5, mc_timeout) + 5.0
+
+
+def _validate_encode_drain_bound() -> None:
+    """Validate the drain bound against cross-process constraints we can read.
+
+    The bound that actually ends an in-flight RDMA write lives on the ENCODER
+    process (it calls transfer_sync), so this process can only validate what
+    it can see: the gRPC receiver's own RPC deadline. Anything that depends on
+    the encoder's environment is logged as a deployment requirement.
+
+    This module is imported by every SGLang process (tokenizer_manager,
+    scheduler), including non-mooncake / non-EPD deployments, so the unset-env
+    note is informational; only a genuinely misconfigured gRPC deadline (a
+    real, actionable error) stays at WARNING.
+    """
+    grpc_timeout = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
+    if _ENCODE_DRAIN_TIMEOUT_S >= grpc_timeout:
+        logger.warning(
+            "mm receiver: encode drain bound %.0fs >= "
+            "SGLANG_ENCODER_GRPC_TIMEOUT_SECS %.0fs -- the client-side RPC "
+            "deadline fires before the drain completes, so the drain is "
+            "ineffective on the gRPC path. Lower MC_TRANSFER_TIMEOUT or raise "
+            "SGLANG_ENCODER_GRPC_TIMEOUT_SECS.",
+            _ENCODE_DRAIN_TIMEOUT_S,
+            grpc_timeout,
+        )
+    mc_timeout = os.environ.get("MC_TRANSFER_TIMEOUT")
+    if mc_timeout is None:
+        logger.info(
+            "mm receiver: MC_TRANSFER_TIMEOUT is unset on this process; the "
+            "encode drain bound assumes the default 30s. Encoder processes "
+            "in a mooncake EPD deployment MUST set the same value -- the "
+            "transfer_sync timeout that actually bounds an in-flight RDMA "
+            "write is read from the ENCODER's environment, and a larger value "
+            "there makes this bound expire mid-write "
+            "(deregister-while-writing race)."
+        )
+
+
+_ENCODE_DRAIN_TIMEOUT_S = _encode_drain_timeout_s()
+_validate_encode_drain_bound()
+
+
 class RdmaBufferPool:
-    """Pool of long-lived, RDMA-registered CPU receive buffers."""
+    """Pool of long-lived, RDMA-registered CPU buffers.
+
+    The receiver uses these buffers as RDMA-write targets. The encoder sender
+    copies embeddings into the same kind of registered-once buffers and uses
+    them as RDMA-write sources, avoiding per-transfer registration churn.
+
+    The byte cap (SGLANG_MC_RDMA_POOL_MAX_MB) acts on two sides.
+    release() bounds only the idle reuse cache -- in-flight and quiesced
+    buffers stay registered until their transfers are safe to release, so a
+    traffic or failure spike does not trigger deregister/registration churn.
+    acquire() additionally admission-controls the total live working set
+    against the same cap: it first evicts idle buffers of smaller size
+    classes to make room, and only when none are left blocks until a
+    release/discard frees budget instead of allocating unbounded (which
+    would OOM the pod). That wait is bounded by
+    SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS, and a request larger
+    than the whole cap is always admitted, so the working set can still
+    briefly exceed the cap.
+    """
 
     def __init__(self, engine):
         self._engine = engine
         self._lock = threading.Lock()
+        # Signalled whenever budget frees up (release/discard) so acquire()
+        # waiters can retry instead of allocating over budget.
+        self._cond = threading.Condition(self._lock)
         self._free = {}
         self._floor = 1 * 1024 * 1024
         self._max_total_bytes = _rdma_pool_max_bytes()
-        self._max_buffers = _rdma_pool_max_buffers()
         self._total_bytes = 0
         self._total_count = 0
-        self._warned_over = False
+        self._free_bytes = 0
+        self._free_count = 0
+        self._warned_free_over = False
+        self._acquire_timeout = _rdma_pool_acquire_timeout_secs()
 
     def _size_class(self, nbytes: int) -> int:
         nbytes = max(int(nbytes), self._floor)
@@ -192,63 +362,146 @@ class RdmaBufferPool:
 
     def acquire(self, nbytes: int) -> torch.Tensor:
         class_bytes = self._size_class(nbytes)
+        deadline = None
+        evicted = []
+        reused = None
         with self._lock:
-            free = self._free.get(class_bytes)
-            if free:
-                return free.pop()
+            while True:
+                free = self._free.get(class_bytes)
+                if free:
+                    reused = free.pop()
+                    self._free_bytes -= reused.numel()
+                    self._free_count -= 1
+                    break
 
-            best_key = None
-            for size, buffers in self._free.items():
+                best_key = None
+                for size, buffers in self._free.items():
+                    if (
+                        size > class_bytes
+                        and buffers
+                        and (best_key is None or size < best_key)
+                    ):
+                        best_key = size
+                if best_key is not None:
+                    reused = self._free[best_key].pop()
+                    self._free_bytes -= reused.numel()
+                    self._free_count -= 1
+                    break
+
+                # No reusable buffer: we must allocate a new one. Admission
+                # control -- block until releases free budget instead of
+                # allocating unbounded (a burst of concurrent large multimodal
+                # receives otherwise blows past the cap and OOMs the pod).
+                would_exceed = self._total_bytes + class_bytes > self._max_total_bytes
+                # Proceed anyway when within budget, when nothing is
+                # outstanding to free up (a single request larger than the
+                # whole cap must still run; also avoids deadlock), or when the
+                # wait is disabled.
                 if (
-                    size > class_bytes
-                    and buffers
-                    and (best_key is None or size < best_key)
+                    not would_exceed
+                    or self._total_count == 0
+                    or self._acquire_timeout <= 0
                 ):
-                    best_key = size
-            if best_key is not None:
-                return self._free[best_key].pop()
+                    break
+                # GLM NOTE: any idle buffer left here is smaller than
+                # class_bytes (a larger one would have been reused above).
+                # Evict idle buffers for budget instead of waiting -- a free
+                # cache saturated with small size classes must not starve
+                # larger allocations into the timeout path (that wedge held
+                # prefill pods in permanent 60s-wait + register churn).
+                if self._free_count > 0:
+                    while (
+                        self._free_count > 0
+                        and self._total_bytes + class_bytes > self._max_total_bytes
+                    ):
+                        smallest = min(
+                            size for size, buffers in self._free.items() if buffers
+                        )
+                        buffer = self._free[smallest].pop()
+                        self._free_bytes -= buffer.numel()
+                        self._free_count -= 1
+                        self._total_bytes -= buffer.numel()
+                        self._total_count -= 1
+                        evicted.append(buffer)
+                    continue
+                if deadline is None:
+                    deadline = time.monotonic() + self._acquire_timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "mooncake RDMA pool: acquire waited %.0fs for %d bytes "
+                        "but pool still at bytes=%d/%d count=%d; allocating "
+                        "over budget",
+                        self._acquire_timeout,
+                        class_bytes,
+                        self._total_bytes,
+                        self._max_total_bytes,
+                        self._total_count,
+                    )
+                    break
+                self._cond.wait(timeout=remaining)
 
-        buffer = torch.empty(class_bytes, dtype=torch.uint8)
-        ret = self._engine.register(buffer.data_ptr(), buffer.nbytes)
-        if ret != 0:
-            raise RuntimeError(
-                f"mooncake register_memory failed (ret={ret}, bytes={class_bytes})"
-            )
+            if reused is None:
+                # Reserve the budget under the lock so concurrent acquirers
+                # observe it and cannot all race past the check together.
+                self._total_bytes += class_bytes
+                self._total_count += 1
 
-        with self._lock:
-            self._total_bytes += class_bytes
-            self._total_count += 1
-            if (
-                self._total_bytes > self._max_total_bytes
-                or self._total_count > self._max_buffers
-            ) and not self._warned_over:
-                self._warned_over = True
-                logger.warning(
-                    "mooncake RDMA buffer pool over budget "
-                    "(bytes=%d/%d, count=%d/%d); released buffers will be "
-                    "deregistered to shrink. Increase "
-                    "SGLANG_MC_RDMA_POOL_MAX_MB or "
-                    "SGLANG_MC_RDMA_POOL_MAX_BUFFERS.",
-                    self._total_bytes,
-                    self._max_total_bytes,
-                    self._total_count,
-                    self._max_buffers,
+        # Deregister evicted idle buffers outside the lock (engine calls are
+        # slow). Safe: they sat in the free cache, so no in-flight write
+        # references their MRs.
+        for buffer in evicted:
+            self._engine.deregister(buffer.data_ptr())
+        if reused is not None:
+            return reused
+
+        try:
+            buffer = torch.empty(class_bytes, dtype=torch.uint8)
+            ret = self._engine.register(buffer.data_ptr(), buffer.nbytes)
+            if ret != 0:
+                raise RuntimeError(
+                    f"mooncake register_memory failed (ret={ret}, bytes={class_bytes})"
                 )
+        except BaseException:
+            # Roll back the reservation so a failed allocation does not leak
+            # budget (which would wedge every future acquire).
+            with self._lock:
+                self._total_bytes -= class_bytes
+                self._total_count -= 1
+                self._cond.notify_all()
+            raise
         return buffer
 
     def release(self, buffer: torch.Tensor) -> None:
         if buffer is None:
             return
+        buffer_bytes = buffer.numel()
         with self._lock:
-            over_budget = (
-                self._total_bytes > self._max_total_bytes
-                or self._total_count > self._max_buffers
-            )
+            over_budget = self._free_bytes + buffer_bytes > self._max_total_bytes
             if not over_budget:
-                self._free.setdefault(buffer.numel(), []).append(buffer)
+                self._free.setdefault(buffer_bytes, []).append(buffer)
+                self._free_bytes += buffer_bytes
+                self._free_count += 1
+                self._cond.notify_all()
                 return
-            self._total_bytes -= buffer.numel()
+            if not self._warned_free_over:
+                self._warned_free_over = True
+                logger.warning(
+                    "mooncake RDMA free buffer cache at budget "
+                    "(cached bytes=%d/%d, count=%d; returned bytes=%d; "
+                    "registered bytes=%d count=%d); deregistering returned "
+                    "buffer. Increase SGLANG_MC_RDMA_POOL_MAX_MB to retain a "
+                    "larger working set.",
+                    self._free_bytes,
+                    self._max_total_bytes,
+                    self._free_count,
+                    buffer_bytes,
+                    self._total_bytes,
+                    self._total_count,
+                )
+            self._total_bytes -= buffer_bytes
             self._total_count -= 1
+            self._cond.notify_all()
         self._engine.deregister(buffer.data_ptr())
 
     def discard(self, buffer: torch.Tensor) -> None:
@@ -260,6 +513,7 @@ class RdmaBufferPool:
             self._total_count -= 1
             remaining_bytes = self._total_bytes
             remaining_count = self._total_count
+            self._cond.notify_all()
         logger.warning(
             "mooncake RDMA pool: discarding buffer (bytes=%d) on abort/timeout; "
             "pool now bytes=%d count=%d",
@@ -317,6 +571,7 @@ class EmbeddingData:
         embedding_shape=None,
         error_msg=None,
         error_code=None,
+        item_hashes: Optional[List[int]] = None,
         **kwargs,
     ):
         self.req_id = req_id
@@ -334,6 +589,7 @@ class EmbeddingData:
             self.shape = list(embedding.shape) if embedding is not None else None
         self.error_msg = error_msg
         self.error_code = error_code
+        self.item_hashes = item_hashes
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -401,6 +657,21 @@ def _cat_grid(dims, flatten_items=False):
     return torch.cat(valid, dim=0) if valid else None
 
 
+def combine_ordered_item_hashes(item_hashes: List[int]) -> Optional[int]:
+    """Combine multiple item hashes without relying on Python's process hash."""
+    if not item_hashes:
+        return None
+    if len(item_hashes) == 1:
+        return item_hashes[0]
+
+    hasher = hashlib.sha256(b"sglang-epd-item-hashes-v1\0")
+    for item_hash in item_hashes:
+        encoded = str(item_hash).encode("ascii")
+        hasher.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(encoded)
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
 class MultiModalEmbeddingData(EmbeddingData):
     def __init__(
         self,
@@ -411,6 +682,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         modality,
         embedding,
         embedding_shape,
+        item_hashes=None,
         **kwargs,
     ):
         super().__init__(
@@ -421,6 +693,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality,
             embedding,
             embedding_shape,
+            item_hashes=item_hashes,
             **kwargs,
         )
         self.img_grid_thw = [None] * num_parts
@@ -435,6 +708,9 @@ class MultiModalEmbeddingData(EmbeddingData):
         ]
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
+        ]
+        self.item_hashes_by_part = [
+            item_hashes if i == part_idx else None for i in range(num_parts)
         ]
         self.video_timestamps = [None] * num_parts
         self.second_per_grid_ts = [None] * num_parts
@@ -480,6 +756,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality=embedding_data.modality,
             embedding=embedding_data.embedding,
             embedding_shape=embedding_data.shape,
+            item_hashes=getattr(embedding_data, "item_hashes", None),
             **extra,
         )
         mm_data.send_time = embedding_data.send_time
@@ -578,6 +855,17 @@ class MultiModalEmbeddingData(EmbeddingData):
 
             byte_offset = next_byte_offset
 
+        # raw_buffer is sliced to the bytes the encoder actually wrote, so the
+        # reconstructed offset must consume it exactly. A mismatch means the
+        # shapes/dtype disagree with the buffer layout (offset drift -> wrong
+        # data); this also catches a wrong dtype, since element_size scales it.
+        if byte_offset != raw_buffer.numel():
+            raise ValueError(
+                "Mooncake embedding reconstruction mismatch: consumed "
+                f"{byte_offset} bytes but buffer holds {raw_buffer.numel()} "
+                f"(dtype={dtype} shapes={self.embedding_shape_list})"
+            )
+
         result = {}
         for modality, group in ranges.items():
             embedding = (
@@ -610,6 +898,62 @@ class MultiModalEmbeddingData(EmbeddingData):
                 kwargs[attr] = list(itertools.chain(*valid))
         return kwargs
 
+    def get_item_hashes_by_modality(self) -> Dict[Modality, List[int]]:
+        """Return ordered hashes for modalities whose non-empty parts are complete."""
+        hashes_by_modality = defaultdict(list)
+        invalid_modalities = set()
+
+        for part_idx, modality in enumerate(self.modality_list):
+            if modality is None:
+                continue
+
+            shape = self.embedding_shape_list[part_idx]
+            is_empty_part = bool(shape is not None and len(shape) > 0 and shape[0] == 0)
+            part_hashes = self.item_hashes_by_part[part_idx]
+            if part_hashes is None:
+                if not is_empty_part:
+                    invalid_modalities.add(modality)
+                continue
+            if not isinstance(part_hashes, (list, tuple)) or any(
+                not isinstance(item_hash, int) or isinstance(item_hash, bool)
+                for item_hash in part_hashes
+            ):
+                invalid_modalities.add(modality)
+                continue
+            hashes_by_modality[modality].extend(part_hashes)
+
+        return {
+            modality: hashes
+            for modality, hashes in hashes_by_modality.items()
+            if modality not in invalid_modalities and hashes
+        }
+
+    def inject_item_hashes(self, processor_output) -> None:
+        """Attach encoder hashes to rebuilt items, falling back per modality."""
+        hashes_by_modality = self.get_item_hashes_by_modality()
+        items_by_modality = defaultdict(list)
+        for item in processor_output.mm_items:
+            items_by_modality[item.modality].append(item)
+
+        for modality, item_hashes in hashes_by_modality.items():
+            items = items_by_modality.get(modality, [])
+            if len(items) == len(item_hashes):
+                assignments = list(zip(items, item_hashes))
+            elif len(items) == 1 and len(item_hashes) > 1:
+                assignments = [(items[0], combine_ordered_item_hashes(item_hashes))]
+            else:
+                logger.warning(
+                    "Ignoring encoder item hashes for %s: received %d hashes "
+                    "but rebuilt %d items",
+                    modality.name,
+                    len(item_hashes),
+                    len(items),
+                )
+                continue
+
+            for item, item_hash in assignments:
+                item.hash = item_hash
+
     def add(self, embedding_data: EmbeddingData):
         if self.req_id != embedding_data.req_id:
             logger.warning(
@@ -623,6 +967,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.modality_list[pid] = embedding_data.modality
         self.embedding_list[pid] = embedding_data.get_embedding()
         self.embedding_shape_list[pid] = embedding_data.shape
+        self.item_hashes_by_part[pid] = getattr(embedding_data, "item_hashes", None)
         self._set_part_grid(pid, embedding_data.modality, embedding_data.get_grid())
         if embedding_data.modality == Modality.VIDEO:
             self._set_video_meta_for_part(pid, embedding_data)
@@ -649,8 +994,32 @@ def extract_original_req_id(part_req_id: str) -> str:
 
 # GLM Note: Route duplicate URL/base64 media to the same encoder before the
 # encoder-side, feature-based multimodal hash is available.
+def _encoder_affinity_shard_id(req_id: Optional[str]) -> Tuple[int, int]:
+    global _encoder_affinity_invalid_shards_warned
+
+    affinity_shards = envs.GLM_ENCODER_AFFINITY_SHARDS.get()
+    if affinity_shards < 1:
+        if not _encoder_affinity_invalid_shards_warned:
+            logger.warning(
+                "Invalid GLM_ENCODER_AFFINITY_SHARDS=%s; falling back to 1",
+                affinity_shards,
+            )
+            _encoder_affinity_invalid_shards_warned = True
+        affinity_shards = 1
+    if affinity_shards == 1:
+        return 0, affinity_shards
+    if not req_id:
+        raise ValueError("req_id is required when encoder affinity sharding is enabled")
+
+    request_hash = hashlib.sha256(req_id.encode("utf-8")).digest()
+    shard_id = int.from_bytes(request_hash[:8], byteorder="big") % affinity_shards
+    return shard_id, affinity_shards
+
+
 def create_encoder_session_id(
-    upstream_session_id: Optional[str], media_identifier
+    upstream_session_id: Optional[str],
+    media_identifier,
+    req_id: Optional[str] = None,
 ) -> str:
     if isinstance(media_identifier, bytes):
         media_bytes = media_identifier
@@ -667,7 +1036,22 @@ def create_encoder_session_id(
     media_hash = hashlib.sha256(media_bytes).hexdigest()[
         :_ENCODER_MEDIA_HASH_HEX_LENGTH
     ]
-    return f"{upstream_session_id}_{media_hash}" if upstream_session_id else media_hash
+    session_id = (
+        f"{upstream_session_id}_{media_hash}" if upstream_session_id else media_hash
+    )
+
+    # Keep K=1 byte-for-byte compatible with the original media affinity. For
+    # K>1, distribute a hot media key over a bounded number of LB affinity
+    # keys while keeping /encode and /send for the same part on one encoder.
+    shard_id, affinity_shards = _encoder_affinity_shard_id(req_id)
+    if affinity_shards == 1:
+        return session_id
+
+    # Re-hash the bounded affinity key so the LB always receives the original
+    # fixed-width 16-character hexadecimal format. This remains compatible
+    # with LBs that parse Session-Id as a uint64 or validate it as hex.
+    sharded_key = f"{session_id}:{shard_id}".encode("utf-8")
+    return hashlib.sha256(sharded_key).hexdigest()[:_ENCODER_MEDIA_HASH_HEX_LENGTH]
 
 
 def _encoder_request_headers(req_id: str, encoder_session_id: Optional[str] = None):
@@ -701,7 +1085,9 @@ def _split_mooncake_encode_requests(
             encode_requests.append(encode_request)
             if session_id_header_enabled:
                 encoder_session_ids[part_idx] = create_encoder_session_id(
-                    upstream_session_id, media_identifier
+                    upstream_session_id,
+                    media_identifier,
+                    req_id=encode_request["req_id"],
                 )
 
     total_num_parts = len(encode_requests)
@@ -886,7 +1272,28 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
+            # TODO(P0-5, follow-up): this PULL socket binds the pod IP and the
+            # host:port travels in plaintext inside every /encode payload, so
+            # any pod in the cluster can push an arbitrary pickle here (RCE).
+            # Plan: generate a random per-port token, hand it out with the
+            # /encode request, and have the encoder send it as the first ZMQ
+            # frame for comparison BEFORE pickle.loads. Requires an atomic
+            # encoder+receiver upgrade (protocol change).
             recv_obj: EmbeddingData = pickle.loads(parts[0])
+            # Drop frames belonging to a different request that landed here via
+            # OS port reuse (a cancelled/timed-out request freed this random
+            # port). Without this, a foreign frame is aggregated by part_idx and
+            # its shape metadata is applied to our buffer -> NaN; a foreign error
+            # frame would also wrongly FAIL this request. See
+            # docs/epd-mm-frame-pollution.
+            if extract_original_req_id(recv_obj.req_id) != self.rid:
+                logger.warning(
+                    "mm: dropping foreign frame on reused port req_id=%s "
+                    "(expected %s)",
+                    recv_obj.req_id,
+                    self.rid,
+                )
+                continue
             if getattr(recv_obj, "error_msg", None) is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
@@ -928,8 +1335,9 @@ class WaitingImageRequest:
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
+        self.recv_embedding_data.inject_item_hashes(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -942,22 +1350,29 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
             assigned = list(self.num_items_assigned.values())[0]
             logger.info(f"num_items_assigned={assigned}")
 
+            cum_idx = 0
             for idx, assigned_num in enumerate(assigned):
                 if assigned_num == 0:
                     continue
+                # Match MMReceiverGrpc.encode's part numbering: the encoder's
+                # send_with_url looks the receive endpoint up by part req_id.
+                part_req_id = create_part_req_id(req_id, cum_idx)
                 encoder_url = self.encoder_urls[idx]
                 receive_url = f"{host_name}:{embedding_port}"
                 target_url = f"{encoder_url}/SchedulerReceiveUrl"
-                logger.info(f"Preparing to send to {target_url}")
+                logger.info(
+                    f"Preparing to send to {target_url} with part_req_id={part_req_id}"
+                )
                 tasks.append(
                     asyncio.to_thread(
                         _grpc_scheduler_receive_url,
                         _grpc_target(encoder_url),
-                        req_id,
+                        part_req_id,
                         receive_url,
                         receive_count,
                     )
                 )
+                cum_idx += 1
 
             if not tasks:
                 logger.info("No tasks to send.")
@@ -1004,13 +1419,20 @@ class MMReceiverBase(ABC):
         is_decode_role: bool = False,
     ):
         self.context = zmq.asyncio.Context(20)
+        # Detached drain+cleanup tasks spawned on the request-cancellation
+        # path (see _schedule_drained_cleanup); kept referenced so they are
+        # never garbage-collected mid-flight.
+        self._cleanup_tasks = set()
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)
         self.is_decode_role = is_decode_role
         self.meta_only = is_decode_role and self.encoder_transfer_backend == "mooncake"
+        # Element type used to validate incoming frames (mooncake) and to
+        # reinterpret ZMQ buffers. Assigned unconditionally: the mooncake
+        # cross-check must not silently degrade to a no-op on other backends.
+        self.dtype = dtype
         if self.encoder_transfer_backend == "mooncake":
-            self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
             if self.embeddings_engine is None:
                 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -1025,22 +1447,42 @@ class MMReceiverBase(ABC):
                     ),
                 )
             self.embeddings_buffer = dict()
+            # Index original req_id -> list of part_req_ids, so cleanup can drop
+            # a request's parts without scanning every in-flight buffer.
+            self._buffer_index = dict()
             self._use_rdma_pool = rdma_pool_enabled()
             self._rdma_pool = (
-                RdmaBufferPool(self.embeddings_engine)
-                if self._use_rdma_pool
-                else None
+                RdmaBufferPool(self.embeddings_engine) if self._use_rdma_pool else None
+            )
+            logger.info(
+                "mm receiver: encode drain bound is %.0fs "
+                "(MC_TRANSFER_TIMEOUT=%s on this process; encoder processes "
+                "MUST set the same value, and on gRPC receivers "
+                "MC_TRANSFER_TIMEOUT + margin must stay under "
+                "SGLANG_ENCODER_GRPC_TIMEOUT_SECS or this bound is wrong)",
+                _ENCODE_DRAIN_TIMEOUT_S,
+                os.environ.get("MC_TRANSFER_TIMEOUT", "30"),
             )
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
             self.tp_size = server_args.tp_size
             self.tp_group = tp_group
+            self.receive_count = self.tp_size
+            self.status_reduce_groups = (
+                [tp_group.cpu_group] if tp_group is not None else []
+            )
             self.nnodes = server_args.nnodes
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
             self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+            if scheduler is not None and server_args.enable_dp_attention:
+                self.receive_count = scheduler.attn_tp_size * scheduler.attn_cp_size
+                self.status_reduce_groups = [
+                    scheduler.attn_tp_cpu_group,
+                    scheduler.attn_cp_cpu_group,
+                ]
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -1106,6 +1548,17 @@ class MMReceiverBase(ABC):
                 self.context, zmq.PULL, host=self.host
             )
             mm_data = self._extract_url_data(request_obj)
+            # The payloads in mm_data now own the only references the encode
+            # path needs (extraction shares the strings, it does not copy).
+            # With the mooncake backend there is exactly one extraction per
+            # request -- the chat pre-validation pass caches its result in
+            # obj._precomputed_mm_inputs and /generate is single-pass -- so
+            # the raw fields on the request object can be released here,
+            # instead of pinning the media bytes through the whole encoder
+            # wait. Other backends may re-extract (zmq_to_tokenizer re-entry)
+            # and must keep the originals.
+            if mm_data and self.encoder_transfer_backend == "mooncake":
+                self._release_raw_media_after_extract(request_obj)
             encode_task = asyncio.create_task(
                 self.encode(
                     req_id,
@@ -1138,8 +1591,11 @@ class MMReceiverBase(ABC):
             return None
         except asyncio.CancelledError:
             # The awaiting request was cancelled (e.g. client disconnect during
-            # the encode/E stage). Re-raise to preserve cancellation semantics.
-            await self._abort_encode_and_cleanup(encode_task, req_id, recv_task)
+            # the encode/E stage). Abort fast, but hand drain+cleanup to a
+            # detached background task so in-flight RDMA writes finish before
+            # the buffers are deregistered; then re-raise to preserve
+            # cancellation semantics.
+            self._schedule_drained_cleanup(encode_task, req_id, recv_task)
             raise
         except BaseException:
             # EncoderError (fail-fast from the encode task or an encoder error
@@ -1171,47 +1627,267 @@ class MMReceiverBase(ABC):
             raise exc
         return await recv_task
 
-    async def _abort_encode_and_cleanup(self, encode_task, req_id, recv_task=None):
-        """Stop the encode/recv tasks, then discard req_id's RDMA buffer.
+    def _schedule_drained_cleanup(self, encode_task, req_id, recv_task=None):
+        """Run drain-then-deregister in a detached background task.
 
-        The encode task is what allocates and registers the RDMA buffer, so it
-        must be cancelled and drained BEFORE we discard -- otherwise it could
-        allocate a fresh buffer after cleanup (re-leaking it), and a /send
-        could still be in flight when we deregister the MR. Tasks that are
-        already done are drained too, so their exceptions are always
-        retrieved (no "Task exception was never retrieved" warnings).
+        Used on the request-cancellation path: the parent task is being
+        cancelled and cannot wait for in-flight /send to drain, but
+        deregistering immediately would tear down a live MR while E is still
+        writing (the mooncake local/remote protection error). The detached
+        task waits (bounded by the RDMA-write timeout) for the encode task,
+        then deregisters, so cancellation latency and MR safety no longer
+        trade off. It is referenced from _cleanup_tasks so it is never
+        garbage-collected mid-flight.
         """
-        for task in (encode_task, recv_task):
-            if task is None:
-                continue
-            if not task.done():
-                task.cancel()
+        if req_id is None and encode_task is None and recv_task is None:
+            return
+
+        async def _drain_and_cleanup():
             try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                # Expected: CancelledError from our cancel(), or the task's
-                # own failure. We only need it to stop touching the buffer.
-                pass
-        if req_id is not None:
-            self._cleanup_mooncake_buffer(req_id)
+                await self._abort_encode_and_cleanup(encode_task, req_id, recv_task)
+            except BaseException:
+                logger.exception(
+                    "mm: background drain+cleanup failed for req_id=%s", req_id
+                )
+
+        cleanup_task = asyncio.create_task(_drain_and_cleanup())
+        self._cleanup_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self._cleanup_tasks.discard)
+        logger.info(
+            "mm-cleanup: detached drain+cleanup scheduled for req_id=%s "
+            "(caller is being cancelled; in-flight RDMA writes must still "
+            "finish before deregister)",
+            req_id,
+        )
+
+    def _schedule_quiesced_deregister(self, req_id):
+        """Defer the quiesce hold + deregister to a detached background task.
+
+        Used when the parent task is cancelled again MID-QUIESCE (or
+        mid-drain): deregistering right now would skip the very hold that
+        keeps E's residual posted slices away from a torn rkey, re-opening
+        the deregister-while-writing race. The detached task sleeps the full
+        write-timeout window (conservative -- the parent lost track of how
+        much of the hold elapsed) and only then discards the buffers.
+        """
+
+        async def _quiesce_then_deregister():
+            try:
+                await asyncio.sleep(_ENCODE_DRAIN_TIMEOUT_S)
+                self._cleanup_mooncake_buffer(req_id)
+            except BaseException:
+                logger.exception(
+                    "mm: background quiesced deregister failed for req_id=%s",
+                    req_id,
+                )
+
+        cleanup_task = asyncio.create_task(_quiesce_then_deregister())
+        cleanup_tasks = getattr(self, "_cleanup_tasks", None)
+        if cleanup_tasks is not None:
+            cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(cleanup_tasks.discard)
+        logger.info(
+            "mm-cleanup: detached quiesced deregister scheduled for req_id=%s "
+            "(re-cancelled mid-quiesce/mid-drain; holding one full window "
+            "before deregister)",
+            req_id,
+        )
+
+    async def _abort_encode_and_cleanup(self, encode_task, req_id, recv_task=None):
+        """Stop the recv task, drain the encode task, then discard the buffers.
+
+        The encode task owns every /send HTTP request, and E completes (or
+        times out) the RDMA write into a part's buffer *before* that part's
+        /send returns. Cancelling encode_task and deregistering immediately
+        would tear down a live MR while E is still writing, which is the
+        local/remote protection error seen in production. So wait -- bounded
+        by the RDMA-write timeout -- for the encode task to finish, then
+        deregister. Draining also guarantees no _encode_then_send registers a
+        buffer after cleanup, and every task's exception is retrieved.
+
+        On the request-cancellation path the caller cannot await this (the
+        parent is already being cancelled); it goes through
+        _schedule_drained_cleanup instead, which runs this detached.
+        """
+        failed = False
+        force_cancelled = False
+        try:
+            if recv_task is not None and not recv_task.done():
+                recv_task.cancel()
+
+            if encode_task is not None and not encode_task.done():
+                # Let in-flight /send drain. E's write is bounded by mooncake's
+                # MC_TRANSFER_TIMEOUT, so this normally returns quickly.
+                cancelled_mid_drain = False
+                try:
+                    _, pending = await asyncio.wait(
+                        {encode_task}, timeout=_ENCODE_DRAIN_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    # Cancelled mid-drain. We must NOT fall through to an
+                    # inline deregister: a part's buffer may already be in
+                    # E's hands with its transfer_sync still running. Defer
+                    # quiesce+deregister to a detached task (if any buffer
+                    # was handed over) and let the cancellation propagate.
+                    cancelled_mid_drain = True
+                    pending = {encode_task}
+                if pending:
+                    # A sibling /send did not drain in time (e.g. a hung
+                    # /encode); force it down. encode()'s finally still
+                    # cancels/drains every _encode_then_send, so none registers
+                    # a buffer after cleanup. Cancelling only interrupts the
+                    # HTTP call: if a part's /encode completed near the end of
+                    # the drain window its buffer is already allocated and its
+                    # /send dispatched, and E's transfer_sync keeps running on
+                    # an executor thread -- treat like a failure below.
+                    encode_task.cancel()
+                    force_cancelled = True
+                    logger.warning(
+                        "mm-cleanup: drain bound %.0fs exceeded; force-cancelling "
+                        "stuck encode task for req_id=%s",
+                        _ENCODE_DRAIN_TIMEOUT_S,
+                        req_id,
+                    )
+                if cancelled_mid_drain:
+                    # We are about to propagate without awaiting these tasks;
+                    # attach retrieval callbacks so their eventual exceptions
+                    # do not surface as "Task exception was never retrieved".
+                    for task in (encode_task, recv_task):
+                        if task is not None and not task.done():
+                            task.add_done_callback(_log_task_exception)
+                    if req_id is not None and self._request_has_live_buffers(req_id):
+                        self._schedule_quiesced_deregister(req_id)
+                        req_id = None  # inline cleanup below must not run
+                    raise
+
+            for task in (encode_task, recv_task):
+                if task is None:
+                    continue
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    # Self-inflicted (our cancel above, or the parent's): the
+                    # task stopped before reporting anything; quiesce need is
+                    # decided below from the request's own buffers.
+                    pass
+                except BaseException:
+                    # encode task failed on its own (non-200 /encode or /send),
+                    # or recv task surfaced an encoder error frame (E-side RDMA
+                    # write failure arrives as a ZMQ error frame while every
+                    # /send still returned 200 -- encode task looks
+                    # "successful"). Either way E may hold this request's
+                    # buffers/rkeys with residual posted slices in flight.
+                    failed = True
+        finally:
+            # Always deregister, even if we were cancelled mid-drain (the drain
+            # window is up to _ENCODE_DRAIN_TIMEOUT_S); otherwise the part
+            # buffers and their MRs leak permanently.
+            if req_id is not None:
+                # Quiesce whenever any buffer was handed to E -- i.e. whenever
+                # a /send was dispatched, so E holds this request's rkeys.
+                # We deliberately do NOT require a reported failure: on the
+                # timeout and client-disconnect paths the recv task (the only
+                # consumer of E's ZMQ error frame) is cancelled BEFORE the
+                # drain, and the /send failure signal can equally be lost, so
+                # "no exception seen" does not mean "no write in flight".
+                # Once we are in this cleanup the request is dead either way;
+                # the only cost of the hold is a bounded async wait. Pure
+                # /encode-dispatch failures allocate no buffer and skip the
+                # hold, preserving fail-fast.
+                quiesce = self._request_has_live_buffers(req_id)
+                if quiesce:
+                    # transferSync returning -1 (or an error frame) only means
+                    # the waiter gave up; posted slices can still be in flight
+                    # (observed landing ~5s later). Hold the MRs for one more
+                    # write-timeout window before deregistering so those
+                    # residual slices hit a live rkey instead of a torn one.
+                    n_buffers = len(getattr(self, "_buffer_index", {}).get(req_id, ()))
+                    if failed or force_cancelled:
+                        logger.info(
+                            "mm-cleanup: quiesce hold %.0fs before deregister "
+                            "for req_id=%s (%d part buffer(s), failure reported)",
+                            _ENCODE_DRAIN_TIMEOUT_S,
+                            req_id,
+                            n_buffers,
+                        )
+                    else:
+                        logger.info(
+                            "mm-cleanup: quiesce hold %.0fs before deregister "
+                            "for req_id=%s (%d part buffer(s), no failure signal "
+                            "-- timeout/disconnect path)",
+                            _ENCODE_DRAIN_TIMEOUT_S,
+                            req_id,
+                            n_buffers,
+                        )
+                    try:
+                        await asyncio.sleep(_ENCODE_DRAIN_TIMEOUT_S)
+                    except asyncio.CancelledError:
+                        # Cancelled again mid-quiesce: deregistering now would
+                        # skip the hold entirely and re-open the race. Defer
+                        # the remaining window + deregister to a detached task
+                        # and let the cancellation propagate.
+                        for task in (encode_task, recv_task):
+                            if task is not None and not task.done():
+                                task.add_done_callback(_log_task_exception)
+                        self._schedule_quiesced_deregister(req_id)
+                        req_id = None  # suppress the inline cleanup below
+                        raise
+                self._cleanup_mooncake_buffer(req_id)
+
+    def _request_has_live_buffers(self, req_id) -> bool:
+        """Whether any per-part buffer for this request is still held.
+
+        This is the sole quiesce criterion in _abort_encode_and_cleanup:
+        holding a buffer means a /send was dispatched, so E holds this
+        request's rkeys and residual posted slices may be in flight
+        regardless of whether a failure signal reached us.
+
+        A failure before any /send (e.g. /encode dispatch failure, bad image,
+        encoder unreachable) allocates no buffer, so there is nothing on E's
+        side still writing and the quiesce hold would only delay the client
+        error response for no safety benefit.
+        """
+        if self.encoder_transfer_backend != "mooncake":
+            return False
+        index = getattr(self, "_buffer_index", None)
+        if index is None:
+            return False
+        return bool(index.get(req_id))
 
     def _cleanup_mooncake_buffer(self, req_id):
         if self.encoder_transfer_backend != "mooncake":
             return
         if not hasattr(self, "embeddings_buffer"):
             return
-        embeddings = self.embeddings_buffer.pop(req_id, None)
-        if embeddings is None:
-            return
-        try:
-            if self._use_rdma_pool:
-                self._rdma_pool.discard(embeddings)
-            else:
-                self.embeddings_engine.deregister(embeddings.data_ptr())
-        except Exception:
-            logger.exception(
-                "mooncake: failed to discard/deregister buffer for req_id=%s",
+        # Buffers are keyed by part req_id ({req_id}_local_part_{idx}); drop
+        # every part belonging to this request via the req_id index. The index
+        # only exists once the first buffer was stored (and on receivers built
+        # via __new__ in tests), so tolerate its absence.
+        part_req_ids = getattr(self, "_buffer_index", {}).pop(req_id, [])
+        released = 0
+        for part_req_id in part_req_ids:
+            entry = self.embeddings_buffer.pop(part_req_id, None)
+            if entry is None:
+                continue
+            embeddings, _expected_bytes = entry
+            try:
+                if self._use_rdma_pool:
+                    self._rdma_pool.discard(embeddings)
+                else:
+                    self.embeddings_engine.deregister(embeddings.data_ptr())
+                released += 1
+            except Exception:
+                logger.exception(
+                    "mooncake: failed to discard/deregister buffer for "
+                    "part_req_id=%s",
+                    part_req_id,
+                )
+        if released:
+            logger.info(
+                "mm-cleanup: released %d part buffer(s) for req_id=%s " "(pool=%s)",
+                released,
                 req_id,
+                self._use_rdma_pool,
             )
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
@@ -1227,14 +1903,39 @@ class MMReceiverBase(ABC):
                 parts = await recv_socket.recv_multipart(copy=False)
                 if not parts:
                     continue
+                # TODO(P0-5, follow-up): see the sync-path note -- pickle.loads
+                # on a pod-IP-bound PULL socket is an in-cluster RCE surface;
+                # gate it on a per-port token sent with the /encode payload.
                 recv_obj: EmbeddingData = pickle.loads(parts[0])
+                # Frames reach this socket purely by which (per-request, randomly
+                # bound) port they land on. A cancelled/timed-out request frees
+                # its port, which the OS can recycle to a later request; a late or
+                # in-flight frame from the old request then arrives here. Validate
+                # the embedded req_id and drop foreign frames -- otherwise they are
+                # aggregated by part_idx and this request's RDMA buffer is later
+                # read with the wrong request's shape metadata -> silent NaN (or an
+                # add()/bounds assert).
+                part_req_id = recv_obj.req_id
+                original_req_id = extract_original_req_id(part_req_id)
+                if original_req_id != req_id:
+                    logger.warning(
+                        "mm: dropping foreign frame on reused port req_id=%s "
+                        "(expected %s, part_req_id=%s)",
+                        original_req_id,
+                        req_id,
+                        part_req_id,
+                    )
+                    continue
                 if getattr(recv_obj, "error_msg", None) is not None:
                     error_code = getattr(recv_obj, "error_code", None)
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
                         f"error_code={error_code}"
                     )
-                    self._cleanup_mooncake_buffer(req_id)
+                    # Don't deregister here: recv_mm_data routes this through
+                    # _abort_encode_and_cleanup, which first drains the encode
+                    # task so no RDMA write is still in flight when the buffers
+                    # are deregistered.
                     # Propagate the encoder's real error code (e.g. 500 for an
                     # RDMA write failure) instead of collapsing into a generic
                     # recv-timeout 504.
@@ -1242,10 +1943,28 @@ class MMReceiverBase(ABC):
                         f"Encoder error: {recv_obj.error_msg}",
                         status_code=int(error_code) if error_code else 500,
                     )
+                # Cross-check the element type: bf16 vs fp16 both have 2-byte
+                # items, so the byte-size guard alone would let a mismatched
+                # buffer be reinterpreted silently into corrupted output.
+                # Empty video shards are exempt: their placeholder embedding
+                # carries zero bytes and is never reinterpreted (its dtype is
+                # best-effort metadata on the encoder, not a buffer promise).
+                frame_shape = getattr(recv_obj, "shape", None)
+                frame_is_empty = not frame_shape or frame_shape[0] == 0
+                frame_dtype = getattr(recv_obj, "dtype", None)
+                expected_dtype = getattr(self, "dtype", None)
+                if (
+                    not frame_is_empty
+                    and frame_dtype is not None
+                    and expected_dtype is not None
+                    and frame_dtype != expected_dtype
+                ):
+                    raise EncoderError(
+                        f"Encoder dtype mismatch for req_id={req_id}: encoder "
+                        f"sent {frame_dtype}, model expects {expected_dtype}",
+                        status_code=500,
+                    )
                 logger.debug("recv_obj=%s", recv_obj)
-                # Extract original req_id from part_req_id
-                part_req_id = recv_obj.req_id
-                original_req_id = extract_original_req_id(part_req_id)
                 # Update recv_obj.req_id to original for aggregation
                 recv_obj.req_id = original_req_id
                 if self.encoder_transfer_backend == "zmq_to_tokenizer":
@@ -1272,36 +1991,73 @@ class MMReceiverBase(ABC):
                     recv_embedding_data.add(recv_obj)
 
             if self.encoder_transfer_backend == "mooncake" and not self.meta_only:
-                if req_id not in self.embeddings_buffer:
-                    logger.error(
-                        "mooncake: embeddings_buffer missing req_id=%s", req_id
-                    )
-                    return None
-                raw_buffer = self.embeddings_buffer.pop(req_id)
-                if self._use_rdma_pool:
+                # Each part owns its own RDMA buffer (keyed by part req_id),
+                # allocated and /sent independently during the pipelined
+                # encode. Pop and decode each part's buffer separately.
+                for part_idx in range(recv_embedding_data.num_parts):
+                    shape = recv_embedding_data.embedding_shape_list[part_idx]
+                    if shape is None:
+                        # Defensive: nothing to decode for this part, but still
+                        # release its buffer (if one was allocated) instead of
+                        # leaking it past this request.
+                        entry = self._pop_embedding_buffer(
+                            create_part_req_id(req_id, part_idx)
+                        )
+                        if entry is not None:
+                            orphan, _ = entry
+                            if self._use_rdma_pool:
+                                self._rdma_pool.release(orphan)
+                            else:
+                                self.embeddings_engine.deregister(orphan.data_ptr())
+                        continue
+                    part_req_id = create_part_req_id(req_id, part_idx)
+                    entry = self._pop_embedding_buffer(part_req_id)
+                    if entry is None:
+                        logger.error(
+                            "mooncake: embeddings_buffer missing part_req_id=%s",
+                            part_req_id,
+                        )
+                        raise EncoderError(
+                            f"mooncake: embeddings_buffer missing part_req_id={part_req_id}"
+                        )
+                    raw_buffer, expected_bytes = entry
                     try:
-                        recv_embedding = (
-                            recv_embedding_data.get_embedding_from_contiguous_buffer(
-                                raw_buffer, self.dtype, clone=True
+                        # Guard against an RDMA-layout mismatch (embedding_size
+                        # != actual write): the byte length must exactly match
+                        # the expected shape before reinterpreting the buffer.
+                        expected_numel = 1
+                        for dim in shape:
+                            expected_numel *= dim
+                        if expected_bytes != expected_numel * self.dtype.itemsize:
+                            raise EncoderError(
+                                f"mooncake: buffer size mismatch for "
+                                f"part_req_id={part_req_id}: expected "
+                                f"{expected_numel * self.dtype.itemsize} bytes "
+                                f"for shape {shape}, got {expected_bytes}"
                             )
+                        read_buffer = raw_buffer[:expected_bytes]
+                        part_embedding = (
+                            read_buffer.view(self.dtype).reshape(*shape).clone()
                         )
+                        recv_embedding_data.embedding_list[part_idx] = part_embedding
                     finally:
-                        self._rdma_pool.release(raw_buffer)
-                else:
-                    self.embeddings_engine.deregister(raw_buffer.data_ptr())
-                    recv_embedding = (
-                        recv_embedding_data.get_embedding_from_contiguous_buffer(
-                            raw_buffer, self.dtype
-                        )
-                    )
+                        if self._use_rdma_pool:
+                            self._rdma_pool.release(raw_buffer)
+                        else:
+                            self.embeddings_engine.deregister(raw_buffer.data_ptr())
+                recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
             else:
                 recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+
+            if envs.SGLANG_ENCODER_CHECK_NAN.get():
+                _check_recv_embedding_nan(req_id, recv_embedding)
 
             mm_inputs = mm_processor.get_mm_data(
                 prompt,
                 recv_embedding,
                 **recv_embedding_data.get_mm_extra_meta(),
             )
+            recv_embedding_data.inject_item_hashes(mm_inputs)
             return mm_inputs
         finally:
             recv_socket.close()
@@ -1348,8 +2104,16 @@ class MMReceiverBase(ABC):
                     mm_processor=self.mm_processor,
                     encoder_urls=self.encode_urls,
                     host_name=self.hostname,
-                    receive_count=self.tp_size,
+                    receive_count=self.receive_count,
                 )
+                # TODO(P0-4, follow-up): send_encode_request() runs inline in
+                # the scheduler's synchronous main loop: it does
+                # asyncio.run(...) + an aiohttp call with total=1800s, so a
+                # black-holed encoder connection can freeze the whole loop
+                # well past the 300s watchdog and take the replica down, and
+                # any exception here (fd exhaustion, bind failure) kills the
+                # scheduler process. Move the registration out of the loop
+                # and wrap it in try/except that fails only the request.
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:
@@ -1368,17 +2132,19 @@ class MMReceiverBase(ABC):
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
 
-        torch.distributed.all_reduce(
-            local_status,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_group.cpu_group,
-        )
+        for group in self.status_reduce_groups:
+            torch.distributed.all_reduce(
+                local_status,
+                op=torch.distributed.ReduceOp.MIN,
+                group=group,
+            )
 
         new_waiting = []
         abort_reqs = []
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingImageRequestStatus.SUCCESS:
+                waiting_req.recv_req.need_wait_for_mm_inputs = False
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingImageRequestStatus.FAIL:
                 logger.error(
@@ -1462,11 +2228,96 @@ class MMReceiverBase(ABC):
         req.tokenizer = self.scheduler.tokenizer
         return req
 
+    def _store_embedding_buffer(self, part_req_id, embeddings, expected_bytes):
+        self.embeddings_buffer[part_req_id] = (embeddings, expected_bytes)
+        original_req_id = extract_original_req_id(part_req_id)
+        # The index is normally created in __init__ (mooncake branch); use
+        # setdefault-style access so test doubles built via __new__ still work.
+        if not hasattr(self, "_buffer_index"):
+            self._buffer_index = {}
+        self._buffer_index.setdefault(original_req_id, []).append(part_req_id)
+
+    def _pop_embedding_buffer(self, part_req_id):
+        entry = self.embeddings_buffer.pop(part_req_id, None)
+        if entry is not None:
+            original_req_id = extract_original_req_id(part_req_id)
+            parts = self._buffer_index.get(original_req_id)
+            if parts is not None:
+                if part_req_id in parts:
+                    parts.remove(part_req_id)
+                if not parts:
+                    self._buffer_index.pop(original_req_id, None)
+        return entry
+
+    def _encoder_send_slot(self, encoder_idx: int) -> "asyncio.Semaphore":
+        """Per-encoder in-flight /send limiter (see SGLANG_ENCODER_MAX_INFLIGHT_SENDS).
+
+        Lazily created so receivers built via __new__ in tests keep working.
+        """
+        slots = getattr(self, "_encoder_send_slots", None)
+        if slots is None:
+            slots = {}
+            self._encoder_send_slots = slots
+        semaphore = slots.get(encoder_idx)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(
+                max(1, envs.SGLANG_ENCODER_MAX_INFLIGHT_SENDS.get())
+            )
+            slots[encoder_idx] = semaphore
+        return semaphore
+
+    def _pool_acquire_executor(self) -> "concurrent.futures.ThreadPoolExecutor":
+        """Worker threads for the (potentially blocking) pool acquire.
+
+        Lazily created so receivers built via __new__ in tests keep working.
+        """
+        executor = getattr(self, "_pool_acquire_workers", None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="mm-pool-acquire"
+            )
+            self._pool_acquire_workers = executor
+        return executor
+
+    async def _acquire_pool_buffer(self, total_bytes) -> torch.Tensor:
+        # GLM NOTE: pool.acquire blocks for budget (admission control). This
+        # coroutine runs on the http worker's event loop -- calling it inline
+        # froze the whole worker (including /health) for the full wait, so
+        # run it in a worker thread instead.
+        future = self._pool_acquire_executor().submit(
+            self._rdma_pool.acquire, total_bytes
+        )
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # The thread cannot be interrupted; if it still completes the
+            # acquire, hand the buffer straight back so an abandoned wait
+            # does not leak pool budget. release() (not discard) is right:
+            # the address was never exposed to the encoder, so no write can
+            # be in flight against it.
+            def _reclaim(f):
+                if f.cancelled() or f.exception() is not None:
+                    return
+                self._rdma_pool.release(f.result())
+
+            future.add_done_callback(_reclaim)
+            raise
+
     async def allocate_embedding_buffer(self, req_id, total_bytes):
+        # NOTE: per-part buffers cost one mooncake register/deregister per part
+        # (the pre-pipelining contiguous layout did a single registration per
+        # request). This is the price of pipelining /send per part; enable the
+        # RDMA pool (SGLANG_MC_RDMA_POOL_MAX_MB)
+        # for multi-image workloads so buffers are reused via size classes
+        # instead of re-registered per request.
+        #
+        # Empty video shards carry 0 bytes; mooncake rejects zero-length regions
+        # so allocate at least 1 byte, and the recorded write-length stays 0 so
+        # the read slices to empty. The pool path floors to its size class.
         if self._use_rdma_pool:
-            embeddings = self._rdma_pool.acquire(total_bytes)
+            embeddings = await self._acquire_pool_buffer(total_bytes)
         else:
-            embeddings = torch.empty(total_bytes, dtype=torch.uint8)
+            embeddings = torch.empty(max(1, total_bytes), dtype=torch.uint8)
             ret = self.embeddings_engine.register(
                 embeddings.data_ptr(),
                 embeddings.nbytes,
@@ -1480,7 +2331,17 @@ class MMReceiverBase(ABC):
                     f"(ret={ret}, bytes={total_bytes})",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-        self.embeddings_buffer[req_id] = embeddings
+        # INVARIANT: a torch allocation never returns a NULL data_ptr, and the
+        # gRPC Encode path derives `meta_only` from `buffer_address == 0`
+        # (encode_grpc_server.py). Check BEFORE storing so a hypothetical
+        # violation does not leak an entry into embeddings_buffer.
+        assert embeddings.data_ptr() != 0, (
+            "allocate_embedding_buffer must return a non-zero data_ptr; "
+            "gRPC meta_only detection relies on it"
+        )
+        # Keep the FULL tensor (pool release/discard key on its numel()) plus the
+        # expected write length, so the read can slice to the written region.
+        self._store_embedding_buffer(req_id, embeddings, total_bytes)
         return embeddings.data_ptr()
 
     def _assign_items_by_modality(
@@ -1589,15 +2450,37 @@ class MMReceiverBase(ABC):
             return False
         return True
 
+    _RAW_MM_RELEASED_MARKER = "<released-to-encoder>"
+
+    def _release_raw_media_after_extract(self, request_obj) -> None:
+        """Drop raw media payload references once _extract_url_data owns them.
+
+        _extract_url_data builds payloads that share (not copy) the base64/URL
+        string references, so after it returns the request object's raw fields
+        have no remaining reader on the encode path. Replacing them here frees
+        the media bytes for the whole encoder wait (up to
+        SGLANG_ENCODER_RECV_TIMEOUT) instead of holding them until scheduler
+        dispatch. A truthy, length-preserving marker per item keeps
+        contains_mm_input(), mm-limit validation and item counting truthful;
+        the tokenizer manager's _release_raw_multimodal_payload nulls the
+        fields for real after dispatch.
+        """
+        for attr in ("image_data", "video_data", "audio_data"):
+            data = getattr(request_obj, attr, None)
+            if data is None:
+                continue
+            if isinstance(data, list):
+                setattr(request_obj, attr, [self._RAW_MM_RELEASED_MARKER] * len(data))
+            else:
+                setattr(request_obj, attr, self._RAW_MM_RELEASED_MARKER)
+
     def _extract_url_data(self, request_obj) -> List[Dict]:
         def is_video_frame_sequence(items):
             return (
                 isinstance(items, (list, tuple))
                 and bool(items)
                 and all(
-                    isinstance(item, dict)
-                    and "url" in item
-                    and "timestamp" in item
+                    isinstance(item, dict) and "url" in item and "timestamp" in item
                     for item in items
                 )
             )
@@ -1780,24 +2663,32 @@ class MMReceiverHTTP(MMReceiverBase):
             encode_requests, encoder_session_ids = _split_mooncake_encode_requests(
                 req_id, encode_requests, upstream_session_id
             )
-            total_num_parts = len(encode_requests)
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=1800
             )  # Add timeout for request reliability
         ) as session:
+
             async def post_encoder_request(payload, endpoint, phase):
                 encoder_idx = payload["encoder_idx"]
                 encoder_session_id = encoder_session_ids.get(payload["part_idx"])
+                affinity_shard = None
+                affinity_shards = envs.GLM_ENCODER_AFFINITY_SHARDS.get()
+                if encoder_session_id:
+                    affinity_shard, affinity_shards = _encoder_affinity_shard_id(
+                        payload["req_id"]
+                    )
                 url = f"{self.encode_urls[encoder_idx]}/{endpoint}"
-                headers = _encoder_request_headers(payload["req_id"], encoder_session_id)
+                headers = _encoder_request_headers(
+                    payload["req_id"], encoder_session_id
+                )
                 # GLM Note: Log encoder routing metadata so operators can verify
                 # per-media parallel dispatch and Session-Id affinity in production.
                 logger.info(
                     "Sending request to encoder: phase=%s url=%s req_id=%s "
                     "part_idx=%s num_parts=%s modality=%s encoder_idx=%s "
-                    "session_id=%s",
+                    "session_id=%s affinity_shard=%s affinity_shards=%s",
                     phase,
                     url,
                     payload["req_id"],
@@ -1806,82 +2697,127 @@ class MMReceiverHTTP(MMReceiverBase):
                     payload["modality"],
                     encoder_idx,
                     encoder_session_id,
+                    affinity_shard,
+                    affinity_shards,
                 )
                 return await session.post(url, json=payload, headers=headers)
 
             # Send encode requests. Session-Id provides media affinity while
             # Request-Id retains the unique request/part identity.
-            tasks = [
-                post_encoder_request(encode_request, endpoint_encode, "encode")
-                for encode_request in encode_requests
-            ]
-
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for response in responses:
-                if isinstance(response, Exception):
-                    # Fail fast: surface the dispatch failure to recv_mm_data
-                    # instead of silently returning and letting the request
-                    # wait out the full recv timeout (180s pile-up).
+            # Each part is encoded and immediately sent (pipelined) instead of
+            # gathering all /encode responses first: an early part's embedding
+            # must not sit in the encoder waiting for every other part to
+            # finish encoding, or it can exceed the orphan-sweeper TTL and be
+            # reclaimed before its /send arrives.
+            async def _encode_then_send(encode_request):
+                try:
+                    response = await post_encoder_request(
+                        encode_request, endpoint_encode, "encode"
+                    )
+                except Exception as e:
                     raise EncoderError(
-                        f"Encoder request failed for {req_id}: {response}",
+                        f"Encoder request failed for {req_id}: {e}",
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    ) from response
+                    ) from e
                 if response.status != 200:
                     try:
                         err_data = await response.json()
                         msg = err_data.get("message", "Unknown encoder error")
                     except Exception:
                         msg = await response.text()
-
                     raise EncoderError(
                         f"Encoder returned error {response.status}: {msg}",
                         status_code=response.status,
                     )
-            response_json_list_unsort = [
-                await response.json() for response in responses
-            ]
+                response_json = await response.json()
+                if self.meta_only:
+                    return
+                # zmq backend: return is None
+                if response_json is None:
+                    return
 
-            if self.meta_only:
-                return
-
-            # zmq backend: return is None
-            if None in response_json_list_unsort:
-                return
-
-            # mooncake backend: send bootstrap info
-
-            embedding_size_list_sort = [None for _ in range(total_num_parts)]
-            response_json_list_sort = [None for _ in range(total_num_parts)]
-            for response_json in response_json_list_unsort:
-                idx = response_json["part_idx"]
-                embedding_size_list_sort[idx] = response_json["embedding_size"]
-                response_json_list_sort[idx] = response_json
-
-            total_embedding_bytes = sum(
-                s for s in embedding_size_list_sort if s is not None
-            )
-            offset = 0
-            metadata_tasks = []
-            buffer_address = await self.allocate_embedding_buffer(
-                req_id,
-                total_embedding_bytes,
-            )
-            for idx in range(len(tasks)):
-                response_json = response_json_list_sort[idx]
-                buffer_address_adjust = offset + buffer_address
+                # mooncake backend: allocate a per-part RDMA buffer and send
+                # immediately, keyed by the part req_id so recv can pop each
+                # part independently.
+                part_idx = response_json["part_idx"]
+                embedding_size = response_json["embedding_size"]
+                part_req_id = create_part_req_id(req_id, part_idx)
+                buffer_address = await self.allocate_embedding_buffer(
+                    part_req_id, embedding_size
+                )
                 response_json.update(
                     {
                         "session_id": self.embeddings_engine.session_id,
-                        "buffer_address": buffer_address_adjust,
+                        "buffer_address": buffer_address,
                     }
                 )
-                metadata_tasks.append(
-                    # GLM Note: Reuse the media affinity key so /send reaches
-                    # the encoder replica that retained the /encode result.
-                    post_encoder_request(response_json, endpoint_send, "send")
-                )
-                offset += embedding_size_list_sort[idx]
-            await asyncio.gather(*metadata_tasks)
+                # Bound concurrent in-flight /send per encoder: the encoder's
+                # transfer executor has 10 workers, and a queued transfer_sync
+                # can wait a full MC_TRANSFER_TIMEOUT behind a stalled batch --
+                # longer than the quiesce window budgets, reviving the
+                # deregister-while-writing race under saturation.
+                semaphore = self._encoder_send_slot(encode_request["encoder_idx"])
+                try:
+                    async with semaphore:
+                        send_response = await post_encoder_request(
+                            response_json, endpoint_send, "send"
+                        )
+                except Exception as e:
+                    raise EncoderError(
+                        f"Encoder /send request failed for {req_id}: {e}",
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    ) from e
+                if send_response.status != 200:
+                    try:
+                        err_data = await send_response.json()
+                        msg = err_data.get("message", "Unknown encoder error")
+                    except Exception:
+                        msg = await send_response.text()
+                    raise EncoderError(
+                        f"Encoder returned error {send_response.status} on /send: {msg}",
+                        status_code=send_response.status,
+                    )
+
+            tasks = [
+                asyncio.ensure_future(_encode_then_send(er)) for er in encode_requests
+            ]
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+                first_exc = None
+                for t in done:
+                    t_exc = t.exception()
+                    if t_exc is not None:
+                        first_exc = t_exc
+                        break
+                if first_exc is not None:
+                    # Let siblings finish their /send (draining their in-flight
+                    # RDMA writes) before surfacing the failure, so the caller's
+                    # cleanup deregisters buffers only after every write has
+                    # drained. Bounded like _abort_encode_and_cleanup: anything
+                    # still pending past the RDMA-write bound is a stuck /encode
+                    # (which owns no buffer), so force it down.
+                    pending = [t for t in tasks if not t.done()]
+                    if pending:
+                        _, still_pending = await asyncio.wait(
+                            pending, timeout=_ENCODE_DRAIN_TIMEOUT_S
+                        )
+                        for t in still_pending:
+                            t.cancel()
+                        if still_pending:
+                            await asyncio.gather(*still_pending, return_exceptions=True)
+                    raise first_exc
+            finally:
+                # Parent cancellation cannot wait for in-flight /send to drain
+                # (we are already being cancelled), so cancel and drain every
+                # task so none registers a buffer after _cleanup_mooncake_buffer
+                # has run.
+                for p in tasks:
+                    p.cancel()
+                for p in tasks:
+                    try:
+                        await p
+                    except BaseException:
+                        pass
 
 
 class MMReceiverGrpc(MMReceiverBase):
@@ -1970,7 +2906,7 @@ class MMReceiverGrpc(MMReceiverBase):
                     "mm_items": img_data[start:end],
                     "num_parts": num_parts,
                     "part_idx": cum_idx,
-                    "req_id": req_id,
+                    "req_id": create_part_req_id(req_id, cum_idx),
                     "prefill_host": self.host,
                     "embedding_port": embedding_port,
                 }
@@ -1978,68 +2914,87 @@ class MMReceiverGrpc(MMReceiverBase):
             cum_idx += 1
             cum_num_items += assigned_num
 
-        grpc_tasks = [
-            asyncio.to_thread(
-                _grpc_encode_request,
-                _grpc_target(self.encode_urls[encode_request["encoder_idx"]]),
-                encode_request,
+        # Pipeline each part independently: encode, then (mooncake) allocate a
+        # per-part RDMA buffer and /send as soon as that part's Encode returns,
+        # so no embedding waits on its siblings and gets reclaimed by the
+        # orphan sweeper before its /send arrives.
+        async def _encode_then_send(encode_request):
+            target = _grpc_target(self.encode_urls[encode_request["encoder_idx"]])
+            response = await asyncio.to_thread(
+                _grpc_encode_request, target, encode_request
             )
-            for encode_request in encode_requests
-        ]
-        grpc_responses = await asyncio.gather(*grpc_tasks)
-        response_json_unsorted = []
-        for encode_request, response in zip(encode_requests, grpc_responses):
-            if self.encoder_transfer_backend == "zmq_to_scheduler":
-                response_json_unsorted.append(None)
-                continue
-            response_json_unsorted.append(
+            if self.encoder_transfer_backend != "mooncake":
+                # zmq backends: the encoder's Encode RPC already sent the data
+                # over ZMQ; nothing further to do on the receiver side.
+                return
+            part_req_id = encode_request["req_id"]
+            if self.meta_only:
+                # Decode-role receiver: no RDMA buffer to allocate. Still issue
+                # a bufferless /send so the encoder pushes the metadata frame
+                # over ZMQ (the gRPC Encode handler has no role field, so the
+                # encoder still runs the ViT here -- unlike the HTTP decode
+                # path, which routes to encode_metadata server-side).
+                await asyncio.to_thread(
+                    _grpc_send_request,
+                    target,
+                    {
+                        "req_id": part_req_id,
+                        "prefill_host": encode_request["prefill_host"],
+                        "embedding_port": encode_request["embedding_port"],
+                        "session_id": "",
+                        "buffer_address": 0,
+                    },
+                )
+                return
+            buffer_address = await self.allocate_embedding_buffer(
+                part_req_id, response.embedding_size
+            )
+            await asyncio.to_thread(
+                _grpc_send_request,
+                target,
                 {
-                    "req_id": encode_request["req_id"],
+                    "req_id": part_req_id,
                     "prefill_host": encode_request["prefill_host"],
                     "embedding_port": encode_request["embedding_port"],
-                    "encoder_idx": encode_request["encoder_idx"],
-                    "part_idx": encode_request["part_idx"],
-                    "embedding_size": response.embedding_size,
-                    "embedding_len": response.embedding_len,
-                    "embedding_dim": response.embedding_dim,
-                }
-            )
-
-        if None in response_json_unsorted:
-            return
-
-        embedding_size_by_part = [None for _ in range(num_parts)]
-        response_json_sorted = [None for _ in range(num_parts)]
-        for response_json in response_json_unsorted:
-            idx = response_json["part_idx"]
-            embedding_size_by_part[idx] = response_json["embedding_size"]
-            response_json_sorted[idx] = response_json
-
-        total_embedding_bytes = sum(s for s in embedding_size_by_part if s is not None)
-        offset = 0
-        buffer_address = await self.allocate_embedding_buffer(
-            req_id,
-            total_embedding_bytes,
-        )
-        grpc_metadata_tasks = []
-        for response_json in response_json_sorted:
-            response_json.update(
-                {
                     "session_id": self.embeddings_engine.session_id,
-                    "buffer_address": offset + buffer_address,
-                }
+                    "buffer_address": buffer_address,
+                },
             )
-            grpc_metadata_tasks.append(
-                asyncio.to_thread(
-                    _grpc_send_request,
-                    _grpc_target(self.encode_urls[response_json["encoder_idx"]]),
-                    response_json,
-                )
-            )
-            offset += embedding_size_by_part[response_json["part_idx"]]
 
-        if grpc_metadata_tasks:
-            await asyncio.gather(*grpc_metadata_tasks)
+        tasks = [asyncio.ensure_future(_encode_then_send(er)) for er in encode_requests]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+            first_exc = None
+            for t in done:
+                t_exc = t.exception()
+                if t_exc is not None:
+                    first_exc = t_exc
+                    break
+            if first_exc is not None:
+                # Let siblings finish their /send (draining their in-flight RDMA
+                # writes) before surfacing the failure, so the caller's cleanup
+                # deregisters buffers only after every write has drained.
+                # Bounded like _abort_encode_and_cleanup: anything still
+                # pending past the RDMA-write bound is a stuck /encode (which
+                # owns no buffer), so force it down.
+                pending = [t for t in tasks if not t.done()]
+                if pending:
+                    _, still_pending = await asyncio.wait(
+                        pending, timeout=_ENCODE_DRAIN_TIMEOUT_S
+                    )
+                    for t in still_pending:
+                        t.cancel()
+                    if still_pending:
+                        await asyncio.gather(*still_pending, return_exceptions=True)
+                raise first_exc
+        finally:
+            for p in tasks:
+                p.cancel()
+            for p in tasks:
+                try:
+                    await p
+                except BaseException:
+                    pass
 
 
 def _validate_transport_mode(transport_mode: str, encoder_urls):

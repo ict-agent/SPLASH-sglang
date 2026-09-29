@@ -220,11 +220,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
-                query_start_loc[:bs] = forward_batch.extend_start_loc
-                query_start_loc[bs] = (
-                    forward_batch.extend_start_loc[-1]
-                    + forward_batch.extend_seq_lens[-1]
-                )
+                if bs == 0:
+                    query_start_loc[0] = 0
+                else:
+                    query_start_loc[:bs] = forward_batch.extend_start_loc
+                    query_start_loc[bs] = (
+                        forward_batch.extend_start_loc[-1]
+                        + forward_batch.extend_seq_lens[-1]
+                    )
                 if (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
@@ -994,6 +997,40 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
+
+        mamba_pool = self.linear_attn_backend.req_to_token_pool.mamba_pool
+        if mamba_pool.enable_kda_replayssm_spec:
+            from sglang.srt.layers.attention.fla.kda_replayssm_spec_decode import (
+                commit_kda_replayssm_spec_all_layers,
+            )
+
+            commit_kda_replayssm_spec_all_layers(
+                checkpoint_state=mamba_caches.temporal,
+                rawv_cache=mamba_caches.replayssm_rawv,
+                rawk_cache=mamba_caches.replayssm_rawk,
+                g_cache=mamba_caches.replayssm_g,
+                beta_cache=mamba_caches.replayssm_beta,
+                ssm_state_indices=state_indices_tensor,
+                accept_lens=last_correct_step_indices + 1,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            fused_mamba_state_scatter_with_mask(
+                mamba_caches.conv[0],
+                mamba_caches.intermediate_conv_window[0],
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            if mamba_track_indices is not None:
+                assert mamba_steps_to_track is not None
+                fused_mamba_state_scatter_with_mask(
+                    mamba_caches.conv[0],
+                    mamba_caches.intermediate_conv_window[0],
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+            return
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

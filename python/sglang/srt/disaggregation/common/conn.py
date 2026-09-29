@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 from sglang.srt.configs.model_config import ModelConfig
 import numpy as np
@@ -25,6 +24,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
+from sglang.srt.disaggregation.common.utils import ZMQSocketCache
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
@@ -88,6 +88,15 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    # One shared ZMQ context per process for all manager PUSH sockets: a
+    # context owns the IO threads and internal FDs, so per-endpoint contexts
+    # (the old behavior) would multiply threads/FDs by the number of peers.
+    _push_ctx = zmq.Context()
+    _push_ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
+    # fd_budget_share=2: this cache and CommonKVReceiver's split the process
+    # FD budget between them.
+    _push_socket_cache = ZMQSocketCache(_push_ctx, desc="kv_manager", fd_budget_share=2)
+
     def __init__(
         self,
         args: KVArgs,
@@ -133,8 +142,10 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         context = zmq.Context()
-        # Raise libzmq's per-context socket cap because this manager caches two
-        # sockets per decode endpoint, so large fleets can exceed the default.
+        # NOTE: this context only hosts the manager's single PULL server socket;
+        # the cached PUSH sockets live on the class-level _push_ctx. The
+        # MAX_SOCKETS raise below is historical (the old per-endpoint @cache) and
+        # kept for compatibility.
         context.set(
             zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
         )
@@ -393,6 +404,10 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
+            # A wildcard bind address is not a valid outbound HTTP target.
+            # Register through loopback while the bootstrap service keeps
+            # listening on the wildcard address for remote decode workers.
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -422,7 +437,8 @@ class CommonKVManager(BaseKVManager):
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: "
+                    f"status {response.status_code}, {response.text}"
                 )
             except Exception as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
@@ -442,13 +458,8 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+        return self._push_socket_cache.lease(zmq.PUSH, endpoint, is_ipv6)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -744,9 +755,7 @@ class CommonKVSender(BaseKVSender):
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
-    _socket_cache = {}
-    _socket_locks = {}
-    _global_lock = threading.Lock()
+    _push_socket_cache = ZMQSocketCache(_ctx, desc="kv_receiver", fd_budget_share=2)
 
     def __init__(
         self,
@@ -843,10 +852,15 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+                # Register kv_args only once per prefill instance. Only cache the
+                # bootstrap_infos in the connection_pool on success: on failure
+                # the next request must retry _register_kv_args, otherwise a
+                # transient send failure would permanently skip registration for
+                # this prefill connection (the failed room is marked Failed inside
+                # _register_kv_args).
+                if self._register_kv_args():
+                    self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -899,26 +913,19 @@ class CommonKVReceiver(BaseKVReceiver):
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
-        with cls._global_lock:
-            if endpoint not in cls._socket_cache:
-                sock = cls._ctx.socket(zmq.PUSH)
-                if is_ipv6:
-                    sock.setsockopt(zmq.IPV6, 1)
-                sock.connect(endpoint)
-                cls._socket_cache[endpoint] = sock
-                cls._socket_locks[endpoint] = threading.Lock()
-            return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+        return cls._push_socket_cache.lease(zmq.PUSH, endpoint, is_ipv6)
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
         na = NetworkAddress(ip_address, port)
-        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
-        return sock, lock
+        return cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
 
-    def _register_kv_args(self):
-        pass
+    def _register_kv_args(self) -> bool:
+        """No-op default: backends that don't need to register KV args treat this
+        as success so the caller caches bootstrap_infos normally."""
+        return True
 
     def send_metadata(
         self,

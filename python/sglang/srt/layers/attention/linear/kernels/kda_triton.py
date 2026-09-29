@@ -127,4 +127,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            cache_replayssm_inputs=kwargs.get("cache_replayssm_inputs", False),
+            replayssm_rawv=kwargs.get("replayssm_rawv"),
+            replayssm_rawk=kwargs.get("replayssm_rawk"),
+            replayssm_g=kwargs.get("replayssm_g"),
+            replayssm_beta=kwargs.get("replayssm_beta"),
         )

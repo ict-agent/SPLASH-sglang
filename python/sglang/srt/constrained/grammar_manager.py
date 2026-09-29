@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
+    GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
 )
@@ -84,6 +85,18 @@ class GrammarManager:
 
     def __len__(self):
         return len(self.grammar_queue)
+
+    def _log_grammar_stats(self, grammar_stats) -> None:
+        # GLM NOTE: emitted when the grammar attaches (cache hit / compile
+        # done / timeout); tree_traversal_time has no writers yet, so nothing
+        # is lost by not waiting for request finish.
+        if grammar_stats is not None and self.scheduler.enable_metrics:
+            self.scheduler.metrics_collector.log_grammar_stats(grammar_stats)
+
+    def get_cache_stats(self):
+        if self.grammar_backend is None:
+            return 0, 0
+        return self.grammar_backend.get_cache_stats()
 
     def clear(self):
         if self.grammar_backend:
@@ -167,6 +180,7 @@ class GrammarManager:
                         req.set_finish_with_abort(error_msg)
                     else:
                         self._apply_request_reasoning_budget(req)
+                        self._log_grammar_stats(value.grammar_stats)
         elif self._enable_strict_thinking:
             grammar_obj = self.grammar_backend.init_strict_reasoning_grammar(
                 req.require_reasoning
@@ -263,6 +277,8 @@ class GrammarManager:
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
+            else:
+                self._log_grammar_stats(req.grammar.grammar_stats)
 
         # Return failed requests
         for i in synced_failed_req_idxs:
@@ -276,6 +292,7 @@ class GrammarManager:
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
+            self._log_grammar_stats(GrammarStats(num_timeout=1))
 
         # Remove finished requests from grammar_queue
         self.grammar_queue = [

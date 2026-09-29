@@ -129,6 +129,9 @@ def escape_tokenizer_special_tokens(tokenizer, seed: int) -> EscapedSpecialToken
         "cls_token",
         "unk_token",
         "mask_token",
+        # Multimodal placeholder strings, if present. The HF processor reads
+        # tokenizer.image_token/video_token at init; the already-built processor
+        # instance is additionally patched in get_processor.
         "image_token",
         "video_token",
         "audio_token",

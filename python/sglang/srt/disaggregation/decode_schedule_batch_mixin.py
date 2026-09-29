@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
+from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.layers.attention.nsa.utils import (
+    remap_pd_nsa_seed_to_local_slots,
+    should_remap_pd_nsa_seed_to_local_slots,
+)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -71,7 +77,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Set fields
         self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
+            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
         )
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
@@ -163,14 +169,39 @@ class ScheduleBatchDisaggregationDecodeMixin:
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
 
-            mtp_indices_list = [
-                req.mtp_topk_indices_tensor for req in self.reqs
-            ]
+            mtp_indices_list = []
+            for req in self.reqs:
+                indices = req.mtp_topk_indices_tensor
+                if (
+                    indices is not None
+                    and getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST
+                ):
+                    # Fake PD requests have no prefill peer.  Use a valid
+                    # request-relative position so warmup can still exercise
+                    # the fused path after the normal remap below.
+                    indices = torch.zeros_like(indices)
+                mtp_indices_list.append(indices)
             mtp_topk_indices = (
                 torch.stack(mtp_indices_list, dim=0).to(self.device)
                 if mtp_indices_list and all(x is not None for x in mtp_indices_list)
                 else None
             )
+            mtp_topk_indices_are_physical = False
+            if mtp_topk_indices is not None:
+                if should_remap_pd_nsa_seed_to_local_slots(
+                    server_args, self.model_config
+                ):
+                    mtp_topk_indices = remap_pd_nsa_seed_to_local_slots(
+                        mtp_topk_indices,
+                        self.req_to_token_pool.req_to_token,
+                        self.req_pool_indices,
+                        self.seq_lens,
+                    )
+                    mtp_topk_indices_are_physical = mtp_topk_indices is not None
+                elif torch.any(torch.all(mtp_topk_indices < 0, dim=1)).item():
+                    # A missing seed cannot be represented by fused padding slot
+                    # 0.  Let the draft worker recompute TopK for the batch.
+                    mtp_topk_indices = None
 
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -180,6 +211,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 mtp_topk_indices=mtp_topk_indices,
+                mtp_topk_indices_are_physical=mtp_topk_indices_are_physical,
                 bonus_tokens=self.output_ids,
                 new_seq_lens=self.seq_lens,
             )

@@ -204,6 +204,36 @@ def reg_reduce_scatter_tensor(
     group._reduce_scatter_tensor(output, input)
 
 
+@register_custom_op(mutates_args=["output"])
+def reg_all_gatherv(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    sizes: List[int],
+    use_sizes: bool,
+    group_name: str,
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_gatherv_into_tensor(output, input, sizes if use_sizes else None)
+
+
+@register_custom_op(mutates_args=["output"])
+def reg_reduce_scatterv(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    sizes: List[int],
+    use_sizes: bool,
+    group_name: str,
+) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._reduce_scatterv_into_tensor(output, input, sizes if use_sizes else None)
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -783,29 +813,46 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
+        assert (
+            pynccl_comm is not None and not pynccl_comm.disabled
+        ), "pynccl is required for reduce_scatterv"
+
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_.shape[0] % world_size == 0
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
+
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
+
+        reg_reduce_scatterv(
+            output,
+            input_,
+            sizes or [],
+            sizes is not None,
+            group_name=self.unique_name,
+        )
+        return output
+
+    def _reduce_scatterv_into_tensor(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        sizes: Optional[List[int]],
+    ) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        assert (
+            pynccl_comm is not None and not pynccl_comm.disabled
+        ), "pynccl is required for reduce_scatterv"
         with pynccl_comm.change_state(enable=True):
-            assert (
-                pynccl_comm is not None and not pynccl_comm.disabled
-            ), "pynccl is required for reduce_scatterv"
-
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
-
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
-                )
-            else:
-                assert output.shape == output_shape
-
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
-            return output
+        return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
@@ -927,10 +974,12 @@ class GroupCoordinator:
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
         sizes: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Supports varying sizes per rank and input tensor list.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        `output`: optional pre-allocated destination buffer for single-tensor inputs.
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -941,7 +990,9 @@ class GroupCoordinator:
             ), "pynccl is required for all_gatherv"
 
             def _all_gather_allocate_output(
-                input_: torch.Tensor, sizes: Optional[List[int]] = None
+                input_: torch.Tensor,
+                sizes: Optional[List[int]] = None,
+                output: Optional[torch.Tensor] = None,
             ):
                 input_size = input_.size()
                 if sizes is not None:
@@ -953,6 +1004,12 @@ class GroupCoordinator:
                         sizes = None
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
+                if output is not None:
+                    assert tuple(output.shape) == tuple(output_size), (
+                        f"all_gatherv output buffer shape {tuple(output.shape)} "
+                        f"!= expected {tuple(output_size)}"
+                    )
+                    return output, sizes
                 # Allocate output tensor.
                 with self.use_symmetric_memory(self, disabled=sizes is not None):
                     output_tensor = torch.empty(
@@ -960,22 +1017,49 @@ class GroupCoordinator:
                     )
                 return output_tensor, sizes
 
-            if isinstance(input_, torch.Tensor):
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
                 input_ = [input_]
+            elif output is not None:
+                raise ValueError("all_gatherv `output` requires a single-tensor input")
 
             output_list = []
             size_list = []
             for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_tensor, s = _all_gather_allocate_output(
+                    inp, sizes=sizes, output=output
+                )
                 output_list.append(output_tensor)
                 size_list.append(s)
 
-            pynccl_comm.group_start()
-            for i, inp in enumerate(input_):
-                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
-            pynccl_comm.group_end()
+            if single_input:
+                reg_all_gatherv(
+                    output_list[0],
+                    input_[0],
+                    size_list[0] or [],
+                    size_list[0] is not None,
+                    group_name=self.unique_name,
+                )
+            else:
+                pynccl_comm.group_start()
+                for i, inp in enumerate(input_):
+                    pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
+                pynccl_comm.group_end()
 
             return output_list
+
+    def _all_gatherv_into_tensor(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        sizes: Optional[List[int]],
+    ) -> None:
+        pynccl_comm = self.pynccl_comm
+        assert (
+            pynccl_comm is not None and not pynccl_comm.disabled
+        ), "pynccl is required for all_gatherv"
+        with pynccl_comm.change_state(enable=True):
+            pynccl_comm.all_gather(output, input_, sizes=sizes)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

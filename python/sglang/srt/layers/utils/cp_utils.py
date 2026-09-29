@@ -119,6 +119,9 @@ def cp_plain_all_gather(
             ):
                 gathered = input_.new_empty(max_len * cp_size, *input_.shape[1:])
             attn_cp_all_gather_into_tensor(gathered, input_)
+            # Plain CP shards are rank-contiguous, so an equal-size all-gather
+            # is already in natural token order.
+            return gathered
         else:
             pad_shape = (max_len - local_len, *input_.shape[1:])
             padding = input_.new_zeros(pad_shape)

@@ -39,6 +39,9 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+    # Duration of the request's first vocab-mask fill. Under dynamic
+    # compilation this is where the deferred JIT mask cost lands.
+    first_mask_fill_time: Optional[float] = None
 
 
 class BaseGrammarObject:
@@ -240,6 +243,10 @@ class BaseGrammarBackend:
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
+
+    def get_cache_stats(self) -> Tuple[int, int]:
+        """Return (num cached grammar objects, backend-native cache bytes)."""
+        return len(self.cache.entries), 0
 
     def reset(self):
         self.cache.clear()

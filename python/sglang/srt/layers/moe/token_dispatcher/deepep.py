@@ -464,6 +464,25 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+        # DCU's DeepEP port can wedge when a rank enters normal-mode dispatch
+        # with zero local tokens (empty SUM_LEN DP ranks during prefill).
+        # Keep the rank participating with one zero-weight dummy token routed
+        # to expert 0 and strip the row after combine; the weight is zero and
+        # the row only ever returns to this rank, so other ranks are unaffected.
+        if isinstance(x, torch.Tensor):
+            num_local_tokens = x.shape[0]
+        else:
+            num_local_tokens = x[0].shape[0]
+        if num_local_tokens == 0:
+            self._padded_empty_dispatch = True
+            if isinstance(x, torch.Tensor):
+                x = x.new_zeros((1, *x.shape[1:]))
+            else:
+                x = tuple(t.new_zeros((1, *t.shape[1:])) for t in x)
+            topk_ids = topk_ids.new_zeros((1, topk_ids.shape[1]))
+            topk_weights = topk_weights.new_zeros((1, topk_weights.shape[1]))
+        else:
+            self._padded_empty_dispatch = False
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -582,6 +601,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        if getattr(self, "_padded_empty_dispatch", False):
+            # Drop the zero-weight dummy row injected in _dispatch_core.
+            hidden_states = hidden_states[:0]
+            self._padded_empty_dispatch = False
         self.handle = None
         self.src2dst = None
         return hidden_states

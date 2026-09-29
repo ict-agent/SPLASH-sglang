@@ -65,3 +65,27 @@ def hash_suffix(seed: int, token: str) -> str:
 
 def escape_token(seed: int, token: str) -> str:
     return f"{token}<{hash_suffix(seed, token)}>"
+
+
+def escape_text(text):
+    """Apply the process-global escape mapping to ``text`` (e.g. a chat template).
+
+    No-op when escape is disabled, ``text`` is not a str, or it already contains
+    escaped forms (idempotence). Longer originals first to avoid partial overlaps.
+    Used to escape secondary template copies (e.g. processor.chat_template) that
+    escape_tokenizer_special_tokens does not touch.
+    """
+    sp = get_global_escaped_special_tokens()
+    if not sp.enabled or not sp.mapping or not isinstance(text, str):
+        return text
+    already = any(
+        escaped != original and escaped in text
+        for original, escaped in sp.mapping.items()
+    )
+    if already:
+        return text
+    for original in sorted(sp.mapping, key=len, reverse=True):
+        escaped = sp.mapping[original]
+        if escaped != original:
+            text = text.replace(original, escaped)
+    return text

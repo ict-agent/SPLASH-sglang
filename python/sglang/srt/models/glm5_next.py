@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import os
 import re
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -36,8 +35,8 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attention.nsa.utils import can_nsa_cp_split as can_cp_split
 from sglang.srt.layers.attention.nsa.utils import (
-    can_nsa_cp_split as can_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
@@ -85,6 +84,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_plain_all_gather,
@@ -95,7 +95,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
 )
-from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -117,12 +116,14 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
-    _is_dcu,
     _is_cuda,
+    _is_dcu,
     _is_gfx95_supported,
     _use_aiter_gfx95,
 )
-from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as ModelNextMLAAttention
+from sglang.srt.models.deepseek_v2 import (
+    DeepseekV2AttentionMLA as ModelNextMLAAttention,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as ModelNextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as ModelNextMoe
 from sglang.srt.models.glm4v import Glm4vVisionModel
@@ -230,7 +231,7 @@ class ModelNextLinearAttention(nn.Module):
             if self.nsa_enable_prefill_cp
             else get_tensor_model_parallel_world_size()
         )
-        self.do_fuse_qkvbfg = requested_fuse_qkvbfg #  and fuse_qkvbfg_supported
+        self.do_fuse_qkvbfg = requested_fuse_qkvbfg  #  and fuse_qkvbfg_supported
         if requested_fuse_qkvbfg and not fuse_qkvbfg_supported:
             log_info_on_rank0(
                 logger,
@@ -252,7 +253,7 @@ class ModelNextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=None,#quant_config,
+                quant_config=None,  # quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 tp_rank=head_shard_rank,
                 tp_size=head_shard_size,
@@ -761,9 +762,7 @@ class ModelNextDecoderLayer(nn.Module):
             use_mhc_rms_quant
             and (not self.is_linear_attn or not self.self_attn.do_fuse_qkvbfg)
             and attn_prequantized_projection is not None
-            and _linear_supports_prequantized_input(
-                attn_prequantized_projection
-            )
+            and _linear_supports_prequantized_input(attn_prequantized_projection)
         )
         mlp_with_gate_up = (
             self.mlp.shared_experts
@@ -871,15 +870,10 @@ class ModelNextDecoderLayer(nn.Module):
             )
         )
 
-        fuse_attn_rms_quant = (
-            self._can_fuse_attn_rms_quant
-            and not nsa_use_prefill_cp(
-                forward_batch, self.nsa_enable_prefill_cp
-            )
+        fuse_attn_rms_quant = self._can_fuse_attn_rms_quant and not nsa_use_prefill_cp(
+            forward_batch, self.nsa_enable_prefill_cp
         )
-        prepare_attn_kwargs = (
-            {"fuse_rms_quant": True} if fuse_attn_rms_quant else {}
-        )
+        prepare_attn_kwargs = {"fuse_rms_quant": True} if fuse_attn_rms_quant else {}
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
@@ -942,9 +936,7 @@ class ModelNextDecoderLayer(nn.Module):
             maybe_prefetch(forward_batch, next_full_attention_layer_id)
 
         prepare_mlp_kwargs = (
-            {"fuse_rms_quant": True}
-            if self._can_fuse_mlp_rms_quant
-            else {}
+            {"fuse_rms_quant": True} if self._can_fuse_mlp_rms_quant else {}
         )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
@@ -974,13 +966,11 @@ class ModelNextDecoderLayer(nn.Module):
 
         mlp_quant_kwargs = (
             {"input_quant_args": mlp_input_quant_args}
-            if mlp_input_quant_args is not None
-            and isinstance(self.mlp, ModelNextMLP)
+            if mlp_input_quant_args is not None and isinstance(self.mlp, ModelNextMLP)
             else {}
         )
-        prequantized_shared_expert = (
-            mlp_input_quant_args is not None
-            and isinstance(self.mlp, ModelNextMoe)
+        prequantized_shared_expert = mlp_input_quant_args is not None and isinstance(
+            self.mlp, ModelNextMoe
         )
         if prequantized_shared_expert:
             self.mlp.set_shared_expert_input_quant_args(mlp_input_quant_args)
@@ -1452,6 +1442,159 @@ class ModelNextForCausalLM(nn.Module):
         else:
             return hidden_states
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        """Run the opt-in PD prefill path over ``[start, end)`` layers."""
+        start, end = split_interval
+        if self.pp_group.world_size != 1:
+            raise RuntimeError(
+                "Layer-pipelined split prefill is not supported with PP>1"
+            )
+
+        if start == 0:
+            if self.nsa_enable_prefill_cp and can_cp_split(
+                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+            ):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
+            with get_attn_tp_context().maybe_input_scattered(forward_batch):
+                hidden_states = (
+                    self.model.embed_tokens(input_ids)
+                    if input_embeds is None
+                    else input_embeds
+                )
+            residual = None
+            split_positions = positions
+
+            if nsa_use_prefill_cp(forward_batch, self.model.nsa_enable_prefill_cp):
+                hidden_states = cp_plain_split(hidden_states)
+                split_positions = cp_split_and_rebuild_position(
+                    forward_batch, positions
+                )
+                if _is_dcu:
+                    maybe_prefetch_full_attention_kv(
+                        forward_batch, self.model.first_full_attention_layer_id
+                    )
+
+            total_num_layers = self.model.end_layer - self.model.start_layer
+            zero_allocator = BumpAllocator(
+                buffer_size=total_num_layers
+                * 2
+                * (2 if forward_batch.can_run_tbo else 1),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            gemm_output_zero_allocator = (
+                BumpAllocator(
+                    buffer_size=self.model.gemm_output_zero_allocator_size,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                if getattr(self.model, "gemm_output_zero_allocator_size", 0) > 0
+                else None
+            )
+            forward_batch.hidden_states = hidden_states
+            forward_batch.residual = residual
+            forward_batch.model_specific_states = {
+                "positions": split_positions,
+                "zero_allocator": zero_allocator,
+                "gemm_output_zero_allocator": gemm_output_zero_allocator,
+                "topk_indices": None,
+                "aux_hidden_states": [],
+            }
+
+        states = forward_batch.model_specific_states
+        split_positions = states["positions"]
+        topk_indices = states["topk_indices"]
+        aux_hidden_states = states["aux_hidden_states"]
+
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            for i in range(start, end):
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    if i in self.model.layers_to_capture:
+                        if self.config.mhc:
+                            aux_hidden_states.append(
+                                forward_batch.hidden_states
+                                if forward_batch.hidden_states.shape[-1]
+                                == self.config.hidden_size
+                                else hc_contract(
+                                    forward_batch.hidden_states, self.config.hc_mult
+                                )
+                            )
+                        elif (
+                            self.model.enable_a2a_moe
+                            and i > self.model.first_k_dense_replace
+                        ):
+                            aux_hidden_states.append(
+                                get_attention_tp_group().all_gather(
+                                    forward_batch.hidden_states
+                                    + forward_batch.residual,
+                                    dim=0,
+                                )
+                            )
+                        else:
+                            aux_hidden_states.append(
+                                forward_batch.hidden_states + forward_batch.residual
+                            )
+
+                    (
+                        forward_batch.hidden_states,
+                        forward_batch.residual,
+                        topk_indices,
+                    ) = self.model.layers[i](
+                        split_positions,
+                        forward_batch.hidden_states,
+                        forward_batch,
+                        forward_batch.residual,
+                        states["zero_allocator"],
+                        states["gemm_output_zero_allocator"],
+                        prev_topk_indices=topk_indices,
+                        next_full_attention_layer_id=(
+                            self.model.next_full_attention_layer_id.get(i)
+                        ),
+                    )
+
+        states["topk_indices"] = topk_indices
+        if end != self.config.num_hidden_layers:
+            return None
+
+        if forward_batch.residual is None:
+            hidden_states = self.model.norm(forward_batch.hidden_states)
+        else:
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+
+        if nsa_use_prefill_cp(forward_batch, self.model.nsa_enable_prefill_cp):
+            hidden_states = cp_plain_all_gather(
+                hidden_states, self.model.cp_size, forward_batch
+            )
+
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states if aux_hidden_states else None,
+        )
+
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -1888,6 +2031,31 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausal
             )
         else:
             return hidden_states
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ):
+        """Run the text-only split path through the conditional wrapper."""
+        if self.model is None:
+            raise RuntimeError("encoder_only GLM5 Next VLM cannot run language forward")
+
+        start, _ = split_interval
+        if start == 0 and self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+
+        return super().forward_split_prefill(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            split_interval=split_interval,
+            input_embeds=input_embeds,
+        )
 
     def load_weights(
         self,

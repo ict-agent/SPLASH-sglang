@@ -263,6 +263,10 @@ class MambaPool:
     class State:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
+        replayssm_g: Optional[torch.Tensor] = None
+        replayssm_rawv: Optional[torch.Tensor] = None
+        replayssm_rawk: Optional[torch.Tensor] = None
+        replayssm_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -270,7 +274,9 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -281,11 +287,12 @@ class MambaPool:
             return sum(
                 get_tensor_size_bytes(getattr(self, f.name))
                 for f in dataclasses.fields(self)
+                if getattr(self, f.name) is not None
             )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
+        intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
 
     def __init__(
@@ -298,6 +305,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        enable_kda_replayssm_spec: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -310,6 +318,12 @@ class MambaPool:
 
         self.size = size
         self.device = device
+        self.enable_kda_replayssm_spec = enable_kda_replayssm_spec
+
+        if enable_kda_replayssm_spec and not speculative_num_draft_tokens:
+            raise ValueError(
+                "KDA ReplaySSM spec verify requires speculative draft tokens"
+            )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -353,21 +367,65 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+
+            replayssm_g = None
+            replayssm_rawv = replayssm_rawk = replayssm_beta = None
+            if enable_kda_replayssm_spec:
+                hv, v_dim, k_dim = temporal_state_shape
+                shape = cache_params.shape
+                if not hasattr(shape, "num_k_heads") or not hasattr(
+                    shape, "num_heads"
+                ):
+                    raise ValueError(
+                        "--enable-kda-replayssm-spec requires a KDA state shape"
+                    )
+                h_k_num = hv * shape.num_k_heads
+                if h_k_num % shape.num_heads != 0:
+                    raise ValueError(
+                        "KDA local key-head count cannot be derived from the state "
+                        f"shape: {hv=} {shape.num_k_heads=} {shape.num_heads=}"
+                    )
+                h_k = h_k_num // shape.num_heads
+                window_len = speculative_num_draft_tokens
+                num_slots = size + 1
+
+                replayssm_g = torch.zeros(
+                    (num_mamba_layers, num_slots, hv, window_len, k_dim),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                replayssm_rawv = torch.zeros(
+                    (num_mamba_layers, num_slots, hv, window_len, v_dim),
+                    dtype=conv_dtype,
+                    device=device,
+                )
+                replayssm_rawk = torch.zeros(
+                    (num_mamba_layers, num_slots, h_k, window_len, k_dim),
+                    dtype=conv_dtype,
+                    device=device,
+                )
+                replayssm_beta = torch.zeros(
+                    (num_mamba_layers, num_slots, hv, window_len),
+                    dtype=torch.float32,
+                    device=device,
+                )
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
+                intermediate_ssm_state_cache = None
+                if not enable_kda_replayssm_spec:
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device=device,
+                    )
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
@@ -380,7 +438,7 @@ class MambaPool:
                             conv_shape[1],
                         ),
                         dtype=conv_dtype,
-                        device="cuda",
+                        device=device,
                     )
                     for conv_shape in conv_state_shape
                 ]
@@ -389,17 +447,33 @@ class MambaPool:
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
+                    replayssm_g=replayssm_g,
+                    replayssm_rawv=replayssm_rawv,
+                    replayssm_rawk=replayssm_rawk,
+                    replayssm_beta=replayssm_beta,
+                )
+                intermediate_ssm_gb = (
+                    get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
+                    if intermediate_ssm_state_cache is not None
+                    else 0.0
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                    f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(
+                    conv=conv_state,
+                    temporal=temporal_state,
+                    replayssm_g=replayssm_g,
+                    replayssm_rawv=replayssm_rawv,
+                    replayssm_rawk=replayssm_rawk,
+                    replayssm_beta=replayssm_beta,
+                )
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
@@ -516,9 +590,18 @@ class MambaPool:
         for field in vars(self.mamba_cache):
             # Skip intermediate buffers used only for speculative decoding
             # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -548,9 +631,18 @@ class MambaPool:
         """
         state_tensors = []
         for field in vars(self.mamba_cache):
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_g",
+                "replayssm_rawv",
+                "replayssm_rawk",
+                "replayssm_beta",
+            ):
                 continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -597,6 +689,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_kda_replayssm_spec: bool = False,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -620,6 +713,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_kda_replayssm_spec=enable_kda_replayssm_spec,
         )
 
     def _init_mamba_pool(
@@ -631,6 +725,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        enable_kda_replayssm_spec: bool = False,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -640,6 +735,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            enable_kda_replayssm_spec=enable_kda_replayssm_spec,
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 

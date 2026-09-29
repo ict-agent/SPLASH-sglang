@@ -39,6 +39,7 @@ from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     cpu_has_amx_support,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_name,
@@ -50,9 +51,9 @@ from sglang.srt.utils.common import (
     is_blackwell_supported,
     is_cpu,
     is_cuda,
+    is_dcu,
     is_flashinfer_available,
     is_hip,
-    is_dcu,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
     is_mps,
@@ -70,7 +71,6 @@ from sglang.srt.utils.common import (
     parse_connector_type,
     torch_release,
     xpu_has_xmx_support,
-    is_dcu,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -92,6 +92,37 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+
+
+def _resolve_mla_only_dp_size(
+    *,
+    tp_size: int,
+    dp_size: int,
+    attn_cp_size: int,
+) -> int:
+    if tp_size <= 1:
+        raise ValueError("--mla-only-dp requires --tp-size > 1.")
+    if attn_cp_size <= 0:
+        raise ValueError("--attn-cp-size must be positive.")
+    if tp_size % attn_cp_size != 0:
+        raise ValueError(
+            "--mla-only-dp requires tp_size to be divisible by attn_cp_size; "
+            f"got tp_size={tp_size}, attn_cp_size={attn_cp_size}."
+        )
+
+    inferred_dp_size = tp_size // attn_cp_size
+    if inferred_dp_size <= 1:
+        raise ValueError(
+            "--mla-only-dp leaves no data-parallel attention replica with the "
+            f"current topology (tp_size={tp_size}, attn_cp_size={attn_cp_size})."
+        )
+    if dp_size not in (1, inferred_dp_size):
+        raise ValueError(
+            "--mla-only-dp owns the attention-DP degree. Use the default "
+            f"dp_size=1 or set dp_size={inferred_dp_size}; got dp_size={dp_size}."
+        )
+    return inferred_dp_size
+
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -158,7 +189,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # ransplant from vllm
-    "dcu_mla", 
+    "dcu_mla",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -675,6 +706,7 @@ class ServerArgs:
     linear_attn_backend: str = "triton"
     linear_attn_decode_backend: Optional[str] = None
     linear_attn_prefill_backend: Optional[str] = None
+    enable_kda_replayssm_spec: bool = False
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -749,6 +781,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
+    mla_only_dp: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
@@ -997,6 +1030,10 @@ class ServerArgs:
         # Handle Hicache settings.
         self._handle_hicache()
 
+        # Configure MLA request-level attention DP before generic DP handling
+        # adjusts chunked prefill and validates dependent DP features.
+        self._handle_mla_only_dp()
+
         # Handle data parallelism.
         self._handle_data_parallelism()
 
@@ -1015,6 +1052,7 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+        self._validate_kda_replayssm_spec()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -1838,10 +1876,7 @@ class ServerArgs:
                 )
             self.enable_nsa_cache_layer_split = False
 
-        if (
-            self.glm_nsa_shared_hicache
-            and self.glm_nsa_shared_layer_group_hicache
-        ):
+        if self.glm_nsa_shared_hicache and self.glm_nsa_shared_layer_group_hicache:
             raise ValueError(
                 "--glm-nsa-shared-hicache and "
                 "--glm-nsa-shared-layer-group-hicache are mutually exclusive."
@@ -1859,8 +1894,7 @@ class ServerArgs:
                 )
         elif self.enable_hierarchical_cache and self.enable_nsa_cache_layer_split:
             raise ValueError(
-                "Layer-split HiCache requires "
-                "--glm-nsa-shared-layer-group-hicache."
+                "Layer-split HiCache requires " "--glm-nsa-shared-layer-group-hicache."
             )
 
         if self.mla_kv_prefetch_ring_size < 1:
@@ -1869,10 +1903,7 @@ class ServerArgs:
                 self.mla_kv_prefetch_ring_size,
             )
             self.mla_kv_prefetch_ring_size = 1
-        if (
-            self.mla_kv_prefetch_ring_size > 1
-            and not self.enable_nsa_cache_layer_split
-        ):
+        if self.mla_kv_prefetch_ring_size > 1 and not self.enable_nsa_cache_layer_split:
             logger.info(
                 "mla_kv_prefetch_ring_size has no effect without "
                 "--enable-nsa-cache-layer-split; resetting to 1."
@@ -1889,8 +1920,7 @@ class ServerArgs:
             self.enable_nsa_cache_layer_split = False
 
         if (
-            model_arch
-            in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
+            model_arch in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
             and not self.disable_radix_cache
         ):
             if (
@@ -2033,7 +2063,11 @@ class ServerArgs:
                         aiter_can_use_preshuffle_paged_mqa,
                     )
 
-                    if is_hip() and not is_dcu() and not aiter_can_use_preshuffle_paged_mqa():
+                    if (
+                        is_hip()
+                        and not is_dcu()
+                        and not aiter_can_use_preshuffle_paged_mqa()
+                    ):
                         # Legacy ROCm NSA path: aiter's gluon paged-MQA kernel is
                         # unavailable (Triton<3.5 and AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS
                         # not set, or SGLANG_NSA_HIP_DISABLE_PRESHUFFLE=1 / SGLANG_USE_AITER=0).
@@ -3281,6 +3315,46 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
+    def _validate_kda_replayssm_spec(self):
+        if not self.enable_kda_replayssm_spec:
+            return
+        if not (is_cuda() or is_hip()):
+            raise ValueError(
+                "--enable-kda-replayssm-spec requires a CUDA or ROCm device"
+            )
+        if self.speculative_algorithm is None:
+            raise ValueError(
+                "--enable-kda-replayssm-spec requires speculative decoding"
+            )
+        if self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--enable-kda-replayssm-spec supports only a linear draft chain "
+                "(--speculative-eagle-topk 1), got "
+                f"{self.speculative_eagle_topk!r}"
+            )
+        if self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--enable-kda-replayssm-spec is spec-verify-only scratch and a "
+                "PD prefill server never runs spec verify"
+            )
+        draft_tokens = self.speculative_num_draft_tokens
+        if draft_tokens is None or draft_tokens < 1:
+            raise ValueError(
+                "--enable-kda-replayssm-spec requires a positive "
+                "--speculative-num-draft-tokens"
+            )
+        if self.mamba_ssm_dtype is None:
+            logger.info(
+                "--enable-kda-replayssm-spec sets --mamba-ssm-dtype float32 "
+                "for exact checkpoint folds"
+            )
+            self.mamba_ssm_dtype = "float32"
+        elif self.mamba_ssm_dtype != "float32":
+            raise ValueError(
+                "--enable-kda-replayssm-spec requires --mamba-ssm-dtype "
+                f"float32, got {self.mamba_ssm_dtype!r}"
+            )
+
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
@@ -3319,18 +3393,62 @@ class ServerArgs:
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
 
+    def _handle_mla_only_dp(self):
+        if not self.mla_only_dp:
+            return
+
+        if not self.use_mla_backend():
+            raise ValueError(
+                "--mla-only-dp is only supported for MLA-family models."
+            )
+
+        inferred_dp_size = _resolve_mla_only_dp_size(
+            tp_size=self.tp_size,
+            dp_size=self.dp_size,
+            attn_cp_size=self.attn_cp_size,
+        )
+
+        if self.dp_size == 1:
+            logger.info(
+                "--mla-only-dp: setting dp_size=%d from tp_size=%d and "
+                "attn_cp_size=%d.",
+                inferred_dp_size,
+                self.tp_size,
+                self.attn_cp_size,
+            )
+            self.dp_size = inferred_dp_size
+
+        self.enable_dp_attention = True
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
             self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
-            assert self.tp_size % self.dp_size == 0
-            self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
-            logger.warning(
-                f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+            keep_mla_only_dp_prefill_schedule = (
+                self.mla_only_dp
+                and self.disaggregation_mode == "prefill"
+                and get_bool_env_var(
+                    "SGLANG_MLA_ONLY_DP_KEEP_SCHEDULE_CONSERVATIVENESS"
+                )
             )
+            if not keep_mla_only_dp_prefill_schedule:
+                self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            assert self.tp_size % self.dp_size == 0
+            if self.mla_only_dp and get_bool_env_var(
+                "SGLANG_MLA_ONLY_DP_KEEP_CHUNKED_PREFILL"
+            ):
+                logger.warning(
+                    "--mla-only-dp is keeping chunked prefill size at %d because "
+                    "SGLANG_MLA_ONLY_DP_KEEP_CHUNKED_PREFILL=1.",
+                    self.chunked_prefill_size,
+                )
+            else:
+                self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
+                logger.warning(
+                    f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
+                )
 
         if self.enable_dp_lm_head:
             assert (
@@ -3749,8 +3867,7 @@ class ServerArgs:
                 )
         elif self.enable_hierarchical_cache and self.enable_nsa_cache_layer_split:
             raise ValueError(
-                "Layer-split HiCache requires "
-                "--glm-nsa-shared-layer-group-hicache."
+                "Layer-split HiCache requires " "--glm-nsa-shared-layer-group-hicache."
             )
 
         # Skip all normalization when neither hicache nor decode-offload path is active.
@@ -4487,9 +4604,7 @@ class ServerArgs:
             self.enable_nsa_prefill_context_parallel
             and self.nsa_prefill_cp_mode != "round-robin-split"
         ):
-            incompatible.append(
-                f"NSA prefill CP mode {self.nsa_prefill_cp_mode!r}"
-            )
+            incompatible.append(f"NSA prefill CP mode {self.nsa_prefill_cp_mode!r}")
 
         if incompatible:
             raise ValueError(
@@ -5260,7 +5375,11 @@ class ServerArgs:
             "--max-queued-requests",
             type=int,
             default=ServerArgs.max_queued_requests,
-            help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+            help=(
+                "The maximum number of queued requests. In disaggregated "
+                "prefill mode, this limit covers the bootstrap, scheduler "
+                "waiting, and KV-transfer inflight queues."
+            ),
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -6680,6 +6799,14 @@ class ServerArgs:
             help="Override the kernel backend for linear attention prefill/extend. "
             "If not set, uses --linear-attn-backend.",
         )
+        parser.add_argument(
+            "--enable-kda-replayssm-spec",
+            action="store_true",
+            default=ServerArgs.enable_kda_replayssm_spec,
+            help="Enable KDA ReplaySSM speculative verification on a unified or "
+            "PD decode server. Accepted raw inputs are replayed into the state "
+            "after every verify step; do not enable this on a PD prefill server.",
+        )
 
         # Hierarchical cache
         parser.add_argument(
@@ -7014,6 +7141,13 @@ class ServerArgs:
             help="With DP-attention, send control messages to every DP group leader "
             "and broadcast within attn_tp_group instead of the full tp_group. "
             "Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
+        )
+        parser.add_argument(
+            "--mla-only-dp",
+            action="store_true",
+            help="Shortcut for MLA-family models that enables request-level DP "
+            "attention inside the TP group, inferring dp_size from "
+            "tp_size / attn_cp_size.",
         )
         parser.add_argument(
             "--enable-dp-lm-head",
@@ -7536,7 +7670,7 @@ class ServerArgs:
             default=ServerArgs.glm_disable_nothink,
             help="Reject requests that try to disable thinking. When set, a request "
             "carrying a falsy chat_template_kwargs.enable_thinking / thinking "
-            "(false, 0, \"\", [], null -- including the equivalent "
+            '(false, 0, "", [], null -- including the equivalent '
             "reasoning_effort='none') is rejected with HTTP 400. Intended for "
             "thinking-only models such as GLM-5.3.",
         )
@@ -7833,18 +7967,18 @@ class ServerArgs:
                 "prefill_short_req_max_reserve_ratio must be in (0, 1), got "
                 f"{self.prefill_short_req_max_reserve_ratio}"
             )
-            assert self.prefill_short_req_threshold > 0, (
-                "prefill_short_req_threshold must be positive"
-            )
-            assert self.prefill_short_req_scan_depth > 0, (
-                "prefill_short_req_scan_depth must be positive"
-            )
-            assert self.prefill_long_req_starve_threshold > 0, (
-                "prefill_long_req_starve_threshold must be positive"
-            )
-            assert self.prefill_short_req_max_total_len >= 0, (
-                "prefill_short_req_max_total_len must be non-negative"
-            )
+            assert (
+                self.prefill_short_req_threshold > 0
+            ), "prefill_short_req_threshold must be positive"
+            assert (
+                self.prefill_short_req_scan_depth > 0
+            ), "prefill_short_req_scan_depth must be positive"
+            assert (
+                self.prefill_long_req_starve_threshold > 0
+            ), "prefill_long_req_starve_threshold must be positive"
+            assert (
+                self.prefill_short_req_max_total_len >= 0
+            ), "prefill_short_req_max_total_len must be non-negative"
 
         # Check pdmux
         if self.enable_pdmux:
@@ -8338,6 +8472,10 @@ class PortArgs:
 
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
+
+    # The ipc filename for detokenizer workers to acknowledge completed requests
+    # to the multi-detokenizer router. Only used when detokenizer_worker_num > 1.
+    detokenizer_ack_ipc_name: Optional[str] = None
 
     @staticmethod
     def init_new(

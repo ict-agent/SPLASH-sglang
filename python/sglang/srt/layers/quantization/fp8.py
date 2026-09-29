@@ -346,6 +346,10 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        return not self.use_marlin and (self.use_mxfp8 or self.block_quant)
+
     def validate_block_quant_shapes(
         self,
         input_size: int,
@@ -738,12 +742,56 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def support_prequant(self, weight: torch.Tensor) -> bool:
+        """Whether `apply(x=(fp8, scale))` will route through DeepGEMM directly
+        without re-quantizing the input. Callers may then feed a `(fp8, scale)`
+        tuple produced by an upstream fused kernel."""
+        import importlib.util
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+
+        try:
+            has_fused_swiglu_prequant = (
+                importlib.util.find_spec(
+                    "tile_kernels.quant.swiglu_forward_and_per_token_cast_kernel"
+                )
+                is not None
+            )
+        except ModuleNotFoundError:
+            has_fused_swiglu_prequant = False
+
+        return (
+            has_fused_swiglu_prequant
+            and
+            self.block_quant
+            and self.w8a8_block_fp8_linear
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and list(self.quant_config.weight_block_size or ()) == [128, 128]
+            and weight.shape[0] % 64 == 0
+            and weight.shape[1] % 128 == 0
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        input_quant_args=None,
     ) -> torch.Tensor:
+        if input_quant_args is not None:
+            if not self.supports_prequantized_input:
+                raise NotImplementedError(
+                    "Prequantized FP8 input is only supported by block/mxfp8 paths"
+                )
+            if (
+                not isinstance(input_quant_args, (tuple, list))
+                or len(input_quant_args) != 2
+            ):
+                raise ValueError("input_quant_args must be a (q_fp8, scale_fp32) pair")
+            x = (input_quant_args[0], input_quant_args[1])
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

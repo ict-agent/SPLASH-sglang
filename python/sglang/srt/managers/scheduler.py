@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -81,6 +82,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
@@ -152,7 +157,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import (
-    has_shm_features,
     init_mm_embedding_cache,
     unwrap_shm_features,
 )
@@ -192,9 +196,17 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    kv_to_page_indices,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
@@ -256,6 +268,14 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def should_skip_pipelined_kv_chunk(
+    start_idx: int, end_idx: int, is_last_chunk: bool
+) -> bool:
+    """Match send_kv_chunk's cursor behavior for an empty cached-prefix delta."""
+    return end_idx < start_idx or (end_idx == start_idx and not is_last_chunk)
+
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -835,6 +855,7 @@ class Scheduler(
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
+        # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -1199,6 +1220,7 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self._pending_chunked_abort_req = None
         # Tracks whether the current self.chunked_req was actually scheduled
         # into last iteration's batch (i.e., in can_run_list -> got a fresh
         # req_pool_idx from prepare_for_extend). Used to gate the
@@ -1391,7 +1413,7 @@ class Scheduler(
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
-           
+
             # The decode requests pending for pre-allocation
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
@@ -1942,27 +1964,6 @@ class Scheduler(
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
-            #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
-            if (
-                not self.server_args.enable_dp_attention
-                and self.tp_size > 1
-                and self.model_config.is_multimodal
-                and has_shm_features(recv_reqs)
-            ):
-                barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
@@ -2136,13 +2137,26 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, reqs: List[Req]) -> None:
         for req in reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+            finished = getattr(req, "finished", None)
+            if callable(finished):
+                is_finished = finished()
+            else:
+                is_finished = getattr(req, "finished_reason", None) is not None
+            if not is_finished:
                 continue
-            # Always release heavyweight feature and embedding tensors. Session
-            # requests keep only the lightweight multimodal metadata.
-            mm_inputs.release_features()
-            if req.session is None:
-                req.multimodal_inputs = None
+            self._release_req_mm_inputs(req)
+
+    @staticmethod
+    def _release_req_mm_inputs(req: Req) -> bool:
+        """Release multimodal features once this request cannot use them again."""
+        if not (mm_inputs := getattr(req, "multimodal_inputs", None)):
+            return False
+        # Session requests retain lightweight multimodal metadata for subsequent
+        # turns, but the heavyweight feature/embedding tensors are never reused.
+        mm_inputs.release_features()
+        if getattr(req, "session", None) is None:
+            req.multimodal_inputs = None
+        return True
 
     def handle_generate_request(
         self,
@@ -2158,8 +2172,7 @@ class Scheduler(
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+                recv_req.input_ids = array("q", [1]) * seq_length
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
@@ -2283,8 +2296,8 @@ class Scheduler(
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -2364,6 +2377,17 @@ class Scheduler(
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+        elif (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and envs.GLM_GRAMMAR_ENABLE_DECODE_COMPILE_OVERLAP.get()
+        ):
+            # GLM NOTE: Overlap grammar compilation with decode-side prealloc/
+            # bootstrap/KV-transfer: enter the pipeline immediately while the
+            # grammar future compiles. grammar_queue still owns resolution,
+            # timeout, and failure aborts; get_new_prebuilt_batch holds the
+            # request until the future is resolved.
+            req.grammar_overlap_queued = True
+            self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
         self,
@@ -2408,6 +2432,8 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self._abort_on_disagg_prefill_queued_limit(req):
+                return
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
@@ -2496,6 +2522,42 @@ class Scheduler(
         req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
         return req_to_abort.rid == recv_req.rid
 
+    def _abort_on_disagg_prefill_queued_limit(self, recv_req: Req) -> bool:
+        """Bound all P-side queues that may retain multimodal CPU features.
+
+        Unlike the regular waiting queue, bootstrapping and KV-transfer queues
+        contain requests that cannot be safely evicted for a newer or higher
+        priority request. Reject only the incoming request before allocating
+        more disaggregation state.
+        """
+        if self.max_queued_requests is None:
+            return False
+
+        queued = (
+            len(self.disagg_prefill_bootstrap_queue.queue)
+            + len(self.waiting_queue)
+            + len(self.disagg_prefill_inflight_queue)
+        )
+        if queued < self.max_queued_requests:
+            return False
+
+        message = (
+            "The disaggregated prefill request queue is full "
+            f"({queued}/{self.max_queued_requests})."
+        )
+        abort_req = AbortReq(
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+            rid=recv_req.rid,
+        )
+        self._release_req_mm_inputs(recv_req)
+        recv_req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+        self.send_to_tokenizer.send_output(abort_req, recv_req)
+        return True
+
     def _abort_on_waiting_timeout(self):
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
@@ -2556,8 +2618,9 @@ class Scheduler(
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                # See companion call site above for the array.array wrap rationale.
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
 
             req.extend_image_inputs(image_inputs)
@@ -2858,6 +2921,38 @@ class Scheduler(
             long_req.rid,
         )
 
+    def process_pending_chunked_abort(self) -> None:
+        """Abort an in-flight chunked-prefill request at a scheduler boundary."""
+        req = getattr(self, "_pending_chunked_abort_req", None)
+        if req is None:
+            return
+        if self.chunked_req is not req:
+            # Already past chunked prefill; the running-batch abort path handles it.
+            if req.finished() or req.req_pool_idx is None:
+                self._pending_chunked_abort_req = None
+            return
+
+        prepare_abort(req, "Aborted")
+        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        req.to_finish = None
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if hasattr(req.disagg_kv_sender, "abort"):
+                req.disagg_kv_sender.abort()
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if (
+            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+        ) and not req.kv_committed_freed:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+
+        self.chunked_req = None
+        self._pending_chunked_abort_req = None
+        self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
@@ -2895,6 +2990,8 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self.process_pending_chunked_abort()
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -3601,6 +3698,302 @@ class Scheduler(
 
         return ret
 
+    def run_batch_pipelined(
+        self, batch: ScheduleBatch, group_size: int
+    ) -> GenerationBatchResult:
+        """Opt-in GLM prefill: overlap layer groups with Mooncake KV transfer."""
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        self._profile_batch_predicate(batch)
+
+        has_draft_worker = self.spec_algorithm.is_eagle()
+        model_worker_batch = batch.get_model_worker_batch()
+        if has_draft_worker:
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        future_indices = None
+        if self.enable_overlap:
+            self.record_batch_in_overlap(model_worker_batch)
+            model_worker_batch.sampling_info = (
+                model_worker_batch.sampling_info.copy_for_forward()
+            )
+            future_indices = self.future_map.alloc_future_indices(
+                len(model_worker_batch.seq_lens)
+            )
+
+        num_layers = self.model_config.num_hidden_layers
+        page_size = self.token_to_kv_pool_allocator.page_size
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        global_to_transfer_layer = getattr(
+            kvcache, "full_attention_layer_id_mapping", None
+        )
+        target_transfer_layers = (
+            len(global_to_transfer_layer)
+            if global_to_transfer_layer is not None
+            else num_layers
+        )
+        total_transfer_layers = target_transfer_layers + int(has_draft_worker)
+
+        if getattr(kvcache, "layer_shard_enabled", False):
+            owned_start_local, owned_end_local = kvcache._owned_local_layer_range()
+            if global_to_transfer_layer is not None:
+                owned_start = owned_start_local
+                owned_end = owned_end_local
+            else:
+                owned_start = kvcache.start_layer + owned_start_local
+                owned_end = kvcache.start_layer + owned_end_local
+            is_last_shard_rank = (
+                owned_end_local == kvcache.layer_num
+                and owned_start_local < owned_end_local
+            )
+        else:
+            owned_start = 0
+            owned_end = target_transfer_layers
+            is_last_shard_rank = True
+        if has_draft_worker and is_last_shard_rank:
+            owned_end += 1
+
+        req_page_indices_list = []
+        req_page_lease_tokens = []
+        req_is_last_chunk = []
+        pipelined_kv_rids = set()
+        pipelined_kv_finalize_infos = {}
+        for req in batch.reqs:
+            is_last_chunk = req is not batch.chunked_req
+            req_is_last_chunk.append(is_last_chunk)
+            start_idx = req.start_send_idx
+            end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+            if not is_last_chunk:
+                end_idx -= end_idx % page_size
+            if should_skip_pipelined_kv_chunk(start_idx, end_idx, is_last_chunk):
+                logger.debug(
+                    "run_batch_pipelined skip KV chunk: rid=%s "
+                    "start_send_idx=%s end_idx=%s is_last_chunk=%s",
+                    req.rid,
+                    start_idx,
+                    end_idx,
+                    is_last_chunk,
+                )
+                req_page_indices_list.append(None)
+                req_page_lease_tokens.append(None)
+                continue
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, start_idx:end_idx
+            ]
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            req.start_send_idx = end_idx
+            req_page_indices_list.append(page_indices)
+            req_page_lease_tokens.append(None)
+            pipelined_kv_rids.add(req.rid)
+
+        def _run_layer_pipeline_and_sample_impl():
+            forward_batch = self.tp_worker.forward_batch_generation_split_init(
+                model_worker_batch
+            )
+            logits_output = None
+            cuda_event = None
+            for group_start in range(0, num_layers, group_size):
+                group_end = min(group_start + group_size, num_layers)
+                ret, cuda_event = self.tp_worker.forward_batch_generation_split_layer(
+                    forward_batch, forward_count=group_end - group_start
+                )
+                if ret is not None:
+                    logits_output = ret
+
+                layer_ids = []
+                for model_layer_id in range(group_start, group_end):
+                    layer_id = (
+                        global_to_transfer_layer.get(model_layer_id)
+                        if global_to_transfer_layer is not None
+                        else model_layer_id
+                    )
+                    if layer_id is not None and owned_start <= layer_id < owned_end:
+                        layer_ids.append(layer_id)
+                layer_ids = tuple(layer_ids)
+                if not layer_ids:
+                    continue
+
+                for req, page_indices in zip(
+                    batch.reqs,
+                    req_page_indices_list,
+                    strict=True,
+                ):
+                    if page_indices is None or len(page_indices) == 0:
+                        continue
+                    req.disagg_kv_sender.send_layers(
+                        page_indices,
+                        layer_ids=layer_ids,
+                        cuda_event=cuda_event,
+                    )
+
+            assert (
+                logits_output is not None
+            ), "forward_split_prefill must return logits after the final layer"
+            next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
+                logits_output, forward_batch
+            )
+
+            next_draft_input = None
+            producer_event = cuda_event
+            if has_draft_worker:
+                if batch.is_spec_v2:
+                    model_worker_batch.mamba_cow_src_indices = None
+                    model_worker_batch.mamba_cow_dst_indices = None
+                    model_worker_batch.mamba_clear_indices = None
+                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                    inner_draft = self.model_worker.draft_worker
+                    with (
+                        inner_draft.draft_tp_context(inner_draft.draft_runner.tp_group),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                    ):
+                        next_draft_input = inner_draft._draft_extend_for_prefill(
+                            model_worker_batch,
+                            logits_output.hidden_states,
+                            next_token_ids,
+                            logits_output.mm_input_embeds,
+                        )
+                else:
+                    self.model_worker.forward_draft_extend(
+                        batch,
+                        logits_output.hidden_states,
+                        next_token_ids,
+                        seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+                        mm_input_embeds=logits_output.mm_input_embeds,
+                    )
+
+                if is_last_shard_rank:
+                    draft_event = torch.cuda.Event()
+                    draft_event.record()
+                    producer_event = draft_event
+                    for req, page_indices in zip(
+                        batch.reqs,
+                        req_page_indices_list,
+                        strict=True,
+                    ):
+                        if page_indices is not None and len(page_indices) > 0:
+                            req.disagg_kv_sender.send_layers(
+                                page_indices,
+                                layer_ids=(total_transfer_layers - 1,),
+                                cuda_event=draft_event,
+                            )
+
+            for req, page_indices, is_last_chunk in zip(
+                batch.reqs, req_page_indices_list, req_is_last_chunk
+            ):
+                if page_indices is None:
+                    continue
+                if is_last_chunk:
+                    pipelined_kv_finalize_infos[req.rid] = (
+                        page_indices,
+                        producer_event,
+                    )
+                else:
+                    req.disagg_kv_sender.complete_layer_transfer_chunk(page_indices)
+
+            return logits_output, next_token_ids, next_draft_input
+
+        def _run_layer_pipeline_and_sample():
+            try:
+                for i, (req, page_indices) in enumerate(
+                    zip(batch.reqs, req_page_indices_list, strict=True)
+                ):
+                    if page_indices is not None and len(page_indices) > 0:
+                        req_page_lease_tokens[i] = self._begin_pipelined_kv_page_lease(
+                            req, page_indices
+                        )
+                return _run_layer_pipeline_and_sample_impl()
+            finally:
+                # Seal every token even when forward/enqueue raises. A token
+                # completes only after all layer sends associated with it have
+                # left the transfer worker; final state/aux is intentionally
+                # not part of this old-source-page lease.
+                has_active_exception = sys.exc_info()[0] is not None
+                first_seal_exception = None
+                for req, page_lease_token in zip(
+                    batch.reqs, req_page_lease_tokens, strict=True
+                ):
+                    if page_lease_token is None:
+                        continue
+                    try:
+                        req.disagg_kv_sender.seal_layer_transfer_chunk()
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed to seal layer-transfer chunk for request %s",
+                            req.rid,
+                        )
+                        if first_seal_exception is None:
+                            first_seal_exception = exc
+                if first_seal_exception is not None and not has_active_exception:
+                    raise first_seal_exception
+
+        if self.enable_overlap:
+            with self.forward_stream_ctx:
+                self.forward_stream.wait_stream(self.schedule_stream)
+                self.future_map.resolve_future(model_worker_batch)
+                logits_output, next_token_ids, next_draft_input = (
+                    _run_layer_pipeline_and_sample()
+                )
+                batch_result = GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    extend_input_len_per_req=(
+                        [req.extend_input_len for req in batch.reqs]
+                        if batch.return_logprob
+                        else None
+                    ),
+                    extend_logprob_start_len_per_req=(
+                        [req.extend_logprob_start_len for req in batch.reqs]
+                        if batch.return_logprob
+                        else None
+                    ),
+                    can_run_cuda_graph=False,
+                    next_draft_input=next_draft_input,
+                )
+                batch_result.copy_done = self.device_module.Event()
+                self.future_map.store_to_map(future_indices, batch_result)
+                batch_result.copy_to_cpu(
+                    return_logprob=batch.return_logprob,
+                    return_hidden_states=batch.return_hidden_states,
+                )
+                batch_result.pipelined_kv_rids = pipelined_kv_rids
+                batch_result.pipelined_kv_finalize_infos = pipelined_kv_finalize_infos
+
+            if batch.is_spec_v2:
+                batch.spec_info = batch_result.next_draft_input
+                batch.spec_info.future_indices = future_indices
+                batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+            batch.output_ids = -future_indices.indices
+            return batch_result
+
+        logits_output, next_token_ids, next_draft_input = (
+            _run_layer_pipeline_and_sample()
+        )
+        batch.output_ids = next_token_ids
+        if batch.is_spec_v2:
+            batch.spec_info = next_draft_input
+            batch.seq_lens = next_draft_input.new_seq_lens
+
+        batch_result = GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            extend_input_len_per_req=(
+                [req.extend_input_len for req in batch.reqs]
+                if batch.return_logprob
+                else None
+            ),
+            extend_logprob_start_len_per_req=(
+                [req.extend_logprob_start_len for req in batch.reqs]
+                if batch.return_logprob
+                else None
+            ),
+            can_run_cuda_graph=False,
+            next_draft_input=next_draft_input,
+        )
+        batch_result.pipelined_kv_rids = pipelined_kv_rids
+        batch_result.pipelined_kv_finalize_infos = pipelined_kv_finalize_infos
+        return batch_result
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
@@ -3801,20 +4194,27 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                # Layer-pipelined transfers can outlive the request queues for
+                # a short tail while their source-page completion is waiting
+                # to be drained on the scheduler thread. Destructive cache
+                # operations must not treat that state as fully idle.
+                idle &= not getattr(self, "_pipelined_kv_page_leases", None)
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
+                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+                decode_offload_manager = getattr(self, "decode_offload_manager", None)
+                if decode_offload_manager is not None:
+                    idle &= len(decode_offload_manager.ongoing_offload) == 0
 
             # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
+            if getattr(self, "enable_hisparse", False):
                 idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
+            if getattr(self, "enable_hierarchical_cache", False):
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
@@ -4054,6 +4454,10 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if (chunked_req := getattr(self, "chunked_req", None)) is not None:
+            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                self._pending_chunked_abort_req = chunked_req
+
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []

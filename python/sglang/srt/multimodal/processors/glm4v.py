@@ -49,6 +49,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
+        # IMAGE_TOKEN / VIDEO_TOKEN are load-bearing strings: they build the split
+        # regex and are re-inserted into the prompt before the HF processor
+        # re-tokenizes it, so under --glm-special-token-escape-seed they must be
+        # the escaped form to round-trip back to the token id. sp.get() is an
+        # identity no-op when escape is off, so this stays backward compatible.
         from sglang.srt.constrained.glm.escape import (
             get_global_escaped_special_tokens,
         )
@@ -240,6 +245,54 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
                 video_index += 1
         return image_runs, video_frame_runs
 
+    @staticmethod
+    def _build_epd_mm_items(embeddings, image_runs, video_frame_runs):
+        mm_items = []
+        image_embeddings = embeddings.get(Modality.IMAGE) if embeddings else None
+        image_embedding_offset = 0
+
+        for image_offset in image_runs:
+            image_embedding = None
+            if image_embeddings is not None:
+                num_tokens = image_offset[1] - image_offset[0] + 1
+                # Keep each per-image tensor backed by compact storage.  A view
+                # retains the full multi-image storage, and torch/pickle writes
+                # that storage once per view.  With N images this inflated both
+                # tokenizer->scheduler IPC and TP broadcast by roughly N times.
+                image_embedding = image_embeddings[
+                    image_embedding_offset : image_embedding_offset + num_tokens
+                ].clone()
+                image_embedding_offset += num_tokens
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[image_offset],
+                    precomputed_embeddings=image_embedding,
+                )
+            )
+
+        if image_embeddings is not None and image_embedding_offset != len(
+            image_embeddings
+        ):
+            raise ValueError(
+                "GLM4V image embedding length does not match image offsets: "
+                f"consumed {image_embedding_offset}, got {len(image_embeddings)}"
+            )
+
+        if video_frame_runs:
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.VIDEO,
+                    offsets=video_frame_runs,
+                    precomputed_embeddings=(
+                        embeddings.get(Modality.VIDEO) if embeddings else None
+                    ),
+                )
+            )
+
+        mm_items.sort(key=lambda item: item.offsets[0][0])
+        return mm_items
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         """EPD language side: rebuild mm_inputs from precomputed embeddings."""
         img_grid_thw = kwargs.get("img_grid_thw", None)
@@ -260,24 +313,12 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
+        # Split the flat per-image / per-frame offsets by modality. Images remain
+        # separate cache items while all video frames stay in one aggregate item.
         image_runs, video_frame_runs = self._group_offsets_by_modality(
             offsets, modality_list, video_grid_thw
         )
-        mm_items = [
-            MultimodalDataItem(
-                modality=modality,
-                offsets=runs,
-                precomputed_embeddings=(
-                    embeddings.get(modality) if embeddings else None
-                ),
-            )
-            for modality, runs in (
-                (Modality.IMAGE, image_runs),
-                (Modality.VIDEO, video_frame_runs),
-            )
-            if runs
-        ]
-        mm_items.sort(key=lambda item: item.offsets[0][0])
+        mm_items = self._build_epd_mm_items(embeddings, image_runs, video_frame_runs)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,
@@ -311,8 +352,10 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
 
         video_metadata = None
+        skip_video_preprocess = False
         if base_output.videos:
             if any(isinstance(video, list) for video in base_output.videos):
+                skip_video_preprocess = envs.SGLANG_SKIP_VIDEO_PREPROCESS.get()
                 videos_processed = [
                     await preprocess_video_frames(video) for video in base_output.videos
                 ]
@@ -335,6 +378,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         if video_metadata is not None:
             combine_kwargs["video_metadata"] = video_metadata
             combine_kwargs["do_sample_frames"] = False
+            if skip_video_preprocess:
+                combine_kwargs["do_resize"] = False
             video_processor = getattr(self._processor, "video_processor", None)
             videos_kwargs = glm_budget_kwargs(
                 video_processor,
@@ -411,6 +456,32 @@ def _video_metadata(total_num_frames, fps, duration, frames_indices):
     }
 
 
+def _metadata_from_video_frame_list(frame_list):
+    """Use Chamber's source timeline when it is present on a frame list."""
+    if not envs.SGLANG_SKIP_VIDEO_PREPROCESS.get():
+        return None
+
+    first = frame_list[0]
+    source_fps = first.get("source_fps")
+    source_total = first.get("source_total_num_frames")
+    sampled_indices = [frame.get("sampled_index") for frame in frame_list]
+    if (
+        source_fps is None
+        or source_fps <= 0
+        or source_total is None
+        or source_total <= 0
+        or any(index is None for index in sampled_indices)
+    ):
+        return None
+
+    return _video_metadata(
+        source_total,
+        source_fps,
+        source_total / source_fps,
+        sampled_indices,
+    )
+
+
 _MM_SAMPLING_KEYS = ("fps", "max_frames", "max_tokens_per_frame", "max_image_tokens")
 
 
@@ -423,7 +494,9 @@ def _split_mm_items(mm_data, sampling_keys):
     for item in items:
         if isinstance(item, dict) and "format" not in item and "url" in item:
             urls.append(item["url"])
-            configs.append({k: item[k] for k in sampling_keys if item.get(k) is not None})
+            configs.append(
+                {k: item[k] for k in sampling_keys if item.get(k) is not None}
+            )
         else:
             urls.append(item)
             configs.append({})
@@ -665,21 +738,23 @@ async def preprocess_video_frames(frame_list: List[dict]):
 
 
 def preprocess_video_frames_sync(frame_list: List[dict]):
-    total_num_frames = len(frame_list)
-    duration = 0
-    if frame_list[0].get("detail") is not None:
-        details = json.loads(frame_list[0]["detail"])
-        duration = details.get("video_duration", 0)
-    if duration == 0:
-        duration = float(frame_list[-1]["timestamp"])
+    metadata = _metadata_from_video_frame_list(frame_list)
+    if metadata is None:
+        total_num_frames = len(frame_list)
+        duration = 0
+        if frame_list[0].get("detail") is not None:
+            details = json.loads(frame_list[0]["detail"])
+            duration = details.get("video_duration", 0)
+        if duration == 0:
+            duration = float(frame_list[-1]["timestamp"])
 
-    indices = list(range(total_num_frames))
+        indices = list(range(total_num_frames))
+        fps = total_num_frames / duration if duration else 0
+        metadata = _video_metadata(total_num_frames, fps, duration, indices)
+
     frame_images = [frame["frame_image"] for frame in frame_list]
     if frame_images and isinstance(frame_images[0], torch.Tensor):
         images = torch.stack(frame_images).permute(0, 2, 3, 1).contiguous()
     else:
         images = [np.array(image) for image in frame_images]
-    fps = total_num_frames / duration if duration else 0
-
-    metadata = _video_metadata(total_num_frames, fps, duration, indices)
     return images, metadata

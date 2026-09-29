@@ -11,7 +11,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import get_dcu_mla_fp8_kv_cache_dim
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -235,8 +234,16 @@ class ModelRunnerKVCacheMixin:
             # MambaPool allocates one padding row in addition to the runnable
             # request rows.  Account for it here so KV sizing does not consume
             # memory that the intermediate speculative state will later use.
+            cache_params = config.mamba2_cache_params
+            intermediate_per_req = cache_params.mamba_cache_per_req
+            if server_args.enable_kda_replayssm_spec:
+                intermediate_per_req = (
+                    sum(shape[0] * shape[1] for shape in cache_params.shape.conv)
+                    * cache_params.dtype.conv.itemsize
+                    * len(cache_params.layers)
+                )
             mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
+                intermediate_per_req
                 * (max_running_requests + 1)
                 * server_args.speculative_num_draft_tokens
             )
@@ -259,7 +266,8 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            per_req = self._mamba_cache_per_req_with_replayssm()
+            assert per_req > 0
 
             # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
             # solve the equations:
@@ -272,17 +280,69 @@ class ModelRunnerKVCacheMixin:
             )
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
-                (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
+                (mamba_state_memory_raw * (1 << 30)) // per_req
             )
+
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.enable_kda_replayssm_spec
+        ):
+            from sglang.srt.disaggregation.decode import (
+                get_decode_mamba_pool_size,
+                get_decode_prealloc_size,
+            )
+
+            max_num_reqs = server_args.max_running_requests // self.dp_size
+            pre_alloc_size = get_decode_prealloc_size(max_num_reqs)
+            required_mamba_size = get_decode_mamba_pool_size(
+                size=max_num_reqs,
+                pre_alloc_size=pre_alloc_size,
+                enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+                enable_overlap_schedule=not server_args.disable_overlap_schedule,
+            )
+            if server_args.max_mamba_cache_size < required_mamba_size:
+                logger.info(
+                    "Reserving %d Mamba slots for PD decode (%d running, %d "
+                    "pre-allocated), instead of the profiled %d slots.",
+                    required_mamba_size,
+                    max_num_reqs,
+                    pre_alloc_size,
+                    server_args.max_mamba_cache_size,
+                )
+                server_args.max_mamba_cache_size = required_mamba_size
 
         mamba_state_memory = (
             # The main Mamba state pool also has one padding row.
             (server_args.max_mamba_cache_size + 1)
-            * config.mamba2_cache_params.mamba_cache_per_req
+            * self._mamba_cache_per_req_with_replayssm()
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def _mamba_cache_per_req_with_replayssm(self: ModelRunner) -> int:
+        """Persistent bytes per Mamba slot, including KDA verify inputs."""
+        cache_params = self.mambaish_config.mamba2_cache_params
+        per_req = cache_params.mamba_cache_per_req
+        if not self.server_args.enable_kda_replayssm_spec:
+            return per_req
+
+        shape = cache_params.shape
+        if not hasattr(shape, "num_k_heads") or not hasattr(shape, "num_heads"):
+            raise ValueError("--enable-kda-replayssm-spec requires a KDA model")
+        hv, v_dim, k_dim = shape.temporal
+        h_k_num = hv * shape.num_k_heads
+        if h_k_num % shape.num_heads:
+            raise ValueError("Cannot derive local KDA key-head count")
+        h_k = h_k_num // shape.num_heads
+        window_len = self.server_args.speculative_num_draft_tokens
+        assert window_len is not None
+        activation_bytes = cache_params.dtype.conv.itemsize
+        per_layer = (
+            window_len * (hv * v_dim + h_k * k_dim) * activation_bytes
+            + window_len * hv * k_dim * torch.float32.itemsize
+            + window_len * hv * torch.float32.itemsize
+        )
+        return per_req + per_layer * len(cache_params.layers)
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
@@ -321,7 +381,8 @@ class ModelRunnerKVCacheMixin:
         quant_block_size = NSATokenToKVPool.quant_block_size
         rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
         # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
-        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
+        # No-RoPE uses 512 FP8 + 16 scale bytes = 528. RoPE adds 64 BF16
+        # values, producing a 656-byte physical row.
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
             assert (
@@ -333,16 +394,6 @@ class ModelRunnerKVCacheMixin:
                 + kv_lora_rank // quant_block_size * 4
                 + qk_rope_head_dim * rope_storage_dtype.itemsize
             )
-            if (
-                _is_dcu
-                and qk_rope_head_dim == 0
-                and (
-                    self.server_args.nsa_prefill_backend
-                    in ("flashmla_auto", "flashmla_kv")
-                    or self.server_args.nsa_decode_backend == "flashmla_kv"
-                )
-            ):
-                kv_cache_dim += 64 * rope_storage_dtype.itemsize
             return kv_cache_dim
 
         return kv_cache_dim
@@ -414,15 +465,13 @@ class ModelRunnerKVCacheMixin:
                 from sglang.srt.disaggregation.decode import (
                     DecodeReqToTokenPool,
                     HybridMambaDecodeReqToTokenPool,
+                    get_decode_prealloc_size,
                 )
 
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
 
-                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
+                pre_alloc_size = get_decode_prealloc_size(max_num_reqs)
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
@@ -439,6 +488,7 @@ class ModelRunnerKVCacheMixin:
                             ]
                         ),
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        enable_kda_replayssm_spec=self.server_args.enable_kda_replayssm_spec,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -480,6 +530,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=mamba_speculative_num_draft_tokens,
+                    enable_kda_replayssm_spec=self.server_args.enable_kda_replayssm_spec,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )

@@ -22,6 +22,7 @@ import dataclasses
 import logging
 import os
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -289,6 +290,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    is_warmup_owner = True
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -320,6 +322,15 @@ async def lifespan(fast_api_app: FastAPI):
     # Start the tokenizer callback loop before serving requests so the first
     # scheduler/detokenizer reply cannot race with lazy loop creation.
     _global_state.tokenizer_manager.auto_create_handle_loop()
+
+    wait_for_warmup_assignment = getattr(
+        _global_state.tokenizer_manager, "wait_for_warmup_assignment", None
+    )
+    if wait_for_warmup_assignment is not None:
+        is_warmup_owner = await wait_for_warmup_assignment()
+    warmup_thread_kwargs = dict(
+        warmup_thread_kwargs, is_warmup_owner=is_warmup_owner
+    )
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
@@ -386,20 +397,40 @@ async def lifespan(fast_api_app: FastAPI):
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
     # Execute custom warmups
-    if server_args.warmups is not None:
-        await execute_warmups(
-            server_args.disaggregation_mode,
-            server_args.warmups.split(","),
-            _global_state.tokenizer_manager,
-        )
-        logger.info("Warmup ended")
+    if server_args.warmups is not None and is_warmup_owner:
+        try:
+            await execute_warmups(
+                server_args.disaggregation_mode,
+                server_args.warmups.split(","),
+                _global_state.tokenizer_manager,
+            )
+            logger.info("Warmup ended")
+        except BaseException:
+            report_warmup_result = getattr(
+                _global_state.tokenizer_manager,
+                "report_server_warmup_result",
+                None,
+            )
+            if report_warmup_result is not None:
+                report_warmup_result(False)
+            raise
+    elif server_args.warmups is not None:
+        logger.info("Skipping custom warmups in non-owner tokenizer worker")
 
     # Execute the general warmup
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
         kwargs=warmup_thread_kwargs,
     )
-    warmup_thread.start()
+    try:
+        warmup_thread.start()
+    except BaseException:
+        report_warmup_result = getattr(
+            _global_state.tokenizer_manager, "report_server_warmup_result", None
+        )
+        if is_warmup_owner and report_warmup_result is not None:
+            report_warmup_result(False)
+        raise
 
     # Start the HTTP server
     try:
@@ -530,6 +561,11 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
+    warmup_result = getattr(
+        _global_state.tokenizer_manager, "server_warmup_result", True
+    )
+    if warmup_result is not True:
+        return Response(status_code=503)
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
@@ -2050,35 +2086,79 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
-    return success
+    return (
+        success
+        and _global_state.tokenizer_manager.server_status == ServerStatus.Up
+    )
 
 
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    is_warmup_owner: bool = True,
 ):
-    if server_args.checkpoint_engine_wait_weights_before_ready:
-        _wait_weights_ready()
-
-    # Send a warmup request
-    if not server_args.skip_server_warmup:
-        if not execute_warmup_func(server_args):
+    tokenizer_manager = _global_state.tokenizer_manager
+    if not is_warmup_owner:
+        logger.info(
+            "HTTP worker pid=%s is waiting for the warmup owner", os.getpid()
+        )
+        wait_for_warmup_result = getattr(
+            tokenizer_manager, "wait_for_server_warmup_result", None
+        )
+        if wait_for_warmup_result is None:
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+            logger.error("Tokenizer worker cannot receive the server warmup result")
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
-    # The server is ready for requests
-    logger.info("The server is fired up and ready to roll!")
+        success = wait_for_warmup_result()
+        tokenizer_manager.server_status = (
+            ServerStatus.Up if success else ServerStatus.UnHealthy
+        )
+        logger.info(
+            "HTTP worker pid=%s observed server warmup success=%s",
+            os.getpid(),
+            success,
+        )
+        if success:
+            logger.info("The server is fired up and ready to roll!")
+        return
 
-    if server_args.delete_ckpt_after_loading:
-        delete_directory(server_args.model_path)
+    success = False
+    try:
+        if server_args.checkpoint_engine_wait_weights_before_ready:
+            _wait_weights_ready()
 
-    if server_args.debug_tensor_dump_input_file:
-        kill_process_tree(os.getpid())
+        if not server_args.skip_server_warmup:
+            if (
+                not execute_warmup_func(server_args)
+                or tokenizer_manager.server_status != ServerStatus.Up
+            ):
+                tokenizer_manager.server_status = ServerStatus.UnHealthy
+                return
+        else:
+            tokenizer_manager.server_status = ServerStatus.Up
 
-    if launch_callback is not None:
-        launch_callback()
+        logger.info("The server is fired up and ready to roll!")
+
+        if server_args.delete_ckpt_after_loading:
+            delete_directory(server_args.model_path)
+
+        if server_args.debug_tensor_dump_input_file:
+            kill_process_tree(os.getpid())
+
+        if launch_callback is not None:
+            launch_callback()
+        success = True
+    except BaseException:
+        tokenizer_manager.server_status = ServerStatus.UnHealthy
+        raise
+    finally:
+        report_warmup_result = getattr(
+            tokenizer_manager, "report_server_warmup_result", None
+        )
+        if report_warmup_result is not None:
+            report_warmup_result(success)
 
 
 def _wait_weights_ready():

@@ -4,10 +4,12 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
+import os
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -322,31 +324,32 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
-
-        # Replace multimodal tokens using per-item offsets
-        items_by_modality = defaultdict(list)
-        for item in mm_inputs.mm_items:
-            items_by_modality[item.modality].append(item)
-
         token_id_map = {
             Modality.IMAGE: mm_inputs.im_token_id,
             Modality.AUDIO: mm_inputs.audio_token_id,
             Modality.VIDEO: mm_inputs.video_token_id,
         }
+        # NOTE: callers pass `req.origin_input_ids`, which is an `array("q")` in
+        # this branch (upstream migrated it to a plain list). `array` has no
+        # `.copy()` and rejects list slice assignment, so materialize a list
+        # here. Callers already expect a list back (the previous implementation
+        # returned `tensor.tolist()`).
+        padded_input_ids = list(input_ids)
 
-        for modality, items in items_by_modality.items():
-            token_id = token_id_map.get(modality)
-
-            if not items or token_id is None:
+        # Updating list slices avoids two full list<->CPU-tensor conversions
+        # for long prompts.
+        for item in mm_inputs.mm_items:
+            if token_id_map.get(item.modality) is None:
                 continue
+            for start, end in item.offsets:
+                if start < 0 or end < start or end >= len(padded_input_ids):
+                    raise ValueError(
+                        f"Invalid multimodal offset ({start}, {end}) for "
+                        f"input length {len(padded_input_ids)}"
+                    )
+                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
 
-            for i, item in enumerate(items):
-                for offset in items[i].offsets:
-                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-
-        ret_input_ids = input_ids_tensor.tolist()
-        return ret_input_ids
+        return padded_input_ids
 
 
 embedding_cache: Optional[MultiModalStaticCache] = None
@@ -402,17 +405,85 @@ def get_embedding_chunk(
     return embedding_chunk, start_index, end_index
 
 
+def _precomputed_chunk_by_item(
+    items_per_req: List[MultimodalDataItem],
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Low-memory equivalent of slicing ``get_embedding_chunk`` out of
+    ``torch.concat([item.precomputed_embeddings for item in items_per_req])``.
+
+    The index walk in ``get_embedding_chunk`` accumulates independent per-span
+    contributions, so applying the same arithmetic to each item's own spans
+    (``item.offsets``) yields that item's row range inside the chunk window.
+    Each item is therefore sliced in place -- ``reshape``/slice are views,
+    zero-copy for SHM-backed tensors shared across TP ranks -- and only the
+    window-sized slices are concatenated, never the full per-item concat (which
+    the old path copied on every chunk, on every TP rank, then moved to GPU).
+
+    When ``device`` is given, each window-sized slice (not the full item) is
+    moved to it before the concat, so the concat and the scatter in
+    ``embed_mm_inputs`` run on GPU and only window-sized bytes are transferred
+    per chunk; the slice stays a CPU/SHM view until that H2D, so no CPU copy is
+    added. With ``device=None`` the result stays on CPU (the caller's H2D).
+    Byte-identical to the old concat-then-slice.
+
+    Relies on ``item.offsets`` being in the same item order as the flattened
+    ``items_offset`` the callers build via ``flatten_nested_list``.
+    """
+    window_start = extend_prefix_len
+    window_end = extend_prefix_len + extend_seq_len - 1
+
+    slices = []
+    for item in items_per_req:
+        start_index = 0
+        end_index = 0
+        for start, end in item.offsets:
+            if window_start >= start and window_start <= end:
+                start_index += window_start - start
+            elif window_start > end:
+                start_index += end - start + 1
+
+            if window_end >= start and window_end <= end:
+                end_index += window_end - start + 1
+            elif window_end > end:
+                end_index += end - start + 1
+
+        if end_index > start_index:
+            embedding = item.precomputed_embeddings
+            # some models' embedding is 3-dim; reshape is a view on contiguous storage
+            sl = embedding.reshape(-1, embedding.shape[-1])[start_index:end_index]
+            slices.append(sl.to(device, non_blocking=True) if device is not None else sl)
+
+    if not slices:
+        embedding = items_per_req[0].precomputed_embeddings
+        empty = embedding.reshape(-1, embedding.shape[-1])[:0]
+        return empty.to(device) if device is not None else empty
+    if len(slices) == 1:
+        return slices[0]
+    return torch.concat(slices)
+
+
 def _get_precomputed_embedding(
     items: List[MultimodalDataItem],
     items_size: List[int],
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
+    device: Optional[torch.device] = None,
 ) -> Optional[torch.Tensor]:
     """
     If all items have precomputed_embeddings, return their concatenation.
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
+
+    Low-memory variant: items are sliced per-item over their own spans
+    (zero-copy views -- keeps SHM-backed embeddings shared across TP ranks and
+    off the GPU) and only the window-sized slices are moved to ``device`` and
+    concatenated, instead of moving every full item to GPU and materializing the
+    full concat per chunk.
     """
     precomputed_embeddings = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
@@ -423,19 +494,15 @@ def _get_precomputed_embedding(
 
         items_per_req = items[items_size[i] : items_size[i + 1]]
         extend_len = extend_length[i] if i < len(extend_length) else 0
-        items_offset = items_offset_list[i]
 
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
-            chunk, _, _ = get_embedding_chunk(
-                embedding=req_embeddings,
+            chunk = _precomputed_chunk_by_item(
+                items_per_req,
                 extend_prefix_len=prefix_length[i],
                 extend_seq_len=extend_len,
-                items_offset=items_offset,
+                device=device,
             )
 
         if chunk is None and len(items_per_req) > 1:
@@ -447,7 +514,13 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
-        result = torch.concat(precomputed_embeddings)
+        # Single request in the batch: keep the (possibly zero-copy) slice view
+        # itself instead of forcing a concat copy.
+        result = (
+            precomputed_embeddings[0]
+            if len(precomputed_embeddings) == 1
+            else torch.concat(precomputed_embeddings)
+        )
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
         return result
@@ -514,6 +587,19 @@ def _get_chunked_embedding_full(
         items_offset=items_offset,
     )
     return embedding_per_req_chunk, input_ids
+
+
+def _load_embedding_from_cache(
+    embedding: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Move a cached embedding onto the target device for assembly.
+
+    No-op when the cache already holds GPU tensors (default path); a single
+    non-blocking H2D copy when the cache stored it on CPU.
+    """
+    if embedding.device != device:
+        return embedding.to(device, non_blocking=True)
+    return embedding
 
 
 def _get_chunked_embedding_by_item(
@@ -634,7 +720,9 @@ def _get_chunked_prefill_embedding(
                 device,
             )
             if chunk_embedding is not None:
-                embedding_list.append(chunk_embedding)
+                embedding_list.append(
+                    _load_embedding_from_cache(chunk_embedding, device)
+                )
         else:
             chunk_embedding, input_ids = _get_chunked_embedding_full(
                 data_embedding_func,
@@ -646,10 +734,14 @@ def _get_chunked_prefill_embedding(
                 device,
             )
             if chunk_embedding is not None:
-                embedding_list.append(chunk_embedding)
+                embedding_list.append(
+                    _load_embedding_from_cache(chunk_embedding, device)
+                )
 
     if len(embedding_list) == 0:
         return None, input_ids
+    # Keep assembly on the model/input device. This also covers custom embedding
+    # functions that return CPU tensors instead of following the item device.
     return torch.concat(embedding_list, dim=0), input_ids
 
 
@@ -722,7 +814,12 @@ def get_embedding_and_mask(
     """
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
+        embedding_items,
+        items_size,
+        prefix_length,
+        extend_length,
+        items_offset_list,
+        device=input_ids.device,
     )
     if embedding is None:
         embedding, input_ids = _get_chunked_prefill_embedding(
@@ -1525,6 +1622,53 @@ def get_new_expanded_mm_items(original_mm_items):
     return expanded_mm_items
 
 
+def _unregister_shm(shm_name: str) -> None:
+    try:
+        resource_tracker.unregister(f"/{shm_name}", "shared_memory")
+    except Exception:
+        pass
+
+
+class _UntrackedPosixSharedMemory:
+    """Open an existing POSIX SHM segment as an untracked read-only mapping."""
+
+    def __init__(self, name: str):
+        import _posixshmem
+
+        self.name = name.lstrip("/")
+        self._name = f"/{self.name}"
+        fd = _posixshmem.shm_open(self._name, os.O_RDONLY, mode=0o600)
+        try:
+            self._mmap = mmap.mmap(
+                fd,
+                os.fstat(fd).st_size,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ,
+            )
+        finally:
+            os.close(fd)
+        self.buf = self._mmap
+
+    def take_buffer(self):
+        """Transfer mapping ownership to a consumer of the buffer protocol."""
+        buf = self.buf
+        self.buf = None
+        self._mmap = None
+        return buf
+
+    def close(self) -> None:
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
+        self.buf = None
+
+
+def _open_shm_for_receiver(shm_name: str):
+    if os.name == "posix":
+        return _UntrackedPosixSharedMemory(shm_name)
+    return shared_memory.SharedMemory(name=shm_name)
+
+
 class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
@@ -1540,18 +1684,29 @@ class ShmPointerMMData:
         self.dtype = tensor.dtype
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        dst = None
         try:
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
-            shm.close()
-            shm.unlink()
+            dst = None
+            try:
+                shm.unlink()
+            finally:
+                shm.close()
             raise
+        dst = None
         self.shm_name = shm.name
-        shm.close()
-        self._shm_handle = None
+        self._shm_handle = shm
+        self._shm_buffer = None
+        self._shm_base_tensor = None
+        self.tensor = None
+        self._is_owner = True
+        self._released = False
 
     def __getstate__(self):
+        if self._released:
+            raise RuntimeError("Cannot serialize a released shared-memory tensor")
         return {
             "shm_name": self.shm_name,
             "shape": self.shape,
@@ -1562,30 +1717,178 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
-        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
-            self.shape
-        )
+        self._is_owner = False
+        self._shm_handle = None
+        self._shm_buffer = None
+        self._shm_base_tensor = None
+        self.tensor = None
+        self._released = False
 
-    def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
-        tensor = self.tensor.clone()
-        if self._shm_handle is not None:
-            self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass  # Another rank already unlinked
-            self._shm_handle = None
+    @property
+    def is_owner(self) -> bool:
+        return self._is_owner
+
+    def _ensure_open(self) -> None:
+        """Open and map receiver SHM only when its tensor is first consumed."""
+        if self._is_owner or self._released:
+            raise RuntimeError("Shared-memory tensor is not available")
+        if self.tensor is not None:
+            return
+
+        self._shm_handle = _open_shm_for_receiver(self.shm_name)
+        try:
+            if isinstance(self._shm_handle, _UntrackedPosixSharedMemory):
+                self._shm_buffer = self._shm_handle.take_buffer()
+                self._shm_handle = None
+            else:
+                self._shm_buffer = self._shm_handle.buf
+            self._shm_base_tensor = torch.frombuffer(
+                self._shm_buffer, dtype=self.dtype
+            )
+            self.tensor = self._shm_base_tensor.reshape(self.shape)
+        except BaseException:
+            self._release_receiver_references()
+            raise
+
+    def borrow(self) -> torch.Tensor:
+        """Borrow a zero-copy tensor view backed by its storage-owned mapping."""
+        if self._is_owner or self._released:
+            raise RuntimeError("Shared-memory tensor is not available for borrowing")
+        if os.name != "posix":
+            raise RuntimeError("Zero-copy SHM borrowing is only supported on POSIX")
+        self._ensure_open()
+        tensor = self.tensor
+        self._release_receiver_references()
+        self._released = True
         return tensor
 
+    def materialize(self) -> torch.Tensor:
+        """Clone receiver data into owned memory and release its SHM mapping."""
+        if self._is_owner or self._released:
+            raise RuntimeError("Shared-memory tensor is not available to materialize")
+        self._ensure_open()
+        tensor = self.tensor.clone()
+        self.release()
+        return tensor
+
+    def _release_receiver_references(self) -> None:
+        shm_handle = self._shm_handle
+        self._shm_handle = None
+        self.tensor = None
+        self._shm_base_tensor = None
+        self._shm_buffer = None
+        if shm_handle is not None:
+            shm_handle.close()
+
+    def release(self) -> None:
+        """Release this process's owner or receiver handle exactly once."""
+        if self._is_owner:
+            if self._shm_handle is None:
+                return
+            shm_handle = self._shm_handle
+            released = False
+            try:
+                shm_handle.unlink()
+            except FileNotFoundError:
+                _unregister_shm(self.shm_name)
+                released = True
+            else:
+                released = True
+            finally:
+                shm_handle.close()
+            if released:
+                self._shm_handle = None
+                self._released = True
+        else:
+            if self._released:
+                return
+            self._release_receiver_references()
+            self._released = True
+
     def __del__(self):
-        # Only close; never unlink. Unlinking is materialize()'s job.
-        if getattr(self, "_shm_handle", None) is not None:
-            self._shm_handle.close()
-            self._shm_handle = None
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def _iter_shm_features(obj):
+    if hasattr(obj, "batch"):
+        for sub_obj in obj.batch:
+            yield from _iter_shm_features(sub_obj)
+        return
+    if not hasattr(obj, "mm_inputs") or not obj.mm_inputs:
+        return
+    for item in obj.mm_inputs.mm_items:
+        for attr in ("feature", "precomputed_embeddings"):
+            value = getattr(item, attr, None)
+            if isinstance(value, ShmPointerMMData):
+                yield value
+            elif isinstance(value, (list, tuple)):
+                yield from (v for v in value if isinstance(v, ShmPointerMMData))
+
+
+class ShmOwnerTable:
+    """Keep tokenizer-owned SHM alive until every mapped request finishes."""
+
+    def __init__(self):
+        self._next_owner_handle = 0
+        self._handle_to_names = {}
+        self._owners = {}
+
+    def register(self, obj) -> Optional[int]:
+        owners = {
+            pointer.shm_name: pointer
+            for pointer in _iter_shm_features(obj)
+            if pointer.is_owner
+        }
+        if not owners:
+            return None
+        for name, pointer in owners.items():
+            current = self._owners.get(name)
+            if current is not None and current[0] is not pointer:
+                raise RuntimeError(f"Conflicting SHM owners for {name}")
+
+        owner_handle = self._next_owner_handle
+        self._next_owner_handle += 1
+        self._handle_to_names[owner_handle] = tuple(owners)
+        for name, pointer in owners.items():
+            current = self._owners.get(name)
+            self._owners[name] = (
+                (pointer, 1) if current is None else (current[0], current[1] + 1)
+            )
+        return owner_handle
+
+    def release(self, owner_handle: Optional[int]) -> None:
+        if owner_handle is None:
+            return
+        names = self._handle_to_names.get(owner_handle)
+        if names is None:
+            return
+        for name in names:
+            owner, refcount = self._owners[name]
+            if refcount == 1:
+                owner.release()
+        for name in names:
+            owner, refcount = self._owners[name]
+            if refcount > 1:
+                self._owners[name] = (owner, refcount - 1)
+            else:
+                del self._owners[name]
+        del self._handle_to_names[owner_handle]
+
+    def close(self) -> None:
+        for owner_handle in list(self._handle_to_names):
+            self.release(owner_handle)
+
+    def __len__(self) -> int:
+        return len(self._handle_to_names)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _get_is_default_transport():
@@ -1604,52 +1907,49 @@ def _get_is_default_transport():
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
+
+    Encoder-disaggregated requests store their CPU tensor in
+    ``precomputed_embeddings`` instead of ``feature``. Both fields must use
+    the lightweight SHM transport; otherwise the full embedding is serialized
+    through tokenizer ZMQ and again through the scheduler TP broadcast.
     """
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
 
+    if hasattr(obj, "batch"):
+        wrapped_obj = copy.copy(obj)
+        wrapped_obj.batch = [wrap_shm_features(sub_obj) for sub_obj in obj.batch]
+        return wrapped_obj
+
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        wrapped_obj = copy.copy(obj)
+        wrapped_mm_inputs = copy.copy(obj.mm_inputs)
+        wrapped_items = []
         for item in obj.mm_inputs.mm_items:
-            if not hasattr(item, "feature"):
-                continue
-            feat = item.feature
-            if isinstance(feat, torch.Tensor) and feat.is_cpu:
-                item.feature = ShmPointerMMData(feat)
-            elif isinstance(feat, (list, tuple)):
-                wrapped = [
-                    (
-                        ShmPointerMMData(t)
-                        if isinstance(t, torch.Tensor) and t.is_cpu
-                        else t
+            wrapped_item = copy.copy(item)
+            for attr in ("feature", "precomputed_embeddings"):
+                value = getattr(item, attr, None)
+                if isinstance(value, torch.Tensor) and value.is_cpu:
+                    setattr(wrapped_item, attr, ShmPointerMMData(value))
+                elif isinstance(value, (list, tuple)):
+                    wrapped = [
+                        (
+                            ShmPointerMMData(t)
+                            if isinstance(t, torch.Tensor) and t.is_cpu
+                            else t
+                        )
+                        for t in value
+                    ]
+                    setattr(
+                        wrapped_item,
+                        attr,
+                        type(value)(wrapped) if isinstance(value, tuple) else wrapped,
                     )
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(wrapped) if isinstance(feat, tuple) else wrapped
-                )
+            wrapped_items.append(wrapped_item)
+        wrapped_mm_inputs.mm_items = wrapped_items
+        wrapped_obj.mm_inputs = wrapped_mm_inputs
+        return wrapped_obj
     return obj
-
-
-def _feature_has_shm(feat) -> bool:
-    """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
-    if isinstance(feat, ShmPointerMMData):
-        return True
-    if isinstance(feat, (list, tuple)):
-        return any(isinstance(t, ShmPointerMMData) for t in feat)
-    return False
-
-
-def has_shm_features(recv_reqs):
-    """Return True if any request in the list contains ShmPointerMMData."""
-    for req in recv_reqs:
-        if hasattr(req, "batch"):
-            if has_shm_features(req.batch):
-                return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
-            for item in req.mm_inputs.mm_items:
-                if _feature_has_shm(item.feature):
-                    return True
-    return False
 
 
 def unwrap_shm_features(obj):
@@ -1659,6 +1959,11 @@ def unwrap_shm_features(obj):
     """
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
+    unwrap = (
+        ShmPointerMMData.borrow
+        if os.name == "posix" and envs.SGLANG_MM_SHM_ZERO_COPY.get()
+        else ShmPointerMMData.materialize
+    )
     # Handle batch requests
     if hasattr(obj, "batch"):
         for sub_obj in obj.batch:
@@ -1668,15 +1973,18 @@ def unwrap_shm_features(obj):
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.mm_items
         for item in mm_items:
-            feat = item.feature
-            if isinstance(feat, ShmPointerMMData):
-                item.feature = feat.materialize()
-            elif isinstance(feat, (list, tuple)):
-                unwrapped = [
-                    t.materialize() if isinstance(t, ShmPointerMMData) else t
-                    for t in feat
-                ]
-                item.feature = (
-                    type(feat)(unwrapped) if isinstance(feat, tuple) else unwrapped
-                )
+            for attr in ("feature", "precomputed_embeddings"):
+                value = getattr(item, attr, None)
+                if isinstance(value, ShmPointerMMData):
+                    setattr(item, attr, unwrap(value))
+                elif isinstance(value, (list, tuple)):
+                    unwrapped = [
+                        unwrap(t) if isinstance(t, ShmPointerMMData) else t
+                        for t in value
+                    ]
+                    setattr(
+                        item,
+                        attr,
+                        type(value)(unwrapped) if isinstance(value, tuple) else unwrapped,
+                    )
     return obj

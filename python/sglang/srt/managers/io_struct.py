@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -712,7 +713,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: Optional[array[int]]
     # The multimodal inputs
     mm_inputs: object
     # The sampling parameters
@@ -1027,7 +1028,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
     input_text: str
     # The input token ids
-    input_ids: List[int]
+    input_ids: array[int]
     # The image inputs
     image_inputs: dict
     # The token type ids
@@ -1075,10 +1076,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[int]
+    decode_ids: List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1394,6 +1395,30 @@ class TokenizerWorkerRegistration:
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
+    worker_pid: int
+
+
+@dataclass
+class TokenizerWorkerRegistrationAck:
+    """Assign startup-only responsibilities to a tokenizer worker."""
+
+    is_warmup_worker: bool
+    warmup_result: Optional[bool] = None
+
+
+@dataclass
+class TokenizerWarmupResult:
+    """Report the warmup owner's terminal result to the tokenizer router."""
+
+    worker_ipc_name: str
+    success: bool
+
+
+@dataclass
+class TokenizerWarmupResultBroadcast:
+    """Broadcast the terminal server warmup result to tokenizer workers."""
+
+    success: bool
 
 
 @dataclass
@@ -2083,6 +2108,8 @@ class GetLoadsReqOutput(BaseReq):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    queue_details: Optional[List[Dict[str, Any]]] = None
+    running_details: Optional[Dict[str, Any]] = None
 
 
 @dataclass

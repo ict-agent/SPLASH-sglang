@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import is_mtp_index_share_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
@@ -204,6 +205,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.draft_runner_list[step],
                 self.topk,
                 self.speculative_num_steps,
+                seed_nsa_topk_from_draft_extend=is_mtp_index_share_enabled(
+                    self.draft_runner_list[step].model_config.hf_config
+                ),
             )
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()

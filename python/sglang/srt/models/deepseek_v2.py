@@ -53,7 +53,7 @@ from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
-    parallel_state,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
     parallel_state,
@@ -83,12 +83,18 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+)
+from sglang.srt.layers.mla_only_dp_transfer import (
+    dp_rows_to_tp_head_shard,
+    tp_two_head_shards_to_dp_rows,
 )
 from sglang.srt.layers.fused_rms_quant import (
     fused_mla_qkv_a_rms_norm_per_token_quant,
@@ -338,6 +344,73 @@ else:
 
 logger = logging.getLogger(__name__)
 
+
+def _dp_gather_rows_like(
+    local_rows: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Replicate owner-local DP rows into the global token order on every TP rank."""
+    global_rows = local_rows.new_empty(
+        (forward_batch.global_dp_buffer_len, *local_rows.shape[1:])
+    )
+    dp_gather_replicate(
+        global_rows.flatten(1),
+        local_rows.contiguous().flatten(1),
+        forward_batch,
+    )
+    return global_rows
+
+
+def _dp_gather_positions_once(
+    positions: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Replicate position ids once per MLA-DP forward batch."""
+    cached = getattr(forward_batch, "_mla_only_dp_global_positions", None)
+    if (
+        cached is not None
+        and cached.shape[0] == forward_batch.global_dp_buffer_len
+        and cached.device == positions.device
+        and cached.dtype == positions.dtype
+    ):
+        return cached
+
+    global_positions = _dp_gather_rows_like(
+        positions.reshape(-1, 1), forward_batch
+    ).reshape(-1)
+    setattr(forward_batch, "_mla_only_dp_global_positions", global_positions)
+    return global_positions
+
+
+def _dp_scatter_rows_like(
+    global_rows: torch.Tensor, local_rows: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    """Select this DP rank's owner-local rows from a global token buffer."""
+    scattered = global_rows.new_empty((local_rows.shape[0], *global_rows.shape[1:]))
+    dp_scatter(
+        scattered.flatten(1),
+        global_rows.contiguous().flatten(1),
+        forward_batch,
+    )
+    return scattered
+
+
+def _mla_only_dp_debug_phase(layer, phase: str, **kwargs) -> None:
+    if os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_PHASES") != "1":
+        return
+    if (
+        os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_ALL_RANKS") != "1"
+        and get_tensor_model_parallel_rank() != 0
+    ):
+        return
+    target_layer = int(os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_LAYER", "0"))
+    layer_id = getattr(layer, "layer_id", -1)
+    if target_layer >= 0 and layer_id != target_layer:
+        return
+    details = ", ".join(f"{key}={value}" for key, value in kwargs.items())
+    logger.warning("mla-only-dp phase %s layer=%s begin %s", phase, layer_id, details)
+    torch.cuda.synchronize()
+    logger.warning("mla-only-dp phase %s layer=%s synchronized", phase, layer_id)
+
+
 def ds_bmm_wrapper(q: torch.Tensor, w: torch.Tensor, scale: float, dtype: torch.dtype):
     # # scale=1时去掉elementwise数乘
     if abs(scale - 1) < 1e-6:
@@ -547,8 +620,18 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        # BF16 by default; opt in at startup to the configured FP32 router.
+        self._use_fp32_router = (
+            envs.SGLANG_MOE_ROUTER_USE_CONFIG_DTYPE.get()
+            and getattr(config, "router_dtype", None) in ("float32", "fp32")
+        )
+        # Store the projection weight directly so weight reloads are visible
+        # without invalidating a separate FP32 cache.
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size),
+                dtype=torch.float32 if self._use_fp32_router else torch.bfloat16,
+            )
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
@@ -587,6 +670,11 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
+
+        if self._use_fp32_router:
+            return F.linear(hidden_states.to(torch.float32), self.weight, None)
+
+        hidden_states = hidden_states.to(self.weight.dtype)
 
         if get_global_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
@@ -1628,6 +1716,23 @@ class DeepseekV2AttentionMLA(
         # self.input_layernorm_weight = input_layernorm_weight
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        server_args = get_global_server_args()
+        self.mla_only_dp = bool(
+            getattr(server_args, "mla_only_dp", False) and is_dp_attention_enabled()
+        )
+        if self.mla_only_dp and attn_tp_size != 1:
+            raise NotImplementedError(
+                "true --mla-only-dp currently supports tp_size == dp_size "
+                "(attention TP size 1). Partial attention TP needs an additional "
+                "head-layout redistribution between full-TP projection shards and "
+                "attention-TP head shards."
+            )
+        if self.mla_only_dp:
+            proj_tp_rank = get_tensor_model_parallel_rank()
+            proj_tp_size = get_tensor_model_parallel_world_size()
+        else:
+            proj_tp_rank = attn_tp_rank
+            proj_tp_size = attn_tp_size
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1637,11 +1742,13 @@ class DeepseekV2AttentionMLA(
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        assert num_heads % proj_tp_size == 0
+        self.num_local_heads = num_heads // proj_tp_size
+        self.mla_only_dp_attention_heads = num_heads // attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.kv_cache_dtype = server_args.kv_cache_dtype
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1664,8 +1771,8 @@ class DeepseekV2AttentionMLA(
                 quant_config=self._get_q_b_proj_quant_config(quant_config),
                 eps=config.rms_norm_eps,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1674,8 +1781,8 @@ class DeepseekV2AttentionMLA(
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
             )
             self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
@@ -1759,8 +1866,8 @@ class DeepseekV2AttentionMLA(
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -1770,8 +1877,8 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            tp_rank=proj_tp_rank,
+            tp_size=proj_tp_size,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.use_lightop_mla_qkv_a_rms_quant = (
@@ -1801,7 +1908,9 @@ class DeepseekV2AttentionMLA(
         self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
-            self.num_local_heads,
+            self.mla_only_dp_attention_heads
+            if self.mla_only_dp
+            else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -1811,6 +1920,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
 
+        # MHA one-shot/chunked fallbacks materialize q/k/v from the projection
+        # shards and therefore keep the projection TP head layout.  Only the
+        # MLA absorb path redistributes to attention-DP full heads.
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -1878,6 +1990,13 @@ class DeepseekV2AttentionMLA(
             attention_backend = get_global_server_args().prefill_attention_backend
         self.current_attention_backend = attention_backend
 
+        if (
+            self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        ):
+            return AttnForwardMethod.MLA
+
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         return handler(self, forward_batch)
 
@@ -1930,6 +2049,11 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
+        mla_only_dp_sync = bool(
+            self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        )
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
@@ -1938,6 +2062,7 @@ class DeepseekV2AttentionMLA(
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
+                and not mla_only_dp_sync
             ):
                 assert (
                     not self.o_proj.reduce_results
@@ -1947,6 +2072,7 @@ class DeepseekV2AttentionMLA(
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
+                and not mla_only_dp_sync
             ):
                 assert (
                     not self.o_proj.reduce_results
@@ -1954,6 +2080,25 @@ class DeepseekV2AttentionMLA(
                 return hidden_states, None, forward_batch, None
         
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        if (
+            self.mla_only_dp
+            and os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_PHASES") == "1"
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            global_num_tokens_cpu = forward_batch.global_num_tokens_cpu
+            logger.warning(
+                "mla-only-dp dispatch layer=%s method=%s hidden=%s "
+                "global_num_tokens=%s global_dp_buffer_len=%s",
+                self.layer_id,
+                attn_forward_method,
+                tuple(hidden_states[0].shape)
+                if isinstance(hidden_states, tuple)
+                else tuple(hidden_states.shape),
+                None
+                if global_num_tokens_cpu is None
+                else tuple(global_num_tokens_cpu),
+                forward_batch.global_dp_buffer_len,
+            )
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1967,14 +2112,35 @@ class DeepseekV2AttentionMLA(
                 positions, hidden_states, forward_batch, zero_allocator
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
-            inner_state = self.forward_absorb_prepare(
-                positions,
-                hidden_states,
-                forward_batch,
-                zero_allocator,
-                llama_4_scaling,
-                prev_topk_indices,
-            )
+            if mla_only_dp_sync:
+                if os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_PHASES") == "1":
+                    logger.warning(
+                        "mla-only-dp dispatch layer=%s before_mixin_prepare",
+                        self.layer_id,
+                    )
+                inner_state = DeepseekMLAForwardMixin.forward_absorb_prepare(
+                    self,
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
+                if os.getenv("SGLANG_MLA_ONLY_DP_DEBUG_PHASES") == "1":
+                    logger.warning(
+                        "mla-only-dp dispatch layer=%s after_mixin_prepare",
+                        self.layer_id,
+                    )
+            else:
+                inner_state = self.forward_absorb_prepare(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -2028,6 +2194,12 @@ class DeepseekV2AttentionMLA(
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
+            if (
+                self.mla_only_dp
+                and forward_batch.global_num_tokens_cpu is not None
+                and forward_batch.global_dp_buffer_len is not None
+            ):
+                return DeepseekMLAForwardMixin.forward_absorb_core(self, *inner_state)
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
@@ -2127,6 +2299,11 @@ class DeepseekV2AttentionMLA(
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
+        mla_only_dp_sync = bool(
+            self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        )
         use_fused_rmsnorm_rope = (
             _use_fused_rmsnorm_rope
             and self.rotary_emb is not None
@@ -2140,6 +2317,7 @@ class DeepseekV2AttentionMLA(
             q_input_quant_args = None
             use_lightop_mla_norm_quant = (
                 self.use_lightop_mla_qkv_a_rms_quant
+                and not mla_only_dp_sync
                 and not use_fused_rmsnorm_rope
                 and supports_fused_mla_qkv_a_rms_quant_input(
                     qkv_latent,
@@ -2176,7 +2354,10 @@ class DeepseekV2AttentionMLA(
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             elif not use_lightop_mla_norm_quant:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
+                if mla_only_dp_sync:
+                    q = self.q_a_layernorm(q)
+                    k_nope = self.kv_a_layernorm(k_nope)
+                elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                     q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -2231,6 +2412,7 @@ class DeepseekV2AttentionMLA(
             # overlap q_b_proj and indexer during decode
             if (
                 self.alt_stream is not None
+                and not mla_only_dp_sync
                 and get_is_capture_mode()
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
@@ -2260,19 +2442,51 @@ class DeepseekV2AttentionMLA(
             else:
                 if not use_fused_rmsnorm_rope:
                     k_nope = k_nope.unsqueeze(1)
-                if not _use_fused_rms_quant:
+                if mla_only_dp_sync:
+                    _mla_only_dp_debug_phase(
+                        self,
+                        "before_q_gather",
+                        local_q=tuple(q.shape),
+                        global_num_tokens=tuple(forward_batch.global_num_tokens_cpu),
+                        global_dp_buffer_len=forward_batch.global_dp_buffer_len,
+                    )
+                    q_proj_input = _dp_gather_rows_like(q, forward_batch)
+                    _mla_only_dp_debug_phase(
+                        self,
+                        "after_q_gather",
+                        local_q=tuple(q.shape),
+                        q_proj_input=tuple(q_proj_input.shape),
+                    )
+                else:
+                    q_proj_input = q
+                if mla_only_dp_sync:
+                    _mla_only_dp_debug_phase(
+                        self, "before_q_b_proj", q_proj_input=tuple(q_proj_input.shape)
+                    )
+                if not _use_fused_rms_quant or mla_only_dp_sync:
                     q = _apply_linear_with_optional_quant(
-                        self.q_b_proj, q, q_input_quant_args
+                        self.q_b_proj, q_proj_input, q_input_quant_args
                     )[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
                 else:
-                    q = self.q_b_proj(q, rms_weight=self.q_a_layernorm.weight.data, residual=None,
+                    q = self.q_b_proj(q_proj_input, rms_weight=self.q_a_layernorm.weight.data, residual=None,
                                     update_hd=False)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if mla_only_dp_sync:
+                    _mla_only_dp_debug_phase(
+                        self, "after_q_b_proj", projected_q=tuple(q.shape)
+                    )
                 if q_lora is not None:
                     if not self.skip_topk or (
                         self.is_nextn and prev_topk_indices is None
                     ):
+                        if mla_only_dp_sync:
+                            _mla_only_dp_debug_phase(
+                                self,
+                                "before_indexer",
+                                hidden_states=tuple(hidden_states.shape),
+                                q_lora=tuple(q_lora.shape),
+                            )
                         topk_indices = self.indexer(
                             x=hidden_states,
                             q_lora=q_lora,
@@ -2280,6 +2494,16 @@ class DeepseekV2AttentionMLA(
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                         )
+                        if mla_only_dp_sync:
+                            _mla_only_dp_debug_phase(
+                                self,
+                                "after_indexer",
+                                topk=(
+                                    None
+                                    if topk_indices is None
+                                    else tuple(topk_indices.shape)
+                                ),
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -2295,6 +2519,14 @@ class DeepseekV2AttentionMLA(
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        if mla_only_dp_sync:
+            _mla_only_dp_debug_phase(
+                self,
+                "before_q_nope_bmm",
+                q_nope=tuple(q_nope.shape),
+                q_pe=tuple(q_pe.shape),
+                k_nope=tuple(k_nope.shape),
+            )
         if use_fused_rmsnorm_rope:
             k_nope_normed = torch.empty(k_nope.shape, dtype=k_nope.dtype, device=k_nope.device)
             weight = self.kv_a_layernorm.weight
@@ -2308,6 +2540,7 @@ class DeepseekV2AttentionMLA(
                                           kv_pool.kv_buffer[self.layer_id - kv_pool.start_layer],
                                           dtype_mapping.get(kv_pool.dtype),1.0,False,variance_epsilon)
             k_nope = k_nope.unsqueeze(1)
+        q_nope_out_is_attention_layout = False
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
@@ -2342,11 +2575,42 @@ class DeepseekV2AttentionMLA(
                     q_nope_out,
                 )
             else:
-                # q_nope_out = ds_bmm_wrapper(q_nope, self.w_kc, self.w_scale, torch.bfloat16)
-                 q_nope_out = torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    self.w_kc.to(torch.bfloat16) * self.w_scale,
+                batch_attn_backend = getattr(forward_batch, "attn_backend", None)
+                nsa_backend = getattr(
+                    batch_attn_backend, "full_attn_backend", batch_attn_backend
                 )
+                q_nope_out_is_attention_layout = (
+                    self.current_attention_backend == "nsa"
+                    and self.use_nsa
+                    and self.qk_rope_head_dim == 0
+                    and self.kv_lora_rank == 512
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                    and getattr(nsa_backend, "nsa_prefill_impl", None)
+                    == "flashmla_sparse"
+                    and getattr(nsa_backend, "nsa_kv_cache_store_fp8", False)
+                )
+                q_nope_bmm_input = q_nope.to(torch.bfloat16).transpose(0, 1)
+                q_nope_bmm_weight = self.w_kc.to(torch.bfloat16) * self.w_scale
+                if q_nope_out_is_attention_layout:
+                    q_nope_out = torch.empty(
+                        (
+                            q_nope.shape[0],
+                            self.num_local_heads,
+                            self.kv_lora_rank,
+                        ),
+                        dtype=torch.bfloat16,
+                        device=q_nope.device,
+                    )
+                    torch.bmm(
+                        q_nope_bmm_input,
+                        q_nope_bmm_weight,
+                        out=q_nope_out.transpose(0, 1),
+                    )
+                else:
+                    q_nope_out = torch.bmm(
+                        q_nope_bmm_input,
+                        q_nope_bmm_weight,
+                    )
         elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_dcu:
             # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
@@ -2368,7 +2632,12 @@ class DeepseekV2AttentionMLA(
             #         w_vc_t
             #     )
             q_nope_out = torch.bmm(q_nope.transpose(0, 1).to(torch.bfloat16), self.w_kc.to(torch.bfloat16) * self.w_scale)
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if not q_nope_out_is_attention_layout:
+            q_nope_out = q_nope_out.transpose(0, 1)
+        if mla_only_dp_sync:
+            _mla_only_dp_debug_phase(
+                self, "after_q_nope_bmm", q_nope_out=tuple(q_nope_out.shape)
+            )
         
         if (
             self.rotary_emb is not None
@@ -2376,7 +2645,31 @@ class DeepseekV2AttentionMLA(
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
             and not use_fused_rmsnorm_rope
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if mla_only_dp_sync:
+                q_positions = _dp_gather_positions_once(positions, forward_batch)
+                _mla_only_dp_debug_phase(
+                    self,
+                    "before_rope",
+                    q_positions=tuple(q_positions.shape),
+                    positions=tuple(positions.shape),
+                )
+                if q_pe.shape[0] > 0:
+                    dummy_k_for_q = torch.empty_strided(
+                        q_pe.shape, q_pe.stride(), dtype=q_pe.dtype, device=q_pe.device
+                    )
+                    q_pe, _ = self.rotary_emb(q_positions, q_pe, dummy_k_for_q)
+                if k_pe.shape[0] > 0:
+                    dummy_q_for_k = torch.empty_strided(
+                        k_pe.shape, k_pe.stride(), dtype=k_pe.dtype, device=k_pe.device
+                    )
+                    _, k_pe = self.rotary_emb(
+                        positions[: k_pe.shape[0]], dummy_q_for_k, k_pe
+                    )
+                _mla_only_dp_debug_phase(
+                    self, "after_rope", q_pe=tuple(q_pe.shape), k_pe=tuple(k_pe.shape)
+                )
+            else:
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -2411,6 +2704,29 @@ class DeepseekV2AttentionMLA(
     ):
         save_kv_cache = True
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            mla_only_dp_sync = bool(
+                self.mla_only_dp
+                and forward_batch.global_num_tokens_cpu is not None
+                and forward_batch.global_dp_buffer_len is not None
+            )
+            if mla_only_dp_sync:
+                _mla_only_dp_debug_phase(
+                    self,
+                    "before_tp_to_dp",
+                    q_nope_out=tuple(q_nope_out.shape),
+                    q_pe=tuple(q_pe.shape),
+                    k_nope=tuple(k_nope.shape),
+                )
+                q_nope_out, q_pe = tp_two_head_shards_to_dp_rows(
+                    q_nope_out, q_pe, k_nope, forward_batch
+                )
+                _mla_only_dp_debug_phase(
+                    self,
+                    "after_tp_to_dp",
+                    q_nope_out=tuple(q_nope_out.shape),
+                    q_pe=tuple(q_pe.shape),
+                )
+
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args = {
@@ -2419,16 +2735,36 @@ class DeepseekV2AttentionMLA(
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if mla_only_dp_sync and q_nope_out.shape[0] == 0:
+                attn_output = q_nope_out.new_empty(
+                    (0, self.num_heads, self.kv_lora_rank)
+                )
+            else:
+                if mla_only_dp_sync:
+                    _mla_only_dp_debug_phase(
+                        self,
+                        "before_attn",
+                        q_nope_out=tuple(q_nope_out.shape),
+                        k_nope=tuple(k_nope.shape),
+                    )
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+                if mla_only_dp_sync:
+                    _mla_only_dp_debug_phase(
+                        self, "after_attn", attn_output=tuple(attn_output.shape)
+                    )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -2512,6 +2848,23 @@ class DeepseekV2AttentionMLA(
                     save_kv_cache=save_kv_cache,
                     **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
                 )
+        if (
+            self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            and self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        ):
+            attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
+            _mla_only_dp_debug_phase(
+                self, "before_dp_to_tp", attn_output=tuple(attn_output.shape)
+            )
+            attn_output = dp_rows_to_tp_head_shard(
+                attn_output, forward_batch, self.num_local_heads
+            )
+            _mla_only_dp_debug_phase(
+                self, "after_dp_to_tp", attn_output=tuple(attn_output.shape)
+            )
+
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
@@ -2534,6 +2887,7 @@ class DeepseekV2AttentionMLA(
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
+            attn_bmm_output_is_flattened = False
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
                 attn_bmm_output = torch.empty(
@@ -2551,11 +2905,31 @@ class DeepseekV2AttentionMLA(
                     attn_bmm_output,
                 )
             else:
-                # attn_bmm_output = ds_bmm_wrapper(attn_output, self.w_vc, self.w_scale, torch.bfloat16)
-                attn_bmm_output = torch.bmm(
-                    attn_output.to(torch.bfloat16).transpose(0, 1),
-                    self.w_vc.to(torch.bfloat16) * self.w_scale,
-                )
+                attn_bmm_input = attn_output.to(torch.bfloat16).transpose(0, 1)
+                attn_bmm_weight = self.w_vc.to(torch.bfloat16) * self.w_scale
+                if self.o_proj.weight.dtype == torch.uint8:
+                    attn_bmm_output = torch.bmm(
+                        attn_bmm_input,
+                        attn_bmm_weight,
+                    )
+                else:
+                    # Write directly in o_proj layout to avoid a transpose-flatten copy.
+                    attn_bmm_output = torch.empty(
+                        (
+                            attn_output.shape[0],
+                            self.num_local_heads * self.v_head_dim,
+                        ),
+                        dtype=torch.bfloat16,
+                        device=attn_output.device,
+                    )
+                    torch.bmm(
+                        attn_bmm_input,
+                        attn_bmm_weight,
+                        out=attn_bmm_output.view(
+                            -1, self.num_local_heads, self.v_head_dim
+                        ).transpose(0, 1),
+                    )
+                    attn_bmm_output_is_flattened = True
 
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
@@ -2565,7 +2939,7 @@ class DeepseekV2AttentionMLA(
             #     attn_bmm_output = fused_flatten_fp8_group_quant(
             #         attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
             #     )
-            else:
+            elif not attn_bmm_output_is_flattened:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         # elif self.w_vc.dtype == torch.float8_e4m3fn:
@@ -2616,6 +2990,22 @@ class DeepseekV2AttentionMLA(
                 #     ).transpose(0, 1),
                 # )
         output, _ = self.o_proj(attn_bmm_output)
+        if (
+            self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            and self.mla_only_dp
+            and forward_batch.global_num_tokens_cpu is not None
+            and forward_batch.global_dp_buffer_len is not None
+        ):
+            _mla_only_dp_debug_phase(
+                self,
+                "before_output_scatter",
+                output=tuple(output.shape),
+                local_rows=tuple(k_nope.shape),
+            )
+            output = _dp_scatter_rows_like(output, k_nope, forward_batch)
+            _mla_only_dp_debug_phase(
+                self, "after_output_scatter", output=tuple(output.shape)
+            )
         # 如果第一维是1个squeeze
         if self.next_skip_topk is None:
             return output

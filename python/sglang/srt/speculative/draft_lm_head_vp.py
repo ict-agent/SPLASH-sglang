@@ -155,6 +155,13 @@ class DraftLMHeadVocabParallelTop1:
         self.hidden_size = full_weight.shape[1]
         self.device = full_weight.device
         self.dtype = full_weight.dtype
+        # rocBLAS on DCU can produce incorrect results for the non-contiguous
+        # transpose view at larger padded row counts. Cache a contiguous
+        # vocabulary shard transpose once so decode does not copy it per step.
+        self.weight_shard_t = (
+            full_weight.narrow(0, self.vocab_start, self.shard_size)
+            .T.contiguous()
+        )
 
         self.local_hidden = torch.empty(
             (max_rows_per_rank, self.hidden_size),
@@ -253,14 +260,9 @@ class DraftLMHeadVocabParallelTop1:
             group=self.process_group,
         )
 
-        weight_shard = full_weight.narrow(
-            0,
-            self.vocab_start,
-            self.shard_size,
-        )
         torch.mm(
             self.gathered_hidden,
-            weight_shard.T,
+            self.weight_shard_t,
             out=self.local_logits,
         )
         if logit_scale is not None:

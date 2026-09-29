@@ -20,6 +20,7 @@ from sglang.srt.utils.common import (
     crash_on_warnings,
     get_bool_env_var,
     is_cuda,
+    is_dcu,
     is_musa,
     is_npu,
 )
@@ -45,6 +46,15 @@ if is_musa():
 
 if is_npu():
     import torch_npu
+
+lightop_top_k_top_p_sampling_from_probs = None
+if is_dcu():
+    try:
+        from lightop.sampling import (
+            top_k_top_p_sampling_from_probs as lightop_top_k_top_p_sampling_from_probs,
+        )
+    except (ImportError, AttributeError):
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -241,16 +251,34 @@ class Sampler(nn.Module):
                         check_nan=self.use_nan_detection,
                     )
             elif backend == "pytorch":
-                # A slower fallback implementation with torch native operations.
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                    probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
-                    positions,
-                )
+                # LightOp implements the common top-k-first/top-p path. Keep SGLang's
+                # existing compatibility path for min-p and request-specific RNG seeds.
+                if (
+                    lightop_top_k_top_p_sampling_from_probs is None
+                    or sampling_info.sampling_seed is not None
+                    or sampling_info.need_min_p_sampling
+                ):
+                    # A slower fallback implementation with torch native operations.
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                        sampling_info.sampling_seed,
+                        positions,
+                    )
+                else:
+                    batch_next_token_ids = (
+                        lightop_top_k_top_p_sampling_from_probs(
+                            probs.contiguous(),
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            filter_apply_order="top_k_first",
+                            deterministic=True,
+                            check_nan=self.use_nan_detection,
+                        )
+                    )
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids

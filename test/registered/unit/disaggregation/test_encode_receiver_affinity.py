@@ -94,12 +94,67 @@ class TestEncoderAffinity(unittest.IsolatedAsyncioTestCase):
         media = "data:image/png;base64,abc"
         media_hash = hashlib.sha256(media.encode("utf-8")).hexdigest()[:16]
 
-        self.assertEqual(create_encoder_session_id(None, media), media_hash)
-        self.assertEqual(create_encoder_session_id("", media), media_hash)
-        self.assertEqual(
-            create_encoder_session_id("upstream-session", media),
-            f"upstream-session_{media_hash}",
+        with envs.GLM_ENCODER_AFFINITY_SHARDS.override(1):
+            self.assertEqual(create_encoder_session_id(None, media), media_hash)
+            self.assertEqual(create_encoder_session_id("", media), media_hash)
+            self.assertEqual(
+                create_encoder_session_id("upstream-session", media),
+                f"upstream-session_{media_hash}",
+            )
+
+    def test_session_id_shards_hot_media_by_request_id(self):
+        media = "data:image/png;base64,abc"
+        media_hash = hashlib.sha256(media.encode("utf-8")).hexdigest()[:16]
+
+        with envs.GLM_ENCODER_AFFINITY_SHARDS.override(4):
+            session_ids = {
+                create_encoder_session_id(None, media, req_id=f"request-{i}")
+                for i in range(100)
+            }
+            repeated = create_encoder_session_id(None, media, req_id="request-0")
+            request_hash = hashlib.sha256(b"request-0").digest()
+            shard_id = int.from_bytes(request_hash[:8], byteorder="big") % 4
+            expected = hashlib.sha256(
+                f"{media_hash}:{shard_id}".encode("utf-8")
+            ).hexdigest()[:16]
+
+        self.assertEqual(len(session_ids), 4)
+        self.assertEqual(repeated, expected)
+        self.assertTrue(
+            all(
+                len(session_id) == 16
+                and all(character in "0123456789abcdef" for character in session_id)
+                for session_id in session_ids
+            )
         )
+
+    def test_invalid_affinity_shards_warns_once_and_falls_back_to_one(self):
+        expected = hashlib.sha256(b"image").hexdigest()[:16]
+        with patch(
+            "sglang.srt.disaggregation.encode_receiver."
+            "_encoder_affinity_invalid_shards_warned",
+            False,
+        ):
+            with envs.GLM_ENCODER_AFFINITY_SHARDS.override(0):
+                with self.assertLogs(
+                    "sglang.srt.disaggregation.encode_receiver", level="WARNING"
+                ) as captured_logs:
+                    first = create_encoder_session_id(
+                        None, "image", req_id="request-1"
+                    )
+                    second = create_encoder_session_id(
+                        None, "image", req_id="request-2"
+                    )
+
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(len(captured_logs.output), 1)
+        self.assertIn("falling back to 1", captured_logs.output[0])
+
+    def test_session_id_sharding_requires_request_id(self):
+        with envs.GLM_ENCODER_AFFINITY_SHARDS.override(2):
+            with self.assertRaisesRegex(ValueError, "req_id is required"):
+                create_encoder_session_id(None, "image")
 
     def test_builds_one_mooncake_request_per_media_item(self):
         mm_data = [
@@ -127,11 +182,12 @@ class TestEncoderAffinity(unittest.IsolatedAsyncioTestCase):
             },
         ]
         with envs.GLM_ENABLE_ENCODER_SESSION_ID_HEADER.override(True):
-            requests, session_ids = _split_mooncake_encode_requests(
-                req_id="request",
-                grouped_encode_requests=grouped_requests,
-                upstream_session_id="upstream",
-            )
+            with envs.GLM_ENCODER_AFFINITY_SHARDS.override(1):
+                requests, session_ids = _split_mooncake_encode_requests(
+                    req_id="request",
+                    grouped_encode_requests=grouped_requests,
+                    upstream_session_id="upstream",
+                )
 
         self.assertEqual(len(requests), 3)
         self.assertEqual([request["part_idx"] for request in requests], [0, 1, 2])
@@ -140,13 +196,16 @@ class TestEncoderAffinity(unittest.IsolatedAsyncioTestCase):
             [["image-a"], ["image-b"], ["video-a"]],
         )
         self.assertTrue(all(request["num_parts"] == 3 for request in requests))
-        self.assertEqual(
-            session_ids,
-            {
-                index: create_encoder_session_id("upstream", item["url"])
-                for index, item in enumerate(mm_data)
-            },
-        )
+        with envs.GLM_ENCODER_AFFINITY_SHARDS.override(1):
+            self.assertEqual(
+                session_ids,
+                {
+                    index: create_encoder_session_id(
+                        "upstream", item["url"], req_id=requests[index]["req_id"]
+                    )
+                    for index, item in enumerate(mm_data)
+                },
+            )
 
     async def test_encode_and_send_reuse_each_media_session_id(self):
         receiver = object.__new__(MMReceiverHTTP)
@@ -166,22 +225,23 @@ class TestEncoderAffinity(unittest.IsolatedAsyncioTestCase):
         ]
 
         with envs.GLM_ENABLE_ENCODER_SESSION_ID_HEADER.override(True):
-            with self.assertLogs(
-                "sglang.srt.disaggregation.encode_receiver", level="INFO"
-            ) as captured_logs:
-                with patch(
-                    "sglang.srt.disaggregation.encode_receiver.aiohttp.ClientSession",
-                    return_value=fake_session,
-                ):
-                    await receiver.encode(
-                        req_id="request",
-                        mm_data=mm_data,
-                        embedding_port=1234,
-                        endpoint_encode="encode",
-                        endpoint_send="send",
-                        num_items_assigned={Modality.IMAGE: [2]},
-                        upstream_session_id="upstream",
-                    )
+            with envs.GLM_ENCODER_AFFINITY_SHARDS.override(4):
+                with self.assertLogs(
+                    "sglang.srt.disaggregation.encode_receiver", level="INFO"
+                ) as captured_logs:
+                    with patch(
+                        "sglang.srt.disaggregation.encode_receiver.aiohttp.ClientSession",
+                        return_value=fake_session,
+                    ):
+                        await receiver.encode(
+                            req_id="request",
+                            mm_data=mm_data,
+                            embedding_port=1234,
+                            endpoint_encode="encode",
+                            endpoint_send="send",
+                            num_items_assigned={Modality.IMAGE: [2]},
+                            upstream_session_id="upstream",
+                        )
 
         encode_calls = [
             call for call in fake_session.calls if call["url"].endswith("/encode")
@@ -208,6 +268,8 @@ class TestEncoderAffinity(unittest.IsolatedAsyncioTestCase):
         log_output = "\n".join(captured_logs.output)
         self.assertIn("phase=encode", log_output)
         self.assertIn("phase=send", log_output)
+        self.assertIn("affinity_shard=", log_output)
+        self.assertIn("affinity_shards=4", log_output)
         for session_id in encode_sessions_by_req.values():
             self.assertIn(f"session_id={session_id}", log_output)
         self.assertTrue(

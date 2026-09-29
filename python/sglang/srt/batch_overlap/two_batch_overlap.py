@@ -706,6 +706,7 @@ class TboForwardBatchPreparer:
             "return_pooled_hidden_states",
             "reuse_mtp_topk_indices",  # forward-level flag, inherited by both child batches
             "capture_mtp_topk_indices",  # forward-level flag, inherited by both child batches
+            "mtp_topk_indices_are_physical",  # preserve PD seed index domain
         ]:
             output_dict[key] = getattr(batch, key)
 

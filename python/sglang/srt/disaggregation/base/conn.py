@@ -77,11 +77,19 @@ class KVArgs:
 
 
 class KVPoll:
+    """Transfer status codes ordered for MIN-reduction across ranks.
+
+    StoppedSafe must rank below Success so a group containing both states
+    aborts safely instead of committing a partially transferred request.
+    These values are also sent over the prefill/decode status channel.
+    """
+
     Failed = 0
     Bootstrapping = 1
     WaitingForInput = 2
     Transferring = 3
-    Success = 4
+    StoppedSafe = 4
+    Success = 5
 
 
 class BaseKVManager(ABC):
@@ -100,6 +108,10 @@ class BaseKVManager(ABC):
     def register_to_bootstrap(self):
         """Register prefill server info to the bootstrap server."""
         ...
+
+    def send_cancel_to_prefill(self, bootstrap_infos: List[KVArgs], bootstrap_room: int):
+        """Send cancel transfer request to prefill instance."""
+        pass
 
 
 class BaseKVSender(ABC):
@@ -156,6 +168,18 @@ class BaseKVSender(ABC):
         Raise an exception if the kv cache transfer fails.
         """
         ...
+
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
 
 
 class BaseKVReceiver(ABC):
@@ -214,6 +238,13 @@ class BaseKVReceiver(ABC):
     def abort(self):
         """
         Abort the current transfer.
+        """
+        pass
+
+    def cancel_transfer(self):
+        """
+        Cancel future transfer work while allowing the transport implementation
+        to finish any in-flight safe unit of work before reporting terminal status.
         """
         pass
 

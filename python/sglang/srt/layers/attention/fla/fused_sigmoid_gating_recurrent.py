@@ -54,6 +54,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
+    stride_rawv_slot: tl.constexpr = 0,
+    stride_rawk_slot: tl.constexpr = 0,
+    stride_g_slot: tl.constexpr = 0,
+    stride_beta_slot: tl.constexpr = 0,
+    REPLAYSSM_WINDOW_LEN: tl.constexpr = 0,
+    CACHE_REPLAYSSM_INPUTS: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -168,6 +178,46 @@ def fused_sigmoid_gating_delta_rule_update_kernel_opt(
         # Compute beta = sigmoid(b)
         b_beta = beta_scale * (1.0 / (1.0 + tl.exp(-b_b)))
 
+        # Stage the raw inputs consumed by this recurrent update. After
+        # sampling, ReplaySSM folds only the accepted prefix into the fp32
+        # checkpoint; the next verify step overwrites rejected suffix rows.
+        if CACHE_REPLAYSSM_INPUTS:
+            state_slot = tl.load(h0_indices + i_n).to(tl.int64)
+            if state_slot >= 0 and step_idx < REPLAYSSM_WINDOW_LEN:
+                tl.store(
+                    replayssm_rawv
+                    + state_slot * stride_rawv_slot
+                    + (i_hv * REPLAYSSM_WINDOW_LEN + step_idx) * V
+                    + o_v,
+                    b_v.to(replayssm_rawv.dtype.element_ty),
+                    mask=mask_v,
+                )
+                if i_v == 0:
+                    tl.store(
+                        replayssm_rawk
+                        + state_slot * stride_rawk_slot
+                        + (i_h * REPLAYSSM_WINDOW_LEN + step_idx) * K
+                        + o_k,
+                        b_k.to(replayssm_rawk.dtype.element_ty),
+                        mask=mask_k,
+                    )
+                    tl.store(
+                        replayssm_g
+                        + state_slot * stride_g_slot
+                        + (i_hv * REPLAYSSM_WINDOW_LEN + step_idx) * K
+                        + o_k,
+                        b_g,
+                        mask=mask_k,
+                    )
+                    if i_k == 0:
+                        tl.store(
+                            replayssm_beta
+                            + state_slot * stride_beta_slot
+                            + i_hv * REPLAYSSM_WINDOW_LEN
+                            + step_idx,
+                            b_beta,
+                        )
+
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
@@ -258,6 +308,11 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    cache_replayssm_inputs: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -305,6 +360,44 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    if cache_replayssm_inputs:
+        assert is_kda, "ReplaySSM input staging is KDA-only"
+        assert (
+            replayssm_rawv is not None
+            and replayssm_rawk is not None
+            and replayssm_g is not None
+            and replayssm_beta is not None
+        )
+        assert (
+            replayssm_rawv.ndim == 4
+            and replayssm_rawk.ndim == 4
+            and replayssm_g.ndim == 4
+            and replayssm_beta.ndim == 3
+        ), "ReplaySSM expects per-layer input-window views"
+        replayssm_window_len = replayssm_rawv.shape[-2]
+        assert replayssm_rawv.shape[1:] == (HV, replayssm_window_len, V)
+        assert replayssm_rawk.shape[1:] == (H, replayssm_window_len, K)
+        assert replayssm_g.shape[1:] == (HV, replayssm_window_len, K)
+        assert replayssm_beta.shape[1:] == (HV, replayssm_window_len)
+        assert (
+            replayssm_rawv.shape[0]
+            == replayssm_rawk.shape[0]
+            == replayssm_g.shape[0]
+            == replayssm_beta.shape[0]
+        )
+        assert replayssm_g.dtype == torch.float32
+        assert replayssm_beta.dtype == torch.float32
+        stride_rawv_slot = replayssm_rawv.stride(0)
+        stride_rawk_slot = replayssm_rawk.stride(0)
+        stride_g_slot = replayssm_g.stride(0)
+        stride_beta_slot = replayssm_beta.stride(0)
+    else:
+        replayssm_window_len = 0
+        stride_rawv_slot = 0
+        stride_rawk_slot = 0
+        stride_g_slot = 0
+        stride_beta_slot = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel_opt[grid](
         A_log=A_log,
         a=a,
@@ -350,6 +443,16 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
+        stride_rawv_slot=stride_rawv_slot,
+        stride_rawk_slot=stride_rawk_slot,
+        stride_g_slot=stride_g_slot,
+        stride_beta_slot=stride_beta_slot,
+        REPLAYSSM_WINDOW_LEN=replayssm_window_len,
+        CACHE_REPLAYSSM_INPUTS=cache_replayssm_inputs,
         num_warps=num_warps,
         num_stages=num_stages,
     )

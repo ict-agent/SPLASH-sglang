@@ -1022,9 +1022,15 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
                 if q_rope is not None:
-                    q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    q_rope = q_rope.view(
-                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    q_nope = q.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+                    # Use explicit num_tokens (not -1) so the view also works
+                    # when rope_dim==0 (MLA-no-rope); -1 inference is
+                    # ambiguous when any other dim is 0. Same fix as
+                    # k_rope_cache above.
+                    q_rope = q_rope.reshape(
+                        q_nope.shape[0],
+                        layer.tp_q_head_num,
+                        layer.head_dim - layer.v_head_dim,
                     )
                 else:
                     q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1374,9 +1380,14 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
             if q_rope is not None:
-                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_nope = q.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+                # Use explicit num_tokens (not -1) so the view also works when
+                # rope_dim==0 (MLA-no-rope); -1 inference is ambiguous when
+                # any other dim is 0. Same fix as k_rope_cache above.
+                q_rope = q_rope.reshape(
+                    q_nope.shape[0],
+                    layer.tp_q_head_num,
+                    layer.head_dim - layer.v_head_dim,
                 )
             else:
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)

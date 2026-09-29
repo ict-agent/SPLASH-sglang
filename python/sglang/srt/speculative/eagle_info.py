@@ -63,6 +63,17 @@ if is_cuda() or is_musa():
 logger = logging.getLogger(__name__)
 
 
+def _merge_mtp_topk_indices_are_physical(
+    left: Optional[bool], right: Optional[bool]
+) -> Optional[bool]:
+    """Merge batch-level seed-domain markers without treating idle rows as logical."""
+    if left is False or right is False:
+        return False
+    if left is True or right is True:
+        return True
+    return None
+
+
 def _draft_runner_of(worker):
     """Draft model_runner accessor that handles v1 / v2 worker naming.
 
@@ -822,6 +833,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # regular NSA and (b, index_topk + index_kpool - 1) for KPool.
     # Only populated when index_share_for_mtp_iteration is enabled.
     mtp_topk_indices: Optional[torch.Tensor] = None
+    mtp_topk_indices_are_physical: Optional[bool] = None
 
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
@@ -955,14 +967,31 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
+            merged_seed_valid = (
+                self.future_indices.mtp_topk_indices_valid is True
+                and spec_info.future_indices.mtp_topk_indices_valid is True
+            )
             self.future_indices = FutureIndices(
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 ),
-                mtp_topk_indices_valid=(
-                    self.future_indices.mtp_topk_indices_valid is True
-                    and spec_info.future_indices.mtp_topk_indices_valid is True
+                mtp_topk_indices_valid=merged_seed_valid,
+                mtp_topk_indices_are_physical=(
+                    _merge_mtp_topk_indices_are_physical(
+                        self.future_indices.mtp_topk_indices_are_physical,
+                        spec_info.future_indices.mtp_topk_indices_are_physical,
+                    )
+                    if merged_seed_valid
+                    else False
                 ),
+            )
+            self.mtp_topk_indices_are_physical = (
+                _merge_mtp_topk_indices_are_physical(
+                    self.mtp_topk_indices_are_physical,
+                    spec_info.mtp_topk_indices_are_physical,
+                )
+                if merged_seed_valid
+                else False
             )
             return
 
@@ -975,6 +1004,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.mtp_topk_indices = spec_info.mtp_topk_indices
+            self.mtp_topk_indices_are_physical = spec_info.mtp_topk_indices_are_physical
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -991,9 +1021,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             # A partially seeded batch has no request-to-row preserving tensor.
             # Recompute the first draft step for the entire merged batch.
             self.mtp_topk_indices = None
+            self.mtp_topk_indices_are_physical = False
         else:
             self.mtp_topk_indices = torch.cat(
                 [self.mtp_topk_indices, spec_info.mtp_topk_indices]
+            )
+            self.mtp_topk_indices_are_physical = _merge_mtp_topk_indices_are_physical(
+                self.mtp_topk_indices_are_physical,
+                spec_info.mtp_topk_indices_are_physical,
             )
 
 

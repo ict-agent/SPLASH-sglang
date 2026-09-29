@@ -25,9 +25,9 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
+from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
-from sgl_kernel.kvcacheio import dcu_alloc_decode_kernel, dcu_alloc_extend_kernel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -382,7 +382,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.sglang_kvalloc_kernel = get_bool_env_var("SGLANG_KVALLOC_KERNEL", default="true")
+        self.sglang_kvalloc_kernel = get_bool_env_var(
+            "SGLANG_KVALLOC_KERNEL", default="true"
+        )
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
 
@@ -408,6 +410,91 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ).reshape(-1)
 
         return out_indices
+
+    def _normalize_page_indices(self, page_indices) -> torch.Tensor:
+        page_indices = torch.as_tensor(
+            page_indices, dtype=torch.int64, device=self.device
+        ).reshape(-1)
+        if page_indices.numel() == 0:
+            return page_indices
+
+        # Page 0 is reserved for dummy/padding tokens and is never leased.
+        page_indices = torch.unique(page_indices[page_indices > 0])
+        if self.debug_mode and page_indices.numel() > 0:
+            assert torch.all(
+                page_indices <= self.num_pages
+            ), "The page index should be within the allocator capacity"
+        return page_indices
+
+    def _release_page_indices(self, page_indices: torch.Tensor):
+        if page_indices.numel() == 0:
+            return
+        if self.need_sort:
+            self.release_pages = torch.cat((page_indices, self.release_pages))
+        else:
+            self.free_pages = torch.cat((page_indices, self.free_pages))
+
+    def _check_page_lease_invariants(self):
+        if not self.debug_mode:
+            return
+
+        assert torch.all(self._page_pin_counts >= 0)
+        assert self._active_page_leases == int(self._page_pin_counts.sum().item())
+        assert self._page_pin_counts[0] == 0
+        assert not self._deferred_free_pages[0]
+        assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+        assert len(torch.unique(self.release_pages)) == len(self.release_pages)
+        assert not torch.any(torch.isin(self.free_pages, self.release_pages))
+
+        reusable_pages = torch.cat((self.free_pages, self.release_pages))
+        if reusable_pages.numel() > 0:
+            assert torch.all(self._page_pin_counts[reusable_pages] == 0)
+            assert not torch.any(self._deferred_free_pages[reusable_pages])
+        assert torch.all(
+            self._page_pin_counts[self._deferred_free_pages] > 0
+        ), "A deferred-free page must remain pinned"
+
+    def pin_pages(self, page_indices) -> torch.Tensor:
+        """Prevent physical KV pages from being reused until unpinned.
+
+        This API accepts physical page indices, not token indices. Calls are
+        reference-counted per page, while duplicate indices within one call
+        count as a single lease. The scheduler thread owns all pin/unpin calls.
+        """
+        page_indices = self._normalize_page_indices(page_indices)
+        if page_indices.numel() == 0:
+            return page_indices
+
+        if self.debug_mode:
+            assert not torch.any(torch.isin(page_indices, self.free_pages))
+            assert not torch.any(torch.isin(page_indices, self.release_pages))
+
+        self._page_pin_counts[page_indices] += 1
+        self._active_page_leases += page_indices.numel()
+        self._check_page_lease_invariants()
+        return page_indices
+
+    def unpin_pages(self, page_indices):
+        """Release page leases and make deferred-free pages reusable."""
+        page_indices = self._normalize_page_indices(page_indices)
+        if page_indices.numel() == 0:
+            return
+
+        pin_counts = self._page_pin_counts[page_indices]
+        if self.debug_mode:
+            assert torch.all(pin_counts > 0), "Cannot unpin an unpinned KV page"
+
+        releasable_pages = page_indices[
+            (pin_counts == 1) & self._deferred_free_pages[page_indices]
+        ]
+        # The transfer-completion registry consumes each lease exactly once.
+        self._page_pin_counts[page_indices] = pin_counts - 1
+        self._active_page_leases -= page_indices.numel()
+        if releasable_pages.numel() > 0:
+            self._deferred_free_pages[releasable_pages] = False
+            self._release_page_indices(releasable_pages)
+
+        self._check_page_lease_invariants()
 
     def alloc_extend(
         self,
@@ -435,13 +522,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         if self.sglang_kvalloc_kernel:
             dcu_alloc_extend_kernel(
-                pre_lens_ptr = prefix_lens.to(torch.int64),
-                seq_lens_ptr = seq_lens.to(torch.int64),
-                last_loc_ptr = last_loc.to(torch.int64),
-                free_page_ptr = self.free_pages.to(torch.int64),
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                pre_lens_ptr=prefix_lens.to(torch.int64),
+                seq_lens_ptr=seq_lens.to(torch.int64),
+                last_loc_ptr=last_loc.to(torch.int64),
+                free_page_ptr=self.free_pages.to(torch.int64),
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_extend_kernel[(bs,)](
@@ -488,12 +575,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.sglang_kvalloc_kernel:
             dcu_alloc_decode_kernel(
-                seq_lens_ptr = seq_lens,
-                last_loc_ptr = last_loc,
-                free_page_ptr = self.free_pages,
-                out_indices = out_indices,
-                bs = bs,
-                page_size = self.page_size,
+                seq_lens_ptr=seq_lens,
+                last_loc_ptr=last_loc,
+                free_page_ptr=self.free_pages,
+                out_indices=out_indices,
+                bs=bs,
+                page_size=self.page_size,
             )
         else:
             alloc_decode_kernel[(bs,)](
@@ -537,19 +624,37 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 free_page_indices = free_page_indices[
                     ~torch.isin(free_page_indices, self.release_pages)
                 ]
-            if free_page_indices.numel() == 0:
-                return
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+            if self._active_page_leases == 0:
+                # Keep the default, unleased allocator path unchanged.
+                self._release_page_indices(free_page_indices)
             else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+                free_page_indices = free_page_indices[
+                    ~self._deferred_free_pages[free_page_indices]
+                ]
+                if free_page_indices.numel() == 0:
+                    return
+
+                pinned_mask = self._page_pin_counts[free_page_indices] > 0
+                pinned_pages = free_page_indices[pinned_mask]
+                if pinned_pages.numel() > 0:
+                    self._deferred_free_pages[pinned_pages] = True
+                self._release_page_indices(free_page_indices[~pinned_mask])
         else:
             self.free_group.append(free_index)
 
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+        self._check_page_lease_invariants()
 
     def clear(self):
+        has_device_leases = False
+        if hasattr(self, "_page_pin_counts"):
+            has_device_leases = bool(torch.any(self._page_pin_counts != 0)) or bool(
+                torch.any(self._deferred_free_pages)
+            )
+        if getattr(self, "_active_page_leases", 0) != 0 or has_device_leases:
+            raise RuntimeError(
+                "Cannot clear the paged KV allocator while pages are pinned"
+            )
+
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
@@ -557,6 +662,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._page_pin_counts = torch.zeros(
+            (self.num_pages + 1,), dtype=torch.int32, device=self.device
+        )
+        self._active_page_leases = 0
+        self._deferred_free_pages = torch.zeros(
+            (self.num_pages + 1,), dtype=torch.bool, device=self.device
+        )
+
+    def restore_state(self, state):
+        # Page leases belong to external asynchronous transfers and must not be
+        # rolled back with speculative allocator snapshots.
+        super().restore_state(state)
+        self._check_page_lease_invariants()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

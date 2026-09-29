@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_cp_round_robin_split_q_seqs,
     nsa_use_prefill_cp,
     pad_nsa_cache_seqlens,
+    should_use_nsa_fused_topk,
 )
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
@@ -65,6 +66,14 @@ logger = logging.getLogger(__name__)
 
 def _disable_nsa_multi_replay_opt() -> bool:
     return os.getenv("SGLANG_DISABLE_NSA_MULTI_REPLAY_OPT", "0") == "1"
+
+
+def _kpool_topk_sort_writeback_enabled() -> bool:
+    value = os.getenv("SGLANG_KERNEL_KPOOL_TOPK_SORT_WRITEBACK")
+    if value is None:
+        value = os.getenv("SGL_KERNEL_KPOOL_TOPK_SORT_WRITEBACK")
+    return value is not None and value != "" and value[0] != "0"
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -402,8 +411,10 @@ class NativeSparseAttnBackend(
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        seed_nsa_topk_from_draft_extend: bool = False,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.forward_metadata: NSAMetadata
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
@@ -452,10 +463,11 @@ class NativeSparseAttnBackend(
         self._lightop_decode_gather_workspace = None
         self._lightop_decode_compact_indices = None
         self._lightop_decode_graph_workspaces = None
-        # The packed physical row is 656 bytes in both supported layouts:
-        # 512 FP8 latent values, four FP32 scales, then either 64 BF16 RoPE
-        # values or 128 bytes of no-RoPE padding. The LightOp destination keeps
-        # only the logical BF16 dimensions needed by FlashMLA.
+        # The packed physical row is 528 bytes for no-RoPE and 656 bytes
+        # for RoPE: 512 FP8 latent values plus four FP32 scales, with an
+        # extra 64 BF16 RoPE values only when qk_rope_head_dim is 64.
+        # The LightOp destination keeps only the logical BF16 dimensions
+        # needed by FlashMLA.
         self._lightop_decode_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         # KPool keeps ``topk`` selected history tokens and appends up to
         # ``kpool - 1`` uncompressed tail tokens.  DCU sparse FlashMLA pads
@@ -485,7 +497,10 @@ class NativeSparseAttnBackend(
             and self.nsa_kv_cache_store_fp8
             and self.qk_rope_head_dim in (0, 64)
             and self.kv_lora_rank == 512
-            and self.kv_cache_dim == 656
+            and (
+                self.kv_cache_dim == 656
+                or (self.qk_rope_head_dim == 0 and self.kv_cache_dim == 528)
+            )
             and self.nsa_index_topk == 2048
             and self.nsa_index_kpool in (1, 4, 16)
             and self.real_page_size == 64
@@ -541,9 +556,15 @@ class NativeSparseAttnBackend(
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self.use_fused_topk = should_use_nsa_fused_topk(
+            model_runner.server_args,
+            seed_nsa_topk_from_draft_extend,
+            model_runner.model_config,
+        )
+        self.max_graph_page_table_len = self.req_to_token.shape[1]
         self._real_page_col_indices = torch.arange(
             0,
-            self.max_context_len + (self.speculative_num_draft_tokens or 0),
+            self.max_graph_page_table_len,
             self.real_page_size,
             device=self.device,
             dtype=torch.long,
@@ -777,7 +798,11 @@ class NativeSparseAttnBackend(
         )
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+        max_seqlen_k = (
+            int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+            if forward_batch.seq_lens_cpu.numel() != 0
+            else 0
+        )
         # [b, max_seqlen_k]
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -903,21 +928,24 @@ class NativeSparseAttnBackend(
             assert forward_batch.extend_seq_lens is not None
             extend_seq_lens = forward_batch.extend_seq_lens
 
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        forward_batch.extend_seq_lens_cpu,
-                        forward_batch.seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
-            )
+            if len(extend_seq_lens_cpu) == 0:
+                seqlens_expanded = torch.empty(0, dtype=torch.int32, device=device)
+            else:
+                seqlens_expanded = torch.cat(
+                    [
+                        torch.arange(
+                            kv_len - qo_len + 1,
+                            kv_len + 1,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        for qo_len, kv_len in zip(
+                            forward_batch.extend_seq_lens_cpu,
+                            forward_batch.seq_lens_cpu.tolist(),
+                            strict=True,
+                        )
+                    ]
+                )
 
             if use_kpool:
                 kpool_inputs.full_real_page_table = self._transform_table_1_to_real(page_table)
@@ -1208,11 +1236,13 @@ class NativeSparseAttnBackend(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             # fake page_table for sparse_prefill
-            # Add extra columns for speculative draft tokens to avoid
-            # overflow during target_verify when max_seqlen_k = seq_len + num_draft_tokens
+            # Match req_to_token_pool width. Speculative decoding can carry
+            # accepted bonus tokens into the next verify step before adding the
+            # current draft-token window, so context_len + draft_tokens is not
+            # always enough near the context boundary.
             "page_table": torch.zeros(
                 max_num_tokens,
-                self.max_context_len + (self.speculative_num_draft_tokens or 0),
+                self.max_graph_page_table_len,
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -2025,7 +2055,21 @@ class NativeSparseAttnBackend(
                 layer.layer_id
             )
 
-        if q_rope is not None:
+        q_is_flashmla_padded = (
+            _is_dcu
+            and nsa_impl == "flashmla_sparse"
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and q_rope is None
+            and q.ndim == 3
+            and q.shape[1] == layer.tp_q_head_num
+            and q.shape[2] == layer.head_dim + 64
+            and q.is_contiguous()
+        )
+        if q_is_flashmla_padded:
+            q_all = q
+            q_nope = q_all[..., : layer.v_head_dim]
+        elif q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
@@ -2039,6 +2083,16 @@ class NativeSparseAttnBackend(
                 if layer.head_dim == layer.v_head_dim
                 else q_all[:, :, layer.v_head_dim :]
             )
+
+        use_dcu_fp8_no_rope_512_prefill = (
+            _is_dcu
+            and nsa_impl == "flashmla_sparse"
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and q_rope is None
+            and q_all is not None
+            and q_all.shape[-1] == layer.v_head_dim
+        )
 
         # Align topk_indices with q dimensions
         # This handles cases where q is padded (TP + partial DP attention)
@@ -2131,7 +2185,11 @@ class NativeSparseAttnBackend(
                         )
                     )
                     kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
+                        kv_cache,
+                        page_table_1_flattened,
+                        target_dim_rope=(
+                            0 if use_dcu_fp8_no_rope_512_prefill else None
+                        ),
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
@@ -2144,6 +2202,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 layer_id=layer.layer_id,
+                use_dcu_fp8_no_rope_512=use_dcu_fp8_no_rope_512_prefill,
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2402,9 +2461,19 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         layer_id: int = -1,
+        use_dcu_fp8_no_rope_512: bool = False,
     ) -> torch.Tensor:
+        use_aiter_sorted_indices = (
+            _is_dcu
+            and _kpool_topk_sort_writeback_enabled()
+            and envs.SGLANG_NSA_KPOOL_AITER_TOPK.get()
+            and self.nsa_index_kpool in (4, 16)
+            and self.nsa_index_topk == 2048
+        )
         if not _is_dcu:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        elif use_aiter_sorted_indices:
+            import flash_mla.cuda as flash_mla_cuda
         else:
             from flash_mla.flash_mla_interface import flash_mla_sparse_fwd
 
@@ -2448,7 +2517,12 @@ class NativeSparseAttnBackend(
         else:
             q_input = q_all
 
-        if _is_dcu and self.nsa_kv_cache_store_fp8 and self.qk_rope_head_dim == 0:
+        if (
+            _is_dcu
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and not use_dcu_fp8_no_rope_512
+        ):
             if q_input.shape[-1] == v_head_dim:
                 q_padded = q_input.new_zeros(
                     *q_input.shape[:-1],
@@ -2482,13 +2556,27 @@ class NativeSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+        if use_aiter_sorted_indices:
+            # Aiter's RAGGED KPool path already sorted the expanded token
+            # indices during TopK writeback, so bypass FlashMLA's duplicate
+            # Python-wrapper sort.
+            o, _, _ = flash_mla_cuda.sparse_prefill_fwd(
+                q_input,
+                kv_cache,
+                indices_input,
+                sm_scale,
+                v_head_dim,
+                None,
+                None,
+            )
+        else:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
         # Trim output back to original num_heads if we padded
         if ((not _is_dcu) and need_padding) or dcu_padded_q_heads:
@@ -2515,14 +2603,20 @@ class NativeSparseAttnBackend(
                 flash_mla_with_kvcache,
             )
 
-        cache_seqlens = metadata.nsa_cache_seqlens_int32
-        assert metadata.flashmla_metadata is not None
-
         original_q_shape = tuple(q_all.shape)
         original_kv_shape = tuple(kv_cache.shape)
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        cache_seqlens = metadata.nsa_cache_seqlens_int32
+        n_total = q_all.shape[0]
+        n_valid = forward_batch.extend_num_valid_tokens
+        if n_valid is None:
+            n_valid = self._decode_dp_padding_num_valid(forward_batch, n_total)
+        if n_total == 0 or n_valid == 0 or cache_seqlens.numel() == 0:
+            return q_all.new_zeros((n_total, 1, layer.tp_q_head_num, v_head_dim))
+
+        assert metadata.flashmla_metadata is not None
         is_decode_family = (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
@@ -2547,7 +2641,9 @@ class NativeSparseAttnBackend(
             and q_all.shape[-1] == self._lightop_decode_head_dim
             and v_head_dim == 512
             and lightop_kv_cache is not None
-            and lightop_kv_cache.numel() % 656 == 0
+            and self.kv_cache_dim in (528, 656)
+            and lightop_kv_cache.shape[-1] == self.kv_cache_dim
+            and lightop_kv_cache.numel() % self.kv_cache_dim == 0
             and page_table_1.dim() == 2
             and page_table_1.dtype == torch.int32
             and page_table_1.is_contiguous()
@@ -2564,6 +2660,26 @@ class NativeSparseAttnBackend(
             # sparse FlashMLA validity mask.
             and cache_seqlens.numel() <= q_all.shape[0]
         )
+        use_dcu_fp8_no_rope_528_cache = (
+            _is_dcu
+            and self.nsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and self.kv_cache_dim == 528
+        )
+        if (
+            use_dcu_fp8_no_rope_528_cache
+            and q_all.shape[0] > 0
+            and not use_lightop_decode_gather
+        ):
+            if is_decode_family:
+                raise RuntimeError(
+                    "DCU FP8 no-RoPE FlashMLA decode with 528-byte KV rows "
+                    "requires the LightOp decode gather path"
+                )
+            raise RuntimeError(
+                "DCU FP8 no-RoPE FlashMLA prefill with 528-byte KV rows "
+                "must use flashmla_sparse"
+            )
         # The installed gfx936 paged BF16 decode specialization is optimized
         # for d_qk=512.  FlashMLA's existing flat sparse BF16 entry supports
         # the RoPE-aware d_qk=576 layout.  LightOp has already compacted the
@@ -2575,6 +2691,7 @@ class NativeSparseAttnBackend(
             _is_dcu
             and self.nsa_kv_cache_store_fp8
             and self.qk_rope_head_dim == 0
+            and self.kv_cache_dim == 656
             and not use_lightop_decode_gather
         ):
             q_padded = q_all.new_zeros(
@@ -2633,9 +2750,6 @@ class NativeSparseAttnBackend(
         # sglang-zp KDA backend: run the kernel only for real tokens, recompute
         # its schedule for that exact batch, then restore the caller's shape.
         n_total = q_input.shape[0]
-        n_valid = forward_batch.extend_num_valid_tokens
-        if n_valid is None:
-            n_valid = self._decode_dp_padding_num_valid(forward_batch, n_total)
         needs_repad = (
             _is_dcu
             and n_valid is not None
@@ -3349,8 +3463,12 @@ class NativeSparseAttnBackend(
         if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
-            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
+            if forward_batch.seq_lens_cpu.numel() == 0:
+                max_kv_len = 0
+                sum_seq_lens = 0
+            else:
+                max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
@@ -3373,6 +3491,16 @@ class NativeSparseAttnBackend(
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
             if self.nsa_kv_cache_store_fp8:
+                # The DCU FlashMLA paged FP8 entry does not support the compact
+                # no-RoPE layout (q=512, packed KV row=528). Keep prefill on the
+                # sparse BF16 path; decode uses LightOp to gather and dequantize.
+                if (
+                    _is_dcu
+                    and self.qk_rope_head_dim == 0
+                    and self.kv_cache_dim == 528
+                ):
+                    self.nsa_prefill_impl = "flashmla_sparse"
+                    return
                 if (
                     ( is_blackwell() or _is_dcu )
                     and forward_batch is not None
@@ -3414,11 +3542,17 @@ class NativeSparseAttnBackend(
 
     def _force_unfused_topk(self, forward_batch: ForwardBatch) -> bool:
         forward_mode = effective_forward_mode(forward_batch)
-        # Cross-PD MTP sharing must carry logical positions. Fused top-k
-        # produces allocator-local page/offset indices, which cannot be reused
-        # by another worker. The attention path transforms these logical ids
-        # locally, while normal non-sharing forwards keep the fused fast path.
-        if forward_batch.uses_logical_mtp_topk_indices():
+        # A PD prefill draft backend emits request-relative logical positions
+        # for the wire. Its decode counterpart remaps the seed once at batch
+        # assembly, so logical MTP flags alone must not disable fused TopK.
+        if not self.use_fused_topk:
+            return True
+
+        if (
+            self.model_runner.server_args.disaggregation_mode == "decode"
+            and forward_batch.uses_logical_mtp_topk_indices()
+            and forward_batch.mtp_topk_indices_are_physical is False
+        ):
             return True
 
         if (
@@ -3439,9 +3573,7 @@ class NativeSparseAttnBackend(
         )
 
     def _use_fused_topk(self, forward_batch: ForwardBatch) -> bool:
-        return envs.SGLANG_NSA_FUSE_TOPK.get() and not self._force_unfused_topk(
-            forward_batch
-        )
+        return self.use_fused_topk and not self._force_unfused_topk(forward_batch)
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
@@ -3491,7 +3623,11 @@ class NativeSparseAttnBackend(
 class NativeSparseAttnMultiStepBackend:
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        seed_nsa_topk_from_draft_extend: bool = False,
     ):
         self.model_runner = model_runner
         self.topk = topk
@@ -3504,6 +3640,7 @@ class NativeSparseAttnMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    seed_nsa_topk_from_draft_extend=seed_nsa_topk_from_draft_extend,
                 )
             )
         self.nsa_index_kpool = self.attn_backends[0].nsa_index_kpool

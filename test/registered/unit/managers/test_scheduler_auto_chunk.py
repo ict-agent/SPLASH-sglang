@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,9 +30,9 @@ def _make_req(
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = rid
-    req.origin_input_ids = list(range(input_len))
-    req.output_ids = []
-    req.fill_ids = list(req.origin_input_ids)
+    req.origin_input_ids = array("q", range(input_len))
+    req.output_ids = array("q")
+    req.fill_ids = req.origin_input_ids[:]
     req.prefix_indices = list(range(prefix_len))
     req.extend_input_len = input_len - prefix_len
     req.extend_logprob_start_len = 0
@@ -343,18 +344,18 @@ class TestMambaReadonlyPrefixProbe(CustomTestCase):
         tree.disable = False
         tree.page_size = 2
         tree.root_node = root = TreeNode()
-        root.key = RadixKey([])
+        root.key = RadixKey(array("q"))
 
         prefix = TreeNode()
         prefix.parent = root
-        prefix.key = RadixKey([1, 2])
+        prefix.key = RadixKey(array("q", [1, 2]))
         prefix.value = [10, 11]
         prefix.mamba_value = object()
         root.children[prefix.key.child_key(tree.page_size)] = prefix
 
         suffix = TreeNode()
         suffix.parent = prefix
-        suffix.key = RadixKey([3, 4, 5, 6])
+        suffix.key = RadixKey(array("q", [3, 4, 5, 6]))
         suffix.value = [12, 13, 14, 15]
         suffix.mamba_value = object()
         prefix.children[suffix.key.child_key(tree.page_size)] = suffix
@@ -364,10 +365,10 @@ class TestMambaReadonlyPrefixProbe(CustomTestCase):
         suffix_access_time = suffix.last_access_time
 
         self.assertEqual(
-            tree.probe_prefix_len(RadixKey([1, 2, 3, 4, 5, 9])), 2
+            tree.probe_prefix_len(RadixKey(array("q", [1, 2, 3, 4, 5, 9]))), 2
         )
-        self.assertEqual(prefix.key.token_ids, [1, 2])
-        self.assertEqual(suffix.key.token_ids, [3, 4, 5, 6])
+        self.assertEqual(prefix.key.token_ids, array("q", [1, 2]))
+        self.assertEqual(suffix.key.token_ids, array("q", [3, 4, 5, 6]))
         self.assertIs(
             prefix.children[suffix.key.child_key(tree.page_size)], suffix
         )
@@ -380,25 +381,27 @@ class TestMambaReadonlyPrefixProbe(CustomTestCase):
         tree.disable = False
         tree.page_size = 1
         tree.root_node = root = TreeNode()
-        root.key = RadixKey([])
+        root.key = RadixKey(array("q"))
 
         device_node = TreeNode()
         device_node.parent = root
-        device_node.key = RadixKey([1, 2])
+        device_node.key = RadixKey(array("q", [1, 2]))
         device_node.value = [10, 11]
         device_node.mamba_value = object()
         root.children[device_node.key.child_key(1)] = device_node
 
         host_node = TreeNode()
         host_node.parent = device_node
-        host_node.key = RadixKey([3, 4])
+        host_node.key = RadixKey(array("q", [3, 4]))
         host_node.value = None
         host_node.host_value = [12, 13]
         host_node.mamba_host_value = object()
         device_node.children[host_node.key.child_key(1)] = host_node
 
-        self.assertEqual(tree.probe_prefix_len(RadixKey([1, 2, 3, 4])), 2)
-        self.assertEqual(host_node.key.token_ids, [3, 4])
+        self.assertEqual(
+            tree.probe_prefix_len(RadixKey(array("q", [1, 2, 3, 4]))), 2
+        )
+        self.assertEqual(host_node.key.token_ids, array("q", [3, 4]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,16 +240,32 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
-    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(360)
+    # Decode issues a safe cancel to prefill at this timeout, keeping the
+    # effective transfer deadline at the historical 300s; the waiting timeout
+    # above is the fallback for a prefill that never answers the cancel. When
+    # overriding, adjust BOTH and keep enough margin for the handshake to
+    # drain an in-flight chunk (rule of thumb:
+    # TRANSFER <= WAITING - max(60s, worst single-chunk transfer time)).
+    SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT = EnvFloat(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
+    # Bounded LRU cache of PUSH sockets (see disaggregation/common/utils.py).
+    SGLANG_DISAGGREGATION_ZMQ_SOCKET_CACHE_SIZE = EnvInt(10240)
+    SGLANG_DISAGGREGATION_ZMQ_SOCKET_LINGER_MS = EnvInt(500)
+    SGLANG_DISAGGREGATION_ZMQ_SOCKET_LEASE_TIMEOUT_S = EnvInt(30)
+    SGLANG_DISAGGREGATION_ZMQ_SOCKET_SNDTIMEO_MS = EnvInt(5000)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
     SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
+    # Opt-in layer-pipelined KV transfer for PD prefill. The default path is
+    # intentionally unchanged when this switch is disabled.
+    SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(None)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -336,6 +352,9 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
 
     # DCU Lightop
+    # Opt in to model router_dtype; MoE gate weights default to BF16.
+    SGLANG_MOE_ROUTER_USE_CONFIG_DTYPE = EnvBool(False)
+
     SGLANG_USE_LIGHTOP = EnvBool(False)
 
     # MPS (Apple Silicon)
@@ -456,14 +475,15 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
-    SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(False)
-    # Opt in to the GLM5-Next DCU decode-only path that gathers the packed FP8
+    SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(True)
+    # Enable the GLM5-Next DCU decode-only path that gathers the packed FP8
     # sparse KV cache into contiguous BF16 before flash_mla_with_kvcache.
-    SGLANG_NSA_DCU_USE_LIGHTOP_DECODE_GATHER = EnvBool(False)
+    SGLANG_NSA_DCU_USE_LIGHTOP_DECODE_GATHER = EnvBool(True)
     SGLANG_NSA_KPOOL_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_NSA_KPOOL_AITER_TOPK = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_NSA_DCU_MQA_LOGITS_WORKSPACE_GB = EnvFloat(2.0)
+    SGLANG_NSA_DCU_USE_INT8_MQA_LOGITS = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     # Temporary DCU fallback for BF16 NSA index cache head sizes unsupported
@@ -530,6 +550,7 @@ class Envs:
     SGLANG_ENABLE_SMART_IMAGE_RGB = EnvBool(False)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
+    SGLANG_MM_SHM_ZERO_COPY = EnvBool(True)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
@@ -544,6 +565,9 @@ class Envs:
     SGLANG_GLM_VIDEO_PATCH_SIZE = EnvInt(14)
     SGLANG_GLM_VIDEO_MERGE_SIZE = EnvInt(2)
     SGLANG_GLM_VIDEO_PATCH_EXPAND_FACTOR = EnvInt(4)
+    # Skip sampling/resizing for already processed video_frame_url inputs.
+    SGLANG_SKIP_VIDEO_PREPROCESS = EnvBool(False)
+
     # torchcodec video-decode CUDA backend: "ffmpeg" (default, stable) or "beta"
     # (NVDEC, faster but can fail at frame-fetch on some pixel formats, e.g.
     # "Failed to convert NV12 frame.").
@@ -741,19 +765,49 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    # Max concurrent in-flight /send requests from THIS receiver to one
+    # encoder. Bounds the queue wait on the encoder's shared transfer
+    # executor (10 workers): with more than that, a stalled batch of writes
+    # can queue the next transfer_sync behind a full MC_TRANSFER_TIMEOUT,
+    # which the receiver's quiesce window (one write timeout + margin) does
+    # not budget for -> deregister-while-writing race revives under load.
+    SGLANG_ENCODER_MAX_INFLIGHT_SENDS = EnvInt(10)
     # Orphan-embedding sweeper on the encoder side: entries in
     # embedding_to_send whose /send never arrives (LLM timed out / cancelled /
     # crashed). Sweep every INTERVAL seconds (0 = disabled); reclaim entries
     # older than TTL seconds (0 = derive: RECV_TIMEOUT + INTERVAL).
     SGLANG_ENCODER_EMBEDDING_SWEEP_INTERVAL = EnvFloat(60.0)
+    # EPD language side: reliably detect client disconnect for large multimodal
+    SGLANG_EPD_RELIABLE_DISCONNECT_CHECK = EnvBool(True)
     SGLANG_ENCODER_EMBEDDING_TTL = EnvFloat(0.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
+    # Cross-request batching for the encoder HTTP server. The load balancer
+    # normally emits one image per /encode request, so this also bounds the
+    # common-case image batch size.
+    SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
+    # When true, the encoder checks embeddings for NaN/Inf around transfer.
+    SGLANG_ENCODER_CHECK_NAN = EnvBool(False)
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS = EnvInt(4)
-    # Registered Mooncake buffer pool limits. Both values must be positive to
-    # enable the receiver pool and sender-side registration refcounting.
+    # Max number of image/video preprocessing requests that may hold pixel_values
+    # on the GPU while waiting for the (serialized) ViT forward. Bounds the
+    # peak encoder GPU memory when preprocessing outpaces ViT consumption.
+    SGLANG_ENCODER_MAX_PENDING_VIT = EnvInt(32)
+    # Mooncake RDMA registered-buffer pool (encoder transfer path). Must be
+    # > 0 to ENABLE the pool: the receiver then reuses registered-once
+    # buffers and the sender copies each embedding into a registered-once
+    # pool buffer, avoiding the per-transfer register/deregister churn and
+    # its remote/local access errors. 0 (the default) DISABLES the
+    # pool -> original per-request register + deregister. release() bounds only
+    # the idle reuse cache (in-flight buffers stay registered to avoid churn);
+    # acquire() admission-controls the total live working set against the same
+    # cap, evicting idle buffers first and blocking until budget frees -- see
+    # SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS.
     SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
-    SGLANG_MC_RDMA_POOL_MAX_BUFFERS = EnvInt(0)
+    # Max seconds acquire() waits for pool budget before allocating over cap;
+    # 0 disables the wait (legacy unbounded acquire).
+    SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS = EnvFloat(60)
     # A single video is cross-encoder sharded only above these thresholds.
     # A zero size threshold permits any local/in-memory size.
     SGLANG_ENCODER_VIDEO_SHARD_MIN_MB = EnvInt(128)
@@ -763,9 +817,14 @@ class Envs:
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # GLM
+    GLM_USE_DISAGG_ASYNC_HEARTBEAT = EnvBool(True)
     GLM_USE_HICACHE_MTP_FIX = EnvBool(True)
     # Add a SHA-256-derived Session-Id header to encoder requests for LB affinity.
     GLM_ENABLE_ENCODER_SESSION_ID_HEADER = EnvBool(False)
+    # Bound the number of LB affinity keys used by one media item. 1 preserves
+    # strict media affinity; values greater than 1 spread hot media requests
+    # while retaining per-request /encode and /send affinity.
+    GLM_ENCODER_AFFINITY_SHARDS = EnvInt(1)
 
     # GLM
     # Max number of grammar cache entries per scheduler/rank.
@@ -774,6 +833,15 @@ class Envs:
     # Max MiB for xgrammar backend's internal native cache.
     # < 0: unbounded caching (current default); 0: disable internal cache.
     GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB = EnvInt(-1)
+    # JIT token masks instead of precomputing them at compile time (requires
+    # xgrammar >= 0.2.6). Intended for disaggregated prefill, which samples only
+    # the first token per request, reducing compile time from ~0.5s to ~ms while
+    # the JIT mask cost applies to a single step.
+    GLM_XGRAMMAR_ENABLE_DYNAMIC_COMPILATION = EnvBool(False)
+    # On the disaggregated decode engine, run grammar compilation concurrently
+    # with preallocation/bootstrap/KV transfer instead of serializing it before
+    # preallocation; this is the kill switch for the overlap path.
+    GLM_GRAMMAR_ENABLE_DECODE_COMPILE_OVERLAP = EnvBool(True)
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
@@ -835,8 +903,9 @@ def _convert_SGL_to_SGLANG():
             )
             os.environ[new_name] = str(float(ms_val) / 1000.0)
 
+    external_sgl_prefixes = ("SGL_KERNEL_",)
     for key, value in os.environ.items():
-        if key.startswith("SGL_"):
+        if key.startswith("SGL_") and not key.startswith(external_sgl_prefixes):
             new_key = key.replace("SGL_", "SGLANG_", 1)
             warnings.warn(
                 f"Environment variable {key} is deprecated, please use {new_key}"

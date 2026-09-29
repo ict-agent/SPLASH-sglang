@@ -5,12 +5,6 @@ import os
 import sys
 import warnings
 
-from sglang.srt.server_args import prepare_server_args
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
-
-suppress_noisy_warnings()
-
 
 def run_server(server_args):
     """Run the server based on server_args.grpc_mode and server_args.encoder_only."""
@@ -51,6 +45,18 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    # Keep all SGLang imports inside the main-process guard. Uvicorn replacement
+    # workers use multiprocessing spawn, which re-executes this file as
+    # ``__mp_main__`` before its health-pong thread starts. Eagerly importing
+    # server_args/common here can initialize sgl_kernel and HIP/COMGR during that
+    # unmonitored bootstrap window, causing the parent to kill a healthy worker
+    # after the worker-health timeout.
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.srt.utils import kill_process_tree
+    from sglang.srt.utils.common import suppress_noisy_warnings
+
+    suppress_noisy_warnings()
+
     warnings.warn(
         "'python -m sglang.launch_server' is still supported, but "
         "'sglang serve' is the recommended entrypoint.\n"

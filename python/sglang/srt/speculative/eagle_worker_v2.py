@@ -330,6 +330,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            seed_nsa_topk_from_draft_extend=is_mtp_index_share_enabled(
+                self.draft_runner.model_config.hf_config
+            ),
         )
 
         # Initialize decode attention backend
@@ -712,6 +715,7 @@ class EagleDraftWorker(BaseDraftWorker):
         last accepted row already used for logits/hidden states.
         """
         next_draft_input.mtp_topk_indices = None
+        next_draft_input.mtp_topk_indices_are_physical = None
         if not is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
             return
 
@@ -747,6 +751,9 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.mtp_topk_indices = topk_indices.index_select(
             0, select_index
         ).clone()
+        next_draft_input.mtp_topk_indices_are_physical = (
+            forward_batch.mtp_topk_indices_are_physical
+        )
 
     def _draft_extend_for_prefill(
         self,

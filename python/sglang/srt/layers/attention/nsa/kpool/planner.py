@@ -203,6 +203,12 @@ class KPoolExtendPlan:
     # of re-adding the two each forward.
     ragged_q_ks: torch.Tensor  # int32 [sum_q]
     ragged_q_ke: torch.Tensor  # int32 [sum_q]
+    # Request-local Q/K slices as (q_start, q_end, k_start, k_end). These are
+    # CPU constants so the per-layer DCU path can process each request without
+    # synchronizing GPU metadata back to the host.
+    ragged_request_slices: tuple[tuple[int, int, int, int], ...]
+    # Reused zero lower bounds for request-local MQA calls.
+    ragged_q_local_ks: torch.Tensor  # int32 [sum_q]
     ragged_total_k_rows: int  # sum_pool_pages * page_size
     # Layer-shared scratch (alloc out of the per-layer hot path).
     ragged_k_u8: Optional[torch.Tensor]  # uint8 [total_k_rows, head_dim]
@@ -287,6 +293,31 @@ class _KPoolCpuPlan:
     # n_rag = len(ragged_q_len) = batch_size (every batch contributes a row).
     # ragged_batch_idx is therefore arange(batch_size); recomputed in
     # _kpool_plan_to_gpu instead of being H2D'd as a redundant list.
+
+
+def _build_ragged_request_slices(
+    q_starts: List[int],
+    q_lens: List[int],
+    page_starts: List[int],
+    pool_pages: List[int],
+    slots_per_page: int,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Build request-local ``(q_start, q_end, k_start, k_end)`` slices."""
+    return tuple(
+        (
+            q_start,
+            q_start + q_len,
+            page_start * slots_per_page,
+            (page_start + request_pool_pages) * slots_per_page,
+        )
+        for q_start, q_len, page_start, request_pool_pages in zip(
+            q_starts,
+            q_lens,
+            page_starts,
+            pool_pages,
+            strict=True,
+        )
+    )
 
 
 class _KPoolDecompose(NamedTuple):
@@ -507,6 +538,13 @@ def _kpool_plan_to_gpu(
     slots_per_page = page_size // pool_size
     total_pool_pages = cpu.total_pool_pages
     ragged_total_k_rows = total_pool_pages * slots_per_page
+    ragged_request_slices = _build_ragged_request_slices(
+        cpu.cu_q_len_excl,
+        cpu.ragged_q_len,
+        cpu.cu_pages_excl,
+        cpu.ragged_pool_pages,
+        slots_per_page,
+    )
 
     need_paged = (
         topk_transform_method == TopkTransformMethod.PAGED
@@ -639,6 +677,7 @@ def _kpool_plan_to_gpu(
         ragged_concat_page_table = empty_i32_dev
         ragged_q_ks = empty_i32_dev
         ragged_q_ke = empty_i32_dev
+    ragged_q_local_ks = torch.zeros_like(ragged_q_ks)
 
     # Build once per forward to avoid an O(B*layers) Python loop in the indexer.
     ragged_paged_page_table = None
@@ -679,6 +718,8 @@ def _kpool_plan_to_gpu(
         ragged_concat_page_table=ragged_concat_page_table,
         ragged_q_ks=ragged_q_ks,
         ragged_q_ke=ragged_q_ke,
+        ragged_request_slices=ragged_request_slices,
+        ragged_q_local_ks=ragged_q_local_ks,
         ragged_total_k_rows=ragged_total_k_rows,
         ragged_k_u8=ragged_k_u8,
         ragged_k_scale=ragged_k_scale,

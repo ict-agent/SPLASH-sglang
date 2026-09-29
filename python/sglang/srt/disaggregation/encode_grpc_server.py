@@ -93,6 +93,11 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "req_id": request.req_id,
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
+                # The rank-side run_encoder() parses the modality from this
+                # dict (Modality.from_str(request["modality"])); omitting it
+                # crashes every rank process on its first request when
+                # tp_size > 1.
+                "modality": Modality.IMAGE.name,
             }
             for socket in self.send_sockets:
                 await socket.send_pyobj(request_dict)
@@ -112,6 +117,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 part_idx=request.part_idx,
             )
             if error_msg is not None:
+                # encoder.encode() stored an error EmbeddingData for this
+                # req_id; drop it or it leaks until process exit (the gRPC
+                # serve path does not start the orphan sweeper otherwise).
+                self.encoder.embedding_to_send.pop(request.req_id, None)
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
@@ -165,16 +174,32 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.SendRequest, context
     ) -> sglang_encoder_pb2.SendResponse:
         try:
-            await self.encoder.send(
+            buffer_address = request.buffer_address if request.buffer_address else None
+            mm_data = await self.encoder.send(
                 req_id=request.req_id,
                 prefill_host=request.prefill_host,
                 embedding_port=request.embedding_port,
                 session_id=request.session_id if request.session_id else None,
-                buffer_address=(
-                    request.buffer_address if request.buffer_address else None
-                ),
+                buffer_address=buffer_address,
+                # A bufferless /send comes from a decode-role receiver that
+                # wants only the metadata frame (no RDMA transfer target).
+                # Mirrors the HTTP decode path, where the encoder server-pushes
+                # metadata for role=="decode".
+                meta_only=buffer_address is None,
             )
             self.encoder.embedding_to_send.pop(request.req_id, None)
+            if not mm_data:
+                if self.encoder.metrics is not None:
+                    self.encoder.metrics.inc_send_reclaimed()
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                context.set_details("embedding already reclaimed (no /send within TTL)")
+            elif getattr(mm_data, "error_msg", None) is not None:
+                # RDMA write failed: surface it on the RPC itself, not only via
+                # the ZMQ error frame (whose consumer may already be gone).
+                if self.encoder.metrics is not None:
+                    self.encoder.metrics.inc_rdma_write_failures("transfer")
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(mm_data.error_msg)
             return sglang_encoder_pb2.SendResponse()
 
         except Exception as e:
@@ -264,6 +289,12 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     await server.start()
     logger.info(f"gRPC encoder server listening on {listen_addr}")
 
+    # The orphan sweeper is otherwise only started by the FastAPI lifespan;
+    # without it, every entry parked in embedding_to_send by a P crash /
+    # Encode error / 60s-deadline expiry leaks for the process lifetime.
+    sweeper_task = asyncio.create_task(encoder._sweep_stale_embeddings_loop())
+    logger.info("gRPC encoder: orphan-embedding sweeper started")
+
     health_servicer.set_serving()
 
     try:
@@ -272,3 +303,5 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         logger.info("Shutting down gRPC encoder server...")
         health_servicer.set_not_serving()
         await server.stop(grace=5)
+    finally:
+        sweeper_task.cancel()

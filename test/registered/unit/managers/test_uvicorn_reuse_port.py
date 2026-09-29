@@ -15,6 +15,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 import sglang.srt.managers.multi_tokenizer_mixin as multi_tokenizer_mixin
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    GenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
@@ -34,6 +39,14 @@ class _FakeSocket:
 
     def close(self):
         self.closed = True
+
+
+class _FakeZmqSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, obj):
+        self.sent.append(obj)
 
 
 class TestUvicornReusePort(CustomTestCase):
@@ -118,6 +131,62 @@ class TestUvicornReusePort(CustomTestCase):
 
         self.assertEqual(sockets, [inherited])
         self.assertFalse(inherited.closed)
+
+    def test_attach_ipc_updates_cached_batch_items(self):
+        req = GenerateReqInput(text=["hello", "world"], sampling_params=[{}, {}])
+        req.normalize_batch_and_arguments()
+        first_cached = req[0]
+
+        worker = SimpleNamespace(tokenizer_ipc_name="ipc://worker-0")
+        multi_tokenizer_mixin.TokenizerWorker._attach_multi_http_worker_info(
+            worker, req
+        )
+
+        self.assertEqual(req.http_worker_ipc, "ipc://worker-0")
+        self.assertEqual(first_cached.http_worker_ipc, "ipc://worker-0")
+        self.assertEqual(req[1].http_worker_ipc, "ipc://worker-0")
+
+    def test_sender_wrapper_attaches_ipc_to_tokenized_batch(self):
+        socket = _FakeZmqSocket()
+        wrapper = multi_tokenizer_mixin.SenderWrapper(
+            SimpleNamespace(tokenizer_ipc_name="ipc://worker-0"), socket
+        )
+        batch = BatchTokenizedGenerateReqInput(
+            batch=[
+                TokenizedGenerateReqInput(
+                    "hello",
+                    [1],
+                    None,
+                    {},
+                    False,
+                    -1,
+                    0,
+                    None,
+                    False,
+                    rid="rid-0",
+                ),
+                TokenizedGenerateReqInput(
+                    "world",
+                    [2],
+                    None,
+                    {},
+                    False,
+                    -1,
+                    0,
+                    None,
+                    False,
+                    rid="rid-1",
+                ),
+            ]
+        )
+
+        wrapper.send_pyobj(batch)
+
+        self.assertIs(socket.sent[0], batch)
+        self.assertEqual(batch.rids, ["rid-0", "rid-1"])
+        self.assertEqual(batch.http_worker_ipcs, ["ipc://worker-0", "ipc://worker-0"])
+        self.assertEqual(batch.batch[0].http_worker_ipc, "ipc://worker-0")
+        self.assertEqual(batch.batch[1].http_worker_ipc, "ipc://worker-0")
 
 
 if __name__ == "__main__":

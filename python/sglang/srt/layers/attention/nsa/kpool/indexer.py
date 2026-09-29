@@ -55,6 +55,30 @@ logger = logging.getLogger(__name__)
 
 _INT8_UNIFORM_STD = math.sqrt(127 * 128 / 3)
 _random_weight_simulation_logged = False
+_DCU_USE_INT8_MQA_LOGITS = envs.SGLANG_NSA_DCU_USE_INT8_MQA_LOGITS.get()
+# Splitting a ragged MQA request adds one MQA + topk launch. Benchmarks on BW
+# show that an extra launch breaks even after it avoids roughly two million
+# logits cells of invalid K-prefix work.
+_DCU_MQA_REQUEST_SPLIT_MIN_SAVED_CELLS_PER_LAUNCH = 2_000_000
+
+
+def _should_split_dcu_mqa_by_request(
+    request_slices: Tuple[Tuple[int, int, int, int], ...],
+) -> bool:
+    extra_launches = len(request_slices) - 1
+    if extra_launches <= 0:
+        return False
+
+    # Global ragged MQA computes each request from K column zero through KE.
+    # Request-local MQA removes the [0, k_start) rectangle from every Q row.
+    saved_cells = sum(
+        (q_end - q_start) * k_start
+        for q_start, q_end, k_start, _ in request_slices
+    )
+    return (
+        saved_cells
+        >= _DCU_MQA_REQUEST_SPLIT_MIN_SAVED_CELLS_PER_LAUNCH * extra_launches
+    )
 
 _lightop_kpool_topk = None
 if is_dcu():
@@ -244,7 +268,7 @@ class IndexerKPool(Indexer):
 
     @torch.compile(dynamic=True) if not is_hip() else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):
-        # Reuse the parent's bf16 weights_proj path; only difference is the
+        # Reuse the parent's FP32 weights_proj path; only difference is the
         # GLM head broadcast below.
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = _ensure_min_heads(weights)
@@ -266,6 +290,14 @@ class IndexerKPool(Indexer):
         # there is no q_scale term. The MQA kernels consume dense fp32 weights.
         weights = self._project_and_scale_head_gates(x)
         return weights.unsqueeze(-1) * self.softmax_scale
+
+    def _prepare_dcu_prefill_q_and_logits_head_gate(
+        self, query: torch.Tensor, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not _DCU_USE_INT8_MQA_LOGITS:
+            return query, self._get_bf16_logits_head_gate(x)
+        q_index, q_scale = per_token_quant_int8(query)
+        return q_index, self._get_logits_head_gate(x, q_scale)
 
     @staticmethod
     def _cp_gather_concat(
@@ -970,9 +1002,11 @@ class IndexerKPool(Indexer):
     ) -> torch.Tensor:
         """Kpool-aware ragged extend top-k.
 
-        Gathers all batches' compressed K once and uses per-q ``ks/ke`` from
-        ``KPoolExtendPlan``. DCU bounds logits memory by chunking Q rows through
-        a shared workspace and immediately running topk for each chunk.
+        Gathers all batches' compressed K once. DCU then processes each
+        request's contiguous Q/K slices independently so LightOp does not
+        compute the invalid K prefixes before each request's global ``ks``.
+        Large requests are further chunked through a shared logits workspace,
+        with topk consumed immediately after every chunk.
 
         Signature matches ``Indexer._get_topk_ragged``; ``enable_dual_stream``
         is accepted but unused.
@@ -1041,13 +1075,20 @@ class IndexerKPool(Indexer):
             # Rows with ks==ke (pool_seq_len==0) get no writes; cleaned
             # to zero by ``clean_logits=True``.
             if is_dcu():
-                q_bf16 = q_fp8[:n_real].to(torch.bfloat16).contiguous()
-                kv_bf16 = (
-                    k_int8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
-                ).to(torch.bfloat16).unsqueeze(1).contiguous()
+                if q_fp8.dtype == torch.int8:
+                    q_mqa = q_fp8[:n_real].contiguous()
+                    kv_mqa = k_int8.unsqueeze(1).contiguous()
+                    kv_scale_mqa = k_scale.to(torch.float32).contiguous()
+                else:
+                    q_mqa = q_fp8[:n_real].to(torch.bfloat16).contiguous()
+                    kv_mqa = (
+                        k_int8.to(torch.float32)
+                        * k_scale.to(torch.float32).unsqueeze(-1)
+                    ).to(torch.bfloat16).unsqueeze(1).contiguous()
+                    kv_scale_mqa = None
                 weights_f32 = weights[:n_real].to(torch.float32).contiguous()
                 logits_workspace = reserve_dcu_mqa_logits_workspace(
-                    device, q_bf16.dtype
+                    device, q_mqa.dtype
                 )
                 topk_result = torch.full(
                     (total_q, self.index_topk + self.index_kpool - 1),
@@ -1057,41 +1098,118 @@ class IndexerKPool(Indexer):
                 )
                 if n_real == 0:
                     return topk_result
-                max_rows = _get_dcu_mqa_logits_max_rows(
-                    logits_workspace.numel(), n_real, total_k_rows, q_bf16.dtype
-                )
+                if not _should_split_dcu_mqa_by_request(
+                    plan.ragged_request_slices
+                ):
+                    max_rows = _get_dcu_mqa_logits_max_rows(
+                        logits_workspace.numel(),
+                        n_real,
+                        total_k_rows,
+                        q_mqa.dtype,
+                    )
+                    for start in range(0, n_real, max_rows):
+                        end = min(start + max_rows, n_real)
+                        logits_chunk = _run_dcu_mqa_logits_with_workspace(
+                            q_mqa[start:end],
+                            kv_mqa,
+                            weights_f32[start:end],
+                            ks_per_q[start:end],
+                            ke_per_q[start:end],
+                            kv_scale_mqa,
+                            logits_workspace,
+                        )
+                        topk_result[start:end] = self._topk_from_kpool_logits(
+                            logits_chunk,
+                            pool_lens[start:end],
+                            seq_lens=seq_lens_expanded[start:end],
+                            page_table=page_table_all,
+                            topk_offsets=(
+                                None
+                                if topk_offsets_all is None
+                                else topk_offsets_all[start:end]
+                            ),
+                            row_starts=ks_per_q[start:end],
+                            page_table_row_index=(
+                                None
+                                if page_table_row_index is None
+                                else page_table_row_index[start:end]
+                            ),
+                            allow_lightop_topk=(
+                                forward_batch.forward_mode.is_extend_without_speculative()
+                            ),
+                        )
+                    return topk_result
 
-                for start in range(0, n_real, max_rows):
-                    end = min(start + max_rows, n_real)
-                    logits_chunk = _run_dcu_mqa_logits_with_workspace(
-                        q_bf16[start:end],
-                        kv_bf16,
-                        weights_f32[start:end],
-                        ks_per_q[start:end],
-                        ke_per_q[start:end],
-                        None,
-                        logits_workspace,
+                for q_start, q_end, k_start, k_end in plan.ragged_request_slices:
+                    request_k = kv_mqa[k_start:k_end]
+                    request_k_scale = (
+                        None
+                        if kv_scale_mqa is None
+                        else kv_scale_mqa[k_start:k_end]
                     )
-                    topk_result[start:end] = self._topk_from_kpool_logits(
-                        logits_chunk,
-                        pool_lens[start:end],
-                        seq_lens=seq_lens_expanded[start:end],
-                        page_table=page_table_all,
-                        topk_offsets=(
-                            None
-                            if topk_offsets_all is None
-                            else topk_offsets_all[start:end]
-                        ),
-                        row_starts=ks_per_q[start:end],
-                        page_table_row_index=(
-                            None
-                            if page_table_row_index is None
-                            else page_table_row_index[start:end]
-                        ),
-                        allow_lightop_topk=(
-                            forward_batch.forward_mode.is_extend_without_speculative()
-                        ),
+                    request_k_rows = k_end - k_start
+                    if request_k_rows == 0:
+                        topk_result[q_start:q_end] = self._topk_from_kpool_logits(
+                            torch.empty(
+                                (q_end - q_start, 0),
+                                dtype=torch.float32,
+                                device=device,
+                            ),
+                            pool_lens[q_start:q_end],
+                            seq_lens=seq_lens_expanded[q_start:q_end],
+                            page_table=page_table_all,
+                            topk_offsets=(
+                                None
+                                if topk_offsets_all is None
+                                else topk_offsets_all[q_start:q_end]
+                            ),
+                            page_table_row_index=(
+                                None
+                                if page_table_row_index is None
+                                else page_table_row_index[q_start:q_end]
+                            ),
+                            allow_lightop_topk=(
+                                forward_batch.forward_mode.is_extend_without_speculative()
+                            ),
+                        )
+                        continue
+
+                    max_rows = _get_dcu_mqa_logits_max_rows(
+                        logits_workspace.numel(),
+                        q_end - q_start,
+                        request_k_rows,
+                        q_mqa.dtype,
                     )
+                    for start in range(q_start, q_end, max_rows):
+                        end = min(start + max_rows, q_end)
+                        logits_chunk = _run_dcu_mqa_logits_with_workspace(
+                            q_mqa[start:end],
+                            request_k,
+                            weights_f32[start:end],
+                            plan.ragged_q_local_ks[start:end],
+                            pool_lens[start:end],
+                            request_k_scale,
+                            logits_workspace,
+                        )
+                        topk_result[start:end] = self._topk_from_kpool_logits(
+                            logits_chunk,
+                            pool_lens[start:end],
+                            seq_lens=seq_lens_expanded[start:end],
+                            page_table=page_table_all,
+                            topk_offsets=(
+                                None
+                                if topk_offsets_all is None
+                                else topk_offsets_all[start:end]
+                            ),
+                            page_table_row_index=(
+                                None
+                                if page_table_row_index is None
+                                else page_table_row_index[start:end]
+                            ),
+                            allow_lightop_topk=(
+                                forward_batch.forward_mode.is_extend_without_speculative()
+                            ),
+                        )
                 return topk_result
             else:
                 logits = deep_gemm.fp8_mqa_logits(
@@ -1211,20 +1329,28 @@ class IndexerKPool(Indexer):
             )
 
             if is_dcu():
-                kv_bf16 = (
-                    k_i8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
-                ).to(torch.bfloat16).unsqueeze(1).contiguous()
+                if q_fp8.dtype == torch.int8:
+                    q_mqa = q_fp8.contiguous()
+                    kv_mqa = k_i8.unsqueeze(1).contiguous()
+                    kv_scale_mqa = k_scale.contiguous()
+                else:
+                    q_mqa = q_fp8.to(torch.bfloat16).contiguous()
+                    kv_mqa = (
+                        k_i8.to(torch.float32)
+                        * k_scale.to(torch.float32).unsqueeze(-1)
+                    ).to(torch.bfloat16).unsqueeze(1).contiguous()
+                    kv_scale_mqa = None
                 logits = op.mqa_logits(
-                    q_fp8.to(torch.bfloat16).contiguous(),
-                    kv_bf16,
+                    q_mqa,
+                    kv_mqa,
                     weights.to(torch.float32).contiguous(),
                     ks,
                     ke,
-                    q_fp8.shape[0],
-                    kv_bf16.shape[0],
-                    q_fp8.shape[1],
-                    q_fp8.shape[2],
-                    None,
+                    q_mqa.shape[0],
+                    kv_mqa.shape[0],
+                    q_mqa.shape[1],
+                    q_mqa.shape[2],
+                    kv_scale_mqa,
                     True,
                 )
             else:
@@ -1543,22 +1669,24 @@ class IndexerKPool(Indexer):
         elif not is_npu():
             from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
-        if metadata is None:
-            return None
-
         # Empty batch (e.g. cuda-graph max-pad slot): return all-invalid
         # before doing any projections / quant.
         assert forward_batch.seq_lens_cpu is not None
-        if len(forward_batch.seq_lens_cpu) == 0:
+        if len(forward_batch.seq_lens_cpu) == 0 or x.shape[0] == 0:
+            if x.shape[0] == 0:
+                return None
             return torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
                 dtype=torch.int,
                 device=x.device,
             )
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
 
         # Cache mode predicates: forward_mode methods are non-trivial and
         # we'd otherwise call each one 2-4 times in this function.
@@ -1651,6 +1779,10 @@ class IndexerKPool(Indexer):
             if is_dcu():
                 q_index = query
                 weights = self._get_bf16_logits_head_gate(x)
+                if overlap_prefill:
+                    q_index, weights = (
+                        self._prepare_dcu_prefill_q_and_logits_head_gate(query, x)
+                    )
             else:
                 q_index, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 weights = self._get_logits_head_gate(x, q_scale)
@@ -1675,14 +1807,13 @@ class IndexerKPool(Indexer):
                 layer_id=layer_id,
                 metadata=metadata,
             )
-            # if is_dcu():
-            #     q_index = query
-            #     weights = self._get_bf16_logits_head_gate(x)
-            # else:
-            #     q_index, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            #     weights = self._get_logits_head_gate(x, q_scale)
-            q_index, q_scale = per_token_quant_int8(query)
-            weights = self._get_logits_head_gate(x, q_scale)
+            if is_dcu() and (is_extend or is_draft_extend_v1):
+                q_index, weights = self._prepare_dcu_prefill_q_and_logits_head_gate(
+                    query, x
+                )
+            else:
+                q_index, q_scale = per_token_quant_int8(query)
+                weights = self._get_logits_head_gate(x, q_scale)
 
         # K-only fast path (extend only): caller wants the cache
         # populated but not the topk indices.

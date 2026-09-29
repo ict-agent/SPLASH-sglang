@@ -88,6 +88,18 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return tensor_to_reduce.tolist()
 
 
+def all_reduce_attn_cp_tp_group(
+    values,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    op: dist.ReduceOp,
+):
+    tensor_to_reduce = torch.tensor(values, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=op, group=attn_tp_cpu_group)
+    dist.all_reduce(tensor_to_reduce, op=op, group=attn_cp_cpu_group)
+    return tensor_to_reduce.tolist()
+
+
 def poll_and_all_reduce_with_staging(
     decode_reqs, staging_handler, gloo_group: dist.ProcessGroup
 ):
@@ -200,8 +212,9 @@ class MetadataBuffers:
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
             if self.mtp_topk_indices_dim > 0:
-                self.output_mtp_topk_indices = torch.zeros(
+                self.output_mtp_topk_indices = torch.full(
                     (size, self.mtp_topk_indices_dim),
+                    -1,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -340,6 +353,8 @@ class MetadataBuffers:
                 self.output_mtp_topk_indices[req.metadata_buffer_index].copy_(
                     req.mtp_topk_indices_tensor
                 )
+            else:
+                self.output_mtp_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
@@ -777,7 +792,7 @@ def build_state_indices(
 
     def _nsa_pages(pool):
         kv = req_to_token[req_pool_idx, :seq_len]
-        return kv_to_page_indices(kv.cpu().numpy(), pool.page_size).tolist()
+        return kv_to_page_indices(kv, pool.page_size).tolist()
 
     def _append_nsa(pool):
         components.append(_nsa_pages(pool))
@@ -822,9 +837,7 @@ def build_state_indices(
         window_start = (window_start // page_size) * page_size
         window_kv = req_to_token[req_pool_idx, window_start:seq_len]
         swa_loc = swa_translate_loc(window_kv)
-        components.append(
-            kv_to_page_indices(swa_loc.cpu().numpy(), page_size).tolist()
-        )
+        components.append(kv_to_page_indices(swa_loc, page_size).tolist())
     elif isinstance(token_to_kv_pool, NSATokenToKVPool):
         _append_nsa(token_to_kv_pool)
         _append_draft_nsa()

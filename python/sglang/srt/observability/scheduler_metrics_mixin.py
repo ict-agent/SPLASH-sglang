@@ -581,6 +581,10 @@ class SchedulerMetricsMixin:
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            (
+                self.stats.num_grammar_cache_entries,
+                self.stats.grammar_backend_cache_bytes,
+            ) = self.grammar_manager.get_cache_stats()
             self.stats.cache_hit_rate = cache_hit_rate
 
             # Memory pool usage ratios / Absolute token counts
@@ -752,6 +756,10 @@ class SchedulerMetricsMixin:
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            (
+                self.stats.num_grammar_cache_entries,
+                self.stats.grammar_backend_cache_bytes,
+            ) = self.grammar_manager.get_cache_stats()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
             self.stats.decode_sum_seq_lens = self._get_batch_seq_lens_sum(batch)
@@ -1094,6 +1102,8 @@ class SchedulerMetricsMixin:
             )
 
         queues = None
+        queue_details = None
+        running_details = None
         if include_all or "queues" in include:
             queues = QueueMetrics(
                 waiting=len(self.waiting_queue),
@@ -1101,6 +1111,33 @@ class SchedulerMetricsMixin:
                 paused=self.stats.num_paused_reqs,
                 retracted=self.stats.num_retracted_reqs,
             )
+            queue_names = ["waiting_queue"]
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                queue_names.append("bootstrap_queue")
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                queue_names.append("prealloc_queue")
+                queue_names.append("transfer_queue")
+                queue_names.append("retracted_queue")
+
+            queue_details = []
+            for name, queue in zip(queue_names, waiting_queues):
+                reqs_info = [{"seqlen": req.seqlen} for req in queue]
+                queue_details.append(
+                    {
+                        "name": name,
+                        "num_reqs": len(queue),
+                        "num_tokens": sum(r["seqlen"] for r in reqs_info),
+                        "reqs": reqs_info,
+                    }
+                )
+
+            running_reqs_info = [
+                {"seqlen": req.seqlen} for req in self.running_batch.reqs
+            ]
+            running_details = {
+                "num_reqs": num_running_reqs,
+                "reqs": running_reqs_info,
+            }
 
         return GetLoadsReqOutput(
             dp_rank=self.dp_rank,
@@ -1120,6 +1157,8 @@ class SchedulerMetricsMixin:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            queue_details=queue_details,
+            running_details=running_details,
         )
 
     def update_device_timer(self: Scheduler):

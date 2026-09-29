@@ -98,9 +98,16 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("nsa")
 def create_nsa_backend(runner):
+    from sglang.srt.configs.model_config import is_mtp_index_share_enabled
     from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
-    return NativeSparseAttnBackend(runner)
+    return NativeSparseAttnBackend(
+        runner,
+        seed_nsa_topk_from_draft_extend=(
+            runner.is_draft_worker
+            and is_mtp_index_share_enabled(runner.model_config.hf_config)
+        ),
+    )
 
 
 @register_attention_backend("dsv4")

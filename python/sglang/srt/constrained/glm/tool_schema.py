@@ -1,5 +1,6 @@
-from typing import Any, Optional, Protocol, runtime_checkable, TYPE_CHECKING, Literal
 import hashlib
+from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, runtime_checkable
+
 from .ebnf_utils import any_string_exclude
 
 if TYPE_CHECKING:
@@ -21,8 +22,8 @@ XML_GRAMMAR_RULES = [
     'basic_number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?',
     'basic_array ::= "[" ("" | ws basic_any (ws "," ws basic_any)*) ws "]"',
     'basic_object ::= "{" ("" | ws basic_string ws ":" ws basic_any ( ws "," ws basic_string ws ":" ws basic_any)*) ws "}"',
-    'ws ::= [ \\n\\t]*',
-    'basic_any ::= basic_number | basic_string | basic_boolean | basic_null | basic_array | basic_object',
+    "ws ::= [ \\n\\t]*",
+    "basic_any ::= basic_number | basic_string | basic_boolean | basic_null | basic_array | basic_object",
     'basic_boolean ::= "true" | "false"',
     'basic_null ::= "null"',
 ]
@@ -78,7 +79,9 @@ def _handle_enum(prop: dict) -> str:
 def _handle_type(prop: dict) -> str:
     prop_type = prop["type"]
     if isinstance(prop_type, list):
-        type_rules = [TYPE_MAPPING.get(t, "text_without_special_tokens") for t in prop_type]
+        type_rules = [
+            TYPE_MAPPING.get(t, "text_without_special_tokens") for t in prop_type
+        ]
         return " | ".join(type_rules) if type_rules else "text_without_special_tokens"
     return TYPE_MAPPING.get(prop_type, "text_without_special_tokens")
 
@@ -104,13 +107,15 @@ def build_tool_call_rules(
     if chat_template_version == "glm45":
         extra_seperator = '"\\n"'
     elif chat_template_version == "glm47":
-        extra_seperator = ''
+        extra_seperator = ""
     else:
-        raise NotImplementedError(f"Unsupported chat_template_version: {chat_template_version}")
+        raise NotImplementedError(
+            f"Unsupported chat_template_version: {chat_template_version}"
+        )
 
     rules = [
         # Root rule: zero or more tool calls, each preceded by newline
-        f'{non_terminal_name} ::= ( {extra_seperator} tool_call_unit )*',
+        f"{non_terminal_name} ::= ( {extra_seperator} tool_call_unit )*",
         f'tool_call_unit ::= "{special_tokens.begin_of_tool_call}" single_tool_call "{special_tokens.end_of_tool_call}"',
     ]
 
@@ -118,14 +123,23 @@ def build_tool_call_rules(
     # NOTE: functions may share the same name but have different arguments.
     #  This is rather unusual / abnormal, but we handle it by hashing the name with the index to ensure uniqueness.
     tool_alternatives = " | ".join(
-        f"call_{_hash_name(func.name + str(function_index))}" for function_index, func in enumerate(functions)
+        f"call_{_hash_name(func.name + str(function_index))}"
+        for function_index, func in enumerate(functions)
     )
     rules.append(f"single_tool_call ::= {tool_alternatives}")
 
-    # Key-value format template
-    # Wrap {valrule} in parentheses to ensure correct precedence when valrule contains alternatives (e.g., "text | null")
-    kv_template = f'"{special_tokens.begin_of_key}{{key}}{special_tokens.end_of_key}" {extra_seperator} "{special_tokens.begin_of_value}" ({{valrule}}) "{special_tokens.end_of_value}"'
+    # GLM NOTE: xgrammar stores a full-vocab adaptive token mask per byte
+    # position of every literal, so the long <arg_key>/<arg_value> wrappers must
+    # not be inlined per property (compile time and mask-cache memory blow up
+    # superlinearly with the number of tools). Emit them once as shared rules
+    # (one arg_value wrapper per distinct value rule, content-hashed) and keep
+    # only the short key-name literal per property.
     kv_separator = extra_seperator
+    arg_key_begin_rule = f'arg_key_begin ::= "{special_tokens.begin_of_key}"'
+    # Wrap {valrule} in parentheses to ensure correct precedence when valrule contains alternatives (e.g., "text | null")
+    arg_val_template = f'"{special_tokens.end_of_key}" {extra_seperator} "{special_tokens.begin_of_value}" ({{valrule}}) "{special_tokens.end_of_value}"'
+    emitted_arg_val_hashes = set()
+    any_props = False
 
     # Build rules for each function
     for function_index, func in enumerate(functions):
@@ -134,24 +148,37 @@ def build_tool_call_rules(
         params = func.parameters or {}
         properties = params.get("properties", {})
 
-        prop_kv_pairs = {}
-
+        # Group property keys by their value rule, preserving first-appearance order
+        keys_by_value_rule: dict[str, list[str]] = {}
         for prop_name, prop_schema in properties.items():
             value_rule = _get_value_rule(prop_schema)
-            pair = kv_template.format(key=prop_name, valrule=value_rule)
-            prop_kv_pairs[prop_name] = pair
+            keys_by_value_rule.setdefault(value_rule, []).append(prop_name)
 
-        # 所有参数都用 S* 形式，允许任意顺序任意次
-        all_props = list(properties.keys())
-
-        if all_props:
-            all_choices = " | ".join(prop_kv_pairs[k] for k in all_props)
-            # ( any_param ( separator any_param )* )?
-            arguments_rule = f"( ( {all_choices} ) ( {kv_separator} ( {all_choices} ) )* )?"
+        if keys_by_value_rule:
+            if not any_props:
+                any_props = True
+                rules.append(arg_key_begin_rule)
+            kv_choices = []
+            for value_rule, keys in keys_by_value_rule.items():
+                vhash = _hash_name(value_rule)
+                if vhash not in emitted_arg_val_hashes:
+                    emitted_arg_val_hashes.add(vhash)
+                    rules.append(
+                        f"arg_val_{vhash} ::= {arg_val_template.format(valrule=value_rule)}"
+                    )
+                keys_alt = " | ".join(f'"{key}"' for key in keys)
+                kv_choices.append(f"( {keys_alt} ) arg_val_{vhash}")
+            rules.append(
+                f'kv_{namehash} ::= arg_key_begin ( {" | ".join(kv_choices)} )'
+            )
+            # 所有参数都用 S* 形式，允许任意顺序任意次
+            arguments_rule = f"( kv_{namehash} ( {kv_separator} kv_{namehash} )* )?"
         else:
             arguments_rule = '""'
 
-        rules.append(f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?')
+        rules.append(
+            f'call_{namehash} ::= "{tool_name}" {extra_seperator} ( arguments_{namehash} {extra_seperator} )?'
+        )
         rules.append(f"arguments_{namehash} ::= {arguments_rule}")
 
     rules.extend(XML_GRAMMAR_RULES)
@@ -159,28 +186,27 @@ def build_tool_call_rules(
 
 
 if __name__ == "__main__":
-    from pydantic import BaseModel, Field
-    from .schema import SpecialTokenConfig
     import xgrammar as xgr
+    from pydantic import BaseModel, Field
+
+    from .schema import SpecialTokenConfig
 
     checks = [
         (
             "glm45",
-            '\n<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value><NYK>\n\n\nssagsfgas</arg_value>\n<arg_key>unit</arg_key>\n<arg_value>celsius</arg_value>\n</tool_call>',
+            "\n<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value><NYK>\n\n\nssagsfgas</arg_value>\n<arg_key>unit</arg_key>\n<arg_value>celsius</arg_value>\n</tool_call>",
         ),
         (
             "glm47",
-            '<tool_call>get_weather<arg_key>location</arg_key><arg_value><NYK>\n\n\nssagsfgas</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call>',
-        )
+            "<tool_call>get_weather<arg_key>location</arg_key><arg_value><NYK>\n\n\nssagsfgas</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call>",
+        ),
     ]
-
 
     class Function(BaseModel):
         description: Optional[str] = Field(default=None)
         name: str
         parameters: Optional[object] = None
         strict: bool = False
-
 
     test_functions = [
         Function(
@@ -218,7 +244,11 @@ if __name__ == "__main__":
             special_tokens=special_tokens,
             chat_template_version=chat_template_version,
         )
-        rules.extend(any_string_exclude("text_without_special_tokens", special_tokens.all_special_tokens()))
+        rules.extend(
+            any_string_exclude(
+                "text_without_special_tokens", special_tokens.all_special_tokens()
+            )
+        )
 
         ebnf_grammar = "\n".join(rules)
         print("Generated EBNF Grammar:")
@@ -227,9 +257,13 @@ if __name__ == "__main__":
 
         tokenizer_info = xgr.TokenizerInfo([])
         grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-        compiled_grammar = grammar_compiler.compile_grammar(ebnf_grammar, root_rule_name="tool_call_blocks")
+        compiled_grammar = grammar_compiler.compile_grammar(
+            ebnf_grammar, root_rule_name="tool_call_blocks"
+        )
 
-        matcher = xgr.GrammarMatcher(compiled_grammar, terminate_without_stop_token=True)
+        matcher = xgr.GrammarMatcher(
+            compiled_grammar, terminate_without_stop_token=True
+        )
         print("Matching string:", string_to_match)
         print()
 

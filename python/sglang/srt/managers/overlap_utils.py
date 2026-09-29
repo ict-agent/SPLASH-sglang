@@ -44,6 +44,10 @@ class FutureIndices:
     # Python-side validity lets the scheduler make a graph/eager decision
     # before the asynchronous seed tensor is resolved from FutureMap.
     mtp_topk_indices_valid: Optional[bool] = None
+    # Preserve the address domain alongside the deferred MTP seed.  A decoded
+    # PD seed is physical only after the decode-side remap; losing this bit
+    # during overlap resolution can make a logical seed enter fused TopK.
+    mtp_topk_indices_are_physical: Optional[bool] = None
 
 
 class FutureMap:
@@ -183,10 +187,14 @@ class FutureMap:
             if self.mtp_topk_indices_dim > 0:
                 if draft_input.future_indices.mtp_topk_indices_valid is True:
                     draft_input.mtp_topk_indices = self.mtp_topk_indices_buf[indices]
+                    draft_input.mtp_topk_indices_are_physical = (
+                        draft_input.future_indices.mtp_topk_indices_are_physical
+                    )
                 else:
                     # Zero is a valid logical index.  Missing must remain the
                     # Python None sentinel rather than an in-band tensor value.
                     draft_input.mtp_topk_indices = None
+                    draft_input.mtp_topk_indices_are_physical = False
 
     def is_empty_slice(self, s: slice) -> bool:
         start, stop, step = s.indices(self.future_buffer_len)
@@ -229,6 +237,11 @@ class FutureMap:
             self.hidden_states_buf[intv] = draft_input.hidden_states
         if self.mtp_topk_indices_dim > 0:
             mtp_topk_indices = draft_input.mtp_topk_indices
+            future_indices.mtp_topk_indices_are_physical = (
+                draft_input.mtp_topk_indices_are_physical
+                if mtp_topk_indices is not None
+                else False
+            )
             # Publish only after validation/copy; exceptions remain fail-closed.
             future_indices.mtp_topk_indices_valid = False
             if mtp_topk_indices is None:

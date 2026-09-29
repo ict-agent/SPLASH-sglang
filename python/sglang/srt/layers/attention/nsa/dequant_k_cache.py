@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -195,28 +197,46 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
+    target_dim_rope: Optional[int] = None,
 ) -> torch.Tensor:
     """
     De-quantize the k-cache with paged layout
     Args:
         quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
+        target_dim_rope: override the output rope dimension after validating
+            the packed storage layout. The no-rope FlashMLA sparse path uses 0
+            to require a 512-dimensional BF16 result.
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
+    if target_dim_rope is not None:
+        assert target_dim_rope in (0, 64)
+
+    dim_quant = quant_k_cache.shape[-1]
+    lightop_output_dim = None
+    if target_dim_rope is None:
+        if dim_quant == 656:
+            lightop_output_dim = 576
+        elif dim_quant == 528:
+            lightop_output_dim = 512
+    elif target_dim_rope == 0 and dim_quant == 528:
+        lightop_output_dim = 512
+
     use_lightop = (
         _has_lightop_prefill_dequant
+        and lightop_output_dim is not None
         and group_size == 128
         and quant_k_cache.dtype == torch.float8_e4m3fn
         and quant_k_cache.is_contiguous()
         and quant_k_cache.dim() in (3, 4)
-        and quant_k_cache.shape[-2:] == (1, 656)
+        and quant_k_cache.shape[-2] == 1
         and page_table_1_flattened.dtype == torch.int32
         and page_table_1_flattened.is_contiguous()
     )
     if use_lightop:
         output = torch.empty(
-            (page_table_1_flattened.numel(), 1, 576),
+            (page_table_1_flattened.numel(), 1, lightop_output_dim),
             dtype=torch.bfloat16,
             device=quant_k_cache.device,
         )
@@ -227,7 +247,6 @@ def dequantize_k_cache_paged(
         )
         return output
 
-    dim_quant = quant_k_cache.shape[-1]
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
@@ -239,11 +258,13 @@ def dequantize_k_cache_paged(
     scale_bytes = num_tiles * 4
     rope_bytes = dim_quant - dim_nope - scale_bytes
     assert rope_bytes >= 0 and rope_bytes % torch.bfloat16.itemsize == 0
-    dim_rope = rope_bytes // torch.bfloat16.itemsize
-    assert dim_rope in (
+    storage_dim_rope = rope_bytes // torch.bfloat16.itemsize
+    assert storage_dim_rope in (
         0,
         64,
-    ), f"Unsupported rope dimension {dim_rope} for packed MLA KV cache"
+    ), f"Unsupported rope dimension {storage_dim_rope} for packed MLA KV cache"
+    dim_rope = storage_dim_rope if target_dim_rope is None else target_dim_rope
+    assert dim_rope <= storage_dim_rope
 
     output = torch.empty(
         (num_tokens, 1, dim_nope + dim_rope),

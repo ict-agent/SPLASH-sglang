@@ -13,11 +13,13 @@ class DraftBackendFactory:
         draft_model_runner,
         topk: int,
         speculative_num_steps: int,
+        seed_nsa_topk_from_draft_extend: bool = False,
     ):
         self.server_args = server_args
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.seed_nsa_topk_from_draft_extend = seed_nsa_topk_from_draft_extend
         self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
     def _create_backend(
@@ -105,13 +107,20 @@ class DraftBackendFactory:
         )
 
         return NativeSparseAttnMultiStepBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
+            self.draft_model_runner,
+            self.topk,
+            self.speculative_num_steps,
+            seed_nsa_topk_from_draft_extend=self.seed_nsa_topk_from_draft_extend,
         )
 
     def _create_nsa_prefill_backend(self):
         from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
-        return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
+        return NativeSparseAttnBackend(
+            self.draft_model_runner,
+            skip_prefill=False,
+            seed_nsa_topk_from_draft_extend=self.seed_nsa_topk_from_draft_extend,
+        )
 
     def _create_flashinfer_decode_backend(self):
         if not get_global_server_args().use_mla_backend:

@@ -461,15 +461,19 @@ class NixlKVManager(CommonKVManager):
             prefetch_staging_reqs,
         )
 
-        prefetch_staging_reqs(
+        ok = prefetch_staging_reqs(
             room,
             self.transfer_infos,
             self.kv_buffer_tensors,
             self.server_args.chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
-            self._staging_ctx.prefetch_sockets,
+            self._push_socket_cache,
         )
-        self._staging_ctx.prefetched_rooms.add(room)
+        if ok:
+            # Only mark the room as prefetched when the whole fan-out
+            # succeeded; otherwise leave it unmarked so a later chunk retries
+            # the STAGING_REQs whose sends failed (their keys were discarded).
+            self._staging_ctx.prefetched_rooms.add(room)
 
     def _start_heartbeat_checker_thread(self):
         """
@@ -2017,7 +2021,6 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
@@ -2029,21 +2032,35 @@ class NixlKVReceiver(CommonKVReceiver):
                 if not is_dummy and state_indices is not None
                 else b""
             )
-            with lock:
-                sock.send_multipart(
-                    [
-                        GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.name.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii"),
-                        str(self.required_dst_info_num).encode("ascii"),
-                        packed_state_indices,
-                        str(decode_prefix_len or 0).encode("ascii"),
-                    ]
+            try:
+                with self._connect_to_bootstrap_server(bootstrap_info) as sock:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii"),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            packed_state_indices,
+                            str(decode_prefix_len or 0).encode("ascii"),
+                        ]
+                    )
+            except Exception as e:
+                logger.error(
+                    "Failed to send metadata to prefill %s for room %s: %s",
+                    bootstrap_info,
+                    self.bootstrap_room,
+                    e,
                 )
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Failed to send metadata to {bootstrap_info}: {e}",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
 
         # Mark that we expect state data if state_indices was provided
         if state_indices is not None:
@@ -2091,9 +2108,8 @@ class NixlKVReceiver(CommonKVReceiver):
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
-    def _register_kv_args(self):
+    def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -2122,28 +2138,45 @@ class NixlKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
-            with lock:
-                sock.send_multipart(
-                    [
-                        GUARD,
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.name.encode("ascii"),
-                        self.kv_mgr.agent.get_agent_metadata(),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
-                        str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
-                        str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                    ]
+            try:
+                with self._connect_to_bootstrap_server(bootstrap_info) as sock:
+                    sock.send_multipart(
+                        [
+                            GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.agent.name.encode("ascii"),
+                            self.kv_mgr.agent.get_agent_metadata(),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                            str(self.kv_mgr.attn_tp_size).encode("ascii"),
+                            str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
+                            str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                        ]
+                    )
+            except Exception as e:
+                logger.error(
+                    "Failed to register kv_args to prefill %s for room %s: %s",
+                    bootstrap_info,
+                    self.bootstrap_room,
+                    e,
                 )
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Failed to register kv_args to {bootstrap_info}: {e}",
+                )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+
+        return True
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")

@@ -4,6 +4,7 @@ import copy
 import functools
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -156,10 +157,49 @@ def normalize_tool_content(role: str, content):
     return content
 
 
+try:
+    import regex as _pcre
+except ImportError:
+    _pcre = None
+    logger.warning(
+        "The 'regex' package is not installed; tool-schema patterns using "
+        "PCRE-only syntax such as \\p{...} will keep being rejected."
+    )
+
+
+def _is_regex(instance: object) -> bool:
+    """Format check for JSON-schema `pattern`: stdlib `re` first, PCRE
+    (`regex` package) as fallback so `\p{...}` and friends are accepted.
+    Stdlib-re-acceptable patterns keep their original semantics."""
+    if not isinstance(instance, str):
+        return True
+    try:
+        re.compile(instance)
+        return True
+    except re.error:
+        if _pcre is not None:
+            try:
+                _pcre.compile(instance)
+                return True
+            except _pcre.error:
+                return False
+        return False
+
+
+# Draft 2020-12 metaschema requires `pattern` to satisfy format "regex";
+# jsonschema's default check uses stdlib `re`, which rejects PCRE-only
+# syntax (\p{...}) that callers legitimately send in tool definitions.
+# Scope the relaxed check to tool-parameter validation only.
+_TOOL_SCHEMA_FORMAT_CHECKER = copy.deepcopy(Draft202012Validator.FORMAT_CHECKER)
+_TOOL_SCHEMA_FORMAT_CHECKER.checkers["regex"] = (_is_regex, ())
+
+
 @functools.lru_cache(maxsize=4096)
 def _check_schema_cached(schema_json: bytes) -> Optional[str]:
     try:
-        Draft202012Validator.check_schema(orjson.loads(schema_json))
+        Draft202012Validator.check_schema(
+            orjson.loads(schema_json), format_checker=_TOOL_SCHEMA_FORMAT_CHECKER
+        )
     except SchemaError as e:
         return str(e)
     return None
@@ -179,7 +219,9 @@ def _check_tool_parameters_schema(parameters) -> Optional[str]:
     except (TypeError, orjson.JSONEncodeError):
         # Not canonicalizable (non-JSON types); validate uncached.
         try:
-            Draft202012Validator.check_schema(parameters)
+            Draft202012Validator.check_schema(
+                parameters, format_checker=_TOOL_SCHEMA_FORMAT_CHECKER
+            )
         except SchemaError as e:
             return str(e)
         return None
@@ -1223,8 +1265,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    if (
+                        finish_reason_type == "abort"
+                        and os.getenv("GLM_USE_ABORT_FINISH_REASON", "0") == "0"
+                        and isinstance(finish_reason.get("status_code"), HTTPStatus)
                     ):
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(

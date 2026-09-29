@@ -178,6 +178,7 @@ class Glm4vVisionBlock(nn.Module):
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
     ) -> torch.Tensor:
@@ -191,6 +192,7 @@ class Glm4vVisionBlock(nn.Module):
         attn = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
         )
@@ -563,8 +565,10 @@ class Glm4vVisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = int(seq_lens.max().item())
 
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        seqlens = seq_lens.tolist()
         if self.adapt_position:
             x = self.embeddings(
                 x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
@@ -576,6 +580,8 @@ class Glm4vVisionModel(nn.Module):
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
+        else:
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         # x.shape: (s, b, d) where b=1 for vision processing
         # transformers
@@ -584,6 +590,7 @@ class Glm4vVisionModel(nn.Module):
             x = blk(
                 x,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
             )
