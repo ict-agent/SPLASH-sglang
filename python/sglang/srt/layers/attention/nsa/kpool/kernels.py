@@ -664,7 +664,24 @@ def topk_from_pooled_history_logits(
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
-        from sgl_kernel import fast_kpool_topk_transform_fused
+        try:
+            from sgl_kernel import fast_kpool_topk_transform_fused
+        except ImportError:
+            from sglang.srt.layers.attention.nsa.kpool.paged_mqa_compat import (
+                use_hopper_kpool_fallback,
+            )
+
+            if pool_size == 4 and topk == 2048 and use_hopper_kpool_fallback(16, logits.device):
+                # The old installed sgl_kernel has only K=2048 kernels. The
+                # existing exact Torch K=512 path preserves pool expansion,
+                # tail selection, row indirection, and graph-safe padding.
+                return _torch_topk_pooled_history(
+                    logits, group_lengths, pool_size, topk,
+                    page_table=page_table, topk_offsets=topk_offsets,
+                    seq_lens=seq_lens, row_starts=row_starts, out_rows=out_rows,
+                    page_table_row_index=page_table_row_index,
+                )
+            raise
 
         return fast_kpool_topk_transform_fused(
             score=logits,
