@@ -62,7 +62,10 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import get_spec_v2_full_overlap_max_kv_len
 from sglang.srt.utils import is_cuda, is_hip
@@ -388,6 +391,10 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.mla_only_dp = bool(
+            getattr(model_runner.server_args, "mla_only_dp", False)
+            and is_dp_attention_enabled()
+        )
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -2201,6 +2208,16 @@ class NativeSparseAttnBackend(
 
         return o
 
+    def _flashmla_kv_num_heads(self) -> int:
+        # Pad the query-head count to the supported SM100 kernel shape.
+        # MLA has one shared KV head, so independent zero query heads can be
+        # appended and discarded without changing any original head. Match
+        # the scheduler metadata to the actual decode kernel shape.
+        if self.device_sm_major == 10 and 0 < self.num_q_heads < 64:
+            assert 64 % self.num_q_heads == 0
+            return 64
+        return self.num_q_heads
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2216,7 +2233,16 @@ class NativeSparseAttnBackend(
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        num_heads = layer.tp_q_head_num
+        kernel_num_heads = self._flashmla_kv_num_heads()
+        assert num_heads == self.num_q_heads
+        q_all = q_all.view(-1, 1, num_heads, layer.head_dim)
+        if kernel_num_heads != num_heads:
+            q_padded = q_all.new_zeros(
+                (q_all.shape[0], q_all.shape[1], kernel_num_heads, q_all.shape[3])
+            )
+            q_padded[:, :, :num_heads, :] = q_all
+            q_all = q_padded
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
@@ -2244,6 +2270,8 @@ class NativeSparseAttnBackend(
             ),
             is_fp8_kvcache=True,
         )
+        if kernel_num_heads != num_heads:
+            o = o[:, :, :num_heads, :].contiguous()
         return o
 
     def _forward_standard_mha(
@@ -2603,6 +2631,13 @@ class NativeSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
                 and (forward_batch.hisparse_coordinator is None)
+                # Model dispatch forces absorbed MLA for this
+                # layout; metadata and kernel dispatch must agree.
+                and not (
+                    self.mla_only_dp
+                    and forward_batch.global_num_tokens_cpu is not None
+                    and forward_batch.global_dp_buffer_len is not None
+                )
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
@@ -2680,9 +2715,9 @@ class NativeSparseAttnBackend(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?
-            num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
+            num_q_tokens_per_head_k=seq_len_q * self._flashmla_kv_num_heads() // 1,
             num_heads_k=1,
-            num_heads_q=self.num_q_heads,
+            num_heads_q=self._flashmla_kv_num_heads(),
             is_fp8_kvcache=True,
             topk=self.nsa_index_topk,
         )

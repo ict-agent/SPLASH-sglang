@@ -868,13 +868,11 @@ class CudaGraphRunner:
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
+        global_num_tokens_cpu = None
         if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * self.dp_size
             buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
+                torch.tensor(global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device)
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
@@ -885,12 +883,9 @@ class CudaGraphRunner:
             )
             global_dp_buffer_len = num_tokens * self.dp_size
         elif self.require_attn_tp_gather:
+            global_num_tokens_cpu = [num_tokens]
             buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
+                torch.tensor(global_num_tokens_cpu, dtype=torch.int32, device=input_ids.device)
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
@@ -954,6 +949,7 @@ class CudaGraphRunner:
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),

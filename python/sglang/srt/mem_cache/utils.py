@@ -13,6 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
+import os
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -88,6 +89,18 @@ def set_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
+    if os.environ.get("SGLANG_MLA_KV_BUFFER_TORCH_FALLBACK") == "1":
+        n_loc = loc.numel()
+        src = torch.cat(
+            [
+                cache_k_nope.reshape(n_loc, -1),
+                cache_k_rope.reshape(n_loc, -1),
+            ],
+            dim=-1,
+        )
+        kv_buffer.view(kv_buffer.shape[0], -1).index_copy_(0, loc.long(), src)
+        return
+
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
 

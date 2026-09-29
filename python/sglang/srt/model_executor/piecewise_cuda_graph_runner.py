@@ -145,6 +145,22 @@ def set_torch_compile_config():
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
+    def _get_capture_dp_metadata(self, num_tokens: int):
+        if not self.model_runner.server_args.enable_dp_attention:
+            return None, None, None, None
+
+        global_num_tokens_cpu = [num_tokens] * self.dp_size
+        global_dp_buffer_len = sum(global_num_tokens_cpu)
+        global_num_tokens_gpu = torch.tensor(
+            global_num_tokens_cpu, dtype=torch.int32, device=self.device
+        )
+        return (
+            global_num_tokens_cpu,
+            global_num_tokens_gpu,
+            global_num_tokens_gpu,
+            global_dp_buffer_len,
+        )
+
     def is_mamba_track_enabled(self):
         return (
             self.model_runner.server_args.enable_mamba_extra_buffer()
@@ -348,6 +364,12 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+        (
+            global_num_tokens_cpu,
+            global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu,
+            global_dp_buffer_len,
+        ) = self._get_capture_dp_metadata(num_tokens)
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -378,10 +400,11 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_cpu=global_num_tokens_cpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
@@ -394,7 +417,12 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
+        set_dp_buffer_len(
+            global_dp_buffer_len,
+            num_tokens,
+            forward_batch.dp_padding_mode.is_max_len(),
+            global_num_tokens_cpu,
+        )
         set_is_extend_in_batch(False)
         with set_forward_context(
             forward_batch,
@@ -497,6 +525,15 @@ class PiecewiseCudaGraphRunner:
         )
 
         global_dp_buffer_len = None
+        global_num_tokens_cpu = None
+        global_num_tokens_gpu = None
+        global_num_tokens_for_logprob_gpu = None
+        (
+            global_num_tokens_cpu,
+            global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu,
+            global_dp_buffer_len,
+        ) = self._get_capture_dp_metadata(num_tokens)
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -535,10 +572,11 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_cpu=global_num_tokens_cpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
@@ -562,6 +600,7 @@ class PiecewiseCudaGraphRunner:
                 global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
             )
             # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
             # It is True in this context but we need to set it to use low latency deepep mode.

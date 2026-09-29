@@ -378,7 +378,10 @@ def fused_experts_impl(
     E, N, _ = w1.shape
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
-    CHUNK_SIZE = 64 * 1024
+    chunk_size_env = os.getenv("SGLANG_MOE_FUSED_CHUNK_SIZE")
+    CHUNK_SIZE = int(chunk_size_env) if chunk_size_env else 64 * 1024
+    if CHUNK_SIZE <= 0:
+        CHUNK_SIZE = 64 * 1024
     M = min(num_tokens, CHUNK_SIZE)
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,

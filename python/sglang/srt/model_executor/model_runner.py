@@ -653,6 +653,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            self.maybe_init_mla_only_dp_weight_caches()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
@@ -2428,6 +2429,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_lens=torch.ones_like(ngram_embedding_info.out_column_starts),
             ignore_tokens=None,
         )
+
+    def maybe_init_mla_only_dp_weight_caches(self):
+        if not self.server_args.mla_only_dp:
+            return
+        if os.getenv("SGLANG_MLA_ONLY_DP_MOVE_MLA_BMM") != "1":
+            return
+        if (
+            os.getenv("SGLANG_MLA_ONLY_DP_MOVE_O_PROJ") != "1"
+            and os.getenv("SGLANG_MLA_ONLY_DP_MOVE_Q_B_PROJ") != "1"
+        ):
+            return
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            maybe_init_mla_only_dp_weight_caches,
+        )
+
+        maybe_init_mla_only_dp_weight_caches(self.model)
 
     def init_device_graphs(self):
         """Capture device graphs."""
